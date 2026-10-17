@@ -1,39 +1,50 @@
 <h1 align="center">terc</h1>
 
 <p align="center">
-  <a href="README.zh-CN.md">简体中文</a> · <strong>English</strong>
+  <strong>简体中文</strong> · <a href="README.en.md">English</a>
 </p>
 
 <p align="center">
-  <strong>Mihomo, in your terminal.</strong><br>
-  Live traffic telemetry, proxy orchestration, and system proxy control for macOS.
+  <strong>键盘上的 Mihomo。</strong><br>
+  日常开关比菜单短，状态比面板密，足迹只剩一个终端。
 </p>
 
 <p align="center">
-  <img alt="macOS 14 or newer" src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square">
-  <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable-111111?style=flat-square">
-  <img alt="Ratatui terminal interface" src="https://img.shields.io/badge/TUI-ratatui-FFA4A4?style=flat-square">
-  <img alt="Mihomo Clash.Meta core" src="https://img.shields.io/badge/Core-Mihomo-555555?style=flat-square">
+  <img alt="macOS 14 或更新版本" src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square">
+  <img alt="Rust 稳定版" src="https://img.shields.io/badge/Rust-stable-111111?style=flat-square">
+  <img alt="Ratatui 终端界面" src="https://img.shields.io/badge/TUI-ratatui-FFA4A4?style=flat-square">
+  <img alt="Mihomo Clash.Meta 内核" src="https://img.shields.io/badge/Core-Mihomo-555555?style=flat-square">
 </p>
 
 <p align="center">
-  <a href="#quick-start"><strong>Get started</strong></a> ·
-  <a href="#what-it-shows">Features</a> ·
-  <a href="#controls">Controls</a> ·
-  <a href="#configuration">Config</a> ·
-  <a href="#how-it-works">How it works</a> ·
-  <a href="#development">Development</a>
+  <a href="#快速开始"><strong>开始使用</strong></a> ·
+  <a href="#显示内容">功能</a> ·
+  <a href="#快捷键">快捷键</a> ·
+  <a href="#配置">配置</a> ·
+  <a href="#工作原理">工作原理</a> ·
+  <a href="#开发">开发</a>
 </p>
 
 <p align="center">
-  <img src="assets/terc-hero.svg" alt="terc wordmark beside a single rounded control card and a thin traffic trace" width="100%">
+  <img src="assets/terc-hero.svg" alt="复古终端里的 terc：圆角标题切口、盲文上下行速率图、开关条和节点列表" width="100%">
 </p>
 
-`terc` turns your local `mihomo` (Clash.Meta) daemon into a calm, responsive terminal workspace. Built as the companion to [`terb`](https://github.com/pentaoa/terb), it shares the same transparent canvas, rounded title-cutout wireframes (`╭─┐ Title ┌───╮`), and three restrained palettes. TUN, sniffing, routing mode, DNS, rules, and providers sit on one keyboard rail, so the daily path is shorter than a settings menu. Quitting frees the UI and leaves the background core running.
+## 每天用的那些开关
 
-## Quick Start
+Surge 把 TUN、嗅探、分流和 DNS 放进菜单。`terc` 把它们留在同一排键上：按下去就生效，屏上同时看见速率、进程、规则链和解析结果。
 
-**Requires:** macOS 14+, Rust stable, and a `mihomo` binary (either via `brew install mihomo` or downloaded directly inside `terc`).
+| | |
+| --- | --- |
+| **日常路径更短** | TUN、嗅探、IPv6、DNS、分流模式各一个键。系统代理只在按下空格时改变，从不会自己打开。 |
+| **一屏看得更全** | 盲文速率图、命中次数、入站、嗅探域名和 DNS 状态留在同一块屏幕上。 |
+| **几乎零足迹** | 本机 `127.0.0.1:9090` 用标准库 `TcpStream`。远端订阅走系统 `curl`。没有 tokio、reqwest、openssl。 |
+| **内核是敞开的** | 配置仍是 Mihomo 的 YAML。退出只关界面，后台内核继续跑。 |
+
+`terc` 与 [`terb`](https://github.com/pentaoa/terb) 共用透明画布、圆角镂空标题线框（`╭─┐ Title ┌───╮`）和 Spring、Vintage、Mono 三套配色。
+
+## 快速开始
+
+**需要：** macOS 14 或更新版本、Rust 稳定版，以及 `mihomo` 内核（可通过 `brew install mihomo` 安装，或在 `terc` 设置页内一键下载托管内核）。
 
 ```bash
 git clone https://github.com/pentaoa/terc.git
@@ -41,110 +52,110 @@ cd terc
 cargo run --release --locked
 ```
 
-Press **Space** to toggle the macOS system proxy, or press **K** to start/stop the background `mihomo` daemon. Run `terc --version` to verify the installed version.
+按 **空格 (`Space`)** 一键开启或关闭 macOS 系统代理，按 **`K`** 启动或停止后台 `mihomo` 服务。运行 `terc --version` 可查看已安装版本。
 
-On first run `terc` opens a setup window that walks through three steps: paste a subscription URL, locate the `mihomo` binary (<kbd>Ctrl+D</kbd> downloads a managed core) and start the core. <kbd>Esc</kbd> dismisses it and <kbd>u</kbd> brings it back while no subscription is configured — the macOS system proxy is never switched on for you.
+首次运行会自动弹出初始设置窗口，引导完成三步：粘贴机场订阅链接、定位 `mihomo` 二进制（<kbd>Ctrl+D</kbd> 可下载托管内核）、启动内核。按 <kbd>Esc</kbd> 可以先关掉，未配置订阅时按 <kbd>u</kbd> 随时重新打开——系统代理永远不会被自动开启。
 
 > [!NOTE]
-> `terc` decouples the UI lifecycle from the proxy core. Closing `terc` with <kbd>q</kbd> immediately frees all terminal UI resources while your background `mihomo` tunnel continues running uninterrupted.
+> `terc` 将界面与内核生命周期完全解耦。按 <kbd>q</kbd> 退出 `terc` 只会关闭终端界面并释放全部 UI 内存，后台 `mihomo` 代理服务依然稳固运行。
 
-Transparency follows your terminal profile. `terc` leaves the background at its terminal default (`Color::Reset`); configure opacity or blur in your terminal emulator.
+透明度沿用终端配置。`terc` 使用终端默认透明背景（`Color::Reset`）；毛玻璃与背景透明度请在终端应用中设置。
 
-## What It Shows
+## 显示内容
 
-| View | What you get |
+| 视图 | 内容 |
 | --- | --- |
-| **Controls** | One rail for TUN, sniffer, system proxy, routing mode, DNS, IPv6, and WireGuard count |
-| **Traffic graph** | btop-style dual up/down rate history on an auto-scaled, labeled axis (`max …/s`), drawn as Braille or Blocks |
-| **Overview** | Core pulse, ports, TUN stack, process lookup, memory, connection count, and subscription quota |
-| **Groups & Nodes** | Dual-pane selector with protocol tags (`AnyTLS`, `SS`, etc.) and color-graded latency (`ms`) |
-| **Connections** | Process, inbound, sniff host, rule payload, chain, and geo/ASN, with one-key close |
-| **DNS** | Resolver status from the config, live lookup, and DNS / Fake-IP flush |
-| **Rules** | Ordered list with live hit counts, local explain, and runtime disable |
-| **Providers** | Proxy and rule providers, refresh one or all, latency health check |
-| **Snippets** | YAML overlays for TUN, sniffer, Fake-IP, process lookup, TCP racing, and IPv6 |
-| **Profiles** | Switch another YAML onto the running config and hot-reload |
-| **Probe** | DNS answers plus a delay test of the selected node |
-| **Runtime** | TUN device and any WireGuard or Tailscale outbound the core already exposes |
-| **Logs** | Live streaming core logs with severity highlighting |
-| **Themes** | Spring, Vintage, and Mono; all preserve the terminal background |
+| **开关条** | TUN、嗅探、系统代理、分流模式、DNS、IPv6，以及 WireGuard 出站数量 |
+| **实时速率图** | btop 风格的上下行双速率历史图，自适应刻度并标注峰值（`max …/s`），支持 Braille 点阵与方块 |
+| **内核概览** | 内核脉冲、端口、TUN 栈、进程查找、内存、连接数与套餐余量 |
+| **策略组与节点** | 左右双栏，协议标签（如 `AnyTLS`）与按延迟着色的毫秒数 |
+| **活跃连接** | 进程、入站、嗅探域名、规则载荷、链路、Geo/ASN，可单条或全部断开 |
+| **DNS** | 从配置读出的解析状态、即时查询，以及 DNS / Fake-IP 缓存清空 |
+| **规则** | 顺序列表、实时命中次数、本机解释，以及运行时禁用 |
+| **Provider** | 代理与规则订阅源，单条或全部刷新，代理源可做健康检查 |
+| **片段** | TUN、嗅探、Fake-IP、进程名、TCP 竞速、IPv6 的 YAML 叠加 |
+| **配置档案** | 把另一份 YAML 换成当前配置并热重载 |
+| **探测** | 对当前节点同时做 DNS 查询和延迟测试 |
+| **运行时** | TUN 设备，以及内核里已经存在的 WireGuard / Tailscale 出站 |
+| **实时日志** | 按级别着色的内核日志流 |
+| **主题** | Spring、Vintage、Mono，均保留终端透明背景 |
 
-The toolbar stays one row. Narrow terminals keep the key letters and drop the labels.
+底部工具栏只占一行。窗口变窄时只保留按键字母。
 
-## Controls
+## 快捷键
 
-| Where | Key | Action |
+| 页面 | 按键 | 操作 |
 | --- | --- | --- |
-| Dashboard / Settings | <kbd>Space</kbd> | Toggle macOS system proxy (`networksetup` HTTP / HTTPS / SOCKS5). Never toggled for you |
-| Dashboard | <kbd>T</kbd> / <kbd>n</kbd> / <kbd>i</kbd> | Toggle TUN, sniffer, or IPv6. Runtime `PATCH`, then the same value is written back |
-| Dashboard | <kbd>D</kbd> | Toggle `dns.enable` in the config and hot-reload |
-| Dashboard | <kbd>d</kbd> / <kbd>g</kbd> / <kbd>v</kbd> | DNS, rules, providers |
-| Dashboard | <kbd>o</kbd> / <kbd>f</kbd> / <kbd>b</kbd> / <kbd>w</kbd> | Snippet gallery, profiles, probe, WireGuard / runtime |
-| Rules | <kbd>/</kbd> or <kbd>e</kbd> | Filter the list and explain a host, IP, or `process:name` |
-| Rules | <kbd>x</kbd> | Disable or restore the selected rule (`PATCH /rules/disable`) |
-| DNS | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>[</kbd> <kbd>]</kbd> | Look up, flush DNS and Fake-IP, cycle record type |
-| Providers | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>H</kbd> | Refresh the selected provider, refresh all, or health-check a proxy provider |
-| Dashboard | <kbd>K</kbd> | Start or stop the background `mihomo` daemon |
-| Proxies | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Tab</kbd> | Switch focus between **Groups `[1]`** and **Nodes `[2]`** |
-| Any list | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd> | Move the selection |
-| Nodes | <kbd>Enter</kbd> | Activate the highlighted node in the current group |
-| Proxies | <kbd>r</kbd> | Run concurrent URL latency tests for the current group |
-| Proxies | <kbd>a</kbd> | Auto-select the lowest-latency node in the current group |
-| Dashboard | <kbd>m</kbd> | Cycle routing mode (`Rule` → `Global` → `Direct`) |
-| Dashboard | <kbd>u</kbd> | Fetch latest subscription YAML and hot-reload core (`PUT /configs?force=true`); opens the setup window when no URL is saved |
-| Setup window | <kbd>Enter</kbd> | Save the subscription URL, write the config and start the core |
-| Setup window | <kbd>Ctrl+U</kbd> / <kbd>Ctrl+D</kbd> | Clear the input line / download a managed `mihomo` core |
-| Setup window | <kbd>Esc</kbd> | Dismiss for now — <kbd>u</kbd> reopens it while nothing is configured |
-| Dashboard | <kbd>p</kbd> / <kbd>c</kbd> / <kbd>L</kbd> | Switch main pane: **Proxies** / **Connections** / **Logs** |
-| Connections | <kbd>x</kbd> / <kbd>X</kbd> | Close selected connection / close all active connections |
-| Dashboard | <kbd>t</kbd> | Show or hide the top Traffic & Overview panels |
-| Menu / Dashboard | <kbd>s</kbd> | Open the dual-pane Settings board |
-| Settings | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Enter</kbd> | Adjust setting or trigger action |
-| Settings | <kbd>Tab</kbd> | Cycle setting categories (`Core & Proxy` · `Appearance` · `Subscription`) |
-| Any view | <kbd>?</kbd> | Open keyboard shortcut help |
-| Dashboard / Menu | <kbd>q</kbd> or <kbd>Esc</kbd> | Return or quit (`mihomo` stays running in background) |
+| 面板 / 设置 | <kbd>Space</kbd> | 开启或关闭 macOS 系统代理（`networksetup`）。不会自动打开 |
+| 面板 | <kbd>T</kbd> / <kbd>n</kbd> / <kbd>i</kbd> | 开关 TUN、嗅探或 IPv6。先 `PATCH` 运行时，再写回配置 |
+| 面板 | <kbd>D</kbd> | 切换配置里的 `dns.enable` 并热重载 |
+| 面板 | <kbd>d</kbd> / <kbd>g</kbd> / <kbd>v</kbd> | DNS、规则、Provider |
+| 面板 | <kbd>o</kbd> / <kbd>f</kbd> / <kbd>b</kbd> / <kbd>w</kbd> | 片段库、配置档案、探测、WireGuard / 运行时 |
+| 规则 | <kbd>/</kbd> 或 <kbd>e</kbd> | 过滤列表，并解释域名、IP 或 `process:名称` |
+| 规则 | <kbd>x</kbd> | 禁用或恢复当前规则（`PATCH /rules/disable`） |
+| DNS | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>[</kbd> <kbd>]</kbd> | 查询、清空 DNS 与 Fake-IP、切换记录类型 |
+| Provider | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>H</kbd> | 刷新当前项、刷新全部，或对代理源做健康检查 |
+| 面板 | <kbd>K</kbd> | 启动或停止后台 `mihomo` 内核 |
+| 策略组 / 节点 | <kbd>←</kbd> <kbd>→</kbd>、<kbd>h</kbd> <kbd>l</kbd> 或 <kbd>Tab</kbd> | 在左侧 **策略组 `[1]`** 与右侧 **节点 `[2]`** 之间切换焦点 |
+| 任意列表 | <kbd>↑</kbd> <kbd>↓</kbd> 或 <kbd>j</kbd> <kbd>k</kbd> | 上下移动选择 |
+| 节点列表 | <kbd>Enter</kbd> | 切换并激活当前高亮节点 |
+| 面板 | <kbd>r</kbd> | 对当前策略组内所有节点发起并发延迟测速 |
+| 面板 | <kbd>a</kbd> | 自动选中当前策略组中延迟最低的节点 |
+| 面板 | <kbd>m</kbd> | 循环切换分流模式（`Rule` → `Global` → `Direct`） |
+| 面板 | <kbd>u</kbd> | 拉取最新机场订阅 YAML 并执行零停机热重载；未保存订阅链接时先打开初始设置窗口 |
+| 设置窗口 | <kbd>Enter</kbd> | 保存订阅链接、写入配置并启动内核 |
+| 设置窗口 | <kbd>Ctrl+U</kbd> / <kbd>Ctrl+D</kbd> | 清空输入行 / 下载托管 `mihomo` 内核 |
+| 设置窗口 | <kbd>Esc</kbd> | 暂时关闭，未配置订阅时按 <kbd>u</kbd> 可重新打开 |
+| 面板 | <kbd>p</kbd> / <kbd>c</kbd> / <kbd>L</kbd> | 切换主视图：**节点面板** / **连接监控** / **实时日志** |
+| 连接监控 | <kbd>x</kbd> / <kbd>X</kbd> | 断开当前选中连接 / 一键断开全部活跃连接 |
+| 面板 | <kbd>t</kbd> | 显示或隐藏顶部「实时速率」与「内核状态」面板 |
+| 菜单 / 面板 | <kbd>s</kbd> | 打开双栏设置面板 |
+| 设置 | <kbd>←</kbd> <kbd>→</kbd>、<kbd>h</kbd> <kbd>l</kbd> 或 <kbd>Enter</kbd> | 调整并保存当前设置项，或执行动作 |
+| 设置 | <kbd>Tab</kbd> | 切换设置分类（`内核与代理` · `视觉与主题` · `订阅管理`） |
+| 任意页面 | <kbd>?</kbd> | 打开快捷键帮助，再按一次返回 |
+| 面板 / 菜单 | <kbd>q</kbd> 或 <kbd>Esc</kbd> | 返回上级或退出 `terc`（后台内核保持运行） |
 
-## Configuration
+## 配置
 
-Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terc/config.json`. The interface supports **中文 · English · 日本語**.
+按 <kbd>s</kbd> 打开**设置**。修改即时保存到 `~/.config/terc/config.json`。界面支持 **中文 · English · 日本語**。
 
-| Category | Options |
+| 分类 | 可调内容 |
 | --- | --- |
-| **Core & Proxy** | Start/stop `mihomo`, toggle the macOS system proxy, switch routing mode, download `mihomo-darwin-arm64` into `~/.config/terc/core/mihomo` |
-| **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling appends a marked block; disabling removes only that block |
-| **Profiles** | YAML files in the config directory and `~/.config/terc/profiles`. Enter copies one onto `config.yaml` and reloads |
-| **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), refresh rate (`15` / `30` / `60` / `120 Hz`), UI language |
-| **Subscription** | Hot-fetch remote AnyTLS / Clash.Meta YAML subscription and reload without dropping active tunnels |
+| **内核与代理** | 启停 `mihomo`、切换 macOS 系统代理、切换分流模式、下载 `mihomo-darwin-arm64` 到 `~/.config/terc/core/mihomo` |
+| **片段** | 内置 YAML 叠加，以及 `~/.config/terc/modules` 里的文件。开启时追加标记块，关闭时只删掉这块 |
+| **配置档案** | 配置目录和 `~/.config/terc/profiles` 中的 YAML。Enter 会把它写成 `config.yaml` 并热重载 |
+| **视觉与主题** | 色彩主题（`Spring` / `Vintage` / `Mono`）、速率图样式（`Braille` / `Blocks`）、刷新率（`15` / `30` / `60` / `120 Hz`）、界面语言 |
+| **订阅管理** | 一键拉取远端 AnyTLS / Clash.Meta 订阅配置并通过 `PUT /configs?force=true` 热重载 |
 
-## How It Works
+## 工作原理
 
-Instead of pulling in a heavy async HTTP stack, `terc` speaks raw HTTP/1.1 over `std::net::TcpStream` to the local controller (`127.0.0.1:9090`). Background threads read `/traffic`, `/memory`, and `/logs`. Toggles use `PATCH /configs` (`tun.enable`, `sniffing`, `ipv6`). DNS lookup is `GET /dns/query`, flush is `POST /cache/dns/flush` and `POST /cache/fakeip/flush`, and provider refresh is `PUT /providers/...`. Remote subscription downloads still go through `/usr/bin/curl`.
+`terc` 不用异步 HTTP 运行时，而是用标准库 `std::net::TcpStream` 连接本机 `127.0.0.1:9090`。后台线程读取 `/traffic`、`/memory` 和 `/logs`。开关走 `PATCH /configs`（`tun.enable`、`sniffing`、`ipv6`）。DNS 查询是 `GET /dns/query`，清空是 `POST /cache/dns/flush` 与 `POST /cache/fakeip/flush`，Provider 刷新是 `PUT /providers/...`。远端订阅仍通过 `/usr/bin/curl` 下载。
 
 ```mermaid
 flowchart LR
-    A[Mihomo Core :9090] -->|Chunked JSON streams| B[Raw TcpStream workers]
-    B -->|/traffic · /memory · /logs| C[Up/down rate history]
-    D[macOS networksetup] <-->|SysProxy state| E[Controller API]
-    C --> F[Synchronized Ratatui frame]
+    A[Mihomo 内核 :9090] -->|分块 JSON 实时流| B[原生 TcpStream 线程]
+    B -->|/traffic · /memory · /logs| C[上下行速率历史]
+    D[macOS networksetup] <-->|系统代理状态| E[控制器 API]
+    C --> F[Ratatui 同步帧渲染]
     E --> F
 ```
 
 <details>
-<summary>Project layout</summary>
+<summary>项目结构</summary>
 
 ```text
-assets/terc-hero.svg           Minimal wordmark, one control card, one traffic trace
-src/main.rs                    Event loop, screens, i18n
-src/ui.rs                      Rounded cutout Panel, palettes, Braille/Blocks graph
-src/panels.rs                  Controls, DNS, rules, providers, overlays
-src/control.rs                 Toggle, reload, profile, and probe actions
-src/ops.rs                     YAML overlays, rule explain, DNS/rule parsers
-src/mihomo.rs                  HTTP/1.1 over TcpStream, streams, networksetup
+assets/terc-hero.svg           复古终端画面：圆角面板、标题切口与盲文速率图
+src/main.rs                    事件循环、界面状态与多语言
+src/ui.rs                      圆角镂空 Panel、三套主题、Braille/Blocks 速率图
+src/panels.rs                  开关条、DNS、规则、Provider 与浮层
+src/control.rs                 开关、热重载、配置切换与探测
+src/ops.rs                     YAML 叠加、规则解释、DNS/规则解析
+src/mihomo.rs                  TcpStream 上的 HTTP/1.1、流式线程与 networksetup
 ```
 
 </details>
 
-## Development
+## 开发
 
 ```bash
 cargo test --all-targets --locked
