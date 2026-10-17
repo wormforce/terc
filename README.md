@@ -26,10 +26,10 @@
 </p>
 
 <p align="center">
-  <img src="assets/terc-hero.svg" alt="terc ASCII wordmark over a terminal-style backdrop with a proxy node list, a braille traffic graph and a routing chain" width="100%">
+  <img src="assets/terc-hero.svg" alt="terc wordmark beside a single rounded control card and a thin traffic trace" width="100%">
 </p>
 
-`terc` turns your local `mihomo` (Clash.Meta) daemon into a calm, responsive terminal workspace. Built as the companion to [`terb`](https://github.com/pentaoa/terb), it shares the same transparent canvas, rounded title-cutout wireframes (`╭─┐ Title ┌───╮`), and three restrained palettes—while keeping memory footprint near zero and leaving your background proxy untouched when you quit.
+`terc` turns your local `mihomo` (Clash.Meta) daemon into a calm, responsive terminal workspace. Built as the companion to [`terb`](https://github.com/pentaoa/terb), it shares the same transparent canvas, rounded title-cutout wireframes (`╭─┐ Title ┌───╮`), and three restrained palettes. TUN, sniffing, routing mode, DNS, rules, and providers sit on one keyboard rail, so the daily path is shorter than a settings menu. Quitting frees the UI and leaves the background core running.
 
 ## Quick Start
 
@@ -54,20 +54,36 @@ Transparency follows your terminal profile. `terc` leaves the background at its 
 
 | View | What you get |
 | --- | --- |
+| **Controls** | One rail for TUN, sniffer, system proxy, routing mode, DNS, IPv6, and WireGuard count |
 | **Traffic graph** | btop-style dual up/down rate history on an auto-scaled, labeled axis (`max …/s`), drawn as Braille or Blocks |
-| **Overview** | Core pulse indicator, routing mode (`Rule` / `Global` / `Direct`), macOS `SysProxy` badge, memory, and subscription quota |
+| **Overview** | Core pulse, ports, TUN stack, process lookup, memory, connection count, and subscription quota |
 | **Groups & Nodes** | Dual-pane selector with protocol tags (`AnyTLS`, `SS`, etc.) and color-graded latency (`ms`) |
-| **Connections** | Active TCP/UDP flows sorted by bandwidth, matched rules, proxy chains, and one-key termination |
+| **Connections** | Process, inbound, sniff host, rule payload, chain, and geo/ASN, with one-key close |
+| **DNS** | Resolver status from the config, live lookup, and DNS / Fake-IP flush |
+| **Rules** | Ordered list with live hit counts, local explain, and runtime disable |
+| **Providers** | Proxy and rule providers, refresh one or all, latency health check |
+| **Snippets** | YAML overlays for TUN, sniffer, Fake-IP, process lookup, TCP racing, and IPv6 |
+| **Profiles** | Switch another YAML onto the running config and hot-reload |
+| **Probe** | DNS answers plus a delay test of the selected node |
+| **Runtime** | TUN device and any WireGuard or Tailscale outbound the core already exposes |
 | **Logs** | Live streaming core logs with severity highlighting |
 | **Themes** | Spring, Vintage, and Mono; all preserve the terminal background |
 
-The single-row toolbar holds **system proxy toggle · latency test · auto-best · mode · subscription update · views · settings · help**. Smaller terminal windows automatically compact the hints.
+The toolbar stays one row. Narrow terminals keep the key letters and drop the labels.
 
 ## Controls
 
 | Where | Key | Action |
 | --- | --- | --- |
-| Dashboard / Settings | <kbd>Space</kbd> | Toggle macOS system proxy (`networksetup` HTTP / HTTPS / SOCKS5) |
+| Dashboard / Settings | <kbd>Space</kbd> | Toggle macOS system proxy (`networksetup` HTTP / HTTPS / SOCKS5). Never toggled for you |
+| Dashboard | <kbd>T</kbd> / <kbd>n</kbd> / <kbd>i</kbd> | Toggle TUN, sniffer, or IPv6. Runtime `PATCH`, then the same value is written back |
+| Dashboard | <kbd>D</kbd> | Toggle `dns.enable` in the config and hot-reload |
+| Dashboard | <kbd>d</kbd> / <kbd>g</kbd> / <kbd>v</kbd> | DNS, rules, providers |
+| Dashboard | <kbd>o</kbd> / <kbd>f</kbd> / <kbd>b</kbd> / <kbd>w</kbd> | Snippet gallery, profiles, probe, WireGuard / runtime |
+| Rules | <kbd>/</kbd> or <kbd>e</kbd> | Filter the list and explain a host, IP, or `process:name` |
+| Rules | <kbd>x</kbd> | Disable or restore the selected rule (`PATCH /rules/disable`) |
+| DNS | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>[</kbd> <kbd>]</kbd> | Look up, flush DNS and Fake-IP, cycle record type |
+| Providers | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>H</kbd> | Refresh the selected provider, refresh all, or health-check a proxy provider |
 | Dashboard | <kbd>K</kbd> | Start or stop the background `mihomo` daemon |
 | Proxies | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Tab</kbd> | Switch focus between **Groups `[1]`** and **Nodes `[2]`** |
 | Any list | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd> | Move the selection |
@@ -94,13 +110,15 @@ Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terc
 
 | Category | Options |
 | --- | --- |
-| **Core & Proxy** | Start/stop `mihomo` daemon, toggle macOS System Proxy, switch routing mode, one-click download latest `mihomo-darwin-arm64` to `~/.config/terc/core/mihomo` |
+| **Core & Proxy** | Start/stop `mihomo`, toggle the macOS system proxy, switch routing mode, download `mihomo-darwin-arm64` into `~/.config/terc/core/mihomo` |
+| **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling appends a marked block; disabling removes only that block |
+| **Profiles** | YAML files in the config directory and `~/.config/terc/profiles`. Enter copies one onto `config.yaml` and reloads |
 | **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), refresh rate (`15` / `30` / `60` / `120 Hz`), UI language |
 | **Subscription** | Hot-fetch remote AnyTLS / Clash.Meta YAML subscription and reload without dropping active tunnels |
 
 ## How It Works
 
-Instead of pulling in a heavy async HTTP/WebSocket stack, `terc` speaks raw HTTP/1.1 over `std::net::TcpStream` directly to `mihomo`'s local controller (`127.0.0.1:9090`). Dedicated background reader threads consume chunked JSON lines from `/traffic`, `/memory`, and `/logs` and push events over a zero-lock `mpsc` channel to the synchronized `ratatui` render loop.
+Instead of pulling in a heavy async HTTP stack, `terc` speaks raw HTTP/1.1 over `std::net::TcpStream` to the local controller (`127.0.0.1:9090`). Background threads read `/traffic`, `/memory`, and `/logs`. Toggles use `PATCH /configs` (`tun.enable`, `sniffing`, `ipv6`). DNS lookup is `GET /dns/query`, flush is `POST /cache/dns/flush` and `POST /cache/fakeip/flush`, and provider refresh is `PUT /providers/...`. Remote subscription downloads still go through `/usr/bin/curl`.
 
 ```mermaid
 flowchart LR
@@ -115,10 +133,13 @@ flowchart LR
 <summary>Project layout</summary>
 
 ```text
-assets/terc-hero.svg           Transparent ASCII hero banner (wordmark + node/graph backdrop)
-src/main.rs                    Event loop, state machine, traffic history, i18n
-src/ui.rs                      Rounded cutout Panel widget, palettes, Braille/Blocks rate graph
-src/mihomo.rs                  Zero-dependency HTTP/1.1 client, stream workers, macOS networksetup
+assets/terc-hero.svg           Minimal wordmark, one control card, one traffic trace
+src/main.rs                    Event loop, screens, i18n
+src/ui.rs                      Rounded cutout Panel, palettes, Braille/Blocks graph
+src/panels.rs                  Controls, DNS, rules, providers, overlays
+src/control.rs                 Toggle, reload, profile, and probe actions
+src/ops.rs                     YAML overlays, rule explain, DNS/rule parsers
+src/mihomo.rs                  HTTP/1.1 over TcpStream, streams, networksetup
 ```
 
 </details>

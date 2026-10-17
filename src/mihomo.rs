@@ -17,6 +17,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ops::{
+    apply_general_json, bool_patch_body, parse_dns_message, parse_probe_target,
+    parse_providers_json, parse_rules_json, parse_yaml_flags, rule_disable_body, tun_patch_body,
+    DnsMessage, DnsStatus, ProbeTarget, ProviderInfo, RuleInfo, RuntimeFlags,
+};
+
 #[derive(Clone, Debug)]
 pub enum BackendEvent {
     Traffic {
@@ -49,6 +55,14 @@ pub enum BackendEvent {
     CoreDownloadDone {
         ok: bool,
     },
+    DnsLookup {
+        lines: Vec<String>,
+        is_error: bool,
+    },
+    ProbeDone {
+        lines: Vec<String>,
+        is_error: bool,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -69,6 +83,16 @@ pub struct CoreSnapshot {
     pub download_total: u64,
     pub sub_info: Option<SubscriptionSummary>,
     pub core_bin_path: String,
+    pub tun_enabled: bool,
+    pub tun_stack: String,
+    pub tun_device: String,
+    pub sniffing: bool,
+    pub ipv6: bool,
+    pub tcp_concurrent: bool,
+    pub find_process: String,
+    pub dns: DnsStatus,
+    pub rules: Vec<RuleInfo>,
+    pub providers: Vec<ProviderInfo>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -103,6 +127,17 @@ pub struct ConnectionItem {
     pub chains: String,
     pub upload: u64,
     pub download: u64,
+    pub process: String,
+    pub process_path: String,
+    pub inbound: String,
+    pub inbound_name: String,
+    pub source: String,
+    pub sniff_host: String,
+    pub rule_payload: String,
+    pub start: String,
+    pub dns_mode: String,
+    pub dest_geo: String,
+    pub dest_asn: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -372,23 +407,48 @@ fn stream_json_lines<F>(
     }
 }
 
+pub fn config_yaml_path(cfg: &ControllerConfig) -> PathBuf {
+    Path::new(&cfg.config_dir).join("config.yaml")
+}
+
+pub fn read_config_text(cfg: &ControllerConfig) -> Result<String, String> {
+    let path = config_yaml_path(cfg);
+    fs::read_to_string(&path).map_err(|_| format!("config not found: {}", path.display()))
+}
+
+pub fn write_config_text(cfg: &ControllerConfig, text: &str) -> Result<(), String> {
+    let path = config_yaml_path(cfg);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(&path, text).map_err(|err| format!("cannot write {}: {err}", path.display()))
+}
+
+fn local_flags(cfg: &ControllerConfig) -> RuntimeFlags {
+    fs::read_to_string(config_yaml_path(cfg))
+        .map(|text| parse_yaml_flags(&text))
+        .unwrap_or_default()
+}
+
 pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
     let timeout = Duration::from_millis(700);
     let (net_service, sysproxy_enabled) = detect_macos_sysproxy();
     let core_bin_path = discover_mihomo_binary()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
+    let mut flags = local_flags(cfg);
 
     let Ok((200, ver_body)) =
         http_request(&cfg.addr, &cfg.secret, "GET", "/version", None, timeout)
     else {
-        return CoreSnapshot {
-            running: false,
+        return snapshot_from_flags(
+            false,
+            String::new(),
+            flags,
             sysproxy_enabled,
-            network_service: net_service,
+            net_service,
             core_bin_path,
-            ..Default::default()
-        };
+        );
     };
 
     let version = serde_json::from_str::<Value>(&ver_body)
@@ -413,6 +473,7 @@ pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
             socks_port = v.get("socks-port").and_then(Value::as_u64).unwrap_or(7891) as u16;
             mixed_port = v.get("mixed-port").and_then(Value::as_u64).unwrap_or(0) as u16;
             allow_lan = v.get("allow-lan").and_then(Value::as_bool).unwrap_or(false);
+            apply_general_json(&mut flags, &v);
         }
     }
 
@@ -565,19 +626,46 @@ pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
                         .unwrap_or_default();
                     let upload = c.get("upload").and_then(Value::as_u64).unwrap_or(0);
                     let download = c.get("download").and_then(Value::as_u64).unwrap_or(0);
-                    connections.push(ConnectionItem {
-                        id,
-                        host: target,
-                        network,
-                        rule,
-                        chains,
-                        upload,
-                        download,
-                    });
+                    if let Some(mut item) = connection_from_value(c) {
+                        item.id = id;
+                        item.host = target;
+                        item.network = network;
+                        item.rule = rule;
+                        item.chains = chains;
+                        item.upload = upload;
+                        item.download = download;
+                        connections.push(item);
+                    }
                 }
                 connections.sort_by(|a, b| (b.download + b.upload).cmp(&(a.download + a.upload)));
             }
         }
+    }
+
+    let mut rules = Vec::new();
+    if let Ok((200, body)) = http_request(&cfg.addr, &cfg.secret, "GET", "/rules", None, timeout) {
+        rules = parse_rules_json(&body);
+    }
+    let mut providers = Vec::new();
+    if let Ok((200, body)) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "GET",
+        "/providers/proxies",
+        None,
+        timeout,
+    ) {
+        providers.extend(parse_providers_json(&body, "proxy"));
+    }
+    if let Ok((200, body)) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "GET",
+        "/providers/rules",
+        None,
+        timeout,
+    ) {
+        providers.extend(parse_providers_json(&body, "rule"));
     }
 
     CoreSnapshot {
@@ -597,7 +685,107 @@ pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
         download_total,
         sub_info,
         core_bin_path,
+        tun_enabled: flags.tun_enabled,
+        tun_stack: flags.tun_stack,
+        tun_device: flags.tun_device,
+        sniffing: flags.sniffing,
+        ipv6: flags.ipv6,
+        tcp_concurrent: flags.tcp_concurrent,
+        find_process: flags.find_process,
+        dns: flags.dns,
+        rules,
+        providers,
     }
+}
+
+fn snapshot_from_flags(
+    running: bool,
+    version: String,
+    flags: RuntimeFlags,
+    sysproxy_enabled: bool,
+    network_service: String,
+    core_bin_path: String,
+) -> CoreSnapshot {
+    CoreSnapshot {
+        running,
+        version,
+        sysproxy_enabled,
+        network_service,
+        core_bin_path,
+        tun_enabled: flags.tun_enabled,
+        tun_stack: flags.tun_stack,
+        tun_device: flags.tun_device,
+        sniffing: flags.sniffing,
+        ipv6: flags.ipv6,
+        tcp_concurrent: flags.tcp_concurrent,
+        find_process: flags.find_process,
+        dns: flags.dns,
+        ..Default::default()
+    }
+}
+
+pub fn connection_from_value(value: &Value) -> Option<ConnectionItem> {
+    let meta = value.get("metadata");
+    let text = |key: &str| {
+        meta.and_then(|item| item.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let geo = |key: &str| {
+        meta.and_then(|item| item.get(key))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default()
+    };
+    let source_ip = text("sourceIP");
+    let source_port = text("sourcePort");
+    let source = if source_ip.is_empty() {
+        String::new()
+    } else {
+        format!("{source_ip}:{source_port}")
+    };
+    Some(ConnectionItem {
+        id: value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        host: String::new(),
+        network: text("network").to_uppercase(),
+        rule: value
+            .get("rule")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        chains: String::new(),
+        upload: value.get("upload").and_then(Value::as_u64).unwrap_or(0),
+        download: value.get("download").and_then(Value::as_u64).unwrap_or(0),
+        process: text("process"),
+        process_path: text("processPath"),
+        inbound: text("type"),
+        inbound_name: text("inboundName"),
+        source,
+        sniff_host: text("sniffHost"),
+        rule_payload: value
+            .get("rulePayload")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        start: value
+            .get("start")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        dns_mode: text("dnsMode"),
+        dest_geo: geo("destinationGeoIP"),
+        dest_asn: text("destinationIPASN"),
+    })
 }
 
 fn extract_subscription_summary(nodes: &[String]) -> Option<SubscriptionSummary> {
@@ -992,6 +1180,369 @@ fn active_macos_network_service() -> Option<String> {
         .map(String::from)
 }
 
+pub fn patch_configs(cfg: &ControllerConfig, body: &str) -> io::Result<()> {
+    let (status, text) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "PATCH",
+        "/configs",
+        Some(body),
+        Duration::from_millis(1500),
+    )?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("HTTP {status} {}", brief(&text))))
+    }
+}
+
+pub fn set_tun_enabled(cfg: &ControllerConfig, enable: bool) -> io::Result<()> {
+    patch_configs(cfg, &tun_patch_body(enable))
+}
+
+pub fn set_bool_config(cfg: &ControllerConfig, field: &str, enable: bool) -> io::Result<()> {
+    patch_configs(cfg, &bool_patch_body(field, enable))
+}
+
+pub fn set_rule_disabled(cfg: &ControllerConfig, index: usize, disabled: bool) -> io::Result<()> {
+    let body = rule_disable_body(index, disabled);
+    let (status, text) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "PATCH",
+        "/rules/disable",
+        Some(&body),
+        Duration::from_millis(1500),
+    )?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("HTTP {status} {}", brief(&text))))
+    }
+}
+
+pub fn reload_config(cfg: &ControllerConfig) -> Result<(), String> {
+    let path = config_yaml_path(cfg);
+    let body = serde_json::json!({
+        "path": path.display().to_string(),
+        "payload": ""
+    })
+    .to_string();
+    match http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "PUT",
+        "/configs?force=true",
+        Some(&body),
+        Duration::from_millis(2500),
+    ) {
+        Ok((status, _)) if (200..300).contains(&status) => Ok(()),
+        Ok((status, text)) => Err(format!("reload HTTP {status} {}", brief(&text))),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+pub fn reload_config_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
+    thread::spawn(move || {
+        let result = reload_config(&cfg);
+        let ok = result.is_ok();
+        let text = match result {
+            Ok(()) => "config reloaded".to_string(),
+            Err(err) => err,
+        };
+        if ok {
+            let snap = fetch_snapshot(&cfg);
+            let _ = tx.send(BackendEvent::Snapshot(Box::new(snap)));
+        }
+        let _ = tx.send(BackendEvent::StatusMessage {
+            text,
+            is_error: !ok,
+        });
+    });
+}
+
+pub fn persist_nested_bool(
+    cfg: &ControllerConfig,
+    path: &[&str],
+    value: bool,
+) -> Result<(), String> {
+    let raw = read_config_text(cfg)?;
+    let next = crate::ops::set_nested_bool(&raw, path, value);
+    write_config_text(cfg, &next)
+}
+
+pub fn query_dns(cfg: &ControllerConfig, name: &str, qtype: &str) -> Result<DnsMessage, String> {
+    let path = format!(
+        "/dns/query?name={}&type={}",
+        percent_encode(name),
+        percent_encode(qtype)
+    );
+    match http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "GET",
+        &path,
+        None,
+        Duration::from_millis(cfg.timeout_ms.max(1500)),
+    ) {
+        Ok((200, body)) => parse_dns_message(&body).map_err(|err| brief(&err)),
+        Ok((status, body)) => Err(format!("HTTP {status} {}", brief(&body))),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+pub fn dns_query_async(
+    cfg: ControllerConfig,
+    name: String,
+    qtype: String,
+    tx: Sender<BackendEvent>,
+) {
+    thread::spawn(move || {
+        let (lines, is_error) = match query_dns(&cfg, &name, &qtype) {
+            Ok(msg) => (format_dns_lines(&name, &qtype, &msg), false),
+            Err(err) => (vec![err], true),
+        };
+        let _ = tx.send(BackendEvent::DnsLookup { lines, is_error });
+    });
+}
+
+fn format_dns_lines(name: &str, qtype: &str, msg: &DnsMessage) -> Vec<String> {
+    let mut lines = vec![format!("{name}  {qtype}  rcode {}", msg.status)];
+    if msg.answers.is_empty() {
+        lines.push("no answer".to_string());
+    } else {
+        for answer in &msg.answers {
+            lines.push(format!(
+                "{:<6} {:<6} {}",
+                answer.qtype,
+                format!("{}s", answer.ttl),
+                answer.data
+            ));
+        }
+    }
+    lines
+}
+
+pub fn flush_dns(cfg: &ControllerConfig) -> Result<String, String> {
+    let mut done = Vec::new();
+    let mut errors = Vec::new();
+    for (label, path) in [
+        ("dns", "/cache/dns/flush"),
+        ("fake-ip", "/cache/fakeip/flush"),
+    ] {
+        match http_request(
+            &cfg.addr,
+            &cfg.secret,
+            "POST",
+            path,
+            Some(""),
+            Duration::from_millis(1500),
+        ) {
+            Ok((status, _)) if (200..300).contains(&status) => done.push(label),
+            Ok((status, body)) => errors.push(format!("{label} HTTP {status} {}", brief(&body))),
+            Err(err) => errors.push(format!("{label} {err}")),
+        }
+    }
+    if done.is_empty() {
+        Err(errors.join(" · "))
+    } else {
+        Ok(format!("flushed {}", done.join(" + ")))
+    }
+}
+
+pub fn flush_dns_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
+    thread::spawn(move || {
+        let (text, is_error) = match flush_dns(&cfg) {
+            Ok(text) => (text, false),
+            Err(err) => (err, true),
+        };
+        let _ = tx.send(BackendEvent::StatusMessage { text, is_error });
+    });
+}
+
+pub fn refresh_provider(cfg: &ControllerConfig, kind: &str, name: &str) -> Result<(), String> {
+    let path = format!("/providers/{kind}/{}", percent_encode(name));
+    match http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "PUT",
+        &path,
+        None,
+        Duration::from_millis(4000),
+    ) {
+        Ok((status, _)) if (200..300).contains(&status) => Ok(()),
+        Ok((status, body)) => Err(format!("HTTP {status} {}", brief(&body))),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+pub fn provider_healthcheck(cfg: &ControllerConfig, name: &str) -> Result<(), String> {
+    let path = format!("/providers/proxies/{}/healthcheck", percent_encode(name));
+    match http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "GET",
+        &path,
+        None,
+        Duration::from_millis(4000),
+    ) {
+        Ok((status, _)) if (200..300).contains(&status) => Ok(()),
+        Ok((status, body)) => Err(format!("HTTP {status} {}", brief(&body))),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+pub fn refresh_provider_async(
+    cfg: ControllerConfig,
+    kind: String,
+    name: String,
+    tx: Sender<BackendEvent>,
+) {
+    thread::spawn(move || {
+        let result = refresh_provider(&cfg, &kind, &name);
+        let ok = result.is_ok();
+        let text = match result {
+            Ok(()) => format!("provider updated · {name}"),
+            Err(err) => err,
+        };
+        if ok {
+            let snap = fetch_snapshot(&cfg);
+            let _ = tx.send(BackendEvent::Snapshot(Box::new(snap)));
+        }
+        let _ = tx.send(BackendEvent::StatusMessage {
+            text,
+            is_error: !ok,
+        });
+    });
+}
+
+pub fn refresh_all_providers_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
+    thread::spawn(move || {
+        let snap = fetch_snapshot(&cfg);
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        for provider in &snap.providers {
+            if refresh_provider(&cfg, &provider.kind, &provider.name).is_ok() {
+                ok += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        let fresh = fetch_snapshot(&cfg);
+        let _ = tx.send(BackendEvent::Snapshot(Box::new(fresh)));
+        let _ = tx.send(BackendEvent::StatusMessage {
+            text: format!("providers {ok} updated · {failed} failed"),
+            is_error: ok == 0 && failed > 0,
+        });
+    });
+}
+
+pub fn test_node_delay(
+    cfg: &ControllerConfig,
+    node: &str,
+    url: &str,
+) -> Result<Option<u16>, String> {
+    let path = format!(
+        "/proxies/{}/delay?url={}&timeout={}",
+        percent_encode(node),
+        percent_encode(url),
+        cfg.timeout_ms
+    );
+    match http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "GET",
+        &path,
+        None,
+        Duration::from_millis(cfg.timeout_ms + 500),
+    ) {
+        Ok((200, body)) => Ok(serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("delay").and_then(Value::as_u64))
+            .and_then(|d| if d > 0 { Some(d as u16) } else { None })),
+        Ok((status, body)) => Err(format!("HTTP {status} {}", brief(&body))),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+pub fn test_node_async(cfg: ControllerConfig, node: String, tx: Sender<BackendEvent>) {
+    thread::spawn(move || {
+        let delay = test_node_delay(&cfg, &node, &cfg.test_url).ok().flatten();
+        let _ = tx.send(BackendEvent::DelayResult {
+            group: String::new(),
+            node,
+            delay,
+        });
+    });
+}
+
+#[derive(Clone, Debug)]
+pub struct ProbeReport {
+    pub lines: Vec<String>,
+    pub is_error: bool,
+}
+
+pub fn run_probe(cfg: &ControllerConfig, node: &str, raw: &str) -> ProbeReport {
+    let target: ProbeTarget = parse_probe_target(raw);
+    if target.host.is_empty() && target.delay_url.is_empty() {
+        return ProbeReport {
+            lines: vec!["empty target".into()],
+            is_error: true,
+        };
+    }
+    let mut lines = vec![format!("target  {}", target.raw)];
+    let mut dns_ok = false;
+    if target.is_ip {
+        lines.push(format!("ip  {}", target.host));
+        dns_ok = true;
+    } else if !target.host.is_empty() {
+        for qtype in ["A", "AAAA"] {
+            match query_dns(cfg, &target.host, qtype) {
+                Ok(msg) => {
+                    dns_ok = true;
+                    if msg.answers.is_empty() {
+                        lines.push(format!("dns {qtype}  no answer · rcode {}", msg.status));
+                    }
+                    for answer in msg.answers {
+                        lines.push(format!("dns {qtype}  {}  {}s", answer.data, answer.ttl));
+                    }
+                }
+                Err(err) => lines.push(format!("dns {qtype}  {err}")),
+            }
+        }
+    }
+    let mut delay_ok = false;
+    if !target.delay_url.is_empty() {
+        match test_node_delay(cfg, node, &target.delay_url) {
+            Ok(Some(ms)) => {
+                delay_ok = true;
+                lines.push(format!("delay  {node}  {ms} ms"));
+            }
+            Ok(None) => lines.push(format!("delay  {node}  timeout")),
+            Err(err) => lines.push(format!("delay  {node}  {err}")),
+        }
+    }
+    ProbeReport {
+        lines,
+        is_error: !(dns_ok || delay_ok),
+    }
+}
+
+pub fn probe_async(cfg: ControllerConfig, node: String, raw: String, tx: Sender<BackendEvent>) {
+    thread::spawn(move || {
+        let report = run_probe(&cfg, &node, &raw);
+        let _ = tx.send(BackendEvent::ProbeDone {
+            lines: report.lines,
+            is_error: report.is_error,
+        });
+    });
+}
+
+fn brief(text: &str) -> String {
+    let one = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    one.chars().take(80).collect()
+}
+
 pub fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
     let (service, _) = detect_macos_sysproxy();
     let http_p = http_port.to_string();
@@ -1043,5 +1594,43 @@ mod tests {
         let raw = "mixed-port: 7890\nproxies:\n  - name: a\n";
         let out = normalize_subscription(raw, "127.0.0.1:9090");
         assert!(out.starts_with("external-controller: 127.0.0.1:9090\nmixed-port: 7890"));
+    }
+
+    #[test]
+    fn connection_keeps_process_rule_and_inbound() {
+        let raw = serde_json::json!({
+            "id": "abc",
+            "upload": 10,
+            "download": 20,
+            "start": "2026-01-02T03:04:05.1Z",
+            "rule": "DomainSuffix",
+            "rulePayload": "example.com",
+            "metadata": {
+                "network": "tcp",
+                "type": "TUN",
+                "inboundName": "tun0",
+                "sourceIP": "10.0.0.8",
+                "sourcePort": "51234",
+                "host": "example.com",
+                "destinationPort": "443",
+                "process": "curl",
+                "processPath": "/usr/bin/curl",
+                "sniffHost": "example.com",
+                "dnsMode": "fake-ip",
+                "destinationGeoIP": ["US"],
+                "destinationIPASN": "AS15169"
+            }
+        });
+        let item = connection_from_value(&raw).unwrap();
+        assert_eq!(item.process, "curl");
+        assert_eq!(item.process_path, "/usr/bin/curl");
+        assert_eq!(item.inbound, "TUN");
+        assert_eq!(item.inbound_name, "tun0");
+        assert_eq!(item.source, "10.0.0.8:51234");
+        assert_eq!(item.sniff_host, "example.com");
+        assert_eq!(item.rule_payload, "example.com");
+        assert_eq!(item.dns_mode, "fake-ip");
+        assert_eq!(item.dest_geo, "US");
+        assert_eq!(item.dest_asn, "AS15169");
     }
 }

@@ -311,7 +311,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     match app.screen {
         Screen::Menu => draw_menu(frame, app, size),
-        Screen::Dashboard => draw_dashboard(frame, app, size),
+        Screen::Dashboard => {
+            draw_dashboard(frame, app, size);
+            crate::panels::draw_overlay(frame, app, size);
+        }
         Screen::Settings => {
             draw_dashboard(frame, app, size);
             draw_settings(frame, app, size);
@@ -333,15 +336,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 pub fn setup_cursor_cell(app: &App, area: Rect) -> Option<(u16, u16)> {
+    editor_cursor_cell(&app.setup_editor.chars(), app.setup_editor.cursor, area)
+}
+
+pub fn editor_cursor_cell(chars: &[char], cursor: usize, area: Rect) -> Option<(u16, u16)> {
     if area.width == 0 || area.height == 0 {
         return None;
     }
-    let col = input_viewport(
-        &app.setup_editor.chars(),
-        app.setup_editor.cursor,
-        area.width as usize,
-    )
-    .1;
+    let col = input_viewport(chars, cursor.min(chars.len()), area.width as usize).1;
     Some((area.x + col.min(area.width as usize - 1) as u16, area.y))
 }
 
@@ -397,18 +399,20 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         0
     };
-    let top_h = if app.config.settings.show_traffic && area.height >= 18 {
+    let top_h = if app.config.settings.show_traffic && area.height >= 22 {
         7
-    } else if app.config.settings.show_traffic {
+    } else if app.config.settings.show_traffic && area.height >= 16 {
         5
     } else {
         0
     };
+    let toggle_h = if area.height >= 20 { 3 } else { 0 };
 
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(top_h),
+            Constraint::Length(toggle_h),
             Constraint::Min(6),
             Constraint::Length(toolbar_h),
         ])
@@ -423,16 +427,24 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         draw_overview_panel(frame, app, top_cols[1]);
     }
 
+    if toggle_h > 0 {
+        crate::panels::draw_toggle_strip(frame, app, v_chunks[1]);
+    }
+
+    let main = v_chunks[2];
     match app.main_tab {
-        MainTab::Proxies => draw_proxies_main(frame, app, v_chunks[1]),
-        MainTab::Connections => draw_connections_main(frame, app, v_chunks[1]),
-        MainTab::Logs => draw_logs_main(frame, app, v_chunks[1]),
+        MainTab::Proxies => draw_proxies_main(frame, app, main),
+        MainTab::Connections => crate::panels::draw_connections(frame, app, main),
+        MainTab::Logs => draw_logs_main(frame, app, main),
+        MainTab::Dns => crate::panels::draw_dns(frame, app, main),
+        MainTab::Rules => crate::panels::draw_rules(frame, app, main),
+        MainTab::Providers => crate::panels::draw_providers(frame, app, main),
     }
 
     if toolbar_h > 0 {
         frame.render_widget(
-            Paragraph::new(toolbar_line(app, v_chunks[2].width)),
-            v_chunks[2],
+            Paragraph::new(toolbar_line(app, v_chunks[3].width)),
+            v_chunks[3],
         );
     }
 }
@@ -728,7 +740,34 @@ fn draw_overview_panel(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ]));
 
-    if inner.height >= 3 {
+    let show_status = !app.status_message.is_empty() && inner.height < 5;
+    if inner.height >= 3 && !show_status {
+        let stack = if app.snapshot.tun_stack.is_empty() {
+            "—".to_string()
+        } else {
+            app.snapshot.tun_stack.clone()
+        };
+        let proc = if app.snapshot.find_process.is_empty() {
+            "—".to_string()
+        } else {
+            app.snapshot.find_process.clone()
+        };
+        let port = app.snapshot.mixed_port.max(app.snapshot.http_port);
+        lines.push(Line::from(vec![
+            Span::styled(" :", Style::default().fg(theme.muted)),
+            Span::styled(format!("{port:<5}"), Style::default().fg(theme.text)),
+            Span::styled(stack, Style::default().fg(theme.text)),
+            Span::styled("  proc ", Style::default().fg(theme.muted)),
+            Span::styled(proc, Style::default().fg(theme.text)),
+            Span::styled("  WG ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{}", app.wireguard_peers().len()),
+                Style::default().fg(theme.accent),
+            ),
+        ]));
+    }
+
+    if inner.height >= 4 {
         if let Some(sub) = &app.snapshot.sub_info {
             let summary = if !sub.traffic.is_empty() && !sub.expire.is_empty() {
                 format!(" Sub  {} · {}", sub.traffic, sub.expire)
@@ -743,10 +782,10 @@ fn draw_overview_panel(frame: &mut Frame, app: &App, area: Rect) {
             )));
         } else {
             lines.push(Line::from(vec![
-                Span::styled(" Port ", Style::default().fg(theme.muted)),
+                Span::styled(" HTTP ", Style::default().fg(theme.muted)),
                 Span::styled(
                     format!(
-                        "HTTP :{}  SOCKS :{}",
+                        ":{}  SOCKS :{}",
                         app.snapshot.http_port, app.snapshot.socks_port
                     ),
                     Style::default().fg(theme.text),
@@ -755,7 +794,7 @@ fn draw_overview_panel(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    if inner.height >= 4 && !app.status_message.is_empty() {
+    if !app.status_message.is_empty() && (inner.height >= 5 || show_status) {
         let msg_color = if app.status_is_error {
             theme.accent
         } else {
@@ -979,81 +1018,6 @@ fn draw_nodes_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_connections_main(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme();
-    let title_str = format!(
-        "{} ({}) · [x] Close  [X] Close All",
-        app.t("connections"),
-        app.snapshot.connections.len()
-    );
-    let title = module_title_line(theme, app.lang(), 'c', "Connections", &title_str);
-    let inner = draw_panel(frame, area, theme, Some(title), true);
-    if inner.width < 10 || inner.height < 2 {
-        return;
-    }
-
-    if app.snapshot.connections.is_empty() {
-        frame.render_widget(
-            Paragraph::new(app.t("no_connections"))
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(theme.muted)),
-            inner,
-        );
-        return;
-    }
-
-    let visible_h = inner.height as usize;
-    let start = visible_list_start(app.conn_index, app.snapshot.connections.len(), visible_h);
-    let max_w = inner.width.saturating_sub(2) as usize;
-
-    let items: Vec<ListItem> = app
-        .snapshot
-        .connections
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(visible_h)
-        .map(|(idx, c)| {
-            let selected = idx == app.conn_index;
-            let prefix = if selected { "› " } else { "  " };
-            let style = if selected {
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text)
-            };
-
-            let host_part = format!(
-                "{prefix}[{:<3}] {:<30}",
-                c.network,
-                truncate_str(&c.host, 30)
-            );
-            let chain_part = format!(" {} ", truncate_str(&c.chains, 28));
-            let traffic_part = format!("↑{} ↓{}", format_bytes(c.upload), format_bytes(c.download));
-            let used = host_part.width() + chain_part.width() + traffic_part.width();
-            let pad = max_w.saturating_sub(used).max(1);
-
-            ListItem::new(Line::from(vec![
-                Span::styled(host_part, style),
-                Span::styled(chain_part, Style::default().fg(theme.peak)),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(traffic_part, Style::default().fg(theme.muted)),
-            ]))
-        })
-        .collect();
-
-    frame.render_widget(
-        List::new(items),
-        Rect::new(
-            inner.x + 1,
-            inner.y,
-            inner.width.saturating_sub(2),
-            inner.height,
-        ),
-    );
-}
-
 fn draw_logs_main(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
     let title = module_title_line(theme, app.lang(), 'l', "Logs", app.t("logs"));
@@ -1120,14 +1084,17 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
     ];
 
     let hints = format!(
-        "  r {}  a {}  m {}  u {}  c {}  L {}  s {}  ? {}",
+        "  T {}  n {}  d {}  g {}  v {}  o {}  b {}  r {}  a {}  u {}  ? {}",
+        app.t("tun"),
+        app.t("sniff"),
+        app.t("dns"),
+        app.t("rules"),
+        app.t("providers"),
+        app.t("modules"),
+        app.t("probe"),
         app.t("test_delay"),
         app.t("auto_best"),
-        app.t("mode"),
         app.t("sub_update"),
-        app.t("connections"),
-        app.t("logs"),
-        app.t("settings"),
         app.t("help")
     );
 
@@ -1135,7 +1102,7 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
         spans.push(Span::styled(hints, Style::default().fg(theme.muted)));
     } else {
         spans.push(Span::styled(
-            "  r  a  m  u  c  L  s  ?".to_string(),
+            "  T n d g v o f b w r a ?".to_string(),
             Style::default().fg(theme.muted),
         ));
     }
@@ -1337,33 +1304,69 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
 
     let shortcuts = [
         ("Space", app.t("help_space")),
-        ("← / → (h / l)", app.t("help_hl")),
-        ("↑ / ↓ (j / k)", app.t("help_jk")),
-        ("Enter", app.t("help_enter")),
-        ("r", app.t("help_r")),
-        ("a", app.t("help_a")),
+        ("T / n / i", app.t("help_tun")),
+        ("D", app.t("help_dns_key")),
+        ("d g v o f b w", app.t("help_views")),
+        ("e  /", app.t("help_explain")),
+        ("x", app.t("help_rule_x")),
+        ("F", app.t("help_flush")),
         ("m", app.t("help_m")),
+        ("r / a", app.t("help_r")),
         ("u", app.t("help_u")),
+        ("Enter", app.t("help_enter")),
+        ("↑↓ jk", app.t("help_jk")),
         ("c / L / p", app.t("help_tabs")),
-        ("t", app.t("help_t")),
-        ("s", app.t("help_s")),
+        ("t / s", app.t("help_t")),
         ("q / Esc", app.t("help_q")),
     ];
 
     let mut lines = Vec::new();
-    lines.push(Line::default());
-    for (k, desc) in shortcuts {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {k:<18}"),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(desc.to_string(), Style::default().fg(theme.text)),
-        ]));
+    let mid = shortcuts.len().div_ceil(2);
+    let two_col = inner.width >= 72;
+    if two_col {
+        for row in 0..mid {
+            let (left_key, left_desc) = shortcuts[row];
+            let right = shortcuts.get(row + mid);
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {left_key:<16}"),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<28}", truncate_str(left_desc, 28)),
+                    Style::default().fg(theme.text),
+                ),
+            ];
+            if let Some((key, desc)) = right {
+                spans.push(Span::styled(
+                    format!(" {key:<16}"),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    desc.to_string(),
+                    Style::default().fg(theme.text),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        for (key, desc) in shortcuts {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {key:<16}"),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(desc.to_string(), Style::default().fg(theme.text)),
+            ]));
+        }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 /// Single-line input windowing: returns (first visible char, cursor column).
@@ -1386,9 +1389,22 @@ pub fn input_viewport(chars: &[char], cursor: usize, body_w: usize) -> (usize, u
 }
 
 fn setup_line_spans(app: &App, theme: Theme, body_w: usize) -> Vec<Span<'static>> {
-    let chars = app.setup_editor.chars();
-    let cursor = app.setup_editor.cursor.min(chars.len());
-    let head = input_viewport(&chars, cursor, body_w).0;
+    editor_line_spans(
+        &app.setup_editor.chars(),
+        app.setup_editor.cursor,
+        theme,
+        body_w,
+    )
+}
+
+pub fn editor_line_spans(
+    chars: &[char],
+    cursor: usize,
+    theme: Theme,
+    body_w: usize,
+) -> Vec<Span<'static>> {
+    let cursor = cursor.min(chars.len());
+    let head = input_viewport(chars, cursor, body_w).0;
 
     let mut spans = Vec::new();
     let mut used = 0usize;

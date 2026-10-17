@@ -1,57 +1,33 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1013" height="353" viewBox="0 0 1013 353" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="280" viewBox="0 0 1200 280" fill="none" role="img" aria-labelledby="title description">
   <title id="title">terc</title>
-  <desc id="description">Transparent ASCII banner: a block-letter terc wordmark over a terminal-style backdrop with a proxy node list, a braille traffic graph and a routing chain.</desc>
+  <desc id="description">A quiet terc wordmark beside one rounded control card and a single traffic trace.</desc>
   <style>
-    text { font-family: "SFMono-Regular", "Menlo", "DejaVu Sans Mono", Consolas, monospace; font-size: 11px; }
-    .wordmark { font-size: 15px; font-weight: 600; }
-    .tagline { font-weight: 600; }
-    .grain { opacity: .55; }
-    .rule { opacity: .45; }
-    .bright { fill: #7c6f5a; }
-    .dim { fill: #8d8c7f; }
-    .frame { fill: #7d9c97; }
-    .grain { fill: #a8b5b2; }
-    .node { fill: #8a6f4f; }
-    .route { fill: #5f7d79; }
-    .rule { fill: #b0bdba; }
-    .tagline { fill: #7c6f5a; }
-    .wave { fill: #94535e; }
-    .wordmark { fill: #a65d65; }
+    .ink { fill: #24302e; }
+    .muted { fill: #5e7572; }
+    .line { stroke: #7d9c97; }
+    .accent { fill: #a65d65; }
+    .trace { stroke: #a65d65; fill: none; }
     @media (prefers-color-scheme: dark) {
-      .bright { fill: #fcf9ea; }
-      .dim { fill: #8fa3a0; }
-      .frame { fill: #badfdb; }
-      .grain { fill: #5c6f6c; }
-      .node { fill: #c5ae75; }
-      .route { fill: #badfdb; }
-      .rule { fill: #4d5e5c; }
-      .tagline { fill: #fcf9ea; }
-      .wave { fill: #ffa4a4; }
-      .wordmark { fill: #ffa4a4; }
+      .ink { fill: #fcf9ea; }
+      .muted { fill: #9eb5b1; }
+      .line { stroke: #badfdb; }
+      .accent { fill: #ffa4a4; }
+      .trace { stroke: #ffa4a4; }
     }
   </style>
-  <text x="10" y="26.5" xml:space="preserve">                                                                                                      <tspan class="grain">┊</tspan>                 <tspan class="grain">┊</tspan>                 <tspan class="grain">┊</tspan></text>
-  <text x="10" y="39.9" xml:space="preserve">  <tspan class="rule">╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌</tspan></text>
-  <text x="10" y="53.3" xml:space="preserve">                <tspan class="grain">┆</tspan>                 <tspan class="grain">┆</tspan>                 <tspan class="grain">┆</tspan></text>
-  <text x="10" y="66.7" xml:space="preserve">   <tspan class="frame">┌─</tspan><tspan class="bright"> PROXIES </tspan><tspan class="frame">──────────────┐</tspan>                            <tspan class="grain">⋅</tspan>                 <tspan class="grain">⋅</tspan>                 <tspan class="grain">⋅</tspan>                           <tspan class="frame">┌─</tspan><tspan class="bright"> TRAFFIC </tspan><tspan class="frame">──────────────┐</tspan></text>
-  <text x="10" y="80.1" xml:space="preserve">   <tspan class="frame">│</tspan>                        <tspan class="frame">│</tspan>                                                   <tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan>    <tspan class="frame">│</tspan>         <tspan class="wave">⠠⠄</tspan>    <tspan class="wave">⠐⠐⢀⡀</tspan>     <tspan class="frame">│</tspan></text>
-  <text x="10" y="93.5" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="node">◉ HK-01   32ms</tspan>         <tspan class="frame">│</tspan>                                                                                            <tspan class="frame">│</tspan>    <tspan class="wave">⠠⠠</tspan> <tspan class="wave">⠈⠈⠈⠐⠐⢀⢀⠈⠈⠈⠈⠠⠠</tspan> <tspan class="wave">⠠⠠</tspan> <tspan class="frame">│</tspan></text>
-  <text x="10" y="106.9" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="node">◉ JP-02   58ms</tspan>         <tspan class="frame">│</tspan> <tspan class="grain">┊</tspan>                                                                                          <tspan class="frame">│</tspan> <tspan class="wave">⠠⠠⠐⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈</tspan> <tspan class="frame">│</tspan></text>
-  <text x="10" y="120.3" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="node">◉ SG-03   71ms</tspan>         <tspan class="frame">│</tspan>      <tspan class="grain">╎</tspan>          <tspan class="wordmark"> _____ ____  _____  ____ </tspan>                                                  <tspan class="frame">│</tspan> <tspan class="wave">⠈⠈⠐⠠⠠⠐⢀⢀⢀⢀⢀⠠⠠⢀⢀⢀⢀⠠⠠⠠⢀⢀</tspan> <tspan class="frame">│</tspan></text>
-  <text x="10" y="133.7" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="dim">○ US-04     --</tspan>         <tspan class="frame">│</tspan>                 <tspan class="wordmark">|_   _||  _ \|  _ \/ ___|</tspan>                                                  <tspan class="frame">│</tspan>         <tspan class="wave">⠐⠂</tspan>   <tspan class="wave">⠈⠠⠠⠐⠂</tspan>     <tspan class="frame">│</tspan></text>
-  <text x="10" y="147.1" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="dim">○ DE-05     --</tspan>         <tspan class="frame">│</tspan>                 <tspan class="wordmark">  | |  | |_) | |_) \___ \</tspan>                                              <tspan class="grain">⋅</tspan>   <tspan class="frame">│</tspan>                        <tspan class="frame">│</tspan></text>
-  <text x="10" y="160.5" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="node">▶ AUTO     sel</tspan>         <tspan class="frame">│</tspan>                 <tspan class="wordmark">  | |  |  __/|  _ &lt; ___) |</tspan>                                                 <tspan class="frame">│</tspan><tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan>     <tspan class="frame">│</tspan></text>
-  <text x="10" y="173.9" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="dim">url-get 12/24</tspan>          <tspan class="frame">│</tspan>  <tspan class="grain">·</tspan>              <tspan class="wordmark">  |_|  |_|   |_| \_\____/</tspan>                                                  <tspan class="frame">│</tspan> <tspan class="dim">v 6.2  ^ 1.4 Mb/s</tspan>     <tspan class="grain">·</tspan><tspan class="frame">│</tspan></text>
-  <text x="10" y="187.3" xml:space="preserve">   <tspan class="frame">└────────────────────────┘</tspan>       <tspan class="grain">┊</tspan>                                                                                    <tspan class="frame">└────────────────────────┘</tspan></text>
-  <text x="10" y="200.7" xml:space="preserve">                                            <tspan class="tagline">terminal mihomo controller · traffic in your shell</tspan></text>
-  <text x="10" y="214.1" xml:space="preserve">                                                                                                                      <tspan class="grain">┆</tspan>                 <tspan class="grain">┆</tspan></text>
-  <text x="10" y="227.5" xml:space="preserve">         <tspan class="grain">⋅</tspan>                                                                                                                 <tspan class="grain">⋅</tspan>                 <tspan class="grain">⋅</tspan></text>
-  <text x="10" y="240.9" xml:space="preserve">              <tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan></text>
-  <text x="10" y="254.3" xml:space="preserve">                                     <tspan class="grain">·</tspan><tspan class="route">[ macOS ] --&gt; [ 127.0.0.1:9090 ] --&gt; [ mihomo ] --&gt; [ exit ]</tspan></text>
-  <text x="10" y="267.7" xml:space="preserve">                                  <tspan class="dim">┈┈┈┈┈┈┈┈┈╯            ╰┈┈┈┈┈┈┈┈┈</tspan></text>
-  <text x="10" y="281.1" xml:space="preserve">                                                                                                                       <tspan class="grain">╎</tspan>                 <tspan class="grain">╎</tspan></text>
-  <text x="10" y="294.5" xml:space="preserve">          <tspan class="grain">┆</tspan>                                                                                                                 <tspan class="grain">┆</tspan>                 <tspan class="grain">┆</tspan></text>
-  <text x="10" y="307.9" xml:space="preserve">               <tspan class="grain">⋅</tspan>                 <tspan class="grain">⋅</tspan>                 <tspan class="grain">⋅</tspan></text>
-  <text x="10" y="321.3" xml:space="preserve">  <tspan class="rule">╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌</tspan></text>
-  <text x="10" y="334.7" xml:space="preserve">                                                                               <tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan></text>
+  <line class="line" x1="64" y1="44" x2="1136" y2="44" stroke-width="1"/>
+  <text class="ink" x="64" y="132" font-family="ui-sans-serif, 'SF Pro Display', Inter, system-ui, sans-serif" font-size="72" font-weight="520" letter-spacing="-2">terc</text>
+  <text class="muted" x="68" y="168" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="13" letter-spacing="3.4">MIHOMO · TERMINAL</text>
+  <path class="line" d="M92 0 H16 a16 16 0 0 0 -16 16 v88 a16 16 0 0 0 16 16 h400 a16 16 0 0 0 16 -16 v-88 a16 16 0 0 0 -16 -16 H168" transform="translate(688 86)" stroke-width="1"/>
+  <text class="muted" x="792" y="90" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" letter-spacing="1.8">CONTROLS</text>
+  <text class="muted" x="720" y="128" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="13">T</text>
+  <text class="ink" x="738" y="128" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="13">TUN</text>
+  <circle class="accent" cx="786" cy="123" r="3.5"/>
+  <text class="muted" x="808" y="128" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="13">n</text>
+  <text class="ink" x="826" y="128" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="13">SNIFF</text>
+  <circle class="accent" cx="890" cy="123" r="3.5"/>
+  <text class="muted" x="912" y="128" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="13">m</text>
+  <text class="accent" x="932" y="128" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="13" font-weight="600">Rule</text>
+  <path class="trace" d="M720 168 C744 168 748 150 768 150 C788 150 792 176 812 176 C832 176 836 142 856 142 C876 142 884 164 904 164 C924 164 932 128 956 128 C980 128 988 156 1012 156 C1032 156 1040 146 1064 146" stroke-width="1.5" stroke-linecap="round"/>
+  <line class="line" x1="64" y1="228" x2="1136" y2="228" stroke-width="1"/>
 </svg>
