@@ -7,11 +7,11 @@ use ratatui::{
     widgets::{Clear, List, ListItem, Paragraph, Widget, Wrap},
 };
 use serde::{Deserialize, Serialize};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    mihomo::{is_info_pseudo_node, ProxyGroup},
-    App, FocusPane, Lang, MainTab, Screen, SettingCategory, SettingRow,
+    mihomo::{config_file_exists, is_info_pseudo_node, ProxyGroup},
+    App, FocusPane, Lang, MainTab, Screen, SettingCategory, SettingRow, SetupPhase,
 };
 
 pub const THEMES: &[ThemeId] = &[ThemeId::Spring, ThemeId::Vintage, ThemeId::Mono];
@@ -320,7 +320,29 @@ pub fn draw(frame: &mut Frame, app: &App) {
             draw_dashboard(frame, app, size);
             draw_help(frame, app, size);
         }
+        Screen::Setup => {
+            if app.setup_origin == Screen::Settings {
+                draw_dashboard(frame, app, size);
+                draw_settings(frame, app, size);
+            } else {
+                draw_dashboard(frame, app, size);
+            }
+            draw_setup(frame, app, size);
+        }
     }
+}
+
+pub fn setup_cursor_cell(app: &App, area: Rect) -> Option<(u16, u16)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let col = input_viewport(
+        &app.setup_editor.chars(),
+        app.setup_editor.cursor,
+        area.width as usize,
+    )
+    .1;
+    Some((area.x + col.min(area.width as usize - 1) as u16, area.y))
 }
 
 fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
@@ -370,7 +392,11 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
-    let toolbar_h = if app.config.settings.show_toolbar { 1 } else { 0 };
+    let toolbar_h = if app.config.settings.show_toolbar {
+        1
+    } else {
+        0
+    };
     let top_h = if app.config.settings.show_traffic && area.height >= 18 {
         7
     } else if app.config.settings.show_traffic {
@@ -420,12 +446,20 @@ fn draw_traffic_panel(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let stats_line = Line::from(vec![
-        Span::styled(" ▲ ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " ▲ ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!("{:<10}", format_rate(app.up_rate)),
             Style::default().fg(theme.text),
         ),
-        Span::styled(" ▼ ", Style::default().fg(theme.peak).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " ▼ ",
+            Style::default().fg(theme.peak).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!("{:<10}", format_rate(app.down_rate)),
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
@@ -641,7 +675,9 @@ fn draw_overview_panel(frame: &mut Frame, app: &App, area: Rect) {
     let core_style = if app.snapshot.running {
         Style::default().fg(theme.peak).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
     };
 
     let sys_badge = if app.snapshot.sysproxy_enabled {
@@ -676,7 +712,9 @@ fn draw_overview_panel(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Mode ", Style::default().fg(theme.muted)),
         Span::styled(
             format!("{:<7}", app.snapshot.mode),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" Mem ", Style::default().fg(theme.muted)),
         Span::styled(
@@ -809,7 +847,12 @@ fn draw_groups_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(
         List::new(items),
-        Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), inner.height),
+        Rect::new(
+            inner.x + 1,
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        ),
     );
 }
 
@@ -875,10 +918,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             let node_meta = app.snapshot.nodes.get(node_name);
-            let proto = node_meta
-                .map(|n| n.kind.as_str())
-                .unwrap_or("")
-                .to_string();
+            let proto = node_meta.map(|n| n.kind.as_str()).unwrap_or("").to_string();
             let delay = node_meta.and_then(|n| n.delay);
 
             let delay_str = match delay {
@@ -892,9 +932,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else if is_active {
-                Style::default()
-                    .fg(theme.peak)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(theme.peak).add_modifier(Modifier::BOLD)
             } else if is_info {
                 Style::default().fg(theme.muted)
             } else {
@@ -932,7 +970,12 @@ fn draw_nodes_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(
         List::new(items),
-        Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), inner.height),
+        Rect::new(
+            inner.x + 1,
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        ),
     );
 }
 
@@ -981,7 +1024,11 @@ fn draw_connections_main(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme.text)
             };
 
-            let host_part = format!("{prefix}[{:<3}] {:<30}", c.network, truncate_str(&c.host, 30));
+            let host_part = format!(
+                "{prefix}[{:<3}] {:<30}",
+                c.network,
+                truncate_str(&c.host, 30)
+            );
             let chain_part = format!(" {} ", truncate_str(&c.chains, 28));
             let traffic_part = format!("↑{} ↓{}", format_bytes(c.upload), format_bytes(c.download));
             let used = host_part.width() + chain_part.width() + traffic_part.width();
@@ -998,7 +1045,12 @@ fn draw_connections_main(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(
         List::new(items),
-        Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), inner.height),
+        Rect::new(
+            inner.x + 1,
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        ),
     );
 }
 
@@ -1051,7 +1103,12 @@ fn draw_logs_main(frame: &mut Frame, app: &App, area: Rect) {
 fn toolbar_line(app: &App, width: u16) -> Line<'static> {
     let theme = app.theme();
     let mut spans = vec![
-        Span::styled("Space ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Space ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             if app.snapshot.sysproxy_enabled {
                 app.t("sysproxy_off").to_string()
@@ -1235,12 +1292,7 @@ fn draw_settings_rows(frame: &mut Frame, app: &App, area: Rect, rows: &[SettingR
     frame.render_widget(List::new(items), area);
 }
 
-fn draw_settings_detail(
-    frame: &mut Frame,
-    app: &App,
-    area: Rect,
-    selected: Option<&SettingRow>,
-) {
+fn draw_settings_detail(frame: &mut Frame, app: &App, area: Rect, selected: Option<&SettingRow>) {
     let theme = app.theme();
     let Some(row) = selected else {
         return;
@@ -1314,6 +1366,216 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Single-line input windowing: returns (first visible char, cursor column).
+/// One cell is reserved for the cursor block and one for the leading ellipsis.
+pub fn input_viewport(chars: &[char], cursor: usize, body_w: usize) -> (usize, usize) {
+    let cursor = cursor.min(chars.len());
+    let mut head = cursor;
+    let mut text = 0usize;
+    while head > 0 {
+        let w = chars[head - 1].width().unwrap_or(1);
+        let next = text + w;
+        let ellipsis = usize::from(head - 1 > 0);
+        if ellipsis + next + 1 > body_w {
+            break;
+        }
+        head -= 1;
+        text = next;
+    }
+    (head, usize::from(head > 0) + text)
+}
+
+fn setup_line_spans(app: &App, theme: Theme, body_w: usize) -> Vec<Span<'static>> {
+    let chars = app.setup_editor.chars();
+    let cursor = app.setup_editor.cursor.min(chars.len());
+    let head = input_viewport(&chars, cursor, body_w).0;
+
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    if head > 0 {
+        spans.push(Span::styled("…", Style::default().fg(theme.muted)));
+        used += 1;
+    }
+    for c in &chars[head..cursor] {
+        spans.push(Span::styled(c.to_string(), Style::default().fg(theme.text)));
+        used += c.width().unwrap_or(1);
+    }
+    spans.push(Span::styled(
+        " ",
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    ));
+    used += 1;
+    for c in &chars[cursor..] {
+        let w = c.width().unwrap_or(1);
+        if used + w > body_w {
+            break;
+        }
+        spans.push(Span::styled(c.to_string(), Style::default().fg(theme.text)));
+        used += w;
+    }
+    spans
+}
+
+fn setup_step_line(theme: Theme, index: usize, text: String, done: bool) -> Line<'static> {
+    let mark = if done { "✓" } else { "·" };
+    let mark_color = if done { theme.peak } else { theme.accent };
+    Line::from(vec![
+        Span::styled(
+            format!("  {mark} "),
+            Style::default().fg(mark_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{index}. "),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            text,
+            Style::default().fg(if done { theme.text } else { theme.muted }),
+        ),
+    ])
+}
+
+fn draw_setup(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let popup = centered_rect(86, 74, area);
+    frame.render_widget(Clear, popup);
+    let inner = draw_panel(
+        frame,
+        popup,
+        theme,
+        Some(panel_title(app.t("setup_title").to_string(), theme)),
+        true,
+    );
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(5),
+            Constraint::Length(3),
+            Constraint::Min(3),
+        ])
+        .split(inner);
+
+    let intro = Paragraph::new(app.t("setup_intro"))
+        .style(Style::default().fg(theme.muted))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(intro, rows[0]);
+
+    let sub_state = if config_file_exists(&app.config.controller) {
+        app.t("setup_config_ok")
+    } else if app.setup_phase == SetupPhase::Fetching {
+        app.t("setup_fetching")
+    } else {
+        app.t("setup_waiting")
+    };
+    let core_state = if app.core_downloading {
+        app.t("setup_dl_busy")
+    } else if app.core_binary_found() {
+        app.t("setup_found")
+    } else {
+        app.t("setup_missing")
+    };
+    let run_state = if app.snapshot.running {
+        app.t("setup_running")
+    } else if app.setup_phase == SetupPhase::Starting {
+        app.t("setup_starting")
+    } else {
+        app.t("setup_stopped")
+    };
+
+    let has_config = config_file_exists(&app.config.controller);
+    let mut step_lines = vec![
+        setup_step_line(
+            theme,
+            1,
+            format!("{} · {}", app.t("setup_step_sub"), sub_state),
+            has_config,
+        ),
+        setup_step_line(
+            theme,
+            2,
+            format!(
+                "{} · {} · {}",
+                app.t("setup_step_core"),
+                core_state,
+                truncate_str(&app.snapshot.core_bin_path, 28)
+            ),
+            app.core_binary_found(),
+        ),
+        setup_step_line(
+            theme,
+            3,
+            format!("{} · {}", app.t("setup_step_run"), run_state),
+            app.snapshot.running,
+        ),
+    ];
+    if !app.core_binary_found() && !app.core_downloading {
+        step_lines.push(Line::from(Span::styled(
+            format!("      {}", app.t("setup_dl_hint")),
+            Style::default().fg(theme.accent),
+        )));
+    }
+    frame.render_widget(Paragraph::new(step_lines), rows[1]);
+
+    let input_area = draw_panel(
+        frame,
+        rows[2],
+        theme,
+        Some(panel_title(app.t("setup_input").to_string(), theme)),
+        app.setup_phase == SetupPhase::Editing,
+    );
+    let text_area = Rect::new(
+        input_area.x + 1,
+        input_area.y,
+        input_area.width.saturating_sub(2),
+        1,
+    );
+    let body_w = text_area.width as usize;
+    if body_w > 0 {
+        let spans = setup_line_spans(app, theme, body_w);
+        frame.render_widget(Paragraph::new(Line::from(spans)), text_area);
+        if app.setup_phase == SetupPhase::Editing {
+            if let Some(cell) = setup_cursor_cell(app, text_area) {
+                frame.set_cursor_position(cell);
+            }
+        }
+    }
+
+    let busy = app.setup_phase != SetupPhase::Editing || app.core_downloading;
+    let mut foot = vec![
+        Line::from(Span::styled(
+            app.t("setup_paste_hint"),
+            Style::default().fg(theme.muted),
+        )),
+        Line::styled(
+            app.t("setup_keys"),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !app.status_message.is_empty() {
+        foot.push(Line::from(Span::styled(
+            truncate_str(&app.status_message, inner.width.saturating_sub(4) as usize),
+            Style::default().fg(if app.status_is_error {
+                theme.accent
+            } else {
+                theme.text
+            }),
+        )));
+    }
+    if !busy {
+        foot.push(Line::from(Span::styled(
+            app.t("setup_sysproxy_note"),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    frame.render_widget(Paragraph::new(foot).wrap(Wrap { trim: true }), rows[3]);
+}
+
 pub fn visible_list_start(selected: usize, len: usize, visible_height: usize) -> usize {
     if visible_height == 0 || len <= visible_height {
         return 0;
@@ -1367,6 +1629,23 @@ pub fn truncate_str(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_viewport_keeps_cursor_visible_when_scrolled() {
+        let chars: Vec<char> = "https://sub.example.com/link/abcdefghij".chars().collect();
+        // Short field: cursor at the end must stay inside the field, with a leading ellipsis.
+        let (head, col) = input_viewport(&chars, chars.len(), 12);
+        assert!(head > 0);
+        assert!(col < 12, "cursor column {col} escaped the 12 cell field");
+
+        // Wide field: no scrolling needed, cursor sits right after the text.
+        let (head, col) = input_viewport(&chars, chars.len(), chars.len() + 4);
+        assert_eq!(head, 0);
+        assert_eq!(col, chars.len());
+
+        // Empty input at zero width stays clamped.
+        assert_eq!(input_viewport(&[], 0, 1), (0, 0));
+    }
 
     #[test]
     fn nice_rate_max_rounds_to_clean_binary_steps() {

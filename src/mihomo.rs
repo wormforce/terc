@@ -19,13 +19,36 @@ use serde_json::Value;
 
 #[derive(Clone, Debug)]
 pub enum BackendEvent {
-    Traffic { up: u64, down: u64 },
-    Memory { inuse: u64 },
-    Log { level: String, payload: String },
+    Traffic {
+        up: u64,
+        down: u64,
+    },
+    Memory {
+        inuse: u64,
+    },
+    Log {
+        level: String,
+        payload: String,
+    },
     Snapshot(Box<CoreSnapshot>),
-    DelayResult { group: String, node: String, delay: Option<u16> },
-    GroupTestDone { group: String },
-    StatusMessage { text: String, is_error: bool },
+    DelayResult {
+        group: String,
+        node: String,
+        delay: Option<u16>,
+    },
+    GroupTestDone {
+        group: String,
+    },
+    StatusMessage {
+        text: String,
+        is_error: bool,
+    },
+    SubscriptionDone {
+        ok: bool,
+    },
+    CoreDownloadDone {
+        ok: bool,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -97,7 +120,7 @@ impl Default for ControllerConfig {
         Self {
             addr: "127.0.0.1:9090".to_string(),
             secret: String::new(),
-            config_dir: "/opt/homebrew/etc/mihomo".to_string(),
+            config_dir: default_config_dir(),
             subscription_url: String::new(),
             test_url: "http://www.gstatic.com/generate_204".to_string(),
             timeout_ms: 4000,
@@ -105,6 +128,40 @@ impl Default for ControllerConfig {
     }
 }
 
+const HOMEBREW_CONFIG_DIR: &str = "/opt/homebrew/etc/mihomo";
+
+fn default_config_dir() -> String {
+    if Path::new(HOMEBREW_CONFIG_DIR).join("config.yaml").is_file() {
+        return HOMEBREW_CONFIG_DIR.to_string();
+    }
+    std::env::var_os("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".config/terc/mihomo")
+                .display()
+                .to_string()
+        })
+        .unwrap_or_else(|| HOMEBREW_CONFIG_DIR.to_string())
+}
+
+pub fn config_file_exists(cfg: &ControllerConfig) -> bool {
+    Path::new(&cfg.config_dir).join("config.yaml").is_file()
+}
+
+pub fn normalize_subscription(raw: &str, controller_addr: &str) -> String {
+    let normalized = raw.replace(
+        "external-controller: :9090",
+        "external-controller: 127.0.0.1:9090",
+    );
+    let has_controller = normalized
+        .lines()
+        .any(|line| line.starts_with("external-controller:"));
+    if has_controller {
+        normalized
+    } else {
+        format!("external-controller: {controller_addr}\n{normalized}")
+    }
+}
 pub fn percent_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 3);
     for b in input.bytes() {
@@ -174,10 +231,10 @@ pub fn http_request(
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(500);
 
-    let decoded_body = if headers
-        .lines()
-        .any(|l| l.to_ascii_lowercase().contains("transfer-encoding: chunked"))
-    {
+    let decoded_body = if headers.lines().any(|l| {
+        l.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+    }) {
         decode_chunked(rest)
     } else {
         rest.to_string()
@@ -222,11 +279,17 @@ pub fn spawn_stream_workers(
     let secret_traffic = secret.clone();
     let stop_traffic = stop.clone();
     thread::spawn(move || {
-        stream_json_lines(&addr_traffic, &secret_traffic, "/traffic", &stop_traffic, |val| {
-            let up = val.get("up").and_then(Value::as_u64).unwrap_or(0);
-            let down = val.get("down").and_then(Value::as_u64).unwrap_or(0);
-            let _ = tx_traffic.send(BackendEvent::Traffic { up, down });
-        });
+        stream_json_lines(
+            &addr_traffic,
+            &secret_traffic,
+            "/traffic",
+            &stop_traffic,
+            |val| {
+                let up = val.get("up").and_then(Value::as_u64).unwrap_or(0);
+                let down = val.get("down").and_then(Value::as_u64).unwrap_or(0);
+                let _ = tx_traffic.send(BackendEvent::Traffic { up, down });
+            },
+        );
     });
 
     let tx_mem = tx.clone();
@@ -316,7 +379,8 @@ pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
 
-    let Ok((200, ver_body)) = http_request(&cfg.addr, &cfg.secret, "GET", "/version", None, timeout)
+    let Ok((200, ver_body)) =
+        http_request(&cfg.addr, &cfg.secret, "GET", "/version", None, timeout)
     else {
         return CoreSnapshot {
             running: false,
@@ -719,13 +783,15 @@ pub fn discover_mihomo_binary() -> Option<PathBuf> {
 
 pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     let Some(bin) = discover_mihomo_binary() else {
-        return Err("mihomo binary not found (press 'd' in Settings to download)".to_string());
+        return Err("mihomo binary not found · Settings › Download Managed Core".to_string());
     };
 
-    // If Homebrew mihomo exists and config_dir is /opt/homebrew/etc/mihomo, try brew services or direct daemon
     let config_file = Path::new(&cfg.config_dir).join("config.yaml");
     if !config_file.exists() {
-        return Err(format!("config not found: {}", config_file.display()));
+        return Err(format!(
+            "config not found: {} · add a subscription first (u)",
+            config_file.display()
+        ));
     }
 
     let child = Command::new(&bin)
@@ -762,81 +828,86 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
 
 pub fn update_subscription_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
     thread::spawn(move || {
-        if cfg.subscription_url.trim().is_empty() {
-            let _ = tx.send(BackendEvent::StatusMessage {
-                text: "Subscription URL is empty".to_string(),
-                is_error: true,
-            });
-            return;
-        }
-        let _ = tx.send(BackendEvent::StatusMessage {
-            text: "Fetching subscription (AnyTLS)...".to_string(),
-            is_error: false,
-        });
-
-        let _ = fs::create_dir_all(&cfg.config_dir);
-        let tmp_path = Path::new(&cfg.config_dir).join("config.yaml.tmp");
-        let final_path = Path::new(&cfg.config_dir).join("config.yaml");
-
-        let output = Command::new("curl")
-            .args([
-                "-fsSL",
-                "--connect-timeout",
-                "10",
-                "-A",
-                "clash.meta/1.19.32",
-                &cfg.subscription_url,
-                "-o",
-            ])
-            .arg(&tmp_path)
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                if let Ok(raw) = fs::read_to_string(&tmp_path) {
-                    if raw.contains("proxies:") {
-                        let normalized =
-                            raw.replace("external-controller: :9090", "external-controller: 127.0.0.1:9090");
-                        let _ = fs::write(&final_path, normalized);
-                        let _ = fs::remove_file(&tmp_path);
-
-                        let body = serde_json::json!({
-                            "path": final_path.display().to_string(),
-                            "payload": ""
-                        })
-                        .to_string();
-                        let _ = http_request(
-                            &cfg.addr,
-                            &cfg.secret,
-                            "PUT",
-                            "/configs?force=true",
-                            Some(&body),
-                            Duration::from_millis(2500),
-                        );
-                        let snap = fetch_snapshot(&cfg);
-                        let _ = tx.send(BackendEvent::Snapshot(Box::new(snap)));
-                        let _ = tx.send(BackendEvent::StatusMessage {
-                            text: "Subscription updated & hot-reloaded".to_string(),
-                            is_error: false,
-                        });
-                        return;
-                    }
-                }
-                let _ = fs::remove_file(&tmp_path);
-                let _ = tx.send(BackendEvent::StatusMessage {
-                    text: "Downloaded subscription is invalid YAML".to_string(),
-                    is_error: true,
-                });
-            }
-            _ => {
-                let _ = fs::remove_file(&tmp_path);
-                let _ = tx.send(BackendEvent::StatusMessage {
-                    text: "Failed to download subscription".to_string(),
-                    is_error: true,
-                });
-            }
-        }
+        let result = fetch_subscription(&cfg, &tx);
+        let ok = result.is_ok();
+        let (text, is_error) = match result {
+            Ok(text) => (text, false),
+            Err(text) => (text, true),
+        };
+        let _ = tx.send(BackendEvent::StatusMessage { text, is_error });
+        let _ = tx.send(BackendEvent::SubscriptionDone { ok });
     });
+}
+
+fn fetch_subscription(cfg: &ControllerConfig, tx: &Sender<BackendEvent>) -> Result<String, String> {
+    if cfg.subscription_url.trim().is_empty() {
+        return Err("Subscription URL is empty".to_string());
+    }
+    let _ = tx.send(BackendEvent::StatusMessage {
+        text: "Fetching subscription...".to_string(),
+        is_error: false,
+    });
+
+    fs::create_dir_all(&cfg.config_dir)
+        .map_err(|e| format!("Cannot create {}: {e}", cfg.config_dir))?;
+    let tmp_path = Path::new(&cfg.config_dir).join("config.yaml.tmp");
+    let final_path = Path::new(&cfg.config_dir).join("config.yaml");
+
+    let output = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "60",
+            "-A",
+            "clash.meta/1.19.32",
+            "--url",
+            cfg.subscription_url.trim(),
+            "-o",
+        ])
+        .arg(&tmp_path)
+        .stdin(Stdio::null())
+        .output();
+
+    let raw = match output {
+        Ok(out) if out.status.success() => fs::read_to_string(&tmp_path).unwrap_or_default(),
+        _ => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err("Failed to download subscription".to_string());
+        }
+    };
+    let _ = fs::remove_file(&tmp_path);
+    if !raw.contains("proxies:") {
+        return Err("Subscription is not a Clash/Mihomo YAML (missing proxies:)".to_string());
+    }
+
+    fs::write(&final_path, normalize_subscription(&raw, &cfg.addr))
+        .map_err(|e| format!("Cannot write {}: {e}", final_path.display()))?;
+
+    let body = serde_json::json!({
+        "path": final_path.display().to_string(),
+        "payload": ""
+    })
+    .to_string();
+    let reloaded = matches!(
+        http_request(
+            &cfg.addr,
+            &cfg.secret,
+            "PUT",
+            "/configs?force=true",
+            Some(&body),
+            Duration::from_millis(2500),
+        ),
+        Ok((code, _)) if (200..300).contains(&code)
+    );
+    if reloaded {
+        let snap = fetch_snapshot(cfg);
+        let _ = tx.send(BackendEvent::Snapshot(Box::new(snap)));
+        Ok("Subscription updated & hot-reloaded".to_string())
+    } else {
+        Ok(format!("Subscription saved to {}", final_path.display()))
+    }
 }
 
 pub fn download_managed_core_async(tx: Sender<BackendEvent>) {
@@ -862,20 +933,26 @@ pub fn download_managed_core_async(tx: Sender<BackendEvent>) {
             bin_path.display()
         );
 
-        match Command::new("sh").arg("-c").arg(&script).status() {
-            Ok(st) if st.success() => {
-                let _ = tx.send(BackendEvent::StatusMessage {
-                    text: format!("Managed core installed to {}", bin_path.display()),
-                    is_error: false,
-                });
-            }
-            _ => {
-                let _ = tx.send(BackendEvent::StatusMessage {
-                    text: "Failed to download mihomo from GitHub".to_string(),
-                    is_error: true,
-                });
-            }
-        }
+        let ok = matches!(
+            Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+            Ok(st) if st.success()
+        );
+        let text = if ok {
+            format!("Managed core installed to {}", bin_path.display())
+        } else {
+            "Failed to download mihomo from GitHub".to_string()
+        };
+        let _ = tx.send(BackendEvent::StatusMessage {
+            text,
+            is_error: !ok,
+        });
+        let _ = tx.send(BackendEvent::CoreDownloadDone { ok });
     });
 }
 
@@ -898,7 +975,12 @@ fn active_macos_network_service() -> Option<String> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    for candidate in ["Wi-Fi", "USB 10/100/1000 LAN", "Thunderbolt Ethernet", "Ethernet"] {
+    for candidate in [
+        "Wi-Fi",
+        "USB 10/100/1000 LAN",
+        "Thunderbolt Ethernet",
+        "Ethernet",
+    ] {
         if text.lines().any(|l| l.trim() == candidate) {
             return Some(candidate.to_string());
         }
@@ -941,5 +1023,25 @@ pub fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Resu
             .args(["-setsocksfirewallproxystate", &service, "off"])
             .status();
         Ok(format!("System Proxy OFF ({service})"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_subscription_binds_controller_to_loopback() {
+        let raw = "external-controller: :9090\nproxies:\n  - name: a\n";
+        let out = normalize_subscription(raw, "127.0.0.1:9090");
+        assert!(out.starts_with("external-controller: 127.0.0.1:9090\n"));
+        assert_eq!(out.matches("external-controller:").count(), 1);
+    }
+
+    #[test]
+    fn normalize_subscription_adds_missing_controller() {
+        let raw = "mixed-port: 7890\nproxies:\n  - name: a\n";
+        let out = normalize_subscription(raw, "127.0.0.1:9090");
+        assert!(out.starts_with("external-controller: 127.0.0.1:9090\nmixed-port: 7890"));
     }
 }

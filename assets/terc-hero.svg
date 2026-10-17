@@ -1,82 +1,57 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="260" viewBox="0 0 1024 260" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="1013" height="353" viewBox="0 0 1013 353" role="img" aria-labelledby="title description">
   <title id="title">terc</title>
-  <desc id="description">A transparent banner with Terc's ASCII wordmark between two pastel traffic waveform illustrations.</desc>
+  <desc id="description">Transparent ASCII banner: a block-letter terc wordmark over a terminal-style backdrop with a proxy node list, a braille traffic graph and a routing chain.</desc>
   <style>
+    text { font-family: "SFMono-Regular", "Menlo", "DejaVu Sans Mono", Consolas, monospace; font-size: 11px; }
+    .wordmark { font-size: 15px; font-weight: 600; }
+    .tagline { font-weight: 600; }
+    .grain { opacity: .55; }
+    .rule { opacity: .45; }
+    .bright { fill: #7c6f5a; }
+    .dim { fill: #8d8c7f; }
+    .frame { fill: #7d9c97; }
+    .grain { fill: #a8b5b2; }
+    .node { fill: #8a6f4f; }
+    .route { fill: #5f7d79; }
+    .rule { fill: #b0bdba; }
+    .tagline { fill: #7c6f5a; }
+    .wave { fill: #94535e; }
     .wordmark { fill: #a65d65; }
-    .low { stop-color: #779f99; }
-    .mid { stop-color: #c5ae75; }
-    .high { stop-color: #bf7580; }
-    .pulse { fill: #a65d65; }
     @media (prefers-color-scheme: dark) {
-      .wordmark, .pulse { fill: #ffa4a4; }
-      .low { stop-color: #badfdb; }
-      .mid { stop-color: #fcf9ea; }
-      .high { stop-color: #ffa4a4; }
+      .bright { fill: #fcf9ea; }
+      .dim { fill: #8fa3a0; }
+      .frame { fill: #badfdb; }
+      .grain { fill: #5c6f6c; }
+      .node { fill: #c5ae75; }
+      .route { fill: #badfdb; }
+      .rule { fill: #4d5e5c; }
+      .tagline { fill: #fcf9ea; }
+      .wave { fill: #ffa4a4; }
+      .wordmark { fill: #ffa4a4; }
     }
   </style>
-  <defs>
-    <linearGradient id="spectrum" x1="0" y1="1" x2="0" y2="0">
-      <stop class="low" offset="0"/>
-      <stop class="mid" offset="0.55"/>
-      <stop class="high" offset="1"/>
-    </linearGradient>
-  </defs>
-  <g fill="url(#spectrum)">
-    <rect x="58" y="180" width="7" height="12" rx="1"/>
-    <rect x="72" y="172" width="7" height="20" rx="1"/>
-    <rect x="86" y="160" width="7" height="32" rx="1"/>
-    <rect x="100" y="146" width="7" height="46" rx="1"/>
-    <rect x="114" y="162" width="7" height="30" rx="1"/>
-    <rect x="128" y="152" width="7" height="40" rx="1"/>
-    <rect x="142" y="130" width="7" height="62" rx="1"/>
-    <rect x="156" y="106" width="7" height="86" rx="1"/>
-    <rect x="170" y="90" width="7" height="102" rx="1"/>
-    <rect x="184" y="74" width="7" height="118" rx="1"/>
-    <rect x="198" y="102" width="7" height="90" rx="1"/>
-    <rect x="212" y="120" width="7" height="72" rx="1"/>
-    <rect x="226" y="104" width="7" height="88" rx="1"/>
-    <rect x="240" y="88" width="7" height="104" rx="1"/>
-    <rect x="254" y="110" width="7" height="82" rx="1"/>
-    <rect x="268" y="136" width="7" height="56" rx="1"/>
-    <rect x="282" y="130" width="7" height="62" rx="1"/>
-    <rect x="296" y="152" width="7" height="40" rx="1"/>
-    <rect x="310" y="164" width="7" height="28" rx="1"/>
-    <rect x="324" y="156" width="7" height="36" rx="1"/>
-    <rect x="338" y="170" width="7" height="22" rx="1"/>
-    <rect x="352" y="180" width="7" height="12" rx="1"/>
-    <rect x="666" y="180" width="7" height="12" rx="1"/>
-    <rect x="680" y="168" width="7" height="24" rx="1"/>
-    <rect x="694" y="156" width="7" height="36" rx="1"/>
-    <rect x="708" y="166" width="7" height="26" rx="1"/>
-    <rect x="722" y="150" width="7" height="42" rx="1"/>
-    <rect x="736" y="134" width="7" height="58" rx="1"/>
-    <rect x="750" y="116" width="7" height="76" rx="1"/>
-    <rect x="764" y="96" width="7" height="96" rx="1"/>
-    <rect x="778" y="112" width="7" height="80" rx="1"/>
-    <rect x="792" y="128" width="7" height="64" rx="1"/>
-    <rect x="806" y="104" width="7" height="88" rx="1"/>
-    <rect x="820" y="76" width="7" height="116" rx="1"/>
-    <rect x="834" y="90" width="7" height="102" rx="1"/>
-    <rect x="848" y="108" width="7" height="84" rx="1"/>
-    <rect x="862" y="124" width="7" height="68" rx="1"/>
-    <rect x="876" y="140" width="7" height="52" rx="1"/>
-    <rect x="890" y="126" width="7" height="66" rx="1"/>
-    <rect x="904" y="148" width="7" height="44" rx="1"/>
-    <rect x="918" y="160" width="7" height="32" rx="1"/>
-    <rect x="932" y="168" width="7" height="24" rx="1"/>
-    <rect x="946" y="174" width="7" height="18" rx="1"/>
-    <rect x="960" y="182" width="7" height="10" rx="1"/>
-  </g>
-  <g class="wordmark" font-family="SFMono-Regular, Consolas, Liberation Mono, monospace" font-size="18" font-weight="600" text-anchor="middle" xml:space="preserve">
-    <text x="512" y="82"> _                </text>
-    <text x="512" y="104">| |_ ___ _ __ ___ </text>
-    <text x="512" y="126">| __/ _ \ &#x27;__/ __|</text>
-    <text x="512" y="148">| ||  __/ | | (__ </text>
-    <text x="512" y="170"> \__\___|_|  \___|</text>
-  </g>
-  <g class="pulse">
-    <circle cx="500" cy="196" r="2" opacity="0.25"/>
-    <circle cx="512" cy="196" r="3"/>
-    <circle cx="524" cy="196" r="2" opacity="0.25"/>
-  </g>
+  <text x="10" y="26.5" xml:space="preserve">                                                                                                      <tspan class="grain">┊</tspan>                 <tspan class="grain">┊</tspan>                 <tspan class="grain">┊</tspan></text>
+  <text x="10" y="39.9" xml:space="preserve">  <tspan class="rule">╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌</tspan></text>
+  <text x="10" y="53.3" xml:space="preserve">                <tspan class="grain">┆</tspan>                 <tspan class="grain">┆</tspan>                 <tspan class="grain">┆</tspan></text>
+  <text x="10" y="66.7" xml:space="preserve">   <tspan class="frame">┌─</tspan><tspan class="bright"> PROXIES </tspan><tspan class="frame">──────────────┐</tspan>                            <tspan class="grain">⋅</tspan>                 <tspan class="grain">⋅</tspan>                 <tspan class="grain">⋅</tspan>                           <tspan class="frame">┌─</tspan><tspan class="bright"> TRAFFIC </tspan><tspan class="frame">──────────────┐</tspan></text>
+  <text x="10" y="80.1" xml:space="preserve">   <tspan class="frame">│</tspan>                        <tspan class="frame">│</tspan>                                                   <tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan>    <tspan class="frame">│</tspan>         <tspan class="wave">⠠⠄</tspan>    <tspan class="wave">⠐⠐⢀⡀</tspan>     <tspan class="frame">│</tspan></text>
+  <text x="10" y="93.5" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="node">◉ HK-01   32ms</tspan>         <tspan class="frame">│</tspan>                                                                                            <tspan class="frame">│</tspan>    <tspan class="wave">⠠⠠</tspan> <tspan class="wave">⠈⠈⠈⠐⠐⢀⢀⠈⠈⠈⠈⠠⠠</tspan> <tspan class="wave">⠠⠠</tspan> <tspan class="frame">│</tspan></text>
+  <text x="10" y="106.9" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="node">◉ JP-02   58ms</tspan>         <tspan class="frame">│</tspan> <tspan class="grain">┊</tspan>                                                                                          <tspan class="frame">│</tspan> <tspan class="wave">⠠⠠⠐⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈⠈</tspan> <tspan class="frame">│</tspan></text>
+  <text x="10" y="120.3" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="node">◉ SG-03   71ms</tspan>         <tspan class="frame">│</tspan>      <tspan class="grain">╎</tspan>          <tspan class="wordmark"> _____ ____  _____  ____ </tspan>                                                  <tspan class="frame">│</tspan> <tspan class="wave">⠈⠈⠐⠠⠠⠐⢀⢀⢀⢀⢀⠠⠠⢀⢀⢀⢀⠠⠠⠠⢀⢀</tspan> <tspan class="frame">│</tspan></text>
+  <text x="10" y="133.7" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="dim">○ US-04     --</tspan>         <tspan class="frame">│</tspan>                 <tspan class="wordmark">|_   _||  _ \|  _ \/ ___|</tspan>                                                  <tspan class="frame">│</tspan>         <tspan class="wave">⠐⠂</tspan>   <tspan class="wave">⠈⠠⠠⠐⠂</tspan>     <tspan class="frame">│</tspan></text>
+  <text x="10" y="147.1" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="dim">○ DE-05     --</tspan>         <tspan class="frame">│</tspan>                 <tspan class="wordmark">  | |  | |_) | |_) \___ \</tspan>                                              <tspan class="grain">⋅</tspan>   <tspan class="frame">│</tspan>                        <tspan class="frame">│</tspan></text>
+  <text x="10" y="160.5" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="node">▶ AUTO     sel</tspan>         <tspan class="frame">│</tspan>                 <tspan class="wordmark">  | |  |  __/|  _ &lt; ___) |</tspan>                                                 <tspan class="frame">│</tspan><tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan>     <tspan class="frame">│</tspan></text>
+  <text x="10" y="173.9" xml:space="preserve">   <tspan class="frame">│</tspan> <tspan class="dim">url-get 12/24</tspan>          <tspan class="frame">│</tspan>  <tspan class="grain">·</tspan>              <tspan class="wordmark">  |_|  |_|   |_| \_\____/</tspan>                                                  <tspan class="frame">│</tspan> <tspan class="dim">v 6.2  ^ 1.4 Mb/s</tspan>     <tspan class="grain">·</tspan><tspan class="frame">│</tspan></text>
+  <text x="10" y="187.3" xml:space="preserve">   <tspan class="frame">└────────────────────────┘</tspan>       <tspan class="grain">┊</tspan>                                                                                    <tspan class="frame">└────────────────────────┘</tspan></text>
+  <text x="10" y="200.7" xml:space="preserve">                                            <tspan class="tagline">terminal mihomo controller · traffic in your shell</tspan></text>
+  <text x="10" y="214.1" xml:space="preserve">                                                                                                                      <tspan class="grain">┆</tspan>                 <tspan class="grain">┆</tspan></text>
+  <text x="10" y="227.5" xml:space="preserve">         <tspan class="grain">⋅</tspan>                                                                                                                 <tspan class="grain">⋅</tspan>                 <tspan class="grain">⋅</tspan></text>
+  <text x="10" y="240.9" xml:space="preserve">              <tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan></text>
+  <text x="10" y="254.3" xml:space="preserve">                                     <tspan class="grain">·</tspan><tspan class="route">[ macOS ] --&gt; [ 127.0.0.1:9090 ] --&gt; [ mihomo ] --&gt; [ exit ]</tspan></text>
+  <text x="10" y="267.7" xml:space="preserve">                                  <tspan class="dim">┈┈┈┈┈┈┈┈┈╯            ╰┈┈┈┈┈┈┈┈┈</tspan></text>
+  <text x="10" y="281.1" xml:space="preserve">                                                                                                                       <tspan class="grain">╎</tspan>                 <tspan class="grain">╎</tspan></text>
+  <text x="10" y="294.5" xml:space="preserve">          <tspan class="grain">┆</tspan>                                                                                                                 <tspan class="grain">┆</tspan>                 <tspan class="grain">┆</tspan></text>
+  <text x="10" y="307.9" xml:space="preserve">               <tspan class="grain">⋅</tspan>                 <tspan class="grain">⋅</tspan>                 <tspan class="grain">⋅</tspan></text>
+  <text x="10" y="321.3" xml:space="preserve">  <tspan class="rule">╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌</tspan></text>
+  <text x="10" y="334.7" xml:space="preserve">                                                                               <tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan>                 <tspan class="grain">·</tspan></text>
 </svg>

@@ -26,7 +26,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/terc-hero.svg" alt="terc ASCII 字标与柔和配色的流量波形插画" width="100%">
+  <img src="assets/terc-hero.svg" alt="terc ASCII 字标，背景是终端风格的节点列表、Braille 速率图与代理链路" width="100%">
 </p>
 
 `terc` 是与 [`terb`](https://github.com/pentaoa/terb) 一脉相承的 Mihomo (Clash.Meta) 终端管理界面。它沿用了 `terb` 标志性的透明画布、圆角镂空标题线框（`╭─┐ Title ┌───╮`）和三套克制的低饱和配色，让你在 1.4 MB 的纯原生二进制中完成节点测速、系统代理切换、订阅热重载与连接监控——用完即关，UI 内存占用归零。
@@ -42,6 +42,8 @@ cargo run --release --locked
 ```
 
 按 **空格 (`Space`)** 一键开启或关闭 macOS 系统代理，按 **`K`** 启动或停止后台 `mihomo` 服务。运行 `terc --version` 可查看已安装版本。
+
+首次运行会自动弹出初始设置窗口，引导完成三步：粘贴机场订阅链接、定位 `mihomo` 二进制（<kbd>Ctrl+D</kbd> 可下载托管内核）、启动内核。按 <kbd>Esc</kbd> 可以先关掉，未配置订阅时按 <kbd>u</kbd> 随时重新打开——系统代理永远不会被自动开启。
 
 > [!NOTE]
 > `terc` 将界面与内核生命周期完全解耦。按 <kbd>q</kbd> 退出 `terc` 只会关闭终端界面并释放全部 UI 内存，后台 `mihomo` 代理服务依然稳固运行。
@@ -73,7 +75,10 @@ cargo run --release --locked
 | 面板 | <kbd>r</kbd> | 对当前策略组内所有节点发起并发延迟测速 |
 | 面板 | <kbd>a</kbd> | 自动选中当前策略组中延迟最低的节点 |
 | 面板 | <kbd>m</kbd> | 循环切换分流模式（`Rule` → `Global` → `Direct`） |
-| 面板 | <kbd>u</kbd> | 拉取最新机场订阅 YAML 并执行零停机热重载 |
+| 面板 | <kbd>u</kbd> | 拉取最新机场订阅 YAML 并执行零停机热重载；未保存订阅链接时先打开初始设置窗口 |
+| 设置窗口 | <kbd>Enter</kbd> | 保存订阅链接、写入配置并启动内核 |
+| 设置窗口 | <kbd>Ctrl+U</kbd> / <kbd>Ctrl+D</kbd> | 清空输入行 / 下载托管 `mihomo` 内核 |
+| 设置窗口 | <kbd>Esc</kbd> | 暂时关闭，未配置订阅时按 <kbd>u</kbd> 可重新打开 |
 | 面板 | <kbd>p</kbd> / <kbd>c</kbd> / <kbd>L</kbd> | 切换主视图：**节点面板** / **连接监控** / **实时日志** |
 | 连接监控 | <kbd>x</kbd> / <kbd>X</kbd> | 断开当前选中连接 / 一键断开全部活跃连接 |
 | 面板 | <kbd>t</kbd> | 显示或隐藏顶部「实时速率」与「内核状态」面板 |
@@ -110,7 +115,7 @@ flowchart LR
 <summary>项目结构</summary>
 
 ```text
-assets/terc-hero.svg           透明背景 SVG 顶部视觉插画
+assets/terc-hero.svg           透明背景 ASCII 头图（字标 + 节点/速率图背景）
 src/main.rs                    主事件循环、状态机、流量历史与多语言词典
 src/ui.rs                      圆角镂空 Panel 组件、三套主题、Braille/Blocks 速率图渲染
 src/mihomo.rs                  零依赖 HTTP/1.1 客户端、流式监控线程与 macOS networksetup 控制

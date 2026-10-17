@@ -26,7 +26,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/terc-hero.svg" alt="terc ASCII wordmark surrounded by a pastel traffic waveform illustration" width="100%">
+  <img src="assets/terc-hero.svg" alt="terc ASCII wordmark over a terminal-style backdrop with a proxy node list, a braille traffic graph and a routing chain" width="100%">
 </p>
 
 `terc` turns your local `mihomo` (Clash.Meta) daemon into a calm, responsive terminal workspace. Built as the companion to [`terb`](https://github.com/pentaoa/terb), it shares the same transparent canvas, rounded title-cutout wireframes (`╭─┐ Title ┌───╮`), and three restrained palettes—while keeping memory footprint near zero and leaving your background proxy untouched when you quit.
@@ -42,6 +42,8 @@ cargo run --release --locked
 ```
 
 Press **Space** to toggle the macOS system proxy, or press **K** to start/stop the background `mihomo` daemon. Run `terc --version` to verify the installed version.
+
+On first run `terc` opens a setup window that walks through three steps: paste a subscription URL, locate the `mihomo` binary (<kbd>Ctrl+D</kbd> downloads a managed core) and start the core. <kbd>Esc</kbd> dismisses it and <kbd>u</kbd> brings it back while no subscription is configured — the macOS system proxy is never switched on for you.
 
 > [!NOTE]
 > `terc` decouples the UI lifecycle from the proxy core. Closing `terc` with <kbd>q</kbd> immediately frees all terminal UI resources while your background `mihomo` tunnel continues running uninterrupted.
@@ -73,7 +75,10 @@ The single-row toolbar holds **system proxy toggle · latency test · auto-best 
 | Proxies | <kbd>r</kbd> | Run concurrent URL latency tests for the current group |
 | Proxies | <kbd>a</kbd> | Auto-select the lowest-latency node in the current group |
 | Dashboard | <kbd>m</kbd> | Cycle routing mode (`Rule` → `Global` → `Direct`) |
-| Dashboard | <kbd>u</kbd> | Fetch latest subscription YAML and hot-reload core (`PUT /configs?force=true`) |
+| Dashboard | <kbd>u</kbd> | Fetch latest subscription YAML and hot-reload core (`PUT /configs?force=true`); opens the setup window when no URL is saved |
+| Setup window | <kbd>Enter</kbd> | Save the subscription URL, write the config and start the core |
+| Setup window | <kbd>Ctrl+U</kbd> / <kbd>Ctrl+D</kbd> | Clear the input line / download a managed `mihomo` core |
+| Setup window | <kbd>Esc</kbd> | Dismiss for now — <kbd>u</kbd> reopens it while nothing is configured |
 | Dashboard | <kbd>p</kbd> / <kbd>c</kbd> / <kbd>L</kbd> | Switch main pane: **Proxies** / **Connections** / **Logs** |
 | Connections | <kbd>x</kbd> / <kbd>X</kbd> | Close selected connection / close all active connections |
 | Dashboard | <kbd>t</kbd> | Show or hide the top Traffic & Overview panels |
@@ -110,7 +115,7 @@ flowchart LR
 <summary>Project layout</summary>
 
 ```text
-assets/terc-hero.svg           Transparent SVG hero banner
+assets/terc-hero.svg           Transparent ASCII hero banner (wordmark + node/graph backdrop)
 src/main.rs                    Event loop, state machine, traffic history, i18n
 src/ui.rs                      Rounded cutout Panel widget, palettes, Braille/Blocks rate graph
 src/mihomo.rs                  Zero-dependency HTTP/1.1 client, stream workers, macOS networksetup
