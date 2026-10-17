@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod control;
 pub mod mihomo;
+pub mod ops;
+pub mod panels;
 pub mod ui;
 
 use crossterm::{
@@ -67,6 +70,18 @@ pub enum MainTab {
     Proxies,
     Connections,
     Logs,
+    Dns,
+    Rules,
+    Providers,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overlay {
+    None,
+    Modules,
+    Profiles,
+    Probe,
+    Runtime,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +132,10 @@ impl Default for Settings {
 pub struct Config {
     pub settings: Settings,
     pub controller: ControllerConfig,
+    #[serde(default)]
+    pub enabled_modules: Vec<String>,
+    #[serde(default)]
+    pub active_profile: String,
 }
 
 impl Config {
@@ -250,6 +269,25 @@ pub struct App {
     pub node_index: usize,
     pub conn_index: usize,
     pub setting_index: usize,
+    pub rule_index: usize,
+    pub provider_index: usize,
+    pub module_index: usize,
+    pub profile_index: usize,
+    pub tunnel_index: usize,
+    pub overlay: Overlay,
+    pub catalog: Vec<crate::ops::ModuleSnippet>,
+    pub profiles: Vec<crate::ops::ProfileEntry>,
+    pub dns_editor: LineEditor,
+    pub dns_editing: bool,
+    pub dns_qtype_idx: usize,
+    pub dns_lines: Vec<String>,
+    pub dns_error: bool,
+    pub rule_query: LineEditor,
+    pub rule_editing: bool,
+    pub explain: Option<crate::ops::ExplainReport>,
+    pub probe_editor: LineEditor,
+    pub probe_lines: Vec<String>,
+    pub probe_error: bool,
     pub snapshot: CoreSnapshot,
     pub up_rate: u64,
     pub down_rate: u64,
@@ -295,6 +333,25 @@ impl App {
             node_index: 0,
             conn_index: 0,
             setting_index: 0,
+            rule_index: 0,
+            provider_index: 0,
+            module_index: 0,
+            profile_index: 0,
+            tunnel_index: 0,
+            overlay: Overlay::None,
+            catalog: Vec::new(),
+            profiles: Vec::new(),
+            dns_editor: LineEditor::default(),
+            dns_editing: false,
+            dns_qtype_idx: 0,
+            dns_lines: Vec::new(),
+            dns_error: false,
+            rule_query: LineEditor::default(),
+            rule_editing: false,
+            explain: None,
+            probe_editor: LineEditor::default(),
+            probe_lines: Vec::new(),
+            probe_error: false,
             snapshot: initial_snapshot,
             up_rate: 0,
             down_rate: 0,
@@ -315,6 +372,7 @@ impl App {
             setup_start_at: Instant::now(),
             core_downloading: false,
         };
+        app.dns_editor.load("example.com");
         app.sync_node_cursor_to_active();
         if app.needs_setup() {
             app.open_setup(Screen::Dashboard);
@@ -455,7 +513,15 @@ impl App {
                     if self.group_index >= self.snapshot.groups.len() {
                         self.group_index = self.snapshot.groups.len().saturating_sub(1);
                     }
-                    self.clamp_node_index();
+                    self.clamp_aux();
+                }
+                BackendEvent::DnsLookup { lines, is_error } => {
+                    self.dns_error = is_error;
+                    self.dns_lines = lines;
+                }
+                BackendEvent::ProbeDone { lines, is_error } => {
+                    self.probe_error = is_error;
+                    self.probe_lines = lines;
                 }
                 BackendEvent::DelayResult {
                     group: _,
@@ -1066,6 +1132,225 @@ impl App {
             (_, "help_t") => "Toggle top Traffic & Overview panels",
             (_, "help_s") => "Open Settings board (Core / Theme / Subscription)",
             (_, "help_q") => "Back / Quit terc (background core stays running)",
+            (Lang::Zh, "controls") => "开关",
+            (Lang::En, "controls") => "Controls",
+            (Lang::Ja, "controls") => "スイッチ",
+            (Lang::Zh, "tun") => "TUN",
+            (Lang::En, "tun") => "TUN",
+            (Lang::Ja, "tun") => "TUN",
+            (Lang::Zh, "sniff") => "嗅探",
+            (Lang::En, "sniff") => "Sniff",
+            (Lang::Ja, "sniff") => "スニフ",
+            (Lang::Zh, "dns") => "DNS",
+            (Lang::En, "dns") => "DNS",
+            (Lang::Ja, "dns") => "DNS",
+            (Lang::Zh, "rules") => "规则",
+            (Lang::En, "rules") => "Rules",
+            (Lang::Ja, "rules") => "ルール",
+            (Lang::Zh, "providers") => "订阅源",
+            (Lang::En, "providers") => "Providers",
+            (Lang::Ja, "providers") => "プロバイダ",
+            (Lang::Zh, "modules") => "片段",
+            (Lang::En, "modules") => "Snippets",
+            (Lang::Ja, "modules") => "スニペット",
+            (Lang::Zh, "profiles") => "配置",
+            (Lang::En, "profiles") => "Profiles",
+            (Lang::Ja, "profiles") => "プロファイル",
+            (Lang::Zh, "probe") => "探测",
+            (Lang::En, "probe") => "Probe",
+            (Lang::Ja, "probe") => "プローブ",
+            (Lang::Zh, "runtime") => "运行时",
+            (Lang::En, "runtime") => "Runtime",
+            (Lang::Ja, "runtime") => "ランタイム",
+            (Lang::Zh, "ipv6") => "IPv6",
+            (Lang::En, "ipv6") => "IPv6",
+            (Lang::Ja, "ipv6") => "IPv6",
+            (Lang::Zh, "st_tun_on") => "TUN 已开启",
+            (Lang::En, "st_tun_on") => "TUN on",
+            (Lang::Ja, "st_tun_on") => "TUN オン",
+            (Lang::Zh, "st_tun_off") => "TUN 已关闭",
+            (Lang::En, "st_tun_off") => "TUN off",
+            (Lang::Ja, "st_tun_off") => "TUN オフ",
+            (Lang::Zh, "st_sniff_on") => "嗅探已开启",
+            (Lang::En, "st_sniff_on") => "Sniffer on",
+            (Lang::Ja, "st_sniff_on") => "スニファ オン",
+            (Lang::Zh, "st_sniff_off") => "嗅探已关闭",
+            (Lang::En, "st_sniff_off") => "Sniffer off",
+            (Lang::Ja, "st_sniff_off") => "スニファ オフ",
+            (Lang::Zh, "st_ipv6_on") => "IPv6 解析已开启",
+            (Lang::En, "st_ipv6_on") => "IPv6 resolution on",
+            (Lang::Ja, "st_ipv6_on") => "IPv6 解決オン",
+            (Lang::Zh, "st_ipv6_off") => "IPv6 解析已关闭",
+            (Lang::En, "st_ipv6_off") => "IPv6 resolution off",
+            (Lang::Ja, "st_ipv6_off") => "IPv6 解決オフ",
+            (Lang::Zh, "st_dns_on") => "DNS 已开启",
+            (Lang::En, "st_dns_on") => "DNS on",
+            (Lang::Ja, "st_dns_on") => "DNS オン",
+            (Lang::Zh, "st_dns_off") => "DNS 已关闭",
+            (Lang::En, "st_dns_off") => "DNS off",
+            (Lang::Ja, "st_dns_off") => "DNS オフ",
+            (Lang::Zh, "st_dns_missing") => "配置里没有 dns 块 · 按 o 打开片段库",
+            (Lang::En, "st_dns_missing") => "No dns block · o opens snippets",
+            (Lang::Ja, "st_dns_missing") => "dns ブロックがありません · o でスニペット",
+            (Lang::Zh, "st_dns_empty") => "先输入要查询的域名",
+            (Lang::En, "st_dns_empty") => "Type a name to look up",
+            (Lang::Ja, "st_dns_empty") => "検索する名前を入力してください",
+            (Lang::Zh, "st_dns_lookup") => "正在查询 DNS…",
+            (Lang::En, "st_dns_lookup") => "Looking up DNS…",
+            (Lang::Ja, "st_dns_lookup") => "DNS 照会中…",
+            (Lang::Zh, "st_dns_flushing") => "正在清空 DNS / Fake-IP 缓存…",
+            (Lang::En, "st_dns_flushing") => "Flushing DNS / Fake-IP cache…",
+            (Lang::Ja, "st_dns_flushing") => "DNS / Fake-IP キャッシュを消去中…",
+            (Lang::Zh, "st_core_down") => "内核未运行 · 按 K 启动",
+            (Lang::En, "st_core_down") => "Core is stopped · press K",
+            (Lang::Ja, "st_core_down") => "コア停止中 · K で起動",
+            (Lang::Zh, "st_saved_core_down") => "已写入配置 · 内核未运行，启动后生效",
+            (Lang::En, "st_saved_core_down") => "Saved · applies when the core is running",
+            (Lang::Ja, "st_saved_core_down") => "保存済み · コア起動後に反映",
+            (Lang::Zh, "st_reloading") => "正在热重载配置…",
+            (Lang::En, "st_reloading") => "Hot-reloading config…",
+            (Lang::Ja, "st_reloading") => "設定を再読み込み中…",
+            (Lang::Zh, "st_rule_off") => "规则已禁用",
+            (Lang::En, "st_rule_off") => "Rule disabled",
+            (Lang::Ja, "st_rule_off") => "ルールを無効化",
+            (Lang::Zh, "st_rule_on") => "规则已恢复",
+            (Lang::En, "st_rule_on") => "Rule enabled",
+            (Lang::Ja, "st_rule_on") => "ルールを有効化",
+            (Lang::Zh, "st_rule_fail") => "规则切换失败",
+            (Lang::En, "st_rule_fail") => "Rule toggle failed",
+            (Lang::Ja, "st_rule_fail") => "ルール切替に失敗",
+            (Lang::Zh, "st_no_provider") => "没有可刷新的 Provider",
+            (Lang::En, "st_no_provider") => "No providers to refresh",
+            (Lang::Ja, "st_no_provider") => "更新するプロバイダがありません",
+            (Lang::Zh, "st_provider_busy") => "正在更新",
+            (Lang::En, "st_provider_busy") => "Updating",
+            (Lang::Ja, "st_provider_busy") => "更新中",
+            (Lang::Zh, "st_provider_all") => "正在更新全部 Provider…",
+            (Lang::En, "st_provider_all") => "Updating every provider…",
+            (Lang::Ja, "st_provider_all") => "全プロバイダを更新中…",
+            (Lang::Zh, "st_provider_health") => "已发起健康检查",
+            (Lang::En, "st_provider_health") => "Health check started",
+            (Lang::Ja, "st_provider_health") => "ヘルスチェック開始",
+            (Lang::Zh, "st_provider_rule") => "规则 Provider 没有延迟健康检查",
+            (Lang::En, "st_provider_rule") => "Rule providers have no latency check",
+            (Lang::Ja, "st_provider_rule") => "ルールプロバイダに遅延検査はありません",
+            (Lang::Zh, "st_module_on") => "片段已叠加",
+            (Lang::En, "st_module_on") => "Snippet applied",
+            (Lang::Ja, "st_module_on") => "スニペットを適用",
+            (Lang::Zh, "st_module_off") => "片段已移除",
+            (Lang::En, "st_module_off") => "Snippet removed",
+            (Lang::Ja, "st_module_off") => "スニペットを解除",
+            (Lang::Zh, "st_profile") => "配置已切换",
+            (Lang::En, "st_profile") => "Profile switched",
+            (Lang::Ja, "st_profile") => "プロファイルを切替",
+            (Lang::Zh, "st_profile_saved") => "已保存配置副本",
+            (Lang::En, "st_profile_saved") => "Saved profile copy",
+            (Lang::Ja, "st_profile_saved") => "プロファイルを保存",
+            (Lang::Zh, "st_probe_empty") => "输入域名或 URL 后再探测",
+            (Lang::En, "st_probe_empty") => "Type a host or URL first",
+            (Lang::Ja, "st_probe_empty") => "ホストか URL を入力してください",
+            (Lang::Zh, "st_probe_busy") => "正在探测",
+            (Lang::En, "st_probe_busy") => "Probing",
+            (Lang::Ja, "st_probe_busy") => "計測中",
+            (Lang::Zh, "st_no_wg") => "当前配置没有 WireGuard / Tailscale 出站",
+            (Lang::En, "st_no_wg") => "No WireGuard or Tailscale outbound",
+            (Lang::Ja, "st_no_wg") => "WireGuard / Tailscale の出口がありません",
+            (Lang::Zh, "st_wg_test") => "正在测试 WireGuard 出站…",
+            (Lang::En, "st_wg_test") => "Testing WireGuard outbounds…",
+            (Lang::Ja, "st_wg_test") => "WireGuard 出口を計測中…",
+            (Lang::Zh, "mod_tun") => "TUN 路由",
+            (Lang::En, "mod_tun") => "TUN route",
+            (Lang::Ja, "mod_tun") => "TUN ルート",
+            (Lang::Zh, "mod_tun_desc") => "mixed 栈、自动路由、劫持 53 端口",
+            (Lang::En, "mod_tun_desc") => "Mixed stack, auto-route, hijack port 53",
+            (Lang::Ja, "mod_tun_desc") => "mixed スタック、自動ルート、53 番を劫持",
+            (Lang::Zh, "mod_sniffer") => "流量嗅探",
+            (Lang::En, "mod_sniffer") => "Sniffer",
+            (Lang::Ja, "mod_sniffer") => "スニファ",
+            (Lang::Zh, "mod_sniffer_desc") => "解析 HTTP / TLS / QUIC 里的域名",
+            (Lang::En, "mod_sniffer_desc") => "Recover hosts from HTTP, TLS, and QUIC",
+            (Lang::Ja, "mod_sniffer_desc") => "HTTP / TLS / QUIC からホストを復元",
+            (Lang::Zh, "mod_dns_fakeip") => "Fake-IP DNS",
+            (Lang::En, "mod_dns_fakeip") => "Fake-IP DNS",
+            (Lang::Ja, "mod_dns_fakeip") => "Fake-IP DNS",
+            (Lang::Zh, "mod_dns_fakeip_desc") => "开启 DNS，使用 Fake-IP 与 DoH",
+            (Lang::En, "mod_dns_fakeip_desc") => "Enable DNS with Fake-IP and DoH",
+            (Lang::Ja, "mod_dns_fakeip_desc") => "Fake-IP と DoH で DNS を有効化",
+            (Lang::Zh, "mod_find_process") => "进程名",
+            (Lang::En, "mod_find_process") => "Process name",
+            (Lang::Ja, "mod_find_process") => "プロセス名",
+            (Lang::Zh, "mod_find_process_desc") => "连接上始终带上进程名",
+            (Lang::En, "mod_find_process_desc") => "Attach a process name to every connection",
+            (Lang::Ja, "mod_find_process_desc") => "接続にプロセス名を付与",
+            (Lang::Zh, "mod_tcp_concurrent") => "并发连接",
+            (Lang::En, "mod_tcp_concurrent") => "TCP concurrent",
+            (Lang::Ja, "mod_tcp_concurrent") => "TCP 同時接続",
+            (Lang::Zh, "mod_tcp_concurrent_desc") => "同时握手，取最快的一条",
+            (Lang::En, "mod_tcp_concurrent_desc") => "Race TCP handshakes and keep the fastest",
+            (Lang::Ja, "mod_tcp_concurrent_desc") => "TCP ハンドシェイクを競合させる",
+            (Lang::Zh, "mod_ipv6") => "IPv6",
+            (Lang::En, "mod_ipv6") => "IPv6",
+            (Lang::Ja, "mod_ipv6") => "IPv6",
+            (Lang::Zh, "mod_ipv6_desc") => "允许解析 AAAA",
+            (Lang::En, "mod_ipv6_desc") => "Allow AAAA answers",
+            (Lang::Ja, "mod_ipv6_desc") => "AAAA の解決を許可",
+            (Lang::Zh, "help_tun") => "开关 TUN / 嗅探 / IPv6，立即生效并写回配置",
+            (Lang::En, "help_tun") => "Toggle TUN, the sniffer, and IPv6",
+            (Lang::Ja, "help_tun") => "TUN / スニファ / IPv6 を切替",
+            (Lang::Zh, "help_sniff") => "开关嗅探",
+            (Lang::En, "help_sniff") => "Toggle the sniffer",
+            (Lang::Ja, "help_sniff") => "スニファを切替",
+            (Lang::Zh, "help_ipv6") => "开关 IPv6 解析",
+            (Lang::En, "help_ipv6") => "Toggle IPv6 resolution",
+            (Lang::Ja, "help_ipv6") => "IPv6 解決を切替",
+            (Lang::Zh, "help_dns_key") => "开关配置中的 DNS，并热重载",
+            (Lang::En, "help_dns_key") => "Toggle dns.enable and hot-reload",
+            (Lang::Ja, "help_dns_key") => "dns.enable を切替して再読込",
+            (Lang::Zh, "help_views") => "DNS / 规则 / Provider / 片段 / 配置 / 探测 / 运行时",
+            (Lang::En, "help_views") => "DNS / rules / providers / snippets / profiles / probe / runtime",
+            (Lang::Ja, "help_views") => "DNS / ルール / プロバイダ / スニペット / プロファイル / 計測 / 状態",
+            (Lang::Zh, "help_rule_x") => "禁用或恢复当前规则（连接页仍是断开连接）",
+            (Lang::En, "help_rule_x") => "Disable or restore the selected rule",
+            (Lang::Ja, "help_rule_x") => "選択中のルールを無効化 / 復帰",
+            (Lang::Zh, "help_flush") => "DNS 清空缓存；规则与 Provider 页刷新",
+            (Lang::En, "help_flush") => "Flush DNS, or refresh rules and providers",
+            (Lang::Ja, "help_flush") => "DNS 消去、またはルールとプロバイダを更新",
+            (Lang::Zh, "help_explain") => "输入目标，解释会命中哪条规则",
+            (Lang::En, "help_explain") => "Type a target and explain which rule hits",
+            (Lang::Ja, "help_explain") => "対象を入力して一致ルールを説明",
+            (Lang::Zh, "ov_modules") => "片段会追加到配置末尾，关闭后恢复原文",
+            (Lang::En, "ov_modules") => "Snippets append to the config and restore it when removed",
+            (Lang::Ja, "ov_modules") => "スニペットは末尾に追加され、外すと元に戻ります",
+            (Lang::Zh, "ov_profiles") => "Enter 切换并热重载 · c 保存当前副本 · r 重载",
+            (Lang::En, "ov_profiles") => "Enter switches and reloads · c saves a copy · r reloads",
+            (Lang::Ja, "ov_profiles") => "Enter で切替 · c で複製 · r で再読込",
+            (Lang::Zh, "ov_probe") => "对当前节点做 DNS 查询和延迟测试",
+            (Lang::En, "ov_probe") => "DNS lookup plus a latency test of the selected node",
+            (Lang::Ja, "ov_probe") => "選択中ノードの DNS と遅延を計測",
+            (Lang::Zh, "ov_runtime") => "TUN、进程查找，以及 WireGuard 出站",
+            (Lang::En, "ov_runtime") => "TUN, process lookup, and WireGuard outbounds",
+            (Lang::Ja, "ov_runtime") => "TUN、プロセス検索、WireGuard 出口",
+            (Lang::Zh, "no_rules") => "还没有规则 · 内核运行后按 F 刷新",
+            (Lang::En, "no_rules") => "No rules yet · F refreshes once the core is up",
+            (Lang::Ja, "no_rules") => "ルールがありません · コア起動後に F で更新",
+            (Lang::Zh, "no_providers") => "没有 Provider",
+            (Lang::En, "no_providers") => "No providers",
+            (Lang::Ja, "no_providers") => "プロバイダがありません",
+            (Lang::Zh, "explain_match") => "命中",
+            (Lang::En, "explain_match") => "MATCH",
+            (Lang::Ja, "explain_match") => "一致",
+            (Lang::Zh, "explain_partial") => "内核仍会先判断未展开的 GEOSITE / 规则集",
+            (Lang::En, "explain_partial") => "Core still evaluates GEOSITE / rule-set before this",
+            (Lang::Ja, "explain_partial") => "コアは GEOSITE / ルールセットを先に評価します",
+            (Lang::Zh, "explain_none") => "没有命中",
+            (Lang::En, "explain_none") => "No match",
+            (Lang::Ja, "explain_none") => "一致なし",
+            (Lang::Zh, "dns_query") => "查询",
+            (Lang::En, "dns_query") => "Query",
+            (Lang::Ja, "dns_query") => "照会",
+            (Lang::Zh, "dns_status") => "解析状态",
+            (Lang::En, "dns_status") => "Resolver",
+            (Lang::Ja, "dns_status") => "リゾルバ",
             _ => "",
         }
     }
@@ -1144,6 +1429,19 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 CEvent::Paste(text) => {
                     if app.screen == Screen::Setup && app.setup_phase == SetupPhase::Editing {
                         app.setup_editor.insert(&text);
+                    } else if app.screen == Screen::Dashboard && app.overlay == Overlay::Probe {
+                        app.probe_editor.insert(&text);
+                    } else if app.screen == Screen::Dashboard
+                        && app.main_tab == MainTab::Dns
+                        && app.dns_editing
+                    {
+                        app.dns_editor.insert(&text);
+                    } else if app.screen == Screen::Dashboard
+                        && app.main_tab == MainTab::Rules
+                        && app.rule_editing
+                    {
+                        app.rule_query.insert(&text);
+                        app.rule_index = 0;
                     }
                 }
                 _ => {}
@@ -1194,16 +1492,59 @@ fn handle_menu_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
+    if app.overlay != Overlay::None {
+        return handle_overlay_key(app, key);
+    }
+    if app.main_tab == MainTab::Dns && app.dns_editing {
+        return handle_dns_edit_key(app, key);
+    }
+    if app.main_tab == MainTab::Rules && app.rule_editing {
+        return handle_rule_edit_key(app, key);
+    }
     match key.code {
         KeyCode::Char('q') => return true,
         KeyCode::Esc => {
-            if app.main_tab != MainTab::Proxies {
+            if app.rule_query.text.is_empty() && app.main_tab == MainTab::Proxies {
+                app.screen = Screen::Menu;
+            } else if !app.rule_query.text.is_empty() && app.main_tab == MainTab::Rules {
+                app.rule_query.clear();
+                app.rule_index = 0;
+            } else if app.main_tab != MainTab::Proxies {
                 app.main_tab = MainTab::Proxies;
             } else {
                 app.screen = Screen::Menu;
             }
         }
         KeyCode::Char(' ') => app.toggle_sysproxy(),
+        KeyCode::Char('T') => app.toggle_tun(),
+        KeyCode::Char('n') => app.toggle_sniffing(),
+        KeyCode::Char('i') => app.toggle_ipv6(),
+        KeyCode::Char('D') => app.toggle_dns(),
+        KeyCode::Char('d') => app.main_tab = MainTab::Dns,
+        KeyCode::Char('g') => app.main_tab = MainTab::Rules,
+        KeyCode::Char('v') => app.main_tab = MainTab::Providers,
+        KeyCode::Char('o') => app.open_modules(),
+        KeyCode::Char('f') => app.open_profiles(),
+        KeyCode::Char('b') => app.open_probe(),
+        KeyCode::Char('w') => app.open_runtime(),
+        KeyCode::Char('e') if app.main_tab == MainTab::Dns => app.dns_editing = true,
+        KeyCode::Char('e') | KeyCode::Char('/') if app.main_tab == MainTab::Rules => {
+            app.rule_editing = true;
+        }
+        KeyCode::Char('[') if app.main_tab == MainTab::Dns => app.cycle_dns_qtype(-1),
+        KeyCode::Char(']') if app.main_tab == MainTab::Dns => app.cycle_dns_qtype(1),
+        KeyCode::Char('F') => match app.main_tab {
+            MainTab::Dns => app.flush_dns_cache(),
+            MainTab::Rules => {
+                app.refresh_snapshot_now();
+                app.clamp_aux();
+            }
+            MainTab::Providers => app.refresh_all_providers(),
+            _ => {}
+        },
+        KeyCode::Char('H') if app.main_tab == MainTab::Providers => {
+            app.healthcheck_selected_provider()
+        }
         KeyCode::Char('K') => app.toggle_core_service(),
         KeyCode::Char('m') => app.cycle_routing_mode(),
         KeyCode::Char('r') => app.test_current_group(),
@@ -1283,7 +1624,21 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                         .unwrap_or(app.snapshot.connections.len() - 1);
                 }
             }
-            MainTab::Logs => {}
+            MainTab::Logs | MainTab::Dns => {}
+            MainTab::Rules => {
+                let len = app.filtered_rule_indexes().len();
+                if len > 0 {
+                    app.rule_index = app.rule_index.checked_sub(1).unwrap_or(len - 1);
+                }
+            }
+            MainTab::Providers => {
+                if !app.snapshot.providers.is_empty() {
+                    app.provider_index = app
+                        .provider_index
+                        .checked_sub(1)
+                        .unwrap_or(app.snapshot.providers.len() - 1);
+                }
+            }
         },
         KeyCode::Down | KeyCode::Char('j') => match app.main_tab {
             MainTab::Proxies => match app.focus {
@@ -1306,16 +1661,30 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                     app.conn_index = (app.conn_index + 1) % app.snapshot.connections.len();
                 }
             }
-            MainTab::Logs => {}
-        },
-        KeyCode::Enter => {
-            if app.main_tab == MainTab::Proxies {
-                match app.focus {
-                    FocusPane::Groups => app.focus = FocusPane::Nodes,
-                    FocusPane::Nodes => app.activate_selected_node(),
+            MainTab::Logs | MainTab::Dns => {}
+            MainTab::Rules => {
+                let len = app.filtered_rule_indexes().len();
+                if len > 0 {
+                    app.rule_index = (app.rule_index + 1) % len;
                 }
             }
-        }
+            MainTab::Providers => {
+                if !app.snapshot.providers.is_empty() {
+                    app.provider_index = (app.provider_index + 1) % app.snapshot.providers.len();
+                }
+            }
+        },
+        KeyCode::Enter => match app.main_tab {
+            MainTab::Proxies => match app.focus {
+                FocusPane::Groups => app.focus = FocusPane::Nodes,
+                FocusPane::Nodes => app.activate_selected_node(),
+            },
+            MainTab::Dns => app.submit_dns_query(),
+            MainTab::Rules => app.explain_selected_rule(),
+            MainTab::Providers => app.refresh_selected_provider(),
+            MainTab::Connections | MainTab::Logs => {}
+        },
+        KeyCode::Char('x') if app.main_tab == MainTab::Rules => app.toggle_selected_rule(),
         KeyCode::Char('x') if app.main_tab == MainTab::Connections => {
             if let Some(c) = app.snapshot.connections.get(app.conn_index) {
                 let id = c.id.clone();
@@ -1328,6 +1697,167 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             if close_connection(&app.config.controller, None).is_ok() {
                 app.refresh_snapshot_now();
             }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        return true;
+    }
+    match app.overlay {
+        Overlay::None => {}
+        Overlay::Modules => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('o') => app.close_overlay(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.module_index = app
+                    .module_index
+                    .checked_sub(1)
+                    .unwrap_or(app.catalog.len().saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !app.catalog.is_empty() {
+                    app.module_index = (app.module_index + 1) % app.catalog.len();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected_module(),
+            _ => {}
+        },
+        Overlay::Profiles => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => app.close_overlay(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.profile_index = app
+                    .profile_index
+                    .checked_sub(1)
+                    .unwrap_or(app.profiles.len().saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !app.profiles.is_empty() {
+                    app.profile_index = (app.profile_index + 1) % app.profiles.len();
+                }
+            }
+            KeyCode::Enter => app.switch_selected_profile(),
+            KeyCode::Char('c') => app.save_profile_copy(),
+            KeyCode::Char('r') => app.reload_profile(),
+            _ => {}
+        },
+        Overlay::Probe => {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('w'))
+            {
+                app.probe_editor.clear();
+                return false;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
+                KeyCode::Enter => app.submit_probe(),
+                KeyCode::Backspace => {
+                    app.probe_editor.backspace();
+                }
+                KeyCode::Delete => {
+                    app.probe_editor.delete();
+                }
+                KeyCode::Left => app.probe_editor.move_left(),
+                KeyCode::Right => app.probe_editor.move_right(),
+                KeyCode::Home => app.probe_editor.move_home(),
+                KeyCode::End => app.probe_editor.move_end(),
+                KeyCode::Char(ch) => {
+                    app.probe_editor.insert(&ch.to_string());
+                }
+                _ => {}
+            }
+        }
+        Overlay::Runtime => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('w') => app.close_overlay(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                let len = app.wireguard_peers().len();
+                if len > 0 {
+                    app.tunnel_index = app.tunnel_index.checked_sub(1).unwrap_or(len - 1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = app.wireguard_peers().len();
+                if len > 0 {
+                    app.tunnel_index = (app.tunnel_index + 1) % len;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('r') => app.test_selected_tunnel(),
+            KeyCode::Char('a') => app.test_all_tunnels(),
+            _ => {}
+        },
+    }
+    false
+}
+
+fn handle_dns_edit_key(app: &mut App, key: KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        return true;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('w'))
+    {
+        app.dns_editor.clear();
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => app.dns_editing = false,
+        KeyCode::Enter => app.submit_dns_query(),
+        KeyCode::Char('F') => app.flush_dns_cache(),
+        KeyCode::Char('[') => app.cycle_dns_qtype(-1),
+        KeyCode::Char(']') => app.cycle_dns_qtype(1),
+        KeyCode::Backspace => {
+            app.dns_editor.backspace();
+        }
+        KeyCode::Delete => {
+            app.dns_editor.delete();
+        }
+        KeyCode::Left => app.dns_editor.move_left(),
+        KeyCode::Right => app.dns_editor.move_right(),
+        KeyCode::Home => app.dns_editor.move_home(),
+        KeyCode::End => app.dns_editor.move_end(),
+        KeyCode::Char(ch) => {
+            app.dns_editor.insert(&ch.to_string());
+        }
+        _ => {}
+    }
+    false
+}
+
+fn handle_rule_edit_key(app: &mut App, key: KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        return true;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('w'))
+    {
+        app.rule_query.clear();
+        app.rule_index = 0;
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => app.rule_editing = false,
+        KeyCode::Enter => {
+            app.rule_editing = false;
+            app.rule_index = 0;
+            app.explain_selected_rule();
+        }
+        KeyCode::Backspace => {
+            app.rule_query.backspace();
+            app.rule_index = 0;
+        }
+        KeyCode::Delete => {
+            app.rule_query.delete();
+            app.rule_index = 0;
+        }
+        KeyCode::Left => app.rule_query.move_left(),
+        KeyCode::Right => app.rule_query.move_right(),
+        KeyCode::Home => app.rule_query.move_home(),
+        KeyCode::End => app.rule_query.move_end(),
+        KeyCode::Char(ch) => {
+            app.rule_query.insert(&ch.to_string());
+            app.rule_index = 0;
         }
         _ => {}
     }
@@ -1500,5 +2030,33 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.controller.subscription_url.is_empty());
         assert_eq!(cfg.controller.addr, "127.0.0.1:9090");
+        assert!(cfg.enabled_modules.is_empty());
+    }
+
+    #[test]
+    fn older_config_json_still_loads() {
+        let raw = r#"{
+            "settings": {
+                "lang": "en",
+                "theme": "mono",
+                "renderer": "blocks",
+                "refresh_hz": 30,
+                "show_traffic": false,
+                "show_toolbar": true
+            },
+            "controller": {
+                "addr": "127.0.0.1:9090",
+                "secret": "",
+                "config_dir": "/tmp/terc",
+                "subscription_url": "https://example.com/sub",
+                "test_url": "http://www.gstatic.com/generate_204",
+                "timeout_ms": 4000
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(cfg.controller.subscription_url, "https://example.com/sub");
+        assert!(cfg.enabled_modules.is_empty());
+        assert!(cfg.active_profile.is_empty());
+        assert_eq!(cfg.settings.theme, ThemeId::Mono);
     }
 }
