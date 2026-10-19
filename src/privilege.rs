@@ -242,7 +242,10 @@ fn launch_script(cfg: &ControllerConfig, bin: &Path, old_core: Option<(u32, &str
     .collect::<Vec<_>>()
     .join(" ");
     format!(
-        "set -eu\n{stop}/usr/bin/nohup {args} >{log} 2>&1 </dev/null &\necho $! >{pid}\n",
+        // Darwin nohup can fail with ENXIO inside an authorized AppleScript shell.
+        // Ignore HUP in the shell instead; the child inherits it, and all three
+        // standard descriptors are detached from the authorization command.
+        "set -eu\n{stop}trap '' HUP\n{args} >{log} 2>&1 </dev/null &\necho $! >{pid}\n",
         log = quote(
             &Path::new(&cfg.config_dir)
                 .join("terc-core.log")
@@ -321,7 +324,16 @@ pub(crate) fn start_core(cfg: &ControllerConfig, old_pid: Option<u32>) -> Result
             .map_err(|e| format!("{error}; could not restore PID record: {e}"))?;
         return Err(error);
     }
+    let pid: u32 = fs::read_to_string(&pid_path)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .parse()
+        .map_err(|_| "Authorized launch did not return a valid core PID")?;
     for _ in 0..30 {
+        if process_details(pid).is_err() {
+            let _ = fs::remove_file(&pid_path);
+            return Err(startup_exit_message(cfg));
+        }
         if let Some(error) = tun_log_error(cfg, 0) {
             return Err(format!("TUN 启动失败 / TUN startup failed: {error}"));
         }
@@ -345,6 +357,17 @@ pub(crate) fn start_core(cfg: &ControllerConfig, old_pid: Option<u32>) -> Result
         "Authorized core started, but TUN is not ready; inspect {}",
         Path::new(&cfg.config_dir).join("terc-core.log").display()
     ))
+}
+
+fn startup_exit_message(cfg: &ControllerConfig) -> String {
+    let path = Path::new(&cfg.config_dir).join("terc-core.log");
+    let log = fs::read_to_string(&path).unwrap_or_default();
+    let lines: Vec<_> = log.lines().collect();
+    let tail = lines[lines.len().saturating_sub(8)..].join("\n");
+    format!(
+        "内核启动后已退出 / Mihomo exited during startup\n{}\n{tail}",
+        path.display()
+    )
 }
 
 pub(crate) fn tun_log_error(cfg: &ControllerConfig, offset: usize) -> Option<String> {
@@ -428,7 +451,7 @@ mod tests {
         assert!(script.contains("'a'\\''b;$(touch /tmp/never)'"));
         assert!(
             script.find("Managed core identity changed").unwrap()
-                < script.find("/usr/bin/nohup").unwrap()
+                < script.find("trap '' HUP").unwrap()
         );
         // Parse only: never execute the authorization or launch script in tests.
         let mut child = Command::new("/bin/sh")
@@ -445,6 +468,81 @@ mod tests {
             .unwrap();
         assert!(child.wait().unwrap().success());
     }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn background_core_survives_applescript_exit_and_hangup_without_admin() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("terc-background-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let gate = directory.join("continue");
+        let marker = directory.join("survived");
+        let executable = directory.join("fake core");
+        let _ = fs::remove_file(&gate);
+        let _ = fs::remove_file(&marker);
+        // This harmless stand-in accepts the launcher's arguments. It can only
+        // complete after AppleScript exits and the test releases its gate.
+        fs::write(&executable, format!("#!/bin/sh\nn=0\nwhile [ ! -f {} ]; do n=$((n+1)); [ \"$n\" -lt 100 ] || exit 1; /bin/sleep 0.05; done\nprintf survived >{}\n", quote(&gate.to_string_lossy()), quote(&marker.to_string_lossy()))).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let cfg = ControllerConfig {
+            config_dir: directory.to_string_lossy().into_owned(),
+            ..ControllerConfig::default()
+        };
+        let output = Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg("on run argv\n do shell script (item 1 of argv)\nend run")
+            .arg(launch_script(&cfg, &executable, None))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pid = fs::read_to_string(directory.join("terc-core.pid")).unwrap();
+        let signal = Command::new("/bin/kill")
+            .args(["-HUP", pid.trim()])
+            .output()
+            .unwrap();
+        assert!(
+            signal.status.success(),
+            "Background stand-in exited with its AppleScript parent"
+        );
+        fs::write(&gate, "continue").unwrap();
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let result = fs::read_to_string(&marker);
+        let log = fs::read_to_string(directory.join("terc-core.log")).unwrap_or_default();
+        let _ = fs::remove_dir_all(directory);
+        assert_eq!(
+            result
+                .unwrap_or_else(|_| panic!("Stand-in failed to survive shell exit and HUP: {log}")),
+            "survived"
+        );
+    }
+
+    #[test]
+    fn startup_exit_reports_the_real_log_message() {
+        let directory =
+            std::env::temp_dir().join(format!("terc-start-error-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("terc-core.log"),
+            "nohup: can't detach from console: No such process\n",
+        )
+        .unwrap();
+        let cfg = ControllerConfig {
+            config_dir: directory.to_string_lossy().into_owned(),
+            ..ControllerConfig::default()
+        };
+        assert!(startup_exit_message(&cfg).contains("can't detach from console"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
     #[test]
     fn hand_started_homebrew_core_and_explicit_config_are_recognized() {
         let cfg = ControllerConfig {
