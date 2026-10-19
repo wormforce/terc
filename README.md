@@ -1,17 +1,49 @@
-# terc
+<h1 align="center">terc</h1>
 
-**简体中文** · [English](README.en.md)
+<p align="center">
+  <strong>简体中文</strong> &nbsp; / &nbsp; <a href="README.en.md">English</a>
+</p>
 
-**国内开发者的终极 tui 代理软件**  
-`terc` 采纳了现有各个 gui、非 gui 的 Clash 系软件，并对开发者、ai 工具进行了功能增强，致力做到远程友好、内存友好、界面友好、省事。
+<p align="center">
+  <strong>把代理控制台，搬进终端。</strong>
+</p>
 
-![macOS 14 或更新版本](https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square)![Linux](https://img.shields.io/badge/Linux-x86__64%20%7C%20arm64-111111?style=flat-square)![Rust](https://img.shields.io/badge/Rust-stable-111111?style=flat-square)![Ratatui](https://img.shields.io/badge/TUI-ratatui-FFA4A4?style=flat-square)![Mihomo Clash.Meta](https://img.shields.io/badge/Core-Mihomo-555555?style=flat-square)
+<p align="center">
+  为开发者与 AI 工作流打造的 Mihomo 终端代理工具。<br>
+  <sub>键盘直达 &nbsp; · &nbsp; 实时流量 &nbsp; · &nbsp; SSH 友好</sub>
+</p>
 
-**[开始使用](#快速开始)** · **使用说明** · [功能](#显示内容) · [快捷键](#快捷键) · [配置](#配置) · [工作原理](#工作原理) · [开发](#开发)
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-14%2B-20252B?style=flat-square" alt="macOS 14+">
+  &nbsp;
+  <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20arm64-20252B?style=flat-square" alt="Linux x86_64 / arm64">
+  &nbsp;
+  <img src="https://img.shields.io/badge/Rust-stable-20252B?style=flat-square" alt="Rust stable">
+  &nbsp;
+  <img src="https://img.shields.io/badge/TUI-Ratatui-FFA4A4?style=flat-square&amp;labelColor=20252B" alt="Ratatui TUI">
+  &nbsp;
+  <img src="https://img.shields.io/badge/Core-Mihomo-BADFDB?style=flat-square&amp;labelColor=20252B" alt="Mihomo core">
+</p>
 
-![复古终端里的 terc：圆角标题切口、盲文上下行速率图、开关条和节点列表](assets/terc-hero.svg)
+<p align="center">
+  <a href="#快速开始"><strong>开始使用</strong></a> &nbsp; · &nbsp;
+  <a href="docs/使用说明.md">使用说明</a> &nbsp; · &nbsp;
+  <a href="#显示内容">功能一览</a> &nbsp; · &nbsp;
+  <a href="#快捷键">快捷键</a>
+</p>
 
-![Ghostty 终端图标](https://raw.githubusercontent.com/ghostty-org/ghostty/main/images/icons/icon_128.png)  与 **[Ghostty](https://ghostty.org)** 搭配体验最佳
+<br>
+
+<p align="center">
+  <img src="assets/terc-hero.svg" alt="terc 界面预览：实时流量、代理开关、策略组与节点" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://ghostty.org"><img src="https://raw.githubusercontent.com/ghostty-org/ghostty/main/images/icons/icon_128.png" alt="Ghostty" width="28" height="28"></a><br>
+  <sub>推荐搭配 <a href="https://ghostty.org"><strong>Ghostty</strong></a> 使用</sub>
+</p>
+
+---
 
 ## 快速开始
 
@@ -25,12 +57,12 @@ cargo run --release --locked
 
 还没有订阅链接、配置文件，且内核也没在跑时，会先弹出初始设置：粘贴机场订阅链接、定位 `mihomo` 二进制（Ctrl+D 按本机下载 `darwin-arm64`、`darwin-amd64`、`linux-arm64` 或 `linux-amd64`）、启动内核。已有配置则跳过这一步，直接进入面板。按 Esc 可以先关掉，未配置订阅时按 u 随时重新打开。
 
-按 **空格 (**`Space`**)** 开启或关闭系统代理（macOS 用 `networksetup`，Linux 在有 GNOME `gsettings` 时用 `org.gnome.system.proxy`，否则不动并提示），按 `K` 启动或停止后台 `mihomo`。
+按 <kbd>Space</kbd> 开启或关闭系统代理（macOS 用 `networksetup`，Linux 在有 GNOME `gsettings` 时用 `org.gnome.system.proxy`，否则不动并提示），按 <kbd>K</kbd> 启动或停止 terc 管理的后台 `mihomo`。
 
 运行 `terc --version` 可查看已安装版本。
 
 > [!NOTE]  
-> `terc` 将界面与内核生命周期完全解耦。按 q 退出 `terc` 只会关闭终端界面并释放全部 UI 内存，后台 `mihomo` 代理服务依然稳固运行。
+> `terc` 将界面与内核生命周期完全解耦。按 <kbd>q</kbd> 退出 `terc` 只会关闭终端界面并释放全部 UI 内存，后台 `mihomo` 代理服务依然稳固运行。
 
 ## 显示内容
 
@@ -55,38 +87,38 @@ cargo run --release --locked
 
 ## 快捷键
 
-| 页面       | 按键              | 操作                                                                       |
-| -------- | --------------- | ------------------------------------------------------------------------ |
-| 面板 / 设置  | Space           | 开启或关闭系统代理。macOS 用 `networksetup`；Linux 用 GNOME `gsettings`，没有则不改动。不会自动打开 |
-| 面板       | T / n / i       | 开关 TUN、嗅探或 IPv6。先 `PATCH` 运行时，再写回配置                                      |
-| 面板       | D               | 切换配置里的 `dns.enable` 并热重载                                                 |
-| 面板       | d / g / v       | DNS、规则、Provider                                                          |
-| 面板       | o / f / b / w   | 片段库、配置档案、探测、WireGuard / 运行时                                              |
-| 规则       | / 或 e           | 过滤列表，并解释域名、IP 或 `process:名称`                                             |
-| 规则       | x               | 禁用或恢复当前规则（`PATCH /rules/disable`）                                        |
-| DNS      | Enter / F / [ ] | 查询、清空 DNS 与 Fake-IP、切换记录类型                                               |
-| Provider | Enter / F / H   | 刷新当前项、刷新全部，或对代理源做健康检查                                                    |
-| 面板       | K               | 启动或停止 terc 管理的后台 `mihomo` 内核                                                      |
-| 策略组 / 节点 | ← →、h l 或 Tab   | 在左侧 **策略组** `[1]` 与右侧 **节点** `[2]` 之间切换焦点                                |
-| 任意列表     | ↑ ↓ 或 j k       | 上下移动选择                                                                   |
-| 节点列表     | Enter           | 切换并激活当前高亮节点                                                              |
-| 面板       | r               | 对当前策略组内所有节点发起并发延迟测速                                                      |
-| 面板       | a               | 自动选中当前策略组中延迟最低的节点                                                        |
-| 面板       | m               | 循环切换分流模式（`Rule` → `Global` → `Direct`）                                   |
-| 面板       | u               | 拉取最新机场订阅 YAML 并执行零停机热重载；未保存订阅链接时先打开初始设置窗口                                |
-| 设置窗口     | Enter           | 保存订阅链接、写入配置并启动内核                                                         |
-| 设置窗口     | Ctrl+U / Ctrl+D | 清空输入行 / 下载托管 `mihomo` 内核                                                 |
-| 设置窗口     | Esc             | 暂时关闭，未配置订阅时按 u 可重新打开                                                     |
-| 面板       | p / c / L       | 切换主视图：**节点面板** / **连接监控** / **实时日志**                                     |
-| 连接监控     | x / X           | 断开当前选中连接 / 一键断开全部活跃连接                                                    |
-| 面板       | t               | 显示或隐藏顶部「实时速率」与「内核状态」面板                                                   |
-| 面板       | s               | 打开双栏设置面板。设置里再按一次回到面板                                                     |
-| 设置       | ← →、h l 或 Enter | 调整并保存当前设置项，或执行动作                                                         |
-| 设置       | Tab             | 切换设置分类（`内核与代理` · `视觉与主题` · `订阅管理`）                                       |
-| 任意页面     | ?               | 打开快捷键帮助，再按一次回到面板                                                         |
-| 面板       | q               | 退出 `terc`（后台内核保持运行）                                                      |
-| 面板       | Esc             | 子页面回到节点页；退出请按 q                                                       |
-| 设置 / 帮助  | Esc             | 回到面板                                                                     |
+| 页面 | 按键 | 操作 |
+| --- | --- | --- |
+| 面板 / 设置 | Space | 开启或关闭系统代理。macOS 用 `networksetup`；Linux 用 GNOME `gsettings`，没有则不改动。不会自动打开 |
+| 面板 | T / n / i | 开关 TUN、嗅探或 IPv6。先 `PATCH` 运行时，再写回配置 |
+| 面板 | D | 切换配置里的 `dns.enable` 并热重载 |
+| 面板 | d / g / v | DNS、规则、Provider |
+| 面板 | o / f / b / w | 片段库、配置档案、探测、WireGuard / 运行时 |
+| 规则 | / 或 e | 过滤列表，并解释域名、IP 或 `process:名称` |
+| 规则 | x | 禁用或恢复当前规则（`PATCH /rules/disable`） |
+| DNS | Enter / F / [ ] | 查询、清空 DNS 与 Fake-IP、切换记录类型 |
+| Provider | Enter / F / H | 刷新当前项、刷新全部，或对代理源做健康检查 |
+| 面板 | K | 启动或停止 terc 管理的后台 `mihomo` 内核 |
+| 策略组 / 节点 | ← →、h l 或 Tab | 在左侧 **策略组** `[1]` 与右侧 **节点** `[2]` 之间切换焦点 |
+| 任意列表 | ↑ ↓ 或 j k | 上下移动选择 |
+| 节点列表 | Enter | 切换并激活当前高亮节点 |
+| 面板 | r | 对当前策略组内所有节点发起并发延迟测速 |
+| 面板 | a | 自动选中当前策略组中延迟最低的节点 |
+| 面板 | m | 循环切换分流模式（`Rule` → `Global` → `Direct`） |
+| 面板 | u | 拉取最新机场订阅 YAML 并执行零停机热重载；未保存订阅链接时先打开初始设置窗口 |
+| 设置窗口 | Enter | 保存订阅链接、写入配置并启动内核 |
+| 设置窗口 | Ctrl+U / Ctrl+D | 清空输入行 / 下载托管 `mihomo` 内核 |
+| 设置窗口 | Esc | 暂时关闭，未配置订阅时按 u 可重新打开 |
+| 面板 | p / c / L | 切换主视图：**节点面板** / **连接监控** / **实时日志** |
+| 连接监控 | x / X | 断开当前选中连接 / 一键断开全部活跃连接 |
+| 面板 | t | 显示或隐藏顶部「实时速率」与「内核状态」面板 |
+| 面板 | s | 打开双栏设置面板。设置里再按一次回到面板 |
+| 设置 | ← →、h l 或 Enter | 调整并保存当前设置项，或执行动作 |
+| 设置 | Tab | 切换设置分类（`内核与代理` · `视觉与主题` · `订阅管理`） |
+| 任意页面 | ? | 打开快捷键帮助，再按一次回到面板 |
+| 面板 | q | 退出 `terc`（后台内核保持运行） |
+| 面板 | Esc | 子页面回到节点页；退出请按 q |
+| 设置 / 帮助 | Esc | 回到面板 |
 
 首次配置前先安装内核（设置窗口内可按 `Ctrl+D` 下载）。订阅、片段和档案会先运行 `mihomo -t` 验证，再替换配置；热重载被拒绝时恢复旧文件。更新订阅或切换档案会重新应用已启用片段。`K` 只停止 terc 启动的内核，外部服务请使用对应服务管理器。
 
@@ -115,7 +147,8 @@ flowchart LR
     E --> F
 ```
 
-项目结构
+<details>
+<summary>项目结构</summary>
 
 ```text
 assets/terc-hero.svg           复古终端画面：圆角面板、标题切口与盲文速率图
@@ -127,7 +160,7 @@ src/ops.rs                     YAML 叠加、规则解释、DNS/规则解析
 src/mihomo.rs                  TcpStream 上的 HTTP/1.1、流式线程、networksetup 与 gsettings
 ```
 
-
+</details>
 
 ## 开发
 

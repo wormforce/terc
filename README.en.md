@@ -1,53 +1,49 @@
 <h1 align="center">terc</h1>
 
 <p align="center">
-  <a href="README.md">简体中文</a> · <strong>English</strong>
+  <a href="README.md">简体中文</a> &nbsp; / &nbsp; <strong>English</strong>
 </p>
 
 <p align="center">
-  <strong>Mihomo, on the keys.</strong><br>
-  Shorter daily switches, denser state, and a terminal that leaves almost nothing behind.
+  <strong>Your proxy. Your terminal. Your keys.</strong>
 </p>
 
 <p align="center">
-  <img alt="macOS 14 or newer" src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square">
-  <img alt="Linux" src="https://img.shields.io/badge/Linux-x86__64%20%7C%20arm64-111111?style=flat-square">
-  <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable-111111?style=flat-square">
-  <img alt="Ratatui terminal interface" src="https://img.shields.io/badge/TUI-ratatui-FFA4A4?style=flat-square">
-  <img alt="Mihomo Clash.Meta core" src="https://img.shields.io/badge/Core-Mihomo-555555?style=flat-square">
+  A Mihomo-powered terminal proxy tool for developers and AI workflows.<br>
+  <sub>Keyboard-first controls &nbsp; · &nbsp; Live traffic &nbsp; · &nbsp; SSH-friendly</sub>
 </p>
 
 <p align="center">
-  <a href="#quick-start"><strong>Get started</strong></a> ·
-  <a href="docs/usage.en.md"><strong>Guide</strong></a> ·
-  <a href="#what-it-shows">Features</a> ·
-  <a href="#controls">Controls</a> ·
-  <a href="#configuration">Config</a> ·
-  <a href="#how-it-works">How it works</a> ·
-  <a href="#development">Development</a>
+  <img src="https://img.shields.io/badge/macOS-14%2B-20252B?style=flat-square" alt="macOS 14+">
+  &nbsp;
+  <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20arm64-20252B?style=flat-square" alt="Linux x86_64 / arm64">
+  &nbsp;
+  <img src="https://img.shields.io/badge/Rust-stable-20252B?style=flat-square" alt="Rust stable">
+  &nbsp;
+  <img src="https://img.shields.io/badge/TUI-Ratatui-FFA4A4?style=flat-square&amp;labelColor=20252B" alt="Ratatui TUI">
+  &nbsp;
+  <img src="https://img.shields.io/badge/Core-Mihomo-BADFDB?style=flat-square&amp;labelColor=20252B" alt="Mihomo core">
 </p>
 
 <p align="center">
-  <img src="assets/terc-hero.svg" alt="terc in a retro terminal: rounded title cutouts, a braille up/down graph, the toggle rail, and the proxy list" width="100%">
+  <a href="#quick-start"><strong>Get started</strong></a> &nbsp; · &nbsp;
+  <a href="docs/usage.en.md">User guide</a> &nbsp; · &nbsp;
+  <a href="#what-it-shows">Features</a> &nbsp; · &nbsp;
+  <a href="#controls">Key bindings</a>
+</p>
+
+<br>
+
+<p align="center">
+  <img src="assets/terc-hero.svg" alt="terc interface preview: live traffic graph, proxy controls, policy groups and nodes" width="100%">
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ghostty-org/ghostty/main/images/icons/icon_128.png" alt="Ghostty terminal emulator logo" width="22" height="22">
-  &nbsp;Works best with <a href="https://ghostty.org"><strong>Ghostty</strong></a> — any 24-bit color terminal will do.
+  <a href="https://ghostty.org"><img src="https://raw.githubusercontent.com/ghostty-org/ghostty/main/images/icons/icon_128.png" alt="Ghostty" width="28" height="28"></a><br>
+  <sub>Recommended terminal: <a href="https://ghostty.org"><strong>Ghostty</strong></a></sub>
 </p>
 
-## The switches you actually use
-
-Surge keeps TUN, sniffing, routing, and DNS inside menus. `terc` leaves them on one key rail: the press takes effect, and the same screen already shows rate, process, rule chain, and DNS.
-
-| | |
-| --- | --- |
-| **A shorter daily path** | One key each for TUN, sniff, IPv6, DNS, and routing mode. System proxy changes only when you press Space, and never on its own. |
-| **More on one screen** | Braille rate graph, hit counts, inbound, sniffed host, and DNS status stay in view together. |
-| **Almost no extra footprint** | Local control is `TcpStream` to `127.0.0.1:9090`. Remote YAML uses the system `curl`. No tokio, reqwest, or openssl. |
-| **An open core** | The config stays Mihomo YAML. Quitting closes the UI and leaves the core running. |
-
-`terc` is the companion to [`terb`](https://github.com/pentaoa/terb): the same transparent canvas, rounded title-cutout frames (`╭─┐ Title ┌───╮`), and the Spring, Vintage, and Mono palettes.
+---
 
 ## Quick Start
 
@@ -84,10 +80,10 @@ Transparency follows your terminal profile. `terc` leaves the background at its 
 | **Profiles** | Switch another YAML onto the running config and hot-reload |
 | **Probe** | DNS answers plus a delay test of the selected node |
 | **Runtime** | TUN device and any WireGuard or Tailscale outbound the core already exposes |
-| **Logs** | Live streaming core logs with severity highlighting |
+| **Logs** | Live core logs with severity highlighting, pause, search, and full-text reading |
 | **Themes** | Spring, Vintage, and Mono; all preserve the terminal background |
 
-The toolbar stays one row. Narrow terminals keep the key letters and drop the labels.
+The toolbar shows controls for the current view. A separate status row keeps operation results visible; press `!` for the full result. Help scrolls with arrow keys or Page Up/Down. In Connections, Enter opens full details even in a narrow terminal. In Logs, use `P` to pause/resume, `/` to search, and Enter to read the full message.
 
 ## Controls
 
