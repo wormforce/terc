@@ -25,6 +25,12 @@ use crate::ops::{
 
 #[derive(Clone, Debug)]
 pub enum BackendEvent {
+    ActionDone {
+        result: Result<String, String>,
+        modules: Option<Vec<String>>,
+        profile: Option<String>,
+    },
+    SnapshotDone(Box<CoreSnapshot>),
     Traffic {
         up: u64,
         down: u64,
@@ -48,9 +54,6 @@ pub enum BackendEvent {
     StatusMessage {
         text: String,
         is_error: bool,
-    },
-    SubscriptionDone {
-        ok: bool,
     },
     CoreDownloadDone {
         ok: bool,
@@ -414,14 +417,6 @@ pub fn config_yaml_path(cfg: &ControllerConfig) -> PathBuf {
 pub fn read_config_text(cfg: &ControllerConfig) -> Result<String, String> {
     let path = config_yaml_path(cfg);
     fs::read_to_string(&path).map_err(|_| format!("config not found: {}", path.display()))
-}
-
-pub fn write_config_text(cfg: &ControllerConfig, text: &str) -> Result<(), String> {
-    let path = config_yaml_path(cfg);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(&path, text).map_err(|err| format!("cannot write {}: {err}", path.display()))
 }
 
 fn local_flags(cfg: &ControllerConfig) -> RuntimeFlags {
@@ -970,81 +965,137 @@ pub fn discover_mihomo_binary() -> Option<PathBuf> {
 }
 
 pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
-    let Some(bin) = discover_mihomo_binary() else {
-        return Err("mihomo binary not found · Settings › Download Managed Core".to_string());
-    };
-
-    let config_file = Path::new(&cfg.config_dir).join("config.yaml");
-    if !config_file.exists() {
-        return Err(format!(
-            "config not found: {} · add a subscription first (u)",
-            config_file.display()
-        ));
+    let bin = discover_mihomo_binary()
+        .ok_or("mihomo binary not found · download the managed core first")?;
+    let config_file = config_yaml_path(cfg);
+    if !config_file.is_file() {
+        return Err(format!("config not found: {}", config_file.display()));
     }
-
-    let child = Command::new(&bin)
+    if matches!(
+        http_request(
+            &cfg.addr,
+            &cfg.secret,
+            "GET",
+            "/version",
+            None,
+            Duration::from_millis(500)
+        ),
+        Ok((200, _))
+    ) {
+        return Ok("Mihomo controller is already running".into());
+    }
+    let log_path = Path::new(&cfg.config_dir).join("terc-core.log");
+    let log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
+    let mut child = Command::new(&bin)
         .arg("-d")
         .arg(&cfg.config_dir)
+        .arg("-f")
+        .arg(&config_file)
+        .arg("-ext-ctl")
+        .arg(&cfg.addr)
+        .arg("-secret")
+        .arg(&cfg.secret)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(log.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log)
         .spawn()
         .map_err(|e| format!("failed to start mihomo: {e}"))?;
-
-    let _ = child.id();
-    thread::sleep(Duration::from_millis(350));
-    Ok(format!("Started mihomo ({})", bin.display()))
+    let pid_path = Path::new(&cfg.config_dir).join("terc-core.pid");
+    if let Err(err) = fs::write(&pid_path, child.id().to_string()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err.to_string());
+    }
+    for _ in 0..20 {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            let _ = fs::remove_file(&pid_path);
+            return Err(format!(
+                "Mihomo exited ({status}): {}",
+                fs::read_to_string(&log_path).unwrap_or_default()
+            ));
+        }
+        if matches!(
+            http_request(
+                &cfg.addr,
+                &cfg.secret,
+                "GET",
+                "/version",
+                None,
+                Duration::from_millis(200)
+            ),
+            Ok((200, _))
+        ) {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok(format!("Started mihomo ({})", bin.display()));
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Err(format!(
+        "Mihomo process started but controller is not ready; inspect {}",
+        log_path.display()
+    ))
 }
 
 pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
+    let pid_path = Path::new(&cfg.config_dir).join("terc-core.pid");
+    let pid: u32 = fs::read_to_string(&pid_path)
+        .map_err(|_| {
+            "This core is managed externally; stop it with its service manager".to_string()
+        })?
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid managed core PID".to_string())?;
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let command = String::from_utf8_lossy(&output.stdout);
+    let expected = format!(
+        " -d {} -f {}",
+        cfg.config_dir,
+        config_yaml_path(cfg).display()
+    );
+    if !output.status.success() || !command.contains(&expected) {
+        return Err("Managed core is no longer running; no other process was stopped".into());
+    }
     let (_, enabled) = detect_sysproxy();
-    let restored = enabled && set_sysproxy(false, 7890, 7891).is_ok();
-    if cfg!(target_os = "macos") {
-        let _ = Command::new("/opt/homebrew/bin/brew")
-            .args(["services", "stop", "mihomo"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    if enabled {
+        set_sysproxy(false, 0, 0)?;
     }
-    let _ = Command::new("pkill")
-        .args(["-f", &format!("mihomo -d {}", cfg.config_dir)])
-        .status();
-    let _ = Command::new("pkill").args(["-x", "mihomo"]).status();
-    thread::sleep(Duration::from_millis(250));
-    if restored {
-        Ok("Stopped mihomo & restored system proxy".to_string())
-    } else {
-        Ok("Stopped mihomo".to_string())
+    let output = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
+    for _ in 0..25 {
+        let status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !status.status.success() {
+            let _ = fs::remove_file(&pid_path);
+            return Ok("Stopped managed Mihomo core".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err("Stop requested, but managed Mihomo process has not exited".into())
 }
 
-pub fn update_subscription_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
-    thread::spawn(move || {
-        let result = fetch_subscription(&cfg, &tx);
-        let ok = result.is_ok();
-        let (text, is_error) = match result {
-            Ok(text) => (text, false),
-            Err(text) => (text, true),
-        };
-        let _ = tx.send(BackendEvent::StatusMessage { text, is_error });
-        let _ = tx.send(BackendEvent::SubscriptionDone { ok });
-    });
-}
-
-fn fetch_subscription(cfg: &ControllerConfig, tx: &Sender<BackendEvent>) -> Result<String, String> {
+pub fn fetch_subscription(
+    cfg: &ControllerConfig,
+    modules: &[crate::ops::ModuleSnippet],
+    running: bool,
+) -> Result<String, String> {
     if cfg.subscription_url.trim().is_empty() {
-        return Err("Subscription URL is empty".to_string());
+        return Err("Subscription URL is empty".into());
     }
-    let _ = tx.send(BackendEvent::StatusMessage {
-        text: "Fetching subscription...".to_string(),
-        is_error: false,
-    });
-
-    fs::create_dir_all(&cfg.config_dir)
-        .map_err(|e| format!("Cannot create {}: {e}", cfg.config_dir))?;
-    let tmp_path = Path::new(&cfg.config_dir).join("config.yaml.tmp");
-    let final_path = Path::new(&cfg.config_dir).join("config.yaml");
-
     let output = Command::new("curl")
         .args([
             "-fsSL",
@@ -1056,50 +1107,81 @@ fn fetch_subscription(cfg: &ControllerConfig, tx: &Sender<BackendEvent>) -> Resu
             "clash.meta/1.19.32",
             "--url",
             cfg.subscription_url.trim(),
-            "-o",
         ])
-        .arg(&tmp_path)
         .stdin(Stdio::null())
-        .output();
-
-    let raw = match output {
-        Ok(out) if out.status.success() => fs::read_to_string(&tmp_path).unwrap_or_default(),
-        _ => {
-            let _ = fs::remove_file(&tmp_path);
-            return Err("Failed to download subscription".to_string());
-        }
-    };
-    let _ = fs::remove_file(&tmp_path);
-    if !raw.contains("proxies:") {
-        return Err("Subscription is not a Clash/Mihomo YAML (missing proxies:)".to_string());
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to download subscription: {}",
+            brief(&String::from_utf8_lossy(&output.stderr))
+        ));
     }
-
-    fs::write(&final_path, normalize_subscription(&raw, &cfg.addr))
-        .map_err(|e| format!("Cannot write {}: {e}", final_path.display()))?;
-
-    let body = serde_json::json!({
-        "path": final_path.display().to_string(),
-        "payload": ""
-    })
-    .to_string();
-    let reloaded = matches!(
-        http_request(
-            &cfg.addr,
-            &cfg.secret,
-            "PUT",
-            "/configs?force=true",
-            Some(&body),
-            Duration::from_millis(2500),
-        ),
-        Ok((code, _)) if (200..300).contains(&code)
-    );
-    if reloaded {
-        let snap = fetch_snapshot(cfg);
-        let _ = tx.send(BackendEvent::Snapshot(Box::new(snap)));
-        Ok("Subscription updated & hot-reloaded".to_string())
+    let raw = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    if !crate::ops::has_subscription_source(&raw) {
+        return Err("Subscription must contain proxies or proxy-providers".into());
+    }
+    let normalized = normalize_subscription(&raw, &cfg.addr);
+    let generated = crate::ops::apply_enabled_modules(&normalized, modules)?;
+    install_config(cfg, &generated, running)?;
+    Ok(if running {
+        "Subscription updated & hot-reloaded"
     } else {
-        Ok(format!("Subscription saved to {}", final_path.display()))
+        "Subscription validated & saved; core stopped"
     }
+    .into())
+}
+
+/// Validate before replacing the active file. Keep disk and runtime on the old
+/// configuration if the controller rejects the candidate.
+pub fn install_config(cfg: &ControllerConfig, text: &str, running: bool) -> Result<(), String> {
+    fs::create_dir_all(&cfg.config_dir).map_err(|e| e.to_string())?;
+    let candidate = Path::new(&cfg.config_dir).join(".terc-candidate.yaml");
+    fs::write(&candidate, text).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let bin = discover_mihomo_binary()
+            .ok_or("Install the managed Mihomo core before saving a configuration")?;
+        let output = Command::new(bin)
+            .arg("-t")
+            .arg("-d")
+            .arg(&cfg.config_dir)
+            .arg("-f")
+            .arg(&candidate)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "Configuration rejected: {} {}",
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let path = config_yaml_path(cfg);
+        let previous = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.to_string()),
+        };
+        fs::rename(&candidate, &path).map_err(|e| e.to_string())?;
+        if running {
+            if let Err(err) = reload_config(cfg) {
+                let restored = match previous {
+                    Some(bytes) => fs::write(&path, bytes),
+                    None => fs::remove_file(&path),
+                };
+                return match restored {
+                    Ok(()) => Err(format!("{err}; previous configuration restored")),
+                    Err(restore) => Err(format!(
+                        "{err}; could not restore previous configuration: {restore}"
+                    )),
+                };
+            }
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(candidate);
+    result
 }
 
 pub fn mihomo_asset_id_for(os: &str, arch: &str) -> Option<&'static str> {
@@ -1222,19 +1304,19 @@ pub fn gnome_proxy_commands(enable: bool, http_port: u16, socks_port: u16) -> Ve
         return vec![set("org.gnome.system.proxy", "mode", "'none'")];
     }
     let http = http_port.to_string();
-    let socks = if socks_port > 0 {
-        socks_port.to_string()
-    } else {
-        http.clone()
-    };
+    let socks = socks_port.to_string();
     vec![
-        set("org.gnome.system.proxy", "mode", "'manual'"),
         set("org.gnome.system.proxy.http", "host", "'127.0.0.1'"),
         set("org.gnome.system.proxy.http", "port", &http),
         set("org.gnome.system.proxy.https", "host", "'127.0.0.1'"),
         set("org.gnome.system.proxy.https", "port", &http),
-        set("org.gnome.system.proxy.socks", "host", "'127.0.0.1'"),
+        set(
+            "org.gnome.system.proxy.socks",
+            "host",
+            if socks_port > 0 { "'127.0.0.1'" } else { "''" },
+        ),
         set("org.gnome.system.proxy.socks", "port", &socks),
+        set("org.gnome.system.proxy", "mode", "'manual'"),
     ]
 }
 
@@ -1266,7 +1348,9 @@ pub fn detect_sysproxy() -> (String, bool) {
 }
 
 fn detect_macos_sysproxy() -> (String, bool) {
-    let service = active_macos_network_service().unwrap_or_else(|| "Wi-Fi".to_string());
+    let Some(service) = active_macos_network_service() else {
+        return ("n/a".into(), false);
+    };
     let output = Command::new("networksetup")
         .args(["-getwebproxy", &service])
         .output();
@@ -1279,26 +1363,29 @@ fn detect_macos_sysproxy() -> (String, bool) {
 }
 
 fn active_macos_network_service() -> Option<String> {
-    let out = Command::new("networksetup")
-        .arg("-listallnetworkservices")
-        .output()
+    let primary = scutil_value("State:/Network/Global/IPv4", "PrimaryService")
+        .or_else(|| scutil_value("State:/Network/Global/IPv6", "PrimaryService"))?;
+    scutil_value(
+        &format!("Setup:/Network/Service/{primary}"),
+        "UserDefinedName",
+    )
+}
+
+fn scutil_value(key: &str, field: &str) -> Option<String> {
+    let mut child = Command::new("scutil")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    for candidate in [
-        "Wi-Fi",
-        "USB 10/100/1000 LAN",
-        "Thunderbolt Ethernet",
-        "Ethernet",
-    ] {
-        if text.lines().any(|l| l.trim() == candidate) {
-            return Some(candidate.to_string());
-        }
-    }
-    text.lines()
-        .skip(1)
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('*'))
-        .map(String::from)
+    writeln!(child.stdin.take()?, "show {key}").ok()?;
+    let output = child.wait_with_output().ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.trim().split_once(" : ")?;
+            (name == field).then(|| value.trim().to_string())
+        })
 }
 
 pub fn patch_configs(cfg: &ControllerConfig, body: &str) -> io::Result<()> {
@@ -1363,25 +1450,6 @@ pub fn reload_config(cfg: &ControllerConfig) -> Result<(), String> {
     }
 }
 
-pub fn reload_config_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
-    thread::spawn(move || {
-        let result = reload_config(&cfg);
-        let ok = result.is_ok();
-        let text = match result {
-            Ok(()) => "config reloaded".to_string(),
-            Err(err) => err,
-        };
-        if ok {
-            let snap = fetch_snapshot(&cfg);
-            let _ = tx.send(BackendEvent::Snapshot(Box::new(snap)));
-        }
-        let _ = tx.send(BackendEvent::StatusMessage {
-            text,
-            is_error: !ok,
-        });
-    });
-}
-
 pub fn persist_nested_bool(
     cfg: &ControllerConfig,
     path: &[&str],
@@ -1389,7 +1457,7 @@ pub fn persist_nested_bool(
 ) -> Result<(), String> {
     let raw = read_config_text(cfg)?;
     let next = crate::ops::set_nested_bool(&raw, path, value);
-    write_config_text(cfg, &next)
+    install_config(cfg, &next, false)
 }
 
 pub fn query_dns(cfg: &ControllerConfig, name: &str, qtype: &str) -> Result<DnsMessage, String> {
@@ -1703,43 +1771,196 @@ pub fn set_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<Str
     }
 }
 
-fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
-    let (service, _) = detect_macos_sysproxy();
-    let http_p = http_port.to_string();
-    let socks_p = if socks_port > 0 {
-        socks_port.to_string()
+pub fn proxy_ports(snapshot: &CoreSnapshot) -> Result<(u16, u16), String> {
+    let http = if snapshot.http_port > 0 {
+        snapshot.http_port
     } else {
-        http_p.clone()
+        snapshot.mixed_port
     };
-
-    if enable {
-        let _ = Command::new("networksetup")
-            .args(["-setwebproxy", &service, "127.0.0.1", &http_p])
-            .status();
-        let _ = Command::new("networksetup")
-            .args(["-setsecurewebproxy", &service, "127.0.0.1", &http_p])
-            .status();
-        let _ = Command::new("networksetup")
-            .args(["-setsocksfirewallproxy", &service, "127.0.0.1", &socks_p])
-            .status();
-        Ok(format!("System Proxy ON ({service} -> 127.0.0.1:{http_p})"))
+    let socks = if snapshot.socks_port > 0 {
+        snapshot.socks_port
     } else {
-        let _ = Command::new("networksetup")
-            .args(["-setwebproxystate", &service, "off"])
-            .status();
-        let _ = Command::new("networksetup")
-            .args(["-setsecurewebproxystate", &service, "off"])
-            .status();
-        let _ = Command::new("networksetup")
-            .args(["-setsocksfirewallproxystate", &service, "off"])
-            .status();
-        Ok(format!("System Proxy OFF ({service})"))
+        snapshot.mixed_port
+    };
+    if http == 0 {
+        return Err("No HTTP or mixed proxy listener is enabled".into());
     }
+    Ok((http, socks))
+}
+
+fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
+    let service =
+        active_macos_network_service().ok_or("Cannot identify the active macOS network service")?;
+    let run = |args: &[&str]| -> Result<(), String> {
+        let output = Command::new("networksetup")
+            .args(args)
+            .output()
+            .map_err(|e| e.to_string())?;
+        // networksetup may print an error while returning status 0.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() || stdout.contains("Error") || stdout.contains("error") {
+            return Err(format!(
+                "networksetup: {} {}",
+                stdout.trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    };
+    if enable {
+        if http_port == 0 {
+            return Err("No HTTP proxy listener is enabled".into());
+        }
+        let port = http_port.to_string();
+        run(&["-setwebproxy", &service, "127.0.0.1", &port])?;
+        run(&["-setsecurewebproxy", &service, "127.0.0.1", &port])?;
+        run(&["-setwebproxystate", &service, "on"])?;
+        run(&["-setsecurewebproxystate", &service, "on"])?;
+        if socks_port > 0 {
+            run(&[
+                "-setsocksfirewallproxy",
+                &service,
+                "127.0.0.1",
+                &socks_port.to_string(),
+            ])?;
+            run(&["-setsocksfirewallproxystate", &service, "on"])?;
+        } else {
+            run(&["-setsocksfirewallproxystate", &service, "off"])?;
+        }
+    } else {
+        for key in [
+            "-setwebproxystate",
+            "-setsecurewebproxystate",
+            "-setsocksfirewallproxystate",
+        ] {
+            run(&[key, &service, "off"])?;
+        }
+    }
+    Ok(format!(
+        "System Proxy {} ({service})",
+        if enable { "ON" } else { "OFF" }
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_listener_supplies_both_system_proxy_protocols() {
+        let mut snapshot = CoreSnapshot {
+            mixed_port: 7897,
+            ..CoreSnapshot::default()
+        };
+        assert_eq!(proxy_ports(&snapshot).unwrap(), (7897, 7897));
+        snapshot.http_port = 8080;
+        assert_eq!(proxy_ports(&snapshot).unwrap(), (8080, 7897));
+        snapshot.mixed_port = 0;
+        assert_eq!(proxy_ports(&snapshot).unwrap(), (8080, 0));
+        snapshot.http_port = 0;
+        assert!(proxy_ports(&snapshot).is_err());
+        let commands = gnome_proxy_commands(true, 8080, 0);
+        assert!(commands.iter().any(|c| c
+            == &vec![
+                "gsettings",
+                "set",
+                "org.gnome.system.proxy.socks",
+                "host",
+                "''"
+            ]));
+        assert_eq!(commands.last().unwrap()[3], "mode");
+    }
+
+    #[test]
+    fn stopping_an_external_core_does_not_attempt_system_changes() {
+        let cfg = ControllerConfig {
+            config_dir: "/terc-nonexistent-unmanaged-test".into(),
+            ..ControllerConfig::default()
+        };
+        assert!(stop_core_service(&cfg)
+            .unwrap_err()
+            .contains("managed externally"));
+    }
+
+    #[test]
+    #[ignore = "requires an installed Mihomo binary; only validates temporary configs and calls a mock controller"]
+    fn real_core_validates_overlays_and_config_updates_restore_on_failure() {
+        use std::net::TcpListener;
+        let directory = std::env::temp_dir().join(format!(
+            "terc-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut cfg = ControllerConfig {
+            config_dir: directory.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let base = "mode: direct\nmixed-port: 7897\nproxies: []\nrules: []\ntun:\n  enable: false\n  mtu: 1400\ndns:\n  enable: false\n  listen: 127.0.0.1:1053\n  fallback-filter:\n    geoip: false\n";
+        let generated =
+            crate::ops::apply_enabled_modules(base, &crate::ops::builtin_modules()).unwrap();
+        install_config(&cfg, &generated, false).unwrap();
+        assert_eq!(read_config_text(&cfg).unwrap(), generated);
+        let invalid = "dns: [\n";
+        assert!(install_config(&cfg, invalid, false)
+            .unwrap_err()
+            .contains("rejected"));
+        assert_eq!(read_config_text(&cfg).unwrap(), generated);
+        persist_nested_bool(&cfg, &["tun", "enable"], false).unwrap();
+        assert!(!crate::ops::parse_yaml_flags(&read_config_text(&cfg).unwrap()).tun_enabled);
+        // A valid provider-only document does not need a top-level proxies key.
+        let provider_only = "mode: direct\nproxy-providers: {}\nproxy-groups: []\nrules: []\n";
+        install_config(&cfg, provider_only, false).unwrap();
+        for status in [400, 204] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            cfg.addr = listener.local_addr().unwrap().to_string();
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.strip_prefix("Content-Length: ") {
+                        length = v.trim().parse::<usize>().unwrap();
+                    }
+                    request.push_str(&line);
+                }
+                let mut payload = vec![0; length];
+                reader.read_exact(&mut payload).unwrap();
+                assert!(request.starts_with("PUT /configs?force=true "));
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status} Result\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let next = "mode: direct\nipv6: true\nproxies: []\nrules: []\n";
+            let result = install_config(&cfg, next, true);
+            server.join().unwrap();
+            if status == 400 {
+                assert!(result
+                    .unwrap_err()
+                    .contains("previous configuration restored"));
+                assert_eq!(read_config_text(&cfg).unwrap(), provider_only);
+            } else {
+                result.unwrap();
+                assert_eq!(read_config_text(&cfg).unwrap(), next);
+            }
+        }
+        assert!(!directory.join(".terc-candidate.yaml").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn normalize_subscription_binds_controller_to_loopback() {

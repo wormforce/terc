@@ -289,31 +289,108 @@ fn module_header(body: &str, stem: &str) -> (String, String, String) {
     (name, description, rest.join("\n"))
 }
 
-pub fn apply_enabled_modules(doc: &str, modules: &[ModuleSnippet]) -> String {
-    let mut base = strip_marked_modules(doc);
-    if !base.is_empty() && !base.ends_with('\n') {
-        base.push('\n');
+/// Keep the source in a YAML comment so disabling an overlay restores it exactly.
+const BASE_PREFIX: &str = "# terc-base: ";
+
+pub fn has_subscription_source(doc: &str) -> bool {
+    split_chunks(doc)
+        .iter()
+        .any(|chunk| matches!(chunk.key.as_deref(), Some("proxies" | "proxy-providers")))
+}
+
+pub fn apply_enabled_modules(doc: &str, modules: &[ModuleSnippet]) -> Result<String, String> {
+    let base = strip_marked_modules(doc);
+    if modules.is_empty() {
+        return Ok(base);
     }
+    let switches = saved_switches(doc);
+    let mut merged = base.clone();
     for module in modules {
-        if !base.ends_with('\n') {
-            base.push('\n');
-        }
-        if !base.ends_with("\n\n") && !base.trim().is_empty() {
-            base.push('\n');
-        }
-        base.push_str("# terc-module:begin ");
-        base.push_str(&module.id);
-        base.push('\n');
-        base.push_str(module.body.trim_matches('\n'));
-        base.push('\n');
-        base.push_str("# terc-module:end ");
-        base.push_str(&module.id);
-        base.push('\n');
+        merged = merge_yaml_mapping(&merged, &module.body)?;
     }
-    base
+    for (path, value) in &switches {
+        let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        merged = set_nested_bool(&merged, &refs, *value);
+    }
+    Ok(format!(
+        "{BASE_PREFIX}{}\n# terc-switches: {}\n{merged}",
+        serde_json::to_string(&base).unwrap(),
+        serde_json::to_string(&switches).unwrap()
+    ))
+}
+
+/// Merge block mappings recursively; sequences and scalars are replaced as a unit.
+/// Unchanged YAML (including anchors and flow collections) stays verbatim.
+fn merge_yaml_mapping(base: &str, overlay: &str) -> Result<String, String> {
+    let mut chunks = split_chunks(base);
+    for patch in split_chunks(overlay) {
+        let Some(key) = patch.key.as_deref() else {
+            continue;
+        };
+        if let Some(pos) = chunks.iter().position(|c| c.key.as_deref() == Some(key)) {
+            let original = &chunks[pos];
+            let block_body = |chunk: &YamlChunk| -> Option<String> {
+                let (_, scalar) = chunk.lines.first()?.split_once(':')?;
+                if !clean_scalar(scalar).is_empty() {
+                    return None;
+                }
+                let indent = chunk
+                    .lines
+                    .iter()
+                    .skip(1)
+                    .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+                    .map(|l| leading_spaces(l))
+                    .min()?;
+                let body = chunk
+                    .lines
+                    .iter()
+                    .skip(1)
+                    .map(|l| l.get(indent..).unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if body
+                    .lines()
+                    .find(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))?
+                    .trim_start()
+                    .starts_with('-')
+                {
+                    return None;
+                }
+                Some(body)
+            };
+            if let Some(patch_body) = block_body(&patch) {
+                if let Some(original_body) = block_body(original) {
+                    let body = merge_yaml_mapping(&original_body, &patch_body)?;
+                    chunks[pos].lines = std::iter::once(format!("{key}:"))
+                        .chain(body.lines().map(|l| format!("  {l}")))
+                        .collect();
+                    continue;
+                }
+                let scalar = original.lines[0]
+                    .split_once(':')
+                    .map(|(_, v)| clean_scalar(v))
+                    .unwrap_or_default();
+                if !scalar.is_empty() && scalar != "null" && scalar != "~" {
+                    return Err(format!("Cannot overlay block {key} on inline YAML; expand this mapping to multiple lines first"));
+                }
+            }
+            chunks[pos] = patch;
+        } else {
+            chunks.push(patch);
+        }
+    }
+    Ok(join_chunks(&chunks))
 }
 
 pub fn strip_marked_modules(doc: &str) -> String {
+    if let Some(base) = doc
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix(BASE_PREFIX))
+        .and_then(|v| serde_json::from_str::<String>(v).ok())
+    {
+        return base;
+    }
     let mut out = Vec::new();
     let mut skipping = false;
     for line in split_lines(doc) {
@@ -336,7 +413,32 @@ pub fn strip_marked_modules(doc: &str) -> String {
     join_lines(&out)
 }
 
+fn saved_switches(doc: &str) -> Vec<(Vec<String>, bool)> {
+    doc.lines()
+        .nth(1)
+        .and_then(|l| l.strip_prefix("# terc-switches: "))
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
 pub fn set_nested_bool(doc: &str, path: &[&str], value: bool) -> String {
+    if doc.starts_with(BASE_PREFIX) {
+        let base = set_nested_bool(&strip_marked_modules(doc), path, value);
+        let mut switches = saved_switches(doc);
+        switches.retain(|(p, _)| !p.iter().map(String::as_str).eq(path.iter().copied()));
+        switches.push((path.iter().map(|s| s.to_string()).collect(), value));
+        let effective = doc
+            .lines()
+            .filter(|l| !l.starts_with(BASE_PREFIX) && !l.starts_with("# terc-switches: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let updated = set_nested_bool(&effective, path, value);
+        return format!(
+            "{BASE_PREFIX}{}\n# terc-switches: {}\n{updated}",
+            serde_json::to_string(&base).unwrap(),
+            serde_json::to_string(&switches).unwrap()
+        );
+    }
     let literal = if value { "true" } else { "false" };
     match path {
         [key] => set_top_scalar(doc, key, literal),
@@ -1173,7 +1275,16 @@ fn set_block_scalar(doc: &str, block: &str, key: &str, literal: &str) -> String 
         .find(|chunk| chunk.key.as_deref().is_some_and(|name| name == block))
     {
         if let Some(pos) = chunk.lines.iter().rposition(|line| {
-            line_key(line).is_some_and(|name| name == key) && leading_spaces(line) > 0
+            line_key(line).is_some_and(|name| name == key)
+                && leading_spaces(line)
+                    == chunk
+                        .lines
+                        .iter()
+                        .skip(1)
+                        .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+                        .map(|l| leading_spaces(l))
+                        .min()
+                        .unwrap_or(2)
         }) {
             chunk.lines[pos] = replace_scalar_line(&chunk.lines[pos], literal);
         } else {
@@ -1300,7 +1411,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn module_apply_appends_and_strip_restores_original() {
+    fn subscription_accepts_providers_without_accepting_empty_or_commented_documents() {
+        assert!(has_subscription_source("proxy-providers: {}\nrules: []\n"));
+        assert!(has_subscription_source("proxies: []\n"));
+        assert!(!has_subscription_source("# proxies: unavailable\n"));
+        assert!(!has_subscription_source(""));
+    }
+
+    #[test]
+    fn module_switches_survive_regeneration_and_disabling_restores_source() {
+        let base = "tun:\n  enable: false\n  stack: system\n  mtu: 1400\ndns:\n  enable: false\n  nameserver:\n    - 1.1.1.1\n";
+        let modules = builtin_modules();
+        let applied = apply_enabled_modules(base, &modules).unwrap();
+        assert_eq!(applied.lines().filter(|l| *l == "tun:").count(), 1);
+        assert!(applied.contains("mtu: 1400"));
+        let off = set_nested_bool(&applied, &["tun", "enable"], false);
+        let regenerated = apply_enabled_modules(&off, &modules[..2]).unwrap();
+        assert!(!parse_yaml_flags(&regenerated).tun_enabled);
+        assert!(parse_yaml_flags(&regenerated).sniffing);
+        let restored = apply_enabled_modules(&regenerated, &[]).unwrap();
+        assert!(!restored.contains(BASE_PREFIX));
+        assert!(restored.contains("stack: system"));
+        assert!(restored.contains("mtu: 1400"));
+        assert!(!parse_yaml_flags(&restored).tun_enabled);
+    }
+
+    #[test]
+    fn nested_overlay_merges_maps_and_replaces_sequences() {
+        let base = "sniffer:\n  enable: false\n  sniff:\n    TLS:\n      ports: [443]\n    HTTP:\n      ports: [80]\n";
+        let overlay = ModuleSnippet {
+            id: "custom".into(),
+            name: "Custom".into(),
+            description: String::new(),
+            builtin: false,
+            body: "sniffer:\n  enable: true\n  sniff:\n    HTTP:\n      ports: [8080]\n".into(),
+        };
+        let merged = apply_enabled_modules(base, &[overlay]).unwrap();
+        let effective = merged.lines().skip(2).collect::<Vec<_>>().join("\n");
+        assert!(effective.contains("ports: [443]"));
+        assert!(effective.contains("ports: [8080]"));
+        assert!(!effective.contains("ports: [80]"));
+        assert_eq!(effective.lines().filter(|l| l.trim() == "HTTP:").count(), 1);
+    }
+
+    #[test]
+    fn module_merge_and_strip_restores_original() {
         let base = "\
 dns:
   enable: false
@@ -1318,13 +1473,14 @@ dns:
                 .into(),
             builtin: true,
         };
-        let applied = apply_enabled_modules(base, &[module]);
-        assert!(applied.contains("# terc-module:begin dns-fakeip"));
+        let applied = apply_enabled_modules(base, &[module]).unwrap();
+        assert!(applied.starts_with(BASE_PREFIX));
+        assert_eq!(applied.lines().filter(|l| *l == "dns:").count(), 1);
         assert!(applied.contains("listen: 127.0.0.1:1053"));
         assert!(parse_dns_block(&applied).enable);
         assert_eq!(parse_dns_block(&applied).enhanced_mode, "fake-ip");
 
-        let restored = apply_enabled_modules(&applied, &[]);
+        let restored = apply_enabled_modules(&applied, &[]).unwrap();
         assert!(!restored.contains("terc-module"));
         assert!(!parse_dns_block(&restored).enable);
         assert!(restored.contains("proxies: []"));

@@ -54,14 +54,14 @@ Surge keeps TUN, sniffing, routing, and DNS inside menus. `terc` leaves them on 
 **Requires:** macOS 14+ or Linux (x86_64 / arm64), Rust stable, and a `mihomo` binary (`brew install mihomo` on macOS, or the matching official build from inside `terc`). See the [guide](docs/usage.en.md) and the [Chinese manual](docs/使用说明.md).
 
 ```bash
-git clone https://github.com/pentaoa/terc.git
+git clone https://github.com/wormforce/terc.git
 cd terc
 cargo run --release --locked
 ```
 
 `terc` opens on the dashboard. Press **Space** to toggle the system proxy (macOS `networksetup`, or Linux GNOME `gsettings` when `org.gnome.system.proxy` is present; otherwise it stays unchanged and says so), or press **K** to start/stop the background `mihomo` daemon. Run `terc --version` to verify the installed version.
 
-Setup appears only when there is no subscription URL, no `config.yaml`, and the core is not running: paste a subscription URL, locate `mihomo` (<kbd>Ctrl+D</kbd> downloads `darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` for this machine) and start the core. An existing config skips that and lands on the dashboard. <kbd>Esc</kbd> dismisses Setup and <kbd>u</kbd> brings it back while no subscription is configured — the system proxy is never switched on for you.
+Setup appears only when there is no subscription URL, no `config.yaml`, and the core is not running: locate or download `mihomo` first, then paste a subscription URL (<kbd>Ctrl+D</kbd> downloads `darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` for this machine) and start the core. An existing config skips that and lands on the dashboard. <kbd>Esc</kbd> dismisses Setup and <kbd>u</kbd> brings it back while no subscription is configured — the system proxy is never switched on for you.
 
 > [!NOTE]
 > `terc` decouples the UI lifecycle from the proxy core. Closing `terc` with <kbd>q</kbd> immediately frees all terminal UI resources while your background `mihomo` tunnel continues running uninterrupted.
@@ -102,7 +102,7 @@ The toolbar stays one row. Narrow terminals keep the key letters and drop the la
 | Rules | <kbd>x</kbd> | Disable or restore the selected rule (`PATCH /rules/disable`) |
 | DNS | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>[</kbd> <kbd>]</kbd> | Look up, flush DNS and Fake-IP, cycle record type |
 | Providers | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>H</kbd> | Refresh the selected provider, refresh all, or health-check a proxy provider |
-| Dashboard | <kbd>K</kbd> | Start or stop the background `mihomo` daemon |
+| Dashboard | <kbd>K</kbd> | Start or stop the background `mihomo` process managed by terc |
 | Proxies | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Tab</kbd> | Switch focus between **Groups `[1]`** and **Nodes `[2]`** |
 | Any list | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd> | Move the selection |
 | Nodes | <kbd>Enter</kbd> | Activate the highlighted node in the current group |
@@ -121,8 +121,12 @@ The toolbar stays one row. Narrow terminals keep the key letters and drop the la
 | Settings | <kbd>Tab</kbd> | Cycle setting categories (`Core & Proxy` · `Appearance` · `Subscription`) |
 | Any view | <kbd>?</kbd> | Open keyboard shortcut help. Press again to return to the dashboard |
 | Dashboard | <kbd>q</kbd> | Quit (`mihomo` stays running in the background) |
-| Dashboard | <kbd>Esc</kbd> | Leave a subview for the proxy list; quit from that list |
+| Dashboard | <kbd>Esc</kbd> | Return to the proxy list; press q to quit |
 | Settings / Help | <kbd>Esc</kbd> | Return to the dashboard |
+
+Install the core before submitting the first subscription (`Ctrl+D` in Setup downloads it). Subscription, snippet and profile changes are validated with `mihomo -t` before replacing the configuration; rejected reloads restore the previous file. Enabled snippets are reapplied on subscription updates and profile switches. `K` stops only a core started by terc; use the service manager for external cores.
+
+Logs: `P` pauses/resumes display while capture continues, `/` searches, and Enter opens full text. Connections: Enter opens full details on narrow terminals. The independent status row stays visible when graphs are hidden; `!` opens the full result. Help supports arrows and Page Up/Down.
 
 ## Configuration
 
@@ -131,7 +135,7 @@ Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terc
 | Category | Options |
 | --- | --- |
 | **Core & Proxy** | Start/stop `mihomo`, toggle the system proxy, switch routing mode, download `mihomo-darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` into `~/.config/terc/core/mihomo` |
-| **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling appends a marked block; disabling removes only that block |
+| **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling recursively merges mappings; disabling restores the source. Mihomo validates candidates before applying |
 | **Profiles** | YAML files in the config directory and `~/.config/terc/profiles`. Enter copies one onto `config.yaml` and reloads |
 | **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), refresh rate (`15` / `30` / `60` / `120 Hz`), UI language |
 | **Subscription** | Hot-fetch remote AnyTLS / Clash.Meta YAML subscription and reload without dropping active tunnels |

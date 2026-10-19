@@ -31,7 +31,7 @@ use mihomo::{
     close_connection, config_file_exists, download_managed_core_async, fetch_snapshot,
     is_info_pseudo_node, mihomo_asset_label, select_group_node, set_sysproxy, spawn_stream_workers,
     start_core_service, stop_core_service, switch_routing_mode, test_group_delays_async,
-    update_subscription_async, BackendEvent, ControllerConfig, CoreSnapshot,
+    BackendEvent, ControllerConfig, CoreSnapshot,
 };
 use ratatui::prelude::{CrosstermBackend, Terminal};
 use serde::{Deserialize, Serialize};
@@ -153,18 +153,21 @@ impl Config {
             }
         }
         let cfg = Self::default();
-        cfg.save();
+        if let Err(err) = cfg.save() {
+            eprintln!("Cannot save preferences: {err}");
+        }
         cfg
     }
 
-    pub fn save(&self) {
+    pub fn save(&self) -> Result<(), String> {
         let path = Self::path();
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, json);
-        }
+        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        let candidate = path.with_extension("json.tmp");
+        fs::write(&candidate, json).map_err(|e| e.to_string())?;
+        fs::rename(candidate, path).map_err(|e| e.to_string())
     }
 }
 
@@ -197,6 +200,11 @@ impl LineEditor {
             .chars()
             .filter(|c| !c.is_control() && !c.is_whitespace())
             .collect();
+        self.insert_text(&clean)
+    }
+
+    pub fn insert_text(&mut self, input: &str) -> bool {
+        let clean: String = input.chars().filter(|c| !c.is_control()).collect();
         if clean.is_empty() {
             return false;
         }
@@ -265,6 +273,19 @@ pub struct App {
     pub group_index: usize,
     pub node_index: usize,
     pub conn_index: usize,
+    pub connection_detail: bool,
+    pub detail_scroll: u16,
+    pub help_scroll: u16,
+    pub logs_paused: bool,
+    pub frozen_logs: Vec<(String, String)>,
+    pub status_detail: bool,
+    pub log_query: LineEditor,
+    pub log_editing: bool,
+    pub log_detail: bool,
+    pub log_index: usize,
+    pub pending_best_group: Option<String>,
+    pub action_busy: bool,
+    pub snapshot_pending: bool,
     pub setting_index: usize,
     pub rule_index: usize,
     pub provider_index: usize,
@@ -308,17 +329,20 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Self {
+        let snapshot = fetch_snapshot(&config.controller);
+        let app = Self::from_snapshot(config, snapshot);
+        spawn_stream_workers(
+            app.config.controller.addr.clone(),
+            app.config.controller.secret.clone(),
+            app.tx.clone(),
+            app.stop_flag.clone(),
+        );
+        app
+    }
+
+    fn from_snapshot(config: Config, initial_snapshot: CoreSnapshot) -> Self {
         let (tx, rx) = mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let initial_snapshot = fetch_snapshot(&config.controller);
-
-        spawn_stream_workers(
-            config.controller.addr.clone(),
-            config.controller.secret.clone(),
-            tx.clone(),
-            stop_flag.clone(),
-        );
-
         let screen = launch_screen(
             &config.controller.subscription_url,
             initial_snapshot.running,
@@ -332,6 +356,19 @@ impl App {
             group_index: 0,
             node_index: 0,
             conn_index: 0,
+            connection_detail: false,
+            detail_scroll: 0,
+            help_scroll: 0,
+            logs_paused: false,
+            frozen_logs: Vec::new(),
+            status_detail: false,
+            log_query: LineEditor::default(),
+            log_editing: false,
+            log_detail: false,
+            log_index: 0,
+            pending_best_group: None,
+            action_busy: false,
+            snapshot_pending: false,
             setting_index: 0,
             rule_index: 0,
             provider_index: 0,
@@ -407,7 +444,11 @@ impl App {
     }
 
     pub fn submit_setup(&mut self) {
-        if self.setup_phase != SetupPhase::Editing {
+        if self.setup_phase != SetupPhase::Editing || self.action_busy || self.core_downloading {
+            return;
+        }
+        if !self.core_binary_found() {
+            self.set_status(self.t("setup_dl_hint"), true);
             return;
         }
         let url = self.setup_editor.trimmed();
@@ -421,14 +462,20 @@ impl App {
             return;
         }
         self.config.controller.subscription_url = url;
-        self.config.save();
+        self.save_preferences();
         self.setup_phase = SetupPhase::Fetching;
-        update_subscription_async(self.config.controller.clone(), self.tx.clone());
+        self.update_subscription();
     }
 
     pub fn set_status(&mut self, text: &str, is_error: bool) {
         self.status_message = text.to_string();
         self.status_is_error = is_error;
+    }
+
+    pub fn save_preferences(&mut self) {
+        if let Err(err) = self.config.save() {
+            self.set_status(&format!("Could not save preferences: {err}"), true);
+        }
     }
 
     pub fn clear_status(&mut self) {
@@ -460,19 +507,35 @@ impl App {
             self.set_status(self.t("setup_msg_saved"), false);
             return;
         }
-        match start_core_service(&self.config.controller) {
-            Ok(_) => {
-                self.setup_phase = SetupPhase::Starting;
-                self.setup_start_at = Instant::now();
-                self.set_status(self.t("setup_msg_starting"), false);
-            }
-            Err(e) => {
-                self.setup_phase = SetupPhase::Editing;
-                self.set_status(
-                    &format!("{}: {}", self.t("setup_msg_start_failed"), e),
-                    true,
-                );
-            }
+        self.setup_phase = SetupPhase::Starting;
+        self.setup_start_at = Instant::now();
+        self.run_action("Starting Mihomo…", None, None, |cfg| {
+            start_core_service(&cfg)
+        });
+    }
+
+    pub fn filtered_logs(&self) -> Vec<&(String, String)> {
+        let source = if self.logs_paused {
+            &self.frozen_logs
+        } else {
+            &self.logs
+        };
+        let query = self.log_query.text.to_lowercase();
+        source
+            .iter()
+            .filter(|(level, text)| {
+                query.is_empty()
+                    || level.to_lowercase().contains(&query)
+                    || text.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    pub fn pause_logs(&mut self) {
+        if !self.logs_paused {
+            self.frozen_logs = self.logs.clone();
+            self.logs_paused = true;
+            self.log_index = self.filtered_logs().len().saturating_sub(1);
         }
     }
 
@@ -510,8 +573,48 @@ impl App {
                         self.logs.remove(0);
                     }
                 }
+                BackendEvent::ActionDone {
+                    result,
+                    modules,
+                    profile,
+                } => {
+                    self.action_busy = false;
+                    let ok = result.is_ok();
+                    match &result {
+                        Ok(text) => self.set_status(text, false),
+                        Err(err) => self.set_status(err, true),
+                    }
+                    if ok {
+                        if let Some(ids) = modules {
+                            self.config.enabled_modules = ids;
+                            self.save_preferences();
+                        }
+                        if let Some(name) = profile {
+                            self.config.active_profile = name;
+                            self.save_preferences();
+                            self.open_profiles();
+                        }
+                    }
+                    if self.setup_phase == SetupPhase::Fetching {
+                        self.finish_setup_fetch(ok);
+                    } else if self.screen == Screen::Setup
+                        && self.setup_phase == SetupPhase::Starting
+                    {
+                        if ok {
+                            self.close_setup();
+                        } else {
+                            self.setup_phase = SetupPhase::Editing;
+                        }
+                    }
+                }
+                BackendEvent::SnapshotDone(snap) => {
+                    self.snapshot_pending = false;
+                    if !self.action_busy {
+                        self.accept_snapshot(*snap);
+                    }
+                }
                 BackendEvent::Snapshot(snap) => {
-                    self.snapshot = *snap;
+                    self.accept_snapshot(*snap);
                     if self.group_index >= self.snapshot.groups.len() {
                         self.group_index = self.snapshot.groups.len().saturating_sub(1);
                     }
@@ -537,17 +640,25 @@ impl App {
                 BackendEvent::GroupTestDone { group } => {
                     self.status_message = format!("Latency test complete: {group}");
                     self.status_is_error = false;
+                    if self.pending_best_group.as_deref() == Some(&group) {
+                        self.pending_best_group = None;
+                        if let Some(index) =
+                            self.snapshot.groups.iter().position(|g| g.name == group)
+                        {
+                            let previous_group = self.group_index;
+                            let previous_node = self.node_index;
+                            self.group_index = index;
+                            self.select_best_node_in_group_after_test();
+                            if previous_group != index {
+                                self.group_index = previous_group;
+                                self.node_index = previous_node;
+                            }
+                        }
+                    }
                 }
                 BackendEvent::StatusMessage { text, is_error } => {
                     self.status_message = text;
                     self.status_is_error = is_error;
-                }
-                BackendEvent::SubscriptionDone { ok } => {
-                    if matches!(self.screen, Screen::Setup)
-                        || self.setup_phase == SetupPhase::Fetching
-                    {
-                        self.finish_setup_fetch(ok);
-                    }
                 }
                 BackendEvent::CoreDownloadDone { ok } => {
                     self.core_downloading = false;
@@ -571,20 +682,95 @@ impl App {
             self.set_status(self.t("setup_msg_still_starting"), false);
         }
 
-        if self.last_snapshot_poll.elapsed() >= Duration::from_millis(2200) {
+        if !self.action_busy
+            && !self.snapshot_pending
+            && self.last_snapshot_poll.elapsed() >= Duration::from_millis(2200)
+        {
+            self.snapshot_pending = true;
             self.last_snapshot_poll = Instant::now();
             let cfg = self.config.controller.clone();
             let tx = self.tx.clone();
             thread::spawn(move || {
                 let snap = fetch_snapshot(&cfg);
-                let _ = tx.send(BackendEvent::Snapshot(Box::new(snap)));
+                let _ = tx.send(BackendEvent::SnapshotDone(Box::new(snap)));
             });
         }
     }
 
+    pub fn accept_snapshot(&mut self, snapshot: CoreSnapshot) {
+        let selected = self
+            .snapshot
+            .connections
+            .get(self.conn_index)
+            .map(|c| c.id.clone());
+        let was_empty = self.snapshot.connections.is_empty();
+        self.snapshot = snapshot;
+        self.conn_index = selected
+            .and_then(|id| self.snapshot.connections.iter().position(|c| c.id == id))
+            .unwrap_or(if was_empty {
+                0
+            } else {
+                self.snapshot.connections.len()
+            });
+        // An expired selection stays empty until the user navigates again.
+        self.group_index = self
+            .group_index
+            .min(self.snapshot.groups.len().saturating_sub(1));
+        self.clamp_aux();
+    }
+
     pub fn refresh_snapshot_now(&mut self) {
-        self.snapshot = fetch_snapshot(&self.config.controller);
-        self.clamp_node_index();
+        if self.snapshot_pending {
+            return;
+        }
+        self.snapshot_pending = true;
+        let cfg = self.config.controller.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
+        });
+    }
+
+    pub fn run_action<F>(
+        &mut self,
+        label: &str,
+        modules: Option<Vec<String>>,
+        profile: Option<String>,
+        action: F,
+    ) where
+        F: FnOnce(ControllerConfig) -> Result<String, String> + Send + 'static,
+    {
+        if self.action_busy {
+            self.set_status("Another operation is still running", true);
+            return;
+        }
+        self.action_busy = true;
+        self.set_status(label, false);
+        let cfg = self.config.controller.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = action(cfg.clone());
+            let _ = tx.send(BackendEvent::ActionDone {
+                result,
+                modules,
+                profile,
+            });
+            let _ = tx.send(BackendEvent::Snapshot(Box::new(fetch_snapshot(&cfg))));
+        });
+    }
+
+    pub fn update_subscription(&mut self) {
+        let catalog = crate::ops::module_catalog(&crate::ops::modules_dir(&PathBuf::from(
+            env::var_os("HOME").unwrap_or_default(),
+        )));
+        let modules = crate::ops::enabled_snippets(&catalog, &self.config.enabled_modules);
+        let running = self.snapshot.running;
+        self.run_action(
+            "Fetching and validating subscription…",
+            None,
+            None,
+            move |cfg| mihomo::fetch_subscription(&cfg, &modules, running),
+        );
     }
 
     pub fn sync_node_cursor_to_active(&mut self) {
@@ -619,19 +805,10 @@ impl App {
         }
         let group_name = group.name.clone();
         let node_name = node.clone();
-        match select_group_node(&self.config.controller, &group_name, &node_name) {
-            Ok(()) => {
-                if let Some(g) = self.snapshot.groups.get_mut(self.group_index) {
-                    g.now = node_name.clone();
-                }
-                self.status_message = format!("{group_name} › {node_name}");
-                self.status_is_error = false;
-            }
-            Err(e) => {
-                self.status_message = format!("Switch failed: {e}");
-                self.status_is_error = true;
-            }
-        }
+        self.run_action("Switching node…", None, None, move |cfg| {
+            select_group_node(&cfg, &group_name, &node_name).map_err(|e| e.to_string())?;
+            Ok(format!("{group_name} › {node_name}"))
+        });
     }
 
     pub fn test_current_group(&mut self) {
@@ -649,6 +826,21 @@ impl App {
     }
 
     pub fn select_best_node_in_group(&mut self) {
+        if let Some(group) = self.snapshot.groups.get(self.group_index) {
+            if !group
+                .all
+                .iter()
+                .any(|n| self.snapshot.nodes.get(n).and_then(|n| n.delay).is_some())
+            {
+                self.pending_best_group = Some(group.name.clone());
+                self.test_current_group();
+                return;
+            }
+        }
+        self.select_best_node_in_group_after_test();
+    }
+
+    fn select_best_node_in_group_after_test(&mut self) {
         let Some(group) = self.snapshot.groups.get(self.group_index) else {
             return;
         };
@@ -667,69 +859,53 @@ impl App {
             self.node_index = idx;
             self.activate_selected_node();
         } else {
-            self.test_current_group();
+            self.set_status("No reachable node found", true);
         }
     }
 
     pub fn toggle_sysproxy(&mut self) {
         let target = !self.snapshot.sysproxy_enabled;
-        match set_sysproxy(target, self.snapshot.http_port, self.snapshot.socks_port) {
-            Ok(msg) => {
-                self.snapshot.sysproxy_enabled = target;
-                self.status_message = msg;
-                self.status_is_error = false;
+        let ports = if target {
+            if !self.snapshot.running {
+                self.set_status("Start the core before enabling system proxy", true);
+                return;
             }
-            Err(err) => {
-                self.status_message = if err == "sysproxy_unavailable" {
-                    self.t("sysproxy_unavailable").to_string()
-                } else {
-                    err
-                };
-                self.status_is_error = true;
-            }
-        }
-    }
-
-    pub fn cycle_routing_mode(&mut self) {
-        let cur_idx = ROUTING_MODES
-            .iter()
-            .position(|m| m.eq_ignore_ascii_case(&self.snapshot.mode))
-            .unwrap_or(0);
-        let next_mode = ROUTING_MODES[(cur_idx + 1) % ROUTING_MODES.len()];
-        if switch_routing_mode(&self.config.controller, next_mode).is_ok() {
-            self.snapshot.mode = next_mode.to_string();
-            self.status_message = format!("Routing mode › {next_mode}");
-            self.status_is_error = false;
-            self.refresh_snapshot_now();
-        }
-    }
-
-    pub fn toggle_core_service(&mut self) {
-        if self.snapshot.running {
-            match stop_core_service(&self.config.controller) {
-                Ok(msg) => {
-                    self.status_message = msg;
-                    self.status_is_error = false;
-                    self.refresh_snapshot_now();
-                }
+            match mihomo::proxy_ports(&self.snapshot) {
+                Ok(p) => p,
                 Err(e) => {
-                    self.status_message = e;
-                    self.status_is_error = true;
+                    self.set_status(&e, true);
+                    return;
                 }
             }
         } else {
-            match start_core_service(&self.config.controller) {
-                Ok(msg) => {
-                    self.status_message = msg;
-                    self.status_is_error = false;
-                    self.refresh_snapshot_now();
-                }
-                Err(e) => {
-                    self.status_message = e;
-                    self.status_is_error = true;
-                }
+            (0, 0)
+        };
+        self.run_action("Updating system proxy…", None, None, move |_| {
+            set_sysproxy(target, ports.0, ports.1)
+        });
+    }
+
+    pub fn cycle_routing_mode(&mut self) {
+        let index = ROUTING_MODES
+            .iter()
+            .position(|m| m.eq_ignore_ascii_case(&self.snapshot.mode))
+            .unwrap_or(0);
+        let mode = ROUTING_MODES[(index + 1) % ROUTING_MODES.len()];
+        self.run_action("Switching routing mode…", None, None, move |cfg| {
+            switch_routing_mode(&cfg, mode).map_err(|e| e.to_string())?;
+            Ok(format!("Routing mode › {mode}"))
+        });
+    }
+
+    pub fn toggle_core_service(&mut self) {
+        let running = self.snapshot.running;
+        self.run_action("Updating core service…", None, None, move |cfg| {
+            if running {
+                stop_core_service(&cfg)
+            } else {
+                start_core_service(&cfg)
             }
-        }
+        });
     }
 
     pub fn settings_rows(&self) -> Vec<SettingRow> {
@@ -838,7 +1014,7 @@ impl App {
             0 => self.toggle_core_service(),
             1 => self.toggle_sysproxy(),
             2 => self.cycle_routing_mode(),
-            3 => download_managed_core_async(self.tx.clone()),
+            3 => self.download_core(),
             4 => {
                 let pos = THEMES
                     .iter()
@@ -846,7 +1022,7 @@ impl App {
                     .unwrap_or(0);
                 let next = (pos as i32 + dir).rem_euclid(THEMES.len() as i32) as usize;
                 self.config.settings.theme = THEMES[next];
-                self.config.save();
+                self.save_preferences();
             }
             5 => {
                 let pos = WAVE_RENDERERS
@@ -855,7 +1031,7 @@ impl App {
                     .unwrap_or(0);
                 let next = (pos as i32 + dir).rem_euclid(WAVE_RENDERERS.len() as i32) as usize;
                 self.config.settings.renderer = WAVE_RENDERERS[next];
-                self.config.save();
+                self.save_preferences();
             }
             6 => {
                 let pos = REFRESH_RATES
@@ -864,7 +1040,7 @@ impl App {
                     .unwrap_or(2);
                 let next = (pos as i32 + dir).rem_euclid(REFRESH_RATES.len() as i32) as usize;
                 self.config.settings.refresh_hz = REFRESH_RATES[next];
-                self.config.save();
+                self.save_preferences();
             }
             7 => {
                 let langs = [Lang::Zh, Lang::En, Lang::Ja];
@@ -874,7 +1050,7 @@ impl App {
                     .unwrap_or(0);
                 let next = (pos as i32 + dir).rem_euclid(langs.len() as i32) as usize;
                 self.config.settings.lang = langs[next];
-                self.config.save();
+                self.save_preferences();
             }
             8 => {
                 self.open_setup(Screen::Settings);
@@ -883,7 +1059,7 @@ impl App {
                 if self.config.controller.subscription_url.trim().is_empty() {
                     self.open_setup(Screen::Settings);
                 } else {
-                    update_subscription_async(self.config.controller.clone(), self.tx.clone());
+                    self.update_subscription();
                 }
             }
             _ => {}
@@ -1131,9 +1307,9 @@ impl App {
             (Lang::Zh, "help_q") => "退出 terc（后台内核继续运行）",
             (Lang::En, "help_q") => "Quit terc (background core stays running)",
             (Lang::Ja, "help_q") => "終了（バックグラウンドのコアは継続）",
-            (Lang::Zh, "help_esc") => "子页面回节点页，再按退出；设置与帮助回面板",
-            (Lang::En, "help_esc") => "Back to proxies, then quit. Settings and Help return here",
-            (Lang::Ja, "help_esc") => "プロキシへ戻って終了。設定とヘルプはパネルへ",
+            (Lang::Zh, "help_esc") => "返回节点页；退出请按 q。设置与帮助回面板",
+            (Lang::En, "help_esc") => "Back to proxies; q quits. Settings and Help return here",
+            (Lang::Ja, "help_esc") => "プロキシへ戻る。終了は q。設定とヘルプはパネルへ",
             (Lang::Zh, "controls") => "开关",
             (Lang::En, "controls") => "Controls",
             (Lang::Ja, "controls") => "スイッチ",
@@ -1444,6 +1620,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     {
                         app.rule_query.insert(&text);
                         app.rule_index = 0;
+                    } else if app.screen == Screen::Dashboard
+                        && app.main_tab == MainTab::Logs
+                        && app.log_editing
+                    {
+                        app.log_query.insert_text(&text);
+                        app.log_index = 0;
                     }
                 }
                 _ => {}
@@ -1474,7 +1656,6 @@ pub fn launch_screen(subscription_url: &str, core_running: bool, config_exists: 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EscStep {
-    Quit,
     ClearQuery,
     Proxies,
 }
@@ -1482,14 +1663,39 @@ enum EscStep {
 fn dashboard_esc(tab: MainTab, rule_query_empty: bool) -> EscStep {
     if tab == MainTab::Rules && !rule_query_empty {
         EscStep::ClearQuery
-    } else if tab != MainTab::Proxies {
-        EscStep::Proxies
     } else {
-        EscStep::Quit
+        EscStep::Proxies
     }
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return true;
+    }
+    if app.status_detail {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('!') => app.status_detail = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.detail_scroll = app.detail_scroll.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.detail_scroll = app.detail_scroll.saturating_add(1)
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if key.code == KeyCode::Char('!')
+        && !app.dns_editing
+        && !app.rule_editing
+        && !app.log_editing
+        && app.overlay == Overlay::None
+        && app.screen != Screen::Setup
+    {
+        app.status_detail = true;
+        app.detail_scroll = 0;
+        return false;
+    }
     match app.screen {
         Screen::Dashboard => handle_dashboard_key(app, key),
         Screen::Settings => handle_settings_key(app, key),
@@ -1508,6 +1714,51 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
     if app.main_tab == MainTab::Rules && app.rule_editing {
         return handle_rule_edit_key(app, key);
     }
+    if app.main_tab == MainTab::Logs && app.log_editing {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('w'))
+        {
+            app.log_query.clear();
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => app.log_editing = false,
+            KeyCode::Backspace => {
+                app.log_query.backspace();
+            }
+            KeyCode::Delete => {
+                app.log_query.delete();
+            }
+            KeyCode::Left => app.log_query.move_left(),
+            KeyCode::Right => app.log_query.move_right(),
+            KeyCode::Home => app.log_query.move_home(),
+            KeyCode::End => app.log_query.move_end(),
+            KeyCode::Char(ch) => {
+                app.log_query.insert_text(&ch.to_string());
+            }
+            _ => {}
+        }
+        app.log_index = 0;
+        return false;
+    }
+    if (app.main_tab == MainTab::Connections && app.connection_detail)
+        || (app.main_tab == MainTab::Logs && app.log_detail)
+    {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.connection_detail = false;
+                app.log_detail = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.detail_scroll = app.detail_scroll.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.detail_scroll = app.detail_scroll.saturating_add(1)
+            }
+            _ => {}
+        }
+        return false;
+    }
     match key.code {
         KeyCode::Char('q') => return true,
         KeyCode::Esc => match dashboard_esc(app.main_tab, app.rule_query.text.is_empty()) {
@@ -1516,7 +1767,6 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                 app.rule_index = 0;
             }
             EscStep::Proxies => app.main_tab = MainTab::Proxies,
-            EscStep::Quit => return true,
         },
         KeyCode::Char(' ') => app.toggle_sysproxy(),
         KeyCode::Char('T') => app.toggle_tun(),
@@ -1550,18 +1800,30 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('K') => app.toggle_core_service(),
         KeyCode::Char('m') => app.cycle_routing_mode(),
-        KeyCode::Char('r') => app.test_current_group(),
-        KeyCode::Char('a') => app.select_best_node_in_group(),
+        KeyCode::Char('r') if app.main_tab == MainTab::Proxies => app.test_current_group(),
+        KeyCode::Char('a') if app.main_tab == MainTab::Proxies => app.select_best_node_in_group(),
+        KeyCode::Char('/') if app.main_tab == MainTab::Logs => {
+            app.pause_logs();
+            app.log_editing = true;
+        }
+        KeyCode::Char('P') if app.main_tab == MainTab::Logs => {
+            if app.logs_paused {
+                app.logs_paused = false;
+                app.log_detail = false;
+            } else {
+                app.pause_logs();
+            }
+        }
         KeyCode::Char('u') => {
             if app.config.controller.subscription_url.trim().is_empty() {
                 app.open_setup(Screen::Dashboard);
             } else {
-                update_subscription_async(app.config.controller.clone(), app.tx.clone());
+                app.update_subscription();
             }
         }
         KeyCode::Char('t') => {
             app.config.settings.show_traffic = !app.config.settings.show_traffic;
-            app.config.save();
+            app.save_preferences();
         }
         KeyCode::Char('p') => app.main_tab = MainTab::Proxies,
         KeyCode::Char('c') => {
@@ -1626,7 +1888,11 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                         .unwrap_or(app.snapshot.connections.len() - 1);
                 }
             }
-            MainTab::Logs | MainTab::Dns => {}
+            MainTab::Logs => {
+                app.pause_logs();
+                app.log_index = app.log_index.saturating_sub(1);
+            }
+            MainTab::Dns => {}
             MainTab::Rules => {
                 let len = app.filtered_rule_indexes().len();
                 if len > 0 {
@@ -1660,10 +1926,19 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             },
             MainTab::Connections => {
                 if !app.snapshot.connections.is_empty() {
-                    app.conn_index = (app.conn_index + 1) % app.snapshot.connections.len();
+                    app.conn_index = if app.conn_index >= app.snapshot.connections.len() {
+                        0
+                    } else {
+                        (app.conn_index + 1) % app.snapshot.connections.len()
+                    };
                 }
             }
-            MainTab::Logs | MainTab::Dns => {}
+            MainTab::Logs => {
+                app.pause_logs();
+                app.log_index =
+                    (app.log_index + 1).min(app.filtered_logs().len().saturating_sub(1));
+            }
+            MainTab::Dns => {}
             MainTab::Rules => {
                 let len = app.filtered_rule_indexes().len();
                 if len > 0 {
@@ -1684,21 +1959,31 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             MainTab::Dns => app.submit_dns_query(),
             MainTab::Rules => app.explain_selected_rule(),
             MainTab::Providers => app.refresh_selected_provider(),
-            MainTab::Connections | MainTab::Logs => {}
+            MainTab::Connections => {
+                app.connection_detail = true;
+                app.detail_scroll = 0;
+            }
+            MainTab::Logs => {
+                app.pause_logs();
+                app.log_detail = true;
+                app.detail_scroll = 0;
+            }
         },
         KeyCode::Char('x') if app.main_tab == MainTab::Rules => app.toggle_selected_rule(),
         KeyCode::Char('x') if app.main_tab == MainTab::Connections => {
             if let Some(c) = app.snapshot.connections.get(app.conn_index) {
                 let id = c.id.clone();
-                if close_connection(&app.config.controller, Some(&id)).is_ok() {
-                    app.refresh_snapshot_now();
-                }
+                app.run_action("Closing connection…", None, None, move |cfg| {
+                    close_connection(&cfg, Some(&id)).map_err(|e| e.to_string())?;
+                    Ok("Connection closed".into())
+                });
             }
         }
         KeyCode::Char('X') if app.main_tab == MainTab::Connections => {
-            if close_connection(&app.config.controller, None).is_ok() {
-                app.refresh_snapshot_now();
-            }
+            app.run_action("Closing all connections…", None, None, |cfg| {
+                close_connection(&cfg, None).map_err(|e| e.to_string())?;
+                Ok("All connections closed".into())
+            });
         }
         _ => {}
     }
@@ -1753,7 +2038,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
                 return false;
             }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
+                KeyCode::Esc => app.close_overlay(),
                 KeyCode::Enter => app.submit_probe(),
                 KeyCode::Backspace => {
                     app.probe_editor.backspace();
@@ -1806,7 +2091,6 @@ fn handle_dns_edit_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => app.dns_editing = false,
         KeyCode::Enter => app.submit_dns_query(),
-        KeyCode::Char('F') => app.flush_dns_cache(),
         KeyCode::Char('[') => app.cycle_dns_qtype(-1),
         KeyCode::Char(']') => app.cycle_dns_qtype(1),
         KeyCode::Backspace => {
@@ -1937,6 +2221,12 @@ fn handle_setup_key(app: &mut App, key: KeyEvent) -> bool {
 
 fn handle_help_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
+        KeyCode::Up | KeyCode::Char('k') => app.help_scroll = app.help_scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => app.help_scroll = app.help_scroll.saturating_add(1),
+        KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(8),
+        KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(8),
+        KeyCode::Home => app.help_scroll = 0,
+
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
             app.screen = Screen::Dashboard;
         }
@@ -1950,6 +2240,140 @@ mod tests {
     use super::*;
     use ratatui::{buffer::Buffer, layout::Rect, text::Line, widgets::Widget};
     use ui::Panel;
+
+    fn offline_app() -> App {
+        let mut app = App::from_snapshot(Config::default(), CoreSnapshot::default());
+        app.screen = Screen::Dashboard;
+        app
+    }
+
+    fn press(app: &mut App, key: KeyCode) -> bool {
+        handle_key(app, KeyEvent::new(key, KeyModifiers::NONE))
+    }
+
+    fn render_text(app: &mut App, width: u16, height: u16) -> String {
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        term.draw(|frame| ui::draw(frame, app)).unwrap();
+        term.backend()
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| {
+                row.iter()
+                    .filter(|c| c.symbol() != " ")
+                    .map(|c| c.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn input_keeps_q_and_uppercase_f_and_escape_never_quits_dashboard() {
+        let mut app = offline_app();
+        app.overlay = Overlay::Probe;
+        for ch in "qq.com".chars() {
+            assert!(!press(&mut app, KeyCode::Char(ch)));
+        }
+        assert_eq!(app.probe_editor.text, "qq.com");
+        assert_eq!(app.overlay, Overlay::Probe);
+        press(&mut app, KeyCode::Esc);
+        app.main_tab = MainTab::Dns;
+        app.dns_editing = true;
+        app.dns_editor.clear();
+        for ch in "Foo.test".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        assert_eq!(app.dns_editor.text, "Foo.test");
+        press(&mut app, KeyCode::Esc);
+        for _ in 0..3 {
+            assert!(!press(&mut app, KeyCode::Esc));
+        }
+        assert_eq!(app.main_tab, MainTab::Proxies);
+        assert!(press(&mut app, KeyCode::Char('q')));
+    }
+
+    #[test]
+    fn connection_selection_follows_id_and_does_not_replace_expired_target() {
+        let mut app = offline_app();
+        let connection = |id: &str| {
+            mihomo::connection_from_value(&serde_json::json!({"id": id, "metadata": {"host": id}}))
+                .unwrap()
+        };
+        app.snapshot.connections = vec![connection("a"), connection("b")];
+        app.conn_index = 1;
+        let mut next = app.snapshot.clone();
+        next.connections.reverse();
+        app.accept_snapshot(next);
+        assert_eq!(app.snapshot.connections[app.conn_index].id, "b");
+        let mut next = app.snapshot.clone();
+        next.connections.remove(0);
+        app.accept_snapshot(next);
+        assert!(app.snapshot.connections.get(app.conn_index).is_none());
+        app.main_tab = MainTab::Connections;
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.snapshot.connections[app.conn_index].id, "a");
+    }
+
+    #[test]
+    fn paused_logs_keep_reading_position_while_capture_continues() {
+        let mut app = offline_app();
+        app.main_tab = MainTab::Logs;
+        app.logs = vec![
+            ("info".into(), "first".into()),
+            ("error".into(), "second".into()),
+        ];
+        press(&mut app, KeyCode::Char('P'));
+        app.tx
+            .send(BackendEvent::Log {
+                level: "info".into(),
+                payload: "third".into(),
+            })
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.filtered_logs().len(), 2);
+        assert_eq!(app.logs.len(), 3);
+        press(&mut app, KeyCode::Char('/'));
+        for ch in "error".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.filtered_logs().len(), 1);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.log_detail);
+        assert!(render_text(&mut app, 60, 18).contains("second"));
+    }
+
+    #[test]
+    fn status_help_and_connection_detail_remain_accessible_in_small_windows() {
+        let mut app = offline_app();
+        app.config.settings.show_traffic = false;
+        app.status_message = "REVIEW_ERROR_SENTINEL".into();
+        app.status_is_error = true;
+        for (width, height) in [(60, 18), (80, 24), (120, 30)] {
+            assert!(render_text(&mut app, width, height).contains("REVIEW_ERROR_SENTINEL"));
+            app.screen = Screen::Help;
+            app.help_scroll = u16::MAX;
+            let help = render_text(&mut app, width, height);
+            assert!(help.contains("q"));
+            assert!(app.help_scroll < u16::MAX);
+            let previous = app.help_scroll;
+            press(&mut app, KeyCode::Up);
+            assert_eq!(app.help_scroll, previous.saturating_sub(1));
+            app.screen = Screen::Dashboard;
+        }
+        app.snapshot.connections = vec![mihomo::connection_from_value(
+            &serde_json::json!({"id":"a", "metadata":{"host":"visible.test", "process":"curl"}}),
+        )
+        .unwrap()];
+        app.snapshot.connections[0].host = "visible.test".into();
+        app.main_tab = MainTab::Connections;
+        app.conn_index = 0;
+        press(&mut app, KeyCode::Enter);
+        assert!(render_text(&mut app, 60, 18).contains("visible.test"));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.connection_detail);
+    }
 
     #[test]
     fn panel_renders_rounded_btop_style_title_cutout() {
@@ -2074,8 +2498,8 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_esc_quits_from_proxies_and_steps_back_elsewhere() {
-        assert_eq!(dashboard_esc(MainTab::Proxies, true), EscStep::Quit);
+    fn dashboard_esc_steps_back_without_quitting() {
+        assert_eq!(dashboard_esc(MainTab::Proxies, true), EscStep::Proxies);
         assert_eq!(dashboard_esc(MainTab::Rules, false), EscStep::ClearQuery);
         assert_eq!(dashboard_esc(MainTab::Rules, true), EscStep::Proxies);
         assert_eq!(dashboard_esc(MainTab::Providers, true), EscStep::Proxies);

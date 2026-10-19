@@ -222,8 +222,12 @@ pub fn draw_providers(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-pub fn draw_connections(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw_connections(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme();
+    if app.connection_detail {
+        draw_connection_detail(frame, app, area);
+        return;
+    }
     let split = area.width >= 78;
     let (list_area, detail_area) = if split {
         let cols = Layout::default()
@@ -473,13 +477,16 @@ fn draw_rule_query(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_connection_detail(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_connection_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme();
     let inner = draw_panel(
         frame,
         area,
         theme,
-        Some(panel_title(app.t("connections").to_string(), theme)),
+        Some(panel_title(
+            format!("{} · Enter/Esc 返回 · ↑↓ scroll", app.t("connections")),
+            theme,
+        )),
         false,
     );
     let Some(conn) = app.snapshot.connections.get(app.conn_index) else {
@@ -564,7 +571,22 @@ fn draw_connection_detail(frame: &mut Frame, app: &App, area: Rect) {
     if !conn.start.is_empty() {
         lines.push(kv(theme, "start", &short_stamp(&conn.start)));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
+    let max = paragraph
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize);
+    app.detail_scroll = app.detail_scroll.min(max as u16);
+    frame.render_widget(
+        paragraph.scroll((
+            if app.connection_detail {
+                app.detail_scroll
+            } else {
+                0
+            },
+            0,
+        )),
+        inner,
+    );
 }
 
 fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {

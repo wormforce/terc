@@ -10,9 +10,8 @@ use crate::{
     mihomo::{
         dns_query_async, flush_dns_async, is_info_pseudo_node, normalize_subscription,
         persist_nested_bool, probe_async, provider_healthcheck, read_config_text,
-        refresh_all_providers_async, refresh_provider_async, reload_config_async, set_bool_config,
-        set_rule_disabled, set_tun_enabled, test_group_delays_async, test_node_async,
-        write_config_text, ProxyNode,
+        refresh_all_providers_async, refresh_provider_async, set_bool_config, set_rule_disabled,
+        set_tun_enabled, test_group_delays_async, test_node_async, ProxyNode,
     },
     ops::{
         apply_enabled_modules, enabled_snippets, explain_rules, is_runtime_tunnel, list_profiles,
@@ -88,71 +87,64 @@ impl App {
     }
 
     pub fn toggle_tun(&mut self) {
-        let next = !self.snapshot.tun_enabled;
-        if self.apply_runtime_switch(
-            self.snapshot.running.then(|| {
-                set_tun_enabled(&self.config.controller, next).map_err(|err| err.to_string())
-            }),
-            &["tun", "enable"],
-            next,
-            if next { "st_tun_on" } else { "st_tun_off" },
-        ) {
-            self.snapshot.tun_enabled = next;
-        }
+        self.runtime_switch(&["tun", "enable"], "tun", !self.snapshot.tun_enabled);
     }
 
     pub fn toggle_sniffing(&mut self) {
-        let next = !self.snapshot.sniffing;
-        if self.apply_runtime_switch(
-            self.snapshot.running.then(|| {
-                set_bool_config(&self.config.controller, "sniffing", next)
-                    .map_err(|err| err.to_string())
-            }),
-            &["sniffer", "enable"],
-            next,
-            if next { "st_sniff_on" } else { "st_sniff_off" },
-        ) {
-            self.snapshot.sniffing = next;
-        }
+        self.runtime_switch(&["sniffer", "enable"], "sniffing", !self.snapshot.sniffing);
     }
 
     pub fn toggle_ipv6(&mut self) {
-        let next = !self.snapshot.ipv6;
-        if self.apply_runtime_switch(
-            self.snapshot.running.then(|| {
-                set_bool_config(&self.config.controller, "ipv6", next)
-                    .map_err(|err| err.to_string())
-            }),
-            &["ipv6"],
-            next,
-            if next { "st_ipv6_on" } else { "st_ipv6_off" },
-        ) {
-            self.snapshot.ipv6 = next;
-        }
+        self.runtime_switch(&["ipv6"], "ipv6", !self.snapshot.ipv6);
+    }
+
+    fn runtime_switch(&mut self, path: &[&str], field: &str, next: bool) {
+        let path: Vec<String> = path.iter().map(|p| p.to_string()).collect();
+        let field = field.to_string();
+        let running = self.snapshot.running;
+        self.run_action("Applying runtime switch…", None, None, move |cfg| {
+            if running {
+                if field == "tun" {
+                    set_tun_enabled(&cfg, next)
+                } else {
+                    set_bool_config(&cfg, &field, next)
+                }
+                .map_err(|err| format!("Runtime change rejected: {err}"))?;
+            }
+            let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+            persist_nested_bool(&cfg, &refs, next).map_err(|err| {
+                if running {
+                    format!("Runtime changed, but could not save: {err}")
+                } else {
+                    err
+                }
+            })?;
+            Ok(if running {
+                "Runtime changed and saved"
+            } else {
+                "Saved; core stopped"
+            }
+            .into())
+        });
     }
 
     pub fn toggle_dns(&mut self) {
-        let raw = match read_config_text(&self.config.controller) {
-            Ok(text) => text,
-            Err(err) => {
-                self.set_status(&err, true);
-                return;
+        let running = self.snapshot.running;
+        self.run_action("Updating DNS configuration…", None, None, move |cfg| {
+            let raw = read_config_text(&cfg)?;
+            let dns = parse_dns_block(&raw);
+            if !dns.present {
+                return Err("No DNS block is configured".into());
             }
-        };
-        let dns = parse_dns_block(&raw);
-        if !dns.present {
-            self.set_status(self.t("st_dns_missing"), true);
-            return;
-        }
-        let next = !dns.enable;
-        let updated = crate::ops::set_nested_bool(&raw, &["dns", "enable"], next);
-        if let Err(err) = write_config_text(&self.config.controller, &updated) {
-            self.set_status(&err, true);
-            return;
-        }
-        self.snapshot.dns.enable = next;
-        self.snapshot.dns.present = true;
-        self.reload_or_save(if next { "st_dns_on" } else { "st_dns_off" });
+            let updated = crate::ops::set_nested_bool(&raw, &["dns", "enable"], !dns.enable);
+            crate::mihomo::install_config(&cfg, &updated, running)?;
+            Ok(if running {
+                "DNS configuration applied"
+            } else {
+                "DNS saved; core stopped"
+            }
+            .into())
+        });
     }
 
     pub fn submit_dns_query(&mut self) {
@@ -215,29 +207,15 @@ impl App {
             return;
         }
         let disabled = !rule.disabled;
-        match set_rule_disabled(&self.config.controller, rule.index, disabled) {
-            Ok(()) => {
-                if let Some(slot) = self
-                    .snapshot
-                    .rules
-                    .iter_mut()
-                    .find(|item| item.index == rule.index)
-                {
-                    slot.disabled = disabled;
-                }
-                self.set_status(
-                    self.t(if disabled {
-                        "st_rule_off"
-                    } else {
-                        "st_rule_on"
-                    }),
-                    false,
-                );
-                self.refresh_snapshot_now();
-                self.clamp_aux();
+        self.run_action("Updating rule…", None, None, move |cfg| {
+            set_rule_disabled(&cfg, rule.index, disabled).map_err(|e| e.to_string())?;
+            Ok(if disabled {
+                "Rule disabled"
+            } else {
+                "Rule enabled"
             }
-            Err(err) => self.set_status(&format!("{} · {err}", self.t("st_rule_fail")), true),
-        }
+            .into())
+        });
     }
 
     pub fn refresh_selected_provider(&mut self) {
@@ -265,13 +243,10 @@ impl App {
             self.set_status(self.t("st_provider_rule"), false);
             return;
         }
-        match provider_healthcheck(&self.config.controller, &provider.name) {
-            Ok(()) => self.set_status(
-                &format!("{} {}", self.t("st_provider_health"), provider.name),
-                false,
-            ),
-            Err(err) => self.set_status(&err, true),
-        }
+        self.run_action("Running provider health check…", None, None, move |cfg| {
+            provider_healthcheck(&cfg, &provider.name)?;
+            Ok(format!("Health check requested: {}", provider.name))
+        });
     }
 
     pub fn refresh_all_providers(&mut self) {
@@ -316,18 +291,22 @@ impl App {
             ids.retain(|id| id != &module.id);
         }
         let snippets = enabled_snippets(&self.catalog, &ids);
-        let next = apply_enabled_modules(&raw, &snippets);
-        if let Err(err) = write_config_text(&self.config.controller, &next) {
-            self.set_status(&err, true);
-            return;
-        }
-        self.config.enabled_modules = ids;
-        self.config.save();
-        self.reload_or_save(if enabling {
-            "st_module_on"
-        } else {
-            "st_module_off"
-        });
+        let running = self.snapshot.running;
+        self.run_action(
+            "Applying module configuration…",
+            Some(ids),
+            None,
+            move |cfg| {
+                let next = apply_enabled_modules(&raw, &snippets)?;
+                crate::mihomo::install_config(&cfg, &next, running)?;
+                Ok(if enabling {
+                    "Module enabled"
+                } else {
+                    "Module disabled"
+                }
+                .into())
+            },
+        );
     }
 
     pub fn open_profiles(&mut self) {
@@ -347,15 +326,23 @@ impl App {
                 return;
             }
         };
-        let normalized = normalize_subscription(&raw, &self.config.controller.addr);
-        if let Err(err) = write_config_text(&self.config.controller, &normalized) {
-            self.set_status(&err, true);
-            return;
-        }
-        self.config.active_profile = profile.name.clone();
-        self.config.save();
-        self.profiles = self.profile_list();
-        self.reload_or_save("st_profile");
+        let modules = enabled_snippets(
+            &module_catalog(&modules_dir(&home_dir())),
+            &self.config.enabled_modules,
+        );
+        let running = self.snapshot.running;
+        self.run_action(
+            "Applying configuration profile…",
+            None,
+            Some(profile.name),
+            move |cfg| {
+                let base = crate::ops::strip_marked_modules(&raw);
+                let normalized = normalize_subscription(&base, &cfg.addr);
+                let generated = apply_enabled_modules(&normalized, &modules)?;
+                crate::mihomo::install_config(&cfg, &generated, running)?;
+                Ok("Profile applied".into())
+            },
+        );
     }
 
     pub fn save_profile_copy(&mut self) {
@@ -382,7 +369,7 @@ impl App {
             .and_then(|stem| stem.to_str())
             .unwrap_or("profile")
             .to_string();
-        self.config.save();
+        self.save_preferences();
         self.profiles = self.profile_list();
         self.profile_index = self
             .profiles
@@ -398,7 +385,16 @@ impl App {
             return;
         }
         self.set_status(self.t("st_reloading"), false);
-        reload_config_async(self.config.controller.clone(), self.tx.clone());
+        self.run_action(
+            "Validating and reloading configuration…",
+            None,
+            None,
+            |cfg| {
+                let raw = read_config_text(&cfg)?;
+                crate::mihomo::install_config(&cfg, &raw, true)?;
+                Ok("Configuration reloaded".into())
+            },
+        );
     }
 
     pub fn open_probe(&mut self) {
@@ -469,50 +465,6 @@ impl App {
         let indexes = self.filtered_rule_indexes();
         let raw = *indexes.get(self.rule_index)?;
         self.snapshot.rules.get(raw)
-    }
-
-    fn apply_runtime_switch(
-        &mut self,
-        api: Option<Result<(), String>>,
-        yaml_path: &[&str],
-        next: bool,
-        ok_key: &'static str,
-    ) -> bool {
-        let file_ok = persist_nested_bool(&self.config.controller, yaml_path, next).is_ok();
-        match api {
-            Some(Ok(())) => {
-                self.set_status(self.t(ok_key), false);
-                true
-            }
-            Some(Err(err)) => {
-                if file_ok {
-                    self.set_status(self.t("st_saved_core_down"), false);
-                } else {
-                    self.set_status(&err, true);
-                }
-                file_ok
-            }
-            None => {
-                if file_ok {
-                    self.set_status(self.t("st_saved_core_down"), false);
-                } else {
-                    self.set_status(self.t("st_core_down"), true);
-                }
-                file_ok
-            }
-        }
-    }
-
-    fn reload_or_save(&mut self, ok_key: &'static str) {
-        if self.snapshot.running {
-            self.set_status(self.t("st_reloading"), false);
-            reload_config_async(self.config.controller.clone(), self.tx.clone());
-        } else {
-            self.set_status(
-                &format!("{} · {}", self.t(ok_key), self.t("st_saved_core_down")),
-                false,
-            );
-        }
     }
 
     fn profile_list(&self) -> Vec<ProfileEntry> {

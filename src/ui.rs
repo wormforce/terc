@@ -286,7 +286,7 @@ pub fn format_rate(bytes_per_sec: u64) -> String {
     format!("{}/s", format_bytes(bytes_per_sec))
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
     let theme = app.theme();
     frame
@@ -301,28 +301,69 @@ pub fn draw(frame: &mut Frame, app: &App) {
         return;
     }
 
+    let content = Rect::new(size.x, size.y, size.width, size.height.saturating_sub(1));
     match app.screen {
         Screen::Dashboard => {
-            draw_dashboard(frame, app, size);
-            crate::panels::draw_overlay(frame, app, size);
+            draw_dashboard(frame, app, content);
+            crate::panels::draw_overlay(frame, app, content);
         }
         Screen::Settings => {
-            draw_dashboard(frame, app, size);
-            draw_settings(frame, app, size);
+            draw_dashboard(frame, app, content);
+            draw_settings(frame, app, content);
         }
         Screen::Help => {
-            draw_dashboard(frame, app, size);
-            draw_help(frame, app, size);
+            draw_dashboard(frame, app, content);
+            draw_help(frame, app, content);
         }
         Screen::Setup => {
             if app.setup_origin == Screen::Settings {
-                draw_dashboard(frame, app, size);
-                draw_settings(frame, app, size);
+                draw_dashboard(frame, app, content);
+                draw_settings(frame, app, content);
             } else {
-                draw_dashboard(frame, app, size);
+                draw_dashboard(frame, app, content);
             }
-            draw_setup(frame, app, size);
+            draw_setup(frame, app, content);
         }
+    }
+    let status = if app.status_message.is_empty() {
+        "? 帮助 / Help   q 退出 / Quit".to_string()
+    } else {
+        format!(
+            "{} [!] {}",
+            if app.status_is_error {
+                "✗"
+            } else if app.action_busy {
+                "…"
+            } else {
+                "›"
+            },
+            app.status_message.replace('\n', " · ")
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(status).style(Style::default().fg(if app.status_is_error {
+            theme.accent
+        } else {
+            theme.muted
+        })),
+        Rect::new(size.x, size.bottom() - 1, size.width, 1),
+    );
+    if app.status_detail {
+        let popup = centered_rect(92, 84, content);
+        frame.render_widget(Clear, popup);
+        let inner = draw_panel(
+            frame,
+            popup,
+            theme,
+            Some(panel_title("Status · ↑↓ scroll · Esc".into(), theme)),
+            true,
+        );
+        let paragraph = Paragraph::new(app.status_message.clone()).wrap(Wrap { trim: false });
+        let max = paragraph
+            .line_count(inner.width)
+            .saturating_sub(inner.height as usize);
+        app.detail_scroll = app.detail_scroll.min(max as u16);
+        frame.render_widget(paragraph.scroll((app.detail_scroll, 0)), inner);
     }
 }
 
@@ -338,7 +379,7 @@ pub fn editor_cursor_cell(chars: &[char], cursor: usize, area: Rect) -> Option<(
     Some((area.x + col.min(area.width as usize - 1) as u16, area.y))
 }
 
-fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_dashboard(frame: &mut Frame, app: &mut App, area: Rect) {
     let toolbar_h = if app.config.settings.show_toolbar {
         1
     } else {
@@ -685,8 +726,7 @@ fn draw_overview_panel(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ]));
 
-    let show_status = !app.status_message.is_empty() && inner.height < 5;
-    if inner.height >= 3 && !show_status {
+    if inner.height >= 3 {
         let stack = if app.snapshot.tun_stack.is_empty() {
             "—".to_string()
         } else {
@@ -697,7 +737,11 @@ fn draw_overview_panel(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             app.snapshot.find_process.clone()
         };
-        let port = app.snapshot.mixed_port.max(app.snapshot.http_port);
+        let port = if app.snapshot.mixed_port > 0 {
+            app.snapshot.mixed_port
+        } else {
+            app.snapshot.http_port
+        };
         lines.push(Line::from(vec![
             Span::styled(" :", Style::default().fg(theme.muted)),
             Span::styled(format!("{port:<5}"), Style::default().fg(theme.text)),
@@ -737,18 +781,6 @@ fn draw_overview_panel(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ]));
         }
-    }
-
-    if !app.status_message.is_empty() && (inner.height >= 5 || show_status) {
-        let msg_color = if app.status_is_error {
-            theme.accent
-        } else {
-            theme.peak
-        };
-        lines.push(Line::from(Span::styled(
-            format!(" › {}", app.status_message),
-            Style::default().fg(msg_color),
-        )));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -963,54 +995,103 @@ fn draw_nodes_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_logs_main(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_logs_main(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme();
-    let title = module_title_line(theme, app.lang(), 'l', "Logs", app.t("logs"));
-    let inner = draw_panel(frame, area, theme, Some(title), true);
-    if inner.width < 10 || inner.height < 2 {
+    let mode = if app.logs_paused { "Paused" } else { "Live" };
+    let inner = draw_panel(
+        frame,
+        area,
+        theme,
+        Some(panel_title(
+            format!(
+                "{} · {mode} · P pause · / search · Enter detail",
+                app.t("logs")
+            ),
+            theme,
+        )),
+        true,
+    );
+    let logs = app.filtered_logs();
+    if app.log_detail {
+        if let Some((level, text)) = logs.get(app.log_index) {
+            let paragraph = Paragraph::new(format!("{level} · Esc back · ↑↓ scroll\n\n{text}"))
+                .wrap(Wrap { trim: false });
+            let max = paragraph
+                .line_count(inner.width)
+                .saturating_sub(inner.height as usize);
+            app.detail_scroll = app.detail_scroll.min(max as u16);
+            frame.render_widget(paragraph.scroll((app.detail_scroll, 0)), inner);
+        }
         return;
     }
-
-    if app.logs.is_empty() {
-        frame.render_widget(
-            Paragraph::new(app.t("no_logs"))
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(theme.muted)),
-            inner,
-        );
+    let query = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
+    frame.render_widget(
+        Paragraph::new(format!(
+            "/ {}{}",
+            app.log_query.text,
+            if app.log_editing { "▌" } else { "" }
+        ))
+        .style(Style::default().fg(theme.accent)),
+        query,
+    );
+    let body = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    if logs.is_empty() {
+        frame.render_widget(Paragraph::new(app.t("no_logs")), body);
         return;
     }
-
-    let visible_h = inner.height as usize;
-    let skip = app.logs.len().saturating_sub(visible_h);
-    let items: Vec<ListItem> = app
-        .logs
+    let selected = if app.logs_paused {
+        app.log_index.min(logs.len() - 1)
+    } else {
+        logs.len() - 1
+    };
+    let start = visible_list_start(selected, logs.len(), body.height as usize);
+    let items: Vec<ListItem> = logs
         .iter()
-        .skip(skip)
-        .map(|(lvl, msg)| {
-            let lvl_color = match lvl.as_str() {
+        .enumerate()
+        .skip(start)
+        .take(body.height as usize)
+        .map(|(index, (level, text))| {
+            let color = match level.as_str() {
                 "error" | "err" => theme.accent,
                 "warning" | "warn" => theme.mid,
-                _ => theme.peak,
+                _ => theme.text,
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" {:<5} ", lvl.to_uppercase()),
-                    Style::default().fg(lvl_color).add_modifier(Modifier::BOLD),
+            ListItem::new(Line::styled(
+                format!(
+                    "{} {:<5} {}",
+                    if app.logs_paused && index == selected {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    level.to_uppercase(),
+                    text
                 ),
-                Span::styled(
-                    truncate_str(msg, inner.width.saturating_sub(9) as usize),
-                    Style::default().fg(theme.text),
-                ),
-            ]))
+                Style::default().fg(color),
+            ))
         })
         .collect();
-
-    frame.render_widget(List::new(items), inner);
+    frame.render_widget(List::new(items), body);
 }
 
 fn toolbar_line(app: &App, width: u16) -> Line<'static> {
     let theme = app.theme();
+    let context = match app.main_tab {
+        MainTab::Connections => Some("↑↓ 选择  Enter 详情  x 断开  X 全部断开  Esc 返回"),
+        MainTab::Logs => Some("↑↓ 阅读  P 暂停/继续  / 搜索  Enter 全文  Esc 返回"),
+        MainTab::Dns => Some("e 编辑  Enter 查询  [ ] 类型  F 清缓存  Esc 返回"),
+        MainTab::Rules => Some("/ 过滤与解释  Enter 解释  x 禁用/恢复  F 刷新  Esc 返回"),
+        MainTab::Providers => Some("Enter 刷新当前  F 全部刷新  H 健康检查  Esc 返回"),
+        MainTab::Proxies => None,
+    };
+    if let Some(text) = context {
+        return Line::styled(text, Style::default().fg(theme.muted));
+    }
     let mut spans = vec![
         Span::styled(
             "Space ",
@@ -1235,15 +1316,18 @@ fn draw_settings_compact(frame: &mut Frame, app: &App, area: Rect) {
     draw_settings_rows(frame, app, inset_rect(area, 1, 0), &rows);
 }
 
-fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(76, 78, area);
+fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
+    let popup = centered_rect(94, 92, area);
     frame.render_widget(Clear, popup);
     let theme = app.theme();
     let inner = draw_panel(
         frame,
         popup,
         theme,
-        Some(panel_title(app.t("help").to_string(), theme)),
+        Some(panel_title(
+            format!("{} · ↑↓ / PgUp PgDn", app.t("help")),
+            theme,
+        )),
         true,
     );
 
@@ -1262,57 +1346,36 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ("↑↓ jk", app.t("help_jk")),
         ("c / L / p", app.t("help_tabs")),
         ("t / s", app.t("help_t")),
+        ("K", "启动/停止 terc 管理的内核 · Start/stop managed core"),
+        (
+            "Logs: P / Enter",
+            "日志：暂停、搜索、全文 · Logs: pause, search, full text",
+        ),
+        ("!", "查看完整操作结果 · Full operation result"),
         ("q", app.t("help_q")),
         ("Esc", app.t("help_esc")),
     ];
 
-    let mut lines = Vec::new();
-    let mid = shortcuts.len().div_ceil(2);
-    let two_col = inner.width >= 72;
-    if two_col {
-        for row in 0..mid {
-            let (left_key, left_desc) = shortcuts[row];
-            let right = shortcuts.get(row + mid);
-            let mut spans = vec![
+    let lines: Vec<Line> = shortcuts
+        .into_iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
                 Span::styled(
-                    format!(" {left_key:<16}"),
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{:<28}", truncate_str(left_desc, 28)),
-                    Style::default().fg(theme.text),
-                ),
-            ];
-            if let Some((key, desc)) = right {
-                spans.push(Span::styled(
-                    format!(" {key:<16}"),
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                spans.push(Span::styled(
-                    desc.to_string(),
-                    Style::default().fg(theme.text),
-                ));
-            }
-            lines.push(Line::from(spans));
-        }
-    } else {
-        for (key, desc) in shortcuts {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {key:<16}"),
+                    format!("{key}  "),
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(desc.to_string(), Style::default().fg(theme.text)),
-            ]));
-        }
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+            ])
+        })
+        .collect();
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
+    let max = paragraph
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize);
+    app.help_scroll = app.help_scroll.min(max as u16);
+    frame.render_widget(paragraph.scroll((app.help_scroll, 0)), inner);
 }
 
 /// Single-line input windowing: returns (first visible char, cursor column).
