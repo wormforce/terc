@@ -1081,7 +1081,7 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
 pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     let (pid, uid) = crate::privilege::managed_core(cfg)?;
     if cfg!(target_os = "macos") && uid == 0 {
-        crate::privilege::stop_core(cfg, pid)?;
+        crate::privilege::stop_core(pid)?;
     } else {
         let output = Command::new("kill")
             .args(["-TERM", &pid.to_string()])
