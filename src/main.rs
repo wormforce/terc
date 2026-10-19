@@ -110,8 +110,14 @@ pub struct Settings {
     pub theme: ThemeId,
     pub renderer: WaveRenderer,
     pub refresh_hz: u16,
+    #[serde(default = "default_graph_interval")]
+    pub graph_interval_secs: u64,
     pub show_traffic: bool,
     pub show_toolbar: bool,
+}
+
+fn default_graph_interval() -> u64 {
+    1
 }
 
 impl Default for Settings {
@@ -121,6 +127,7 @@ impl Default for Settings {
             theme: ThemeId::Spring,
             renderer: WaveRenderer::Braille,
             refresh_hz: 60,
+            graph_interval_secs: 1,
             show_traffic: true,
             show_toolbar: true,
         }
@@ -310,6 +317,8 @@ pub struct App {
     pub up_rate: u64,
     pub down_rate: u64,
     pub memory_inuse: u64,
+    pub graph_elapsed: Duration,
+    pub graph_samples: (f64, f64, u64),
     pub up_history: Vec<f32>,
     pub down_history: Vec<f32>,
     pub pulse_phase: f32,
@@ -393,6 +402,8 @@ impl App {
             up_rate: 0,
             down_rate: 0,
             memory_inuse: 0,
+            graph_elapsed: Duration::ZERO,
+            graph_samples: (0.0, 0.0, 0),
             up_history: vec![0.0; HISTORY_LEN],
             down_history: vec![0.0; HISTORY_LEN],
             pulse_phase: 0.0,
@@ -559,10 +570,9 @@ impl App {
                     self.up_rate = up;
                     self.down_rate = down;
                     self.snapshot.running = true;
-                    self.up_history.remove(0);
-                    self.up_history.push(up as f32);
-                    self.down_history.remove(0);
-                    self.down_history.push(down as f32);
+                    self.graph_samples.0 += up as f64;
+                    self.graph_samples.1 += down as f64;
+                    self.graph_samples.2 += 1;
                 }
                 BackendEvent::Memory { inuse } => {
                     self.memory_inuse = inuse;
@@ -670,7 +680,26 @@ impl App {
         }
     }
 
+    pub fn advance_graph(&mut self, elapsed: Duration) {
+        self.graph_elapsed += elapsed;
+        if self.graph_elapsed
+            < Duration::from_secs(self.config.settings.graph_interval_secs.clamp(1, 5))
+        {
+            return;
+        }
+        self.graph_elapsed = Duration::ZERO;
+        let (up, down, count) = self.graph_samples;
+        if count > 0 {
+            self.up_history.remove(0);
+            self.up_history.push((up / count as f64) as f32);
+            self.down_history.remove(0);
+            self.down_history.push((down / count as f64) as f32);
+            self.graph_samples = (0.0, 0.0, 0);
+        }
+    }
+
     pub fn tick(&mut self, elapsed: Duration) {
+        self.advance_graph(elapsed);
         let dt = elapsed.as_secs_f32();
         self.pulse_phase = (self.pulse_phase + dt * 0.9) % 1.0;
 
@@ -982,6 +1011,12 @@ impl App {
             },
             SettingRow {
                 category: SettingCategory::Appearance,
+                label: self.t("set_graph_interval").into(),
+                value: format!("{} s", self.config.settings.graph_interval_secs),
+                description: self.t("desc_graph_interval").into(),
+            },
+            SettingRow {
+                category: SettingCategory::Appearance,
                 label: self.t("set_lang").to_string(),
                 value: lang_label.to_string(),
                 description: self.t("desc_lang").to_string(),
@@ -1043,6 +1078,20 @@ impl App {
                 self.save_preferences();
             }
             7 => {
+                let intervals = [1, 2, 5];
+                let pos = intervals
+                    .iter()
+                    .position(|v| *v == self.config.settings.graph_interval_secs)
+                    .unwrap_or(0);
+                self.config.settings.graph_interval_secs =
+                    intervals[(pos as i32 + dir).rem_euclid(3) as usize];
+                self.graph_elapsed = Duration::ZERO;
+                self.graph_samples = (0.0, 0.0, 0);
+                self.up_history.fill(0.0);
+                self.down_history.fill(0.0);
+                self.save_preferences();
+            }
+            8 => {
                 let langs = [Lang::Zh, Lang::En, Lang::Ja];
                 let pos = langs
                     .iter()
@@ -1052,10 +1101,10 @@ impl App {
                 self.config.settings.lang = langs[next];
                 self.save_preferences();
             }
-            8 => {
+            9 => {
                 self.open_setup(Screen::Settings);
             }
-            9 => {
+            10 => {
                 if self.config.controller.subscription_url.trim().is_empty() {
                     self.open_setup(Screen::Settings);
                 } else {
@@ -1189,6 +1238,12 @@ impl App {
             (Lang::Zh, "desc_renderer") => "切换顶栏速率图样式：Braille（盲文点阵）或 Blocks（实心块），上下行以不同颜色分开展示。",
             (Lang::En, "desc_renderer") => "Switch traffic rate graph style: Braille or Blocks, with up/down drawn in separate colors.",
             (Lang::Ja, "desc_renderer") => "トラフィックグラフの描画スタイルを切り替えます。",
+            (Lang::Zh, "set_graph_interval") => "图表更新间隔",
+            (Lang::Ja, "set_graph_interval") => "グラフ更新間隔",
+            (_, "set_graph_interval") => "Graph interval",
+            (Lang::Zh, "desc_graph_interval") => "每 1 / 2 / 5 秒推进速率图，取期间平均速率。改变间隔会清空旧图；不影响实时速率读数。",
+            (Lang::Ja, "desc_graph_interval") => "1 / 2 / 5 秒の平均速度。変更時はグラフをクリアします。",
+            (_, "desc_graph_interval") => "Advance the graph every 1 / 2 / 5 seconds using average rates. Changing interval clears history; live rate readings stay current.",
             (Lang::Zh, "set_refresh") => "界面刷新率",
             (Lang::En, "set_refresh") => "Refresh Rate",
             (Lang::Ja, "set_refresh") => "リフレッシュレート",
@@ -1761,6 +1816,7 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
     }
     match key.code {
         KeyCode::Char('q') => return true,
+        KeyCode::Backspace => app.clear_status(),
         KeyCode::Esc => match dashboard_esc(app.main_tab, app.rule_query.text.is_empty()) {
             EscStep::ClearQuery => {
                 app.rule_query.clear();
@@ -2345,6 +2401,49 @@ mod tests {
     }
 
     #[test]
+    fn graph_interval_averages_samples_without_delaying_live_rates() {
+        let mut app = offline_app();
+        app.config.settings.graph_interval_secs = 2;
+        app.tx
+            .send(BackendEvent::Traffic { up: 100, down: 400 })
+            .unwrap();
+        app.drain_events();
+        app.advance_graph(Duration::from_secs(1));
+        assert_eq!(app.up_rate, 100);
+        assert_eq!(*app.up_history.last().unwrap(), 0.0);
+        app.tx
+            .send(BackendEvent::Traffic { up: 300, down: 800 })
+            .unwrap();
+        app.drain_events();
+        app.advance_graph(Duration::from_secs(1));
+        assert_eq!(app.up_rate, 300);
+        assert_eq!(*app.up_history.last().unwrap(), 200.0);
+        assert_eq!(*app.down_history.last().unwrap(), 600.0);
+        // No incoming samples must not duplicate a stale rate.
+        let previous = app.up_history.clone();
+        app.advance_graph(Duration::from_secs(2));
+        assert_eq!(app.up_history, previous);
+    }
+
+    #[test]
+    fn notification_leaves_one_footer_and_can_be_dismissed() {
+        let mut app = offline_app();
+        app.set_status("TEST_RESULT", false);
+        for (width, height) in [(42, 12), (80, 24), (120, 30)] {
+            let text = render_text(&mut app, width, height);
+            assert!(text.contains("TEST_RESULT"));
+            let footer = text.lines().last().unwrap();
+            assert!(footer.contains("q"));
+            assert!(!footer.contains("TEST_RESULT"));
+            press(&mut app, KeyCode::Char('!'));
+            assert!(app.status_detail);
+            press(&mut app, KeyCode::Esc);
+        }
+        press(&mut app, KeyCode::Backspace);
+        assert!(app.status_message.is_empty());
+    }
+
+    #[test]
     fn status_help_and_connection_detail_remain_accessible_in_small_windows() {
         let mut app = offline_app();
         app.config.settings.show_traffic = false;
@@ -2484,6 +2583,7 @@ mod tests {
         assert!(cfg.enabled_modules.is_empty());
         assert!(cfg.active_profile.is_empty());
         assert_eq!(cfg.settings.theme, ThemeId::Mono);
+        assert_eq!(cfg.settings.graph_interval_secs, 1);
     }
 
     #[test]

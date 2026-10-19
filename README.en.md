@@ -67,36 +67,36 @@ Transparency follows your terminal profile. `terc` leaves the background at its 
 
 | View | What you get |
 | --- | --- |
-| **Controls** | One rail for TUN, sniffer, system proxy, routing mode, DNS, IPv6, and WireGuard count |
-| **Traffic graph** | btop-style dual up/down rate history on an auto-scaled, labeled axis (`max …/s`), drawn as Braille or Blocks |
-| **Overview** | Core pulse, ports, TUN stack, process lookup, memory, connection count, and subscription quota |
 | **Groups & Nodes** | Dual-pane selector with protocol tags (`AnyTLS`, `SS`, etc.) and color-graded latency (`ms`) |
+| **Controls** | System proxy, routing mode, and TUN |
+| **Traffic graph** | btop-style dual up/down rate history on an auto-scaled, labeled axis (`max …/s`), drawn as Braille or Blocks |
+| **Overview** | Aligned core, mode, proxy, TUN, memory, and connection metrics; port and quota below |
+| **Profiles** | Switch another YAML onto the running config and hot-reload |
+| **Themes** | Spring, Vintage, and Mono; all preserve the terminal background |
+
+<details>
+<summary>Advanced tools and diagnostics</summary>
+
+| View | What you get |
+| --- | --- |
 | **Connections** | Process, inbound, sniff host, rule payload, chain, and geo/ASN, with one-key close |
 | **DNS** | Resolver status from the config, live lookup, and DNS / Fake-IP flush |
 | **Rules** | Ordered list with live hit counts, local explain, and runtime disable |
 | **Providers (`v`)** | `proxy-providers` and `rule-providers`, not the airport subscription URL. Refresh one or all; proxy providers can run a health check |
 | **Snippets** | YAML overlays for TUN, sniffer, Fake-IP, process lookup, TCP racing, and IPv6 |
-| **Profiles** | Switch another YAML onto the running config and hot-reload |
 | **Probe** | DNS answers plus a delay test of the selected node |
 | **Runtime** | TUN device and any WireGuard or Tailscale outbound the core already exposes |
 | **Logs** | Live core logs with severity highlighting, pause, search, and full-text reading |
-| **Themes** | Spring, Vintage, and Mono; all preserve the terminal background |
 
-The toolbar shows controls for the current view. A separate status row keeps operation results visible; press `!` for the full result. Help scrolls with arrow keys or Page Up/Down. In Connections, Enter opens full details even in a narrow terminal. In Logs, use `P` to pause/resume, `/` to search, and Enter to read the full message.
+</details>
+
+The footer has one line of shortcuts. Operation results appear in the content area: Backspace dismisses them; `!` opens the full result. Help scrolls with arrow keys or Page Up/Down. In Connections, Enter opens full details even in a narrow terminal. In Logs, use `P` to pause/resume, `/` to search, and Enter to read the full message.
 
 ## Controls
 
 | Where | Key | Action |
 | --- | --- | --- |
 | Dashboard / Settings | <kbd>Space</kbd> | Toggle the system proxy. macOS uses `networksetup`; Linux uses GNOME `gsettings` and otherwise leaves it unchanged. Never toggled for you |
-| Dashboard | <kbd>T</kbd> / <kbd>n</kbd> / <kbd>i</kbd> | Toggle TUN, sniffer, or IPv6. Runtime `PATCH`, then the same value is written back |
-| Dashboard | <kbd>D</kbd> | Toggle `dns.enable` in the config and hot-reload |
-| Dashboard | <kbd>d</kbd> / <kbd>g</kbd> / <kbd>v</kbd> | DNS, rules, providers |
-| Dashboard | <kbd>o</kbd> / <kbd>f</kbd> / <kbd>b</kbd> / <kbd>w</kbd> | Snippet gallery, profiles, probe, WireGuard / runtime |
-| Rules | <kbd>/</kbd> or <kbd>e</kbd> | Filter the list and explain a host, IP, or `process:name` |
-| Rules | <kbd>x</kbd> | Disable or restore the selected rule (`PATCH /rules/disable`) |
-| DNS | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>[</kbd> <kbd>]</kbd> | Look up, flush DNS and Fake-IP, cycle record type |
-| Providers | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>H</kbd> | Refresh the selected provider, refresh all, or health-check a proxy provider |
 | Dashboard | <kbd>K</kbd> | Start or stop the background `mihomo` process managed by terc |
 | Proxies | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Tab</kbd> | Switch focus between **Groups `[1]`** and **Nodes `[2]`** |
 | Any list | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd> | Move the selection |
@@ -109,7 +109,6 @@ The toolbar shows controls for the current view. A separate status row keeps ope
 | Setup window | <kbd>Ctrl+U</kbd> / <kbd>Ctrl+D</kbd> | Clear the input line / download a managed `mihomo` core |
 | Setup window | <kbd>Esc</kbd> | Dismiss for now — <kbd>u</kbd> reopens it while nothing is configured |
 | Dashboard | <kbd>p</kbd> / <kbd>c</kbd> / <kbd>L</kbd> | Switch main pane: **Proxies** / **Connections** / **Logs** |
-| Connections | <kbd>x</kbd> / <kbd>X</kbd> | Close selected connection / close all active connections |
 | Dashboard | <kbd>t</kbd> | Show or hide the top Traffic & Overview panels |
 | Dashboard | <kbd>s</kbd> | Open the dual-pane Settings board. Press again there to return |
 | Settings | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Enter</kbd> | Adjust setting or trigger action |
@@ -119,9 +118,26 @@ The toolbar shows controls for the current view. A separate status row keeps ope
 | Dashboard | <kbd>Esc</kbd> | Return to the proxy list; press q to quit |
 | Settings / Help | <kbd>Esc</kbd> | Return to the dashboard |
 
+<details>
+<summary>Advanced shortcuts</summary>
+
+| Where | Key | Action |
+| --- | --- | --- |
+| Dashboard | <kbd>T</kbd> / <kbd>n</kbd> / <kbd>i</kbd> | Toggle TUN, sniffer, or IPv6. Runtime `PATCH`, then the same value is written back |
+| Dashboard | <kbd>D</kbd> | Toggle `dns.enable` in the config and hot-reload |
+| Dashboard | <kbd>d</kbd> / <kbd>g</kbd> / <kbd>v</kbd> | DNS, rules, providers |
+| Dashboard | <kbd>o</kbd> / <kbd>f</kbd> / <kbd>b</kbd> / <kbd>w</kbd> | Snippet gallery, profiles, probe, WireGuard / runtime |
+| Rules | <kbd>/</kbd> or <kbd>e</kbd> | Filter the list and explain a host, IP, or `process:name` |
+| Rules | <kbd>x</kbd> | Disable or restore the selected rule (`PATCH /rules/disable`) |
+| DNS | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>[</kbd> <kbd>]</kbd> | Look up, flush DNS and Fake-IP, cycle record type |
+| Providers | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>H</kbd> | Refresh the selected provider, refresh all, or health-check a proxy provider |
+| Connections | <kbd>x</kbd> / <kbd>X</kbd> | Close selected connection / close all active connections |
+
+</details>
+
 Install the core before submitting the first subscription (`Ctrl+D` in Setup downloads it). Subscription, snippet and profile changes are validated with `mihomo -t` before replacing the configuration; rejected reloads restore the previous file. Enabled snippets are reapplied on subscription updates and profile switches. `K` stops only a core started by terc; use the service manager for external cores.
 
-Logs: `P` pauses/resumes display while capture continues, `/` searches, and Enter opens full text. Connections: Enter opens full details on narrow terminals. The independent status row stays visible when graphs are hidden; `!` opens the full result. Help supports arrows and Page Up/Down.
+Logs: `P` pauses/resumes display while capture continues, `/` searches, and Enter opens full text. Connections: Enter opens full details on narrow terminals. Results remain accessible with graphs hidden; `!` opens the full result and Backspace dismisses it. Help supports arrows and Page Up/Down.
 
 ## Configuration
 
@@ -132,7 +148,7 @@ Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terc
 | **Core & Proxy** | Start/stop `mihomo`, toggle the system proxy, switch routing mode, download `mihomo-darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` into `~/.config/terc/core/mihomo` |
 | **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling recursively merges mappings; disabling restores the source. Mihomo validates candidates before applying |
 | **Profiles** | YAML files in the config directory and `~/.config/terc/profiles`. Enter copies one onto `config.yaml` and reloads |
-| **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), refresh rate (`15` / `30` / `60` / `120 Hz`), UI language |
+| **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), UI refresh rate (`15` / `30` / `60` / `120 Hz`), graph interval (`1` / `2` / `5` seconds, averaged rates; changing it clears history), UI language |
 | **Subscription** | Hot-fetch remote AnyTLS / Clash.Meta YAML subscription and reload without dropping active tunnels |
 
 ## How It Works

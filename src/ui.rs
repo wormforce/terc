@@ -301,7 +301,37 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    let content = Rect::new(size.x, size.y, size.width, size.height.saturating_sub(1));
+    if !app.status_message.is_empty() {
+        let title = match app.lang() {
+            Lang::Zh => "操作结果 · ! 全文 · Backspace 收起",
+            Lang::Ja => "操作結果 · ! 詳細",
+            Lang::En => "Result · ! details · Backspace dismiss",
+        };
+        let inner = draw_panel(
+            frame,
+            Rect::new(size.x, size.y, size.width, 3),
+            app.theme(),
+            Some(panel_title(title.into(), app.theme())),
+            false,
+        );
+        frame.render_widget(
+            Paragraph::new(app.status_message.replace('\n', " · ")).style(Style::default().fg(
+                if app.status_is_error {
+                    app.theme().accent
+                } else {
+                    app.theme().muted
+                },
+            )),
+            inner,
+        );
+    }
+    let notice_h = if app.status_message.is_empty() { 0 } else { 3 };
+    let content = Rect::new(
+        size.x,
+        size.y + notice_h,
+        size.width,
+        size.height - notice_h,
+    );
     match app.screen {
         Screen::Dashboard => {
             draw_dashboard(frame, app, content);
@@ -325,29 +355,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_setup(frame, app, content);
         }
     }
-    let status = if app.status_message.is_empty() {
-        "? 帮助 / Help   q 退出 / Quit".to_string()
-    } else {
-        format!(
-            "{} [!] {}",
-            if app.status_is_error {
-                "✗"
-            } else if app.action_busy {
-                "…"
-            } else {
-                "›"
-            },
-            app.status_message.replace('\n', " · ")
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(if app.status_is_error {
-            theme.accent
-        } else {
-            theme.muted
-        })),
-        Rect::new(size.x, size.bottom() - 1, size.width, 1),
-    );
     if app.status_detail {
         let popup = centered_rect(92, 84, content);
         frame.render_widget(Clear, popup);
@@ -399,7 +406,7 @@ fn draw_dashboard(frame: &mut Frame, app: &mut App, area: Rect) {
         .constraints([
             Constraint::Length(top_h),
             Constraint::Length(toggle_h),
-            Constraint::Min(6),
+            Constraint::Min(3),
             Constraint::Length(toolbar_h),
         ])
         .split(area);
@@ -407,7 +414,7 @@ fn draw_dashboard(frame: &mut Frame, app: &mut App, area: Rect) {
     if top_h > 0 {
         let top_cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(v_chunks[0]);
         draw_traffic_panel(frame, app, top_cols[0]);
         draw_overview_panel(frame, app, top_cols[1]);
@@ -529,7 +536,11 @@ fn draw_traffic_graph(frame: &mut Frame, app: &App, area: Rect) {
         ),
     }
 
-    let label = format!("max {}", format_rate(axis_max as u64));
+    let label = format!(
+        "max {} · {}s",
+        format_rate(axis_max as u64),
+        app.config.settings.graph_interval_secs
+    );
     frame.render_widget(
         Paragraph::new(Span::styled(label, Style::default().fg(theme.muted))),
         Rect::new(area.x, area.y, area.width, 1),
@@ -663,127 +674,87 @@ fn draw_overview_panel(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let pulse_sym = if !app.snapshot.running {
-        "○"
-    } else if app.pulse_phase > 0.55 {
-        "●"
+    let zh = app.lang() == Lang::Zh;
+    let labels = if zh {
+        ["内核", "模式", "代理", "TUN", "内存", "连接"]
     } else {
-        "◉"
+        ["Core", "Mode", "Proxy", "TUN", "Mem", "Conns"]
     };
-    let core_style = if app.snapshot.running {
-        Style::default().fg(theme.peak).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD)
-    };
-
-    let sys_badge = if app.snapshot.sysproxy_enabled {
-        Span::styled(
-            " ON ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(" OFF ", Style::default().fg(theme.muted))
-    };
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(" Core ", Style::default().fg(theme.muted)),
-        Span::styled(format!("{pulse_sym} "), core_style),
-        Span::styled(
-            if app.snapshot.running {
-                format!("Mihomo {}", app.snapshot.version)
-            } else {
-                app.t("stopped").to_string()
-            },
-            Style::default().fg(theme.text),
-        ),
-        Span::styled("  SysProxy ", Style::default().fg(theme.muted)),
-        sys_badge,
-    ]));
-
-    lines.push(Line::from(vec![
-        Span::styled(" Mode ", Style::default().fg(theme.muted)),
-        Span::styled(
-            format!("{:<7}", app.snapshot.mode),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" Mem ", Style::default().fg(theme.muted)),
-        Span::styled(
-            format!("{:<8}", format_bytes(app.memory_inuse)),
-            Style::default().fg(theme.text),
-        ),
-        Span::styled(" Conns ", Style::default().fg(theme.muted)),
-        Span::styled(
-            format!("{}", app.snapshot.connections.len()),
-            Style::default().fg(theme.text),
-        ),
-    ]));
-
-    if inner.height >= 3 {
-        let stack = if app.snapshot.tun_stack.is_empty() {
-            "—".to_string()
+    let values = [
+        if app.snapshot.running {
+            "● Mihomo".to_string()
         } else {
-            app.snapshot.tun_stack.clone()
-        };
-        let proc = if app.snapshot.find_process.is_empty() {
-            "—".to_string()
+            app.t("stopped").into()
+        },
+        app.snapshot.mode.clone(),
+        if app.snapshot.sysproxy_enabled {
+            "ON"
         } else {
-            app.snapshot.find_process.clone()
-        };
+            "OFF"
+        }
+        .into(),
+        if app.snapshot.tun_enabled {
+            "ON"
+        } else {
+            "OFF"
+        }
+        .into(),
+        format_bytes(app.memory_inuse),
+        app.snapshot.connections.len().to_string(),
+    ];
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    for i in 0..6 {
+        let compact = inner.width < 34;
+        let col = if compact { inner } else { cols[i % 2] };
+        let row = if compact { i as u16 } else { (i / 2) as u16 };
+        if row >= inner.height {
+            break;
+        }
+        let label = labels[i];
+        let line = Line::from(vec![
+            Span::styled(
+                format!(
+                    " {label}{}",
+                    " ".repeat(6usize.saturating_sub(label.width()))
+                ),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(
+                values[i].clone(),
+                Style::default()
+                    .fg(if i < 2 { theme.peak } else { theme.text })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(col.x, inner.y + row, col.width, 1),
+        );
+    }
+    if inner.height >= 4 && inner.width >= 34 {
         let port = if app.snapshot.mixed_port > 0 {
             app.snapshot.mixed_port
         } else {
             app.snapshot.http_port
         };
-        lines.push(Line::from(vec![
-            Span::styled(" :", Style::default().fg(theme.muted)),
-            Span::styled(format!("{port:<5}"), Style::default().fg(theme.text)),
-            Span::styled(stack, Style::default().fg(theme.text)),
-            Span::styled("  proc ", Style::default().fg(theme.muted)),
-            Span::styled(proc, Style::default().fg(theme.text)),
-            Span::styled("  WG ", Style::default().fg(theme.muted)),
-            Span::styled(
-                format!("{}", app.wireguard_peers().len()),
-                Style::default().fg(theme.accent),
-            ),
-        ]));
+        frame.render_widget(
+            Paragraph::new(format!(" {} :{port}", if zh { "代理端口" } else { "Port" }))
+                .style(Style::default().fg(theme.muted)),
+            Rect::new(inner.x, inner.y + 3, inner.width, 1),
+        );
     }
-
-    if inner.height >= 4 {
+    if inner.height >= 5 && inner.width >= 34 {
         if let Some(sub) = &app.snapshot.sub_info {
-            let summary = if !sub.traffic.is_empty() && !sub.expire.is_empty() {
-                format!(" Sub  {} · {}", sub.traffic, sub.expire)
-            } else if !sub.traffic.is_empty() {
-                format!(" Sub  {}", sub.traffic)
-            } else {
-                format!(" Sub  {}", sub.expire)
-            };
-            lines.push(Line::from(Span::styled(
-                summary,
-                Style::default().fg(theme.muted),
-            )));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(" HTTP ", Style::default().fg(theme.muted)),
-                Span::styled(
-                    format!(
-                        ":{}  SOCKS :{}",
-                        app.snapshot.http_port, app.snapshot.socks_port
-                    ),
-                    Style::default().fg(theme.text),
-                ),
-            ]));
+            frame.render_widget(
+                Paragraph::new(format!(" {}  {}", sub.traffic, sub.expire))
+                    .style(Style::default().fg(theme.muted)),
+                Rect::new(inner.x, inner.y + 4, inner.width, 1),
+            );
         }
     }
-
-    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_proxies_main(frame: &mut Frame, app: &App, area: Rect) {
@@ -1092,48 +1063,46 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
     if let Some(text) = context {
         return Line::styled(text, Style::default().fg(theme.muted));
     }
-    let mut spans = vec![
-        Span::styled(
-            "Space ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if app.snapshot.sysproxy_enabled {
-                app.t("sysproxy_off").to_string()
-            } else {
-                app.t("sysproxy_on").to_string()
-            },
-            Style::default().fg(theme.text),
-        ),
-    ];
-
-    let hints = format!(
-        "  T {}  n {}  d {}  g {}  v {}  o {}  b {}  r {}  a {}  u {}  ? {}",
-        app.t("tun"),
-        app.t("sniff"),
-        app.t("dns"),
-        app.t("rules"),
-        app.t("providers"),
-        app.t("modules"),
-        app.t("probe"),
-        app.t("test_delay"),
-        app.t("auto_best"),
-        app.t("sub_update"),
-        app.t("help")
-    );
-
-    if spans.iter().map(|s| s.width()).sum::<usize>() + hints.width() <= width as usize {
-        spans.push(Span::styled(hints, Style::default().fg(theme.muted)));
+    let hints = if app.lang() == Lang::Zh {
+        [
+            "Space 代理",
+            "↵ 选节点",
+            "r 测速",
+            "m 模式",
+            "a 自动优选",
+            "u 更新订阅",
+            "s 设置",
+            "? 更多",
+            "q 退出",
+        ]
     } else {
-        spans.push(Span::styled(
-            "  T n d g v o f b w r a ?".to_string(),
-            Style::default().fg(theme.muted),
-        ));
+        [
+            "Space Proxy",
+            "↵ Select",
+            "r Test",
+            "m Mode",
+            "a Best",
+            "u Update",
+            "s Settings",
+            "? More",
+            "q Quit",
+        ]
+    };
+    let mut text = String::new();
+    // Reserve help and quit so narrow windows still offer a way to discover controls.
+    let tail = format!("  {}  {}", hints[7], hints[8]);
+    for hint in &hints[..7] {
+        let candidate = if text.is_empty() {
+            hint.to_string()
+        } else {
+            format!("{text}  {hint}")
+        };
+        if candidate.width() + tail.width() <= width as usize {
+            text = candidate;
+        }
     }
-
-    Line::from(spans)
+    text.push_str(&tail);
+    Line::styled(text, Style::default().fg(theme.muted))
 }
 
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
@@ -1333,12 +1302,6 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let shortcuts = [
         ("Space", app.t("help_space")),
-        ("T / n / i", app.t("help_tun")),
-        ("D", app.t("help_dns_key")),
-        ("d g v o f b w", app.t("help_views")),
-        ("e  /", app.t("help_explain")),
-        ("x", app.t("help_rule_x")),
-        ("F", app.t("help_flush")),
         ("m", app.t("help_m")),
         ("r / a", app.t("help_r")),
         ("u", app.t("help_u")),
@@ -1347,11 +1310,21 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("c / L / p", app.t("help_tabs")),
         ("t / s", app.t("help_t")),
         ("K", "启动/停止 terc 管理的内核 · Start/stop managed core"),
+        ("", "进阶与排查 / Advanced & diagnostics"),
+        ("T / n / i", app.t("help_tun")),
+        ("D", app.t("help_dns_key")),
+        ("d g v o f b w", app.t("help_views")),
+        ("e  /", app.t("help_explain")),
+        ("x", app.t("help_rule_x")),
+        ("F", app.t("help_flush")),
         (
             "Logs: P / Enter",
             "日志：暂停、搜索、全文 · Logs: pause, search, full text",
         ),
-        ("!", "查看完整操作结果 · Full operation result"),
+        (
+            "! / Backspace",
+            "操作结果：全文 / 收起 · Result: details / dismiss",
+        ),
         ("q", app.t("help_q")),
         ("Esc", app.t("help_esc")),
     ];

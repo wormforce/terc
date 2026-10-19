@@ -33,21 +33,10 @@ pub fn draw_toggle_strip(frame: &mut Frame, app: &App, area: Rect) {
     if inner.width < 8 || inner.height < 1 {
         return;
     }
-    let dns = dns_badge(app);
-    let peers = app.wireguard_peers().len();
     let spans = vec![
-        flag(theme, "T", app.t("tun"), app.snapshot.tun_enabled),
-        flag(theme, "n", app.t("sniff"), app.snapshot.sniffing),
         flag(theme, "␣", "Proxy", app.snapshot.sysproxy_enabled),
         mode_flag(theme, &app.snapshot.mode),
-        text_flag(
-            theme,
-            "D",
-            &format!("{} {dns}", app.t("dns")),
-            app.snapshot.dns.enable,
-        ),
-        flag(theme, "i", app.t("ipv6"), app.snapshot.ipv6),
-        text_flag(theme, "w", &format!("WG {peers}"), peers > 0),
+        flag(theme, "T", app.t("tun"), app.snapshot.tun_enabled),
     ]
     .into_iter()
     .flatten()
@@ -971,19 +960,6 @@ fn kv(theme: Theme, key: &str, value: &str) -> Line<'static> {
         Span::styled(format!("{key:<8}"), Style::default().fg(theme.muted)),
         Span::styled(value.to_string(), Style::default().fg(theme.text)),
     ])
-}
-
-fn dns_badge(app: &App) -> String {
-    let dns = &app.snapshot.dns;
-    if !dns.present {
-        "—".into()
-    } else if !dns.enable {
-        "off".into()
-    } else if dns.enhanced_mode.is_empty() {
-        "on".into()
-    } else {
-        dns.enhanced_mode.clone()
-    }
 }
 
 fn flag(theme: Theme, key: &str, label: &str, on: bool) -> Vec<Span<'static>> {
