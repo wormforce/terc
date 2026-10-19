@@ -432,7 +432,7 @@ fn local_flags(cfg: &ControllerConfig) -> RuntimeFlags {
 
 pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
     let timeout = Duration::from_millis(700);
-    let (net_service, sysproxy_enabled) = detect_macos_sysproxy();
+    let (net_service, sysproxy_enabled) = detect_sysproxy();
     let core_bin_path = discover_mihomo_binary()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
@@ -997,21 +997,25 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
 }
 
 pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
-    let (_, enabled) = detect_macos_sysproxy();
-    if enabled {
-        let _ = set_macos_sysproxy(false, 7890, 7891);
+    let (_, enabled) = detect_sysproxy();
+    let restored = enabled && set_sysproxy(false, 7890, 7891).is_ok();
+    if cfg!(target_os = "macos") {
+        let _ = Command::new("/opt/homebrew/bin/brew")
+            .args(["services", "stop", "mihomo"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
-    let _ = Command::new("/opt/homebrew/bin/brew")
-        .args(["services", "stop", "mihomo"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
     let _ = Command::new("pkill")
         .args(["-f", &format!("mihomo -d {}", cfg.config_dir)])
         .status();
     let _ = Command::new("pkill").args(["-x", "mihomo"]).status();
     thread::sleep(Duration::from_millis(250));
-    Ok("Stopped mihomo & restored system proxy".to_string())
+    if restored {
+        Ok("Stopped mihomo & restored system proxy".to_string())
+    } else {
+        Ok("Stopped mihomo".to_string())
+    }
 }
 
 pub fn update_subscription_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
@@ -1098,43 +1102,87 @@ fn fetch_subscription(cfg: &ControllerConfig, tx: &Sender<BackendEvent>) -> Resu
     }
 }
 
+pub fn mihomo_asset_id_for(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("macos", "x86_64") => Some("darwin-amd64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("linux", "x86_64") => Some("linux-amd64"),
+        _ => None,
+    }
+}
+
+pub fn mihomo_asset_id() -> Option<&'static str> {
+    mihomo_asset_id_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+pub fn mihomo_asset_label() -> String {
+    match mihomo_asset_id() {
+        Some(id) => format!("mihomo-{id}"),
+        None => "unsupported".to_string(),
+    }
+}
+
+pub fn mihomo_release_grep(asset: &str) -> String {
+    format!(r#"https://[^"]*mihomo-{asset}-v[^"]*\.gz"#)
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r#"'\''"#))
+}
+
+pub fn managed_core_script(asset: &str, gz: &str, bin: &str) -> String {
+    let pattern = mihomo_release_grep(asset);
+    format!(
+        r#"URL=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep -o '{pattern}' | head -n 1); if [ -n "$URL" ]; then curl -fsSL "$URL" -o {gz} && gunzip -f {gz} && chmod +x {bin}; else exit 1; fi"#,
+        pattern = pattern,
+        gz = shell_quote(gz),
+        bin = shell_quote(bin),
+    )
+}
+
+fn install_managed_core(tx: &Sender<BackendEvent>) -> Result<String, String> {
+    let asset = mihomo_asset_id().ok_or_else(|| {
+        "No mihomo build for this OS/CPU (darwin-arm64, darwin-amd64, linux-arm64, linux-amd64)"
+            .to_string()
+    })?;
+    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
+    let core_dir = PathBuf::from(home).join(".config/terc/core");
+    fs::create_dir_all(&core_dir)
+        .map_err(|err| format!("Cannot create {}: {err}", core_dir.display()))?;
+    let bin_path = core_dir.join("mihomo");
+    let gz_path = core_dir.join("mihomo.gz");
+    let _ = tx.send(BackendEvent::StatusMessage {
+        text: format!("Checking latest mihomo-{asset} release..."),
+        is_error: false,
+    });
+    let script = managed_core_script(
+        asset,
+        &gz_path.display().to_string(),
+        &bin_path.display().to_string(),
+    );
+    let ok = matches!(
+        Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+        Ok(status) if status.success()
+    );
+    if ok {
+        Ok(bin_path.display().to_string())
+    } else {
+        Err(format!("Failed to download mihomo-{asset} from GitHub"))
+    }
+}
+
 pub fn download_managed_core_async(tx: Sender<BackendEvent>) {
     thread::spawn(move || {
-        let Some(home) = std::env::var_os("HOME") else {
-            return;
-        };
-        let core_dir = PathBuf::from(home).join(".config/terc/core");
-        let _ = fs::create_dir_all(&core_dir);
-        let bin_path = core_dir.join("mihomo");
-        let gz_path = core_dir.join("mihomo.gz");
-
-        let _ = tx.send(BackendEvent::StatusMessage {
-            text: "Checking latest mihomo darwin-arm64 release...".to_string(),
-            is_error: false,
-        });
-
-        let script = format!(
-            r#"URL=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep -o 'https://[^"]*mihomo-darwin-arm64-v[^"]*\.gz' | head -n 1); \
-            if [ -n "$URL" ]; then curl -fsSL "$URL" -o "{}" && gunzip -f "{}" && chmod +x "{}"; else exit 1; fi"#,
-            gz_path.display(),
-            gz_path.display(),
-            bin_path.display()
-        );
-
-        let ok = matches!(
-            Command::new("sh")
-                .arg("-c")
-                .arg(&script)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status(),
-            Ok(st) if st.success()
-        );
-        let text = if ok {
-            format!("Managed core installed to {}", bin_path.display())
-        } else {
-            "Failed to download mihomo from GitHub".to_string()
+        let (text, ok) = match install_managed_core(&tx) {
+            Ok(path) => (format!("Managed core installed to {path}"), true),
+            Err(err) => (err, false),
         };
         let _ = tx.send(BackendEvent::StatusMessage {
             text,
@@ -1144,7 +1192,80 @@ pub fn download_managed_core_async(tx: Sender<BackendEvent>) {
     });
 }
 
-pub fn detect_macos_sysproxy() -> (String, bool) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SysproxyBackend {
+    Macos,
+    Gnome,
+    Unavailable,
+}
+
+pub fn sysproxy_backend_for(os: &str, gnome_ready: bool) -> SysproxyBackend {
+    match os {
+        "macos" => SysproxyBackend::Macos,
+        "linux" if gnome_ready => SysproxyBackend::Gnome,
+        _ => SysproxyBackend::Unavailable,
+    }
+}
+
+/// GVariant text values for `gsettings set`. Strings keep their quotes; the port is an int.
+pub fn gnome_proxy_commands(enable: bool, http_port: u16, socks_port: u16) -> Vec<Vec<String>> {
+    let set = |schema: &str, key: &str, value: &str| {
+        vec![
+            "gsettings".to_string(),
+            "set".to_string(),
+            schema.to_string(),
+            key.to_string(),
+            value.to_string(),
+        ]
+    };
+    if !enable {
+        return vec![set("org.gnome.system.proxy", "mode", "'none'")];
+    }
+    let http = http_port.to_string();
+    let socks = if socks_port > 0 {
+        socks_port.to_string()
+    } else {
+        http.clone()
+    };
+    vec![
+        set("org.gnome.system.proxy", "mode", "'manual'"),
+        set("org.gnome.system.proxy.http", "host", "'127.0.0.1'"),
+        set("org.gnome.system.proxy.http", "port", &http),
+        set("org.gnome.system.proxy.https", "host", "'127.0.0.1'"),
+        set("org.gnome.system.proxy.https", "port", &http),
+        set("org.gnome.system.proxy.socks", "host", "'127.0.0.1'"),
+        set("org.gnome.system.proxy.socks", "port", &socks),
+    ]
+}
+
+fn detect_gnome_sysproxy() -> Option<(String, bool)> {
+    let output = Command::new("gsettings")
+        .args(["get", "org.gnome.system.proxy", "mode"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(("GNOME".to_string(), text.contains("'manual'")))
+}
+
+fn gnome_proxy_ready() -> bool {
+    detect_gnome_sysproxy().is_some()
+}
+
+pub fn detect_sysproxy() -> (String, bool) {
+    match std::env::consts::OS {
+        "macos" => detect_macos_sysproxy(),
+        "linux" => detect_gnome_sysproxy().unwrap_or_else(|| ("n/a".to_string(), false)),
+        _ => ("n/a".to_string(), false),
+    }
+}
+
+fn detect_macos_sysproxy() -> (String, bool) {
     let service = active_macos_network_service().unwrap_or_else(|| "Wi-Fi".to_string());
     let output = Command::new("networksetup")
         .args(["-getwebproxy", &service])
@@ -1543,7 +1664,46 @@ fn brief(text: &str) -> String {
     one.chars().take(80).collect()
 }
 
-pub fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
+fn run_gsettings(schema: &str, key: &str, value: &str) -> Result<(), String> {
+    let status = Command::new("gsettings")
+        .args(["set", schema, key, value])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("gsettings: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("gsettings set {schema} {key} failed"))
+    }
+}
+
+fn set_gnome_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
+    if !gnome_proxy_ready() {
+        return Err("sysproxy_unavailable".to_string());
+    }
+    for cmd in gnome_proxy_commands(enable, http_port, socks_port) {
+        // cmd is gsettings, set, schema, key, value
+        run_gsettings(&cmd[2], &cmd[3], &cmd[4])?;
+    }
+    if enable {
+        let port = if http_port > 0 { http_port } else { socks_port };
+        Ok(format!("System proxy ON (GNOME -> 127.0.0.1:{port})"))
+    } else {
+        Ok("System proxy OFF (GNOME)".to_string())
+    }
+}
+
+pub fn set_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
+    match std::env::consts::OS {
+        "macos" => set_macos_sysproxy(enable, http_port, socks_port),
+        "linux" => set_gnome_sysproxy(enable, http_port, socks_port),
+        _ => Err("sysproxy_unavailable".to_string()),
+    }
+}
+
+fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
     let (service, _) = detect_macos_sysproxy();
     let http_p = http_port.to_string();
     let socks_p = if socks_port > 0 {
@@ -1632,5 +1792,58 @@ mod tests {
         assert_eq!(item.dns_mode, "fake-ip");
         assert_eq!(item.dest_geo, "US");
         assert_eq!(item.dest_asn, "AS15169");
+    }
+
+    #[test]
+    fn asset_id_follows_os_and_cpu() {
+        assert_eq!(
+            mihomo_asset_id_for("macos", "aarch64"),
+            Some("darwin-arm64")
+        );
+        assert_eq!(mihomo_asset_id_for("macos", "x86_64"), Some("darwin-amd64"));
+        assert_eq!(mihomo_asset_id_for("linux", "aarch64"), Some("linux-arm64"));
+        assert_eq!(mihomo_asset_id_for("linux", "x86_64"), Some("linux-amd64"));
+        assert_eq!(mihomo_asset_id_for("windows", "x86_64"), None);
+        assert_eq!(mihomo_asset_id_for("linux", "arm"), None);
+    }
+
+    #[test]
+    fn managed_core_script_selects_matching_asset() {
+        let script = managed_core_script("linux-amd64", "/tmp/terc/mihomo.gz", "/tmp/terc/mihomo");
+        assert!(script.contains(r#"mihomo-linux-amd64-v[^"]*\.gz"#));
+        assert!(!script.contains("darwin-arm64"));
+        assert!(!script.contains("networksetup"));
+        assert!(script.contains("'/tmp/terc/mihomo'"));
+    }
+
+    #[test]
+    fn linux_proxy_plan_uses_gsettings_and_not_networksetup() {
+        assert_eq!(sysproxy_backend_for("linux", true), SysproxyBackend::Gnome);
+        assert_eq!(
+            sysproxy_backend_for("linux", false),
+            SysproxyBackend::Unavailable
+        );
+        assert_eq!(sysproxy_backend_for("macos", false), SysproxyBackend::Macos);
+        assert_eq!(
+            sysproxy_backend_for("windows", true),
+            SysproxyBackend::Unavailable
+        );
+
+        let on = gnome_proxy_commands(true, 7890, 7891);
+        let flat = on
+            .iter()
+            .flat_map(|cmd| cmd.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(flat.contains("gsettings"));
+        assert!(flat.contains("org.gnome.system.proxy"));
+        assert!(flat.contains("'manual'"));
+        assert!(flat.contains("org.gnome.system.proxy.socks"));
+        assert!(flat.contains("7891"));
+        assert!(!flat.contains("networksetup"));
+
+        let off = gnome_proxy_commands(false, 7890, 7891);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0][4], "'none'");
     }
 }

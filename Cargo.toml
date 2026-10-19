@@ -2,7 +2,7 @@
 name = "terc"
 version = "0.1.0"
 edition = "2021"
-description = "A restrained terminal Mihomo (Clash.Meta) controller and visualizer for macOS."
+description = "A restrained terminal Mihomo (Clash.Meta) controller and visualizer for macOS and Linux."
 license = "MIT"
 readme = "README.md"
 keywords = ["tui", "mihomo", "clash", "proxy", "terminal"]

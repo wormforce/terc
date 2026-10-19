@@ -20,14 +20,6 @@ pub const WAVE_RENDERERS: &[WaveRenderer] = &[WaveRenderer::Braille, WaveRendere
 const BRAILLE_DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
 const EIGHTH_BLOCKS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
-pub const TITLE_ART: &[&str] = &[
-    " _                ",
-    "| |_ ___ _ __ ___ ",
-    "| __/ _ \\ '__/ __|",
-    "| ||  __/ | | (__ ",
-    " \\__\\___|_|  \\___|",
-];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeId {
@@ -310,7 +302,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     match app.screen {
-        Screen::Menu => draw_menu(frame, app, size),
         Screen::Dashboard => {
             draw_dashboard(frame, app, size);
             crate::panels::draw_overlay(frame, app, size);
@@ -345,52 +336,6 @@ pub fn editor_cursor_cell(chars: &[char], cursor: usize, area: Rect) -> Option<(
     }
     let col = input_viewport(chars, cursor.min(chars.len()), area.width as usize).1;
     Some((area.x + col.min(area.width as usize - 1) as u16, area.y))
-}
-
-fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme();
-    let mut lines = Vec::new();
-    let title_style = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    if area.height >= 16 {
-        lines.extend(
-            TITLE_ART
-                .iter()
-                .map(|line| Line::styled(*line, title_style)),
-        );
-    } else {
-        lines.push(Line::styled("terc", title_style));
-    }
-    lines.push(Line::default());
-
-    let items = ["menu_dashboard", "menu_settings", "menu_help", "menu_quit"];
-    for (index, key) in items.iter().enumerate() {
-        let selected = index == app.menu_index;
-        lines.push(Line::styled(
-            format!("{}{}", if selected { "› " } else { "  " }, app.t(key)),
-            if selected {
-                title_style
-            } else {
-                Style::default().fg(theme.text)
-            },
-        ));
-    }
-    if area.height >= lines.len() as u16 + 3 {
-        lines.push(Line::default());
-        lines.push(Line::styled(
-            "↑↓  Enter  ·  Space",
-            Style::default().fg(theme.muted),
-        ));
-    }
-    let height = (lines.len() as u16).min(area.height);
-    let content = Rect::new(
-        area.x,
-        area.y + (area.height - height) / 2,
-        area.width,
-        height,
-    );
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), content);
 }
 
 fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
@@ -1317,7 +1262,8 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ("↑↓ jk", app.t("help_jk")),
         ("c / L / p", app.t("help_tabs")),
         ("t / s", app.t("help_t")),
-        ("q / Esc", app.t("help_q")),
+        ("q", app.t("help_q")),
+        ("Esc", app.t("help_esc")),
     ];
 
     let mut lines = Vec::new();
