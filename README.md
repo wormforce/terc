@@ -5,12 +5,11 @@
 </p>
 
 <p align="center">
-  <strong>把代理控制台，搬进终端。</strong>
+  <strong>国内开发者的终极 tui 代理软件</strong>
 </p>
 
 <p align="center">
-  为开发者与 AI 工作流打造的 Mihomo 终端代理工具。<br>
-  <sub>键盘直达 &nbsp; · &nbsp; 实时流量 &nbsp; · &nbsp; SSH 友好</sub>
+  <code>terc</code> 采纳了现有各个 gui、非 gui 的 Clash 系软件，并对开发者、ai 工具进行了功能增强，致力做到远程友好、内存友好、界面友好、省事。
 </p>
 
 <p align="center">
@@ -35,12 +34,12 @@
 <br>
 
 <p align="center">
-  <img src="assets/terc-hero.svg" alt="terc 界面预览：实时流量、代理开关、策略组与节点" width="100%">
+  <img src="assets/terc-hero.svg" alt="复古终端里的 terc：圆角标题切口、盲文上下行速率图、开关条和节点列表" width="100%">
 </p>
 
 <p align="center">
   <a href="https://ghostty.org"><img src="https://raw.githubusercontent.com/ghostty-org/ghostty/main/images/icons/icon_128.png" alt="Ghostty" width="28" height="28"></a><br>
-  <sub>推荐搭配 <a href="https://ghostty.org"><strong>Ghostty</strong></a> 使用</sub>
+  <sub>与 <a href="https://ghostty.org"><strong>Ghostty</strong></a> 搭配体验最佳</sub>
 </p>
 
 ---

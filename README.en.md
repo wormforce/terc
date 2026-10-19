@@ -5,12 +5,11 @@
 </p>
 
 <p align="center">
-  <strong>Your proxy. Your terminal. Your keys.</strong>
+  <strong>The ultimate TUI proxy tool for developers in China</strong>
 </p>
 
 <p align="center">
-  A Mihomo-powered terminal proxy tool for developers and AI workflows.<br>
-  <sub>Keyboard-first controls &nbsp; · &nbsp; Live traffic &nbsp; · &nbsp; SSH-friendly</sub>
+  <code>terc</code> draws on GUI and non-GUI Clash clients, with extra features for developers and AI tools. Built to work well remotely, use less memory, feel comfortable to use, and save you hassle.
 </p>
 
 <p align="center">
@@ -40,7 +39,7 @@
 
 <p align="center">
   <a href="https://ghostty.org"><img src="https://raw.githubusercontent.com/ghostty-org/ghostty/main/images/icons/icon_128.png" alt="Ghostty" width="28" height="28"></a><br>
-  <sub>Recommended terminal: <a href="https://ghostty.org"><strong>Ghostty</strong></a></sub>
+  <sub>Works best with <a href="https://ghostty.org"><strong>Ghostty</strong></a></sub>
 </p>
 
 ---
