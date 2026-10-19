@@ -112,7 +112,7 @@ The footer has one line of shortcuts. Operation results appear in the content ar
 | Dashboard | <kbd>t</kbd> | Show or hide the top Traffic & Overview panels |
 | Dashboard | <kbd>s</kbd> | Open the dual-pane Settings board. Press again there to return |
 | Settings | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Enter</kbd> | Adjust setting or trigger action |
-| Settings | <kbd>Tab</kbd> | Cycle setting categories (`Core & Proxy` · `Appearance` · `Subscription`) |
+| Settings | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> / <kbd>1</kbd>–<kbd>3</kbd> | Switch category pages (`Core & Proxy` · `Appearance` · `Subscription`) |
 | Any view | <kbd>?</kbd> | Open keyboard shortcut help. Press again to return to the dashboard |
 | Dashboard | <kbd>q</kbd> | Quit (`mihomo` stays running in the background) |
 | Dashboard | <kbd>Esc</kbd> | Return to the proxy list; press q to quit |
@@ -148,8 +148,10 @@ Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terc
 | **Core & Proxy** | Start/stop `mihomo`, toggle the system proxy, switch routing mode, download `mihomo-darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` into `~/.config/terc/core/mihomo` |
 | **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling recursively merges mappings; disabling restores the source. Mihomo validates candidates before applying |
 | **Profiles** | YAML files in the config directory and `~/.config/terc/profiles`. Enter copies one onto `config.yaml` and reloads |
-| **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), UI refresh rate (`15` / `30` / `60` / `120 Hz`), graph interval (`1` / `2` / `5` seconds, averaged rates; changing it clears history), UI language |
+| **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), UI refresh rate (`15` / `30` / `60` / `120 Hz`), graph interval (`1000–86400000 ms`, arrows adjust by `100 ms`, Enter accepts a typed value; averaged rates, clears history on change), UI language |
 | **Subscription** | Hot-fetch remote AnyTLS / Clash.Meta YAML subscription and reload without dropping active tunnels |
+
+The graph interval is set in milliseconds. Mihomo normally supplies one traffic sample per second, so the minimum is 1000 ms.
 
 ## How It Works
 

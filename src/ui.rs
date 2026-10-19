@@ -537,9 +537,9 @@ fn draw_traffic_graph(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let label = format!(
-        "max {} · {}s",
+        "max {} · {}ms",
         format_rate(axis_max as u64),
-        app.config.settings.graph_interval_secs
+        app.config.settings.graph_interval_ms()
     );
     frame.render_widget(
         Paragraph::new(Span::styled(label, Style::default().fg(theme.muted))),
@@ -1127,6 +1127,60 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn settings_hint(app: &App) -> &'static str {
+    match (app.lang(), app.setting_input.is_some()) {
+        (Lang::Zh, true) => "Enter 保存 · Esc 取消 · Ctrl+U 清空",
+        (_, true) => "Enter Save · Esc Cancel · Ctrl+U Clear",
+        (Lang::Zh, false) => "Tab 分类  ↑↓ 选择  ←→ 调整  ↵ 编辑  Esc",
+        (_, false) => "Tab Tabs  ↑↓ Select  ←→ Adjust  ↵ Edit  Esc",
+    }
+}
+
+fn draw_settings_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = app.settings_rows();
+    let active = rows[app.setting_index].category;
+    let theme = app.theme();
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 3); 3])
+        .split(area);
+    for (i, (category, key)) in [
+        (SettingCategory::Core, "cat_core"),
+        (SettingCategory::Appearance, "cat_appearance"),
+        (SettingCategory::Subscription, "cat_sub"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = if area.width < 60 {
+            if app.lang() == Lang::Zh {
+                ["代理", "外观", "订阅"][i]
+            } else {
+                ["Core", "UI", "Subs"][i]
+            }
+        } else {
+            app.t(key)
+        };
+        let label = if *category == active {
+            format!("[{} {}]", i + 1, name)
+        } else {
+            format!("{} {}", i + 1, name)
+        };
+        frame.render_widget(
+            Paragraph::new(label)
+                .alignment(Alignment::Center)
+                .style(if *category == active {
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.muted)
+                }),
+            columns[i],
+        );
+    }
+}
+
 fn draw_settings_board(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
     let rows = app.settings_rows();
@@ -1141,34 +1195,7 @@ fn draw_settings_board(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    let active_cat = selected_row
-        .map(|r| r.category)
-        .unwrap_or(SettingCategory::Core);
-    let mut cat_spans = vec![Span::raw("  ")];
-    for cat in [
-        SettingCategory::Core,
-        SettingCategory::Appearance,
-        SettingCategory::Subscription,
-    ] {
-        let is_sel = cat == active_cat;
-        let label = match cat {
-            SettingCategory::Core => app.t("cat_core"),
-            SettingCategory::Appearance => app.t("cat_appearance"),
-            SettingCategory::Subscription => app.t("cat_sub"),
-        };
-        cat_spans.push(Span::styled(
-            format!(" {label} "),
-            if is_sel {
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default().fg(theme.muted)
-            },
-        ));
-        cat_spans.push(Span::raw(" "));
-    }
-    frame.render_widget(Paragraph::new(Line::from(cat_spans)), sections[0]);
+    draw_settings_tabs(frame, app, sections[0]);
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -1193,65 +1220,46 @@ fn draw_settings_board(frame: &mut Frame, app: &App, area: Rect) {
     draw_settings_rows(frame, app, inset_rect(list_inner, 1, 0), &rows);
     draw_settings_detail(frame, app, inset_rect(detail_inner, 1, 0), selected_row);
 
-    let footer = Line::from(vec![
-        Span::styled("←", Style::default().fg(theme.accent)),
-        Span::styled(" / ", Style::default().fg(theme.muted)),
-        Span::styled("→", Style::default().fg(theme.accent)),
-        Span::styled(
-            format!(" {}  ", app.t("setting_adjust")),
-            Style::default().fg(theme.muted),
-        ),
-        Span::styled("↑", Style::default().fg(theme.accent)),
-        Span::styled(" / ", Style::default().fg(theme.muted)),
-        Span::styled("↓", Style::default().fg(theme.accent)),
-        Span::styled(
-            format!(" {}  ", app.t("setting_select")),
-            Style::default().fg(theme.muted),
-        ),
-        Span::styled("Tab", Style::default().fg(theme.accent)),
-        Span::styled(" Category", Style::default().fg(theme.muted)),
-    ]);
-    frame.render_widget(Paragraph::new(footer), sections[2]);
+    frame.render_widget(
+        Paragraph::new(settings_hint(app)).style(Style::default().fg(theme.muted)),
+        sections[2],
+    );
 }
 
 fn draw_settings_rows(frame: &mut Frame, app: &App, area: Rect, rows: &[SettingRow]) {
     let theme = app.theme();
-    let visible_h = area.height as usize;
-    let start = visible_list_start(app.setting_index, rows.len(), visible_h);
-    let max_w = area.width as usize;
-
-    let items: Vec<ListItem> = rows
+    let category = rows[app.setting_index].category;
+    let filtered: Vec<_> = rows
         .iter()
         .enumerate()
-        .skip(start)
-        .take(visible_h)
-        .map(|(idx, row)| {
-            let selected = idx == app.setting_index;
-            let prefix = if selected { "› " } else { "  " };
-            let style = if selected {
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text)
-            };
-            let val_style = if selected {
-                Style::default().fg(theme.peak).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.muted)
-            };
-            let left = format!("{prefix}{}", row.label);
-            let right = row.value.clone();
-            let gap = max_w.saturating_sub(left.width() + right.width()).max(1);
-            ListItem::new(Line::from(vec![
-                Span::styled(left, style),
-                Span::raw(" ".repeat(gap)),
-                Span::styled(right, val_style),
-            ]))
-        })
+        .filter(|(_, r)| r.category == category)
         .collect();
-
-    frame.render_widget(List::new(items), area);
+    let selected = filtered
+        .iter()
+        .position(|(i, _)| *i == app.setting_index)
+        .unwrap_or(0);
+    let visible = (area.height as usize / 2).max(1);
+    let start = visible_list_start(selected, filtered.len(), visible);
+    let mut lines = Vec::new();
+    for (index, row) in filtered.iter().skip(start).take(visible) {
+        let active = *index == app.setting_index;
+        let style = if active {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        lines.push(Line::styled(
+            format!("{}{}", if active { "› " } else { "  " }, row.label),
+            style,
+        ));
+        lines.push(Line::styled(
+            format!("  {}{}", row.value, if active { "  ← →" } else { "" }),
+            Style::default().fg(if active { theme.peak } else { theme.muted }),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_settings_detail(frame: &mut Frame, app: &App, area: Rect, selected: Option<&SettingRow>) {
@@ -1282,7 +1290,24 @@ fn draw_settings_detail(frame: &mut Frame, app: &App, area: Rect, selected: Opti
 
 fn draw_settings_compact(frame: &mut Frame, app: &App, area: Rect) {
     let rows = app.settings_rows();
-    draw_settings_rows(frame, app, inset_rect(area, 1, 0), &rows);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(2),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    draw_settings_tabs(frame, app, sections[0]);
+    draw_settings_rows(frame, app, inset_rect(sections[1], 1, 0), &rows);
+    frame.render_widget(
+        Paragraph::new(rows[app.setting_index].description.clone())
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(app.theme().muted)),
+        sections[2],
+    );
+    frame.render_widget(Paragraph::new(settings_hint(app)), sections[3]);
 }
 
 fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {

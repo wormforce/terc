@@ -111,13 +111,24 @@ pub struct Settings {
     pub renderer: WaveRenderer,
     pub refresh_hz: u16,
     #[serde(default = "default_graph_interval")]
+    // Retain the previous seconds value when loading and re-saving an existing config.
     pub graph_interval_secs: u64,
+    #[serde(default)]
+    pub graph_interval_ms: Option<u64>,
     pub show_traffic: bool,
     pub show_toolbar: bool,
 }
 
 fn default_graph_interval() -> u64 {
     1
+}
+
+impl Settings {
+    pub fn graph_interval_ms(&self) -> u64 {
+        self.graph_interval_ms
+            .unwrap_or_else(|| self.graph_interval_secs.saturating_mul(1000))
+            .clamp(1000, 86_400_000)
+    }
 }
 
 impl Default for Settings {
@@ -128,6 +139,7 @@ impl Default for Settings {
             renderer: WaveRenderer::Braille,
             refresh_hz: 60,
             graph_interval_secs: 1,
+            graph_interval_ms: Some(1000),
             show_traffic: true,
             show_toolbar: true,
         }
@@ -294,6 +306,7 @@ pub struct App {
     pub action_busy: bool,
     pub snapshot_pending: bool,
     pub setting_index: usize,
+    pub setting_input: Option<String>,
     pub rule_index: usize,
     pub provider_index: usize,
     pub module_index: usize,
@@ -379,6 +392,7 @@ impl App {
             action_busy: false,
             snapshot_pending: false,
             setting_index: 0,
+            setting_input: None,
             rule_index: 0,
             provider_index: 0,
             module_index: 0,
@@ -682,9 +696,7 @@ impl App {
 
     pub fn advance_graph(&mut self, elapsed: Duration) {
         self.graph_elapsed += elapsed;
-        if self.graph_elapsed
-            < Duration::from_secs(self.config.settings.graph_interval_secs.clamp(1, 5))
-        {
+        if self.graph_elapsed < Duration::from_millis(self.config.settings.graph_interval_ms()) {
             return;
         }
         self.graph_elapsed = Duration::ZERO;
@@ -1012,7 +1024,11 @@ impl App {
             SettingRow {
                 category: SettingCategory::Appearance,
                 label: self.t("set_graph_interval").into(),
-                value: format!("{} s", self.config.settings.graph_interval_secs),
+                value: self
+                    .setting_input
+                    .as_ref()
+                    .map(|s| format!("{s}▏ ms"))
+                    .unwrap_or_else(|| format!("{} ms", self.config.settings.graph_interval_ms())),
                 description: self.t("desc_graph_interval").into(),
             },
             SettingRow {
@@ -1042,6 +1058,14 @@ impl App {
                 ),
             },
         ]
+    }
+
+    pub fn set_graph_interval(&mut self, ms: u64) {
+        self.config.settings.graph_interval_ms = Some(ms.clamp(1000, 86_400_000));
+        self.graph_elapsed = Duration::ZERO;
+        self.graph_samples = (0.0, 0.0, 0);
+        self.up_history.fill(0.0);
+        self.down_history.fill(0.0);
     }
 
     pub fn adjust_setting(&mut self, dir: i32) {
@@ -1078,17 +1102,8 @@ impl App {
                 self.save_preferences();
             }
             7 => {
-                let intervals = [1, 2, 5];
-                let pos = intervals
-                    .iter()
-                    .position(|v| *v == self.config.settings.graph_interval_secs)
-                    .unwrap_or(0);
-                self.config.settings.graph_interval_secs =
-                    intervals[(pos as i32 + dir).rem_euclid(3) as usize];
-                self.graph_elapsed = Duration::ZERO;
-                self.graph_samples = (0.0, 0.0, 0);
-                self.up_history.fill(0.0);
-                self.down_history.fill(0.0);
+                let current = self.config.settings.graph_interval_ms() as i64;
+                self.set_graph_interval((current + dir as i64 * 100).clamp(1000, 86_400_000) as u64);
                 self.save_preferences();
             }
             8 => {
@@ -1241,9 +1256,9 @@ impl App {
             (Lang::Zh, "set_graph_interval") => "图表更新间隔",
             (Lang::Ja, "set_graph_interval") => "グラフ更新間隔",
             (_, "set_graph_interval") => "Graph interval",
-            (Lang::Zh, "desc_graph_interval") => "每 1 / 2 / 5 秒推进速率图，取期间平均速率。改变间隔会清空旧图；不影响实时速率读数。",
-            (Lang::Ja, "desc_graph_interval") => "1 / 2 / 5 秒の平均速度。変更時はグラフをクリアします。",
-            (_, "desc_graph_interval") => "Advance the graph every 1 / 2 / 5 seconds using average rates. Changing interval clears history; live rate readings stay current.",
+            (Lang::Zh, "desc_graph_interval") => "单位：毫秒。← → 每次调整 100 ms；Enter 输入任意整数，Enter 保存，Esc 取消。范围 1000–86400000 ms。Mihomo 流量数据通常每秒一份，更快重绘不会增加采样精度。图表取期间平均速率，修改后清空旧图。",
+            (Lang::Ja, "desc_graph_interval") => "単位 ms。← →: 100 ms 刻み、Enter: 入力、Esc: キャンセル。1000–86400000 ms。Mihomo のサンプルは通常 1 秒ごとです。変更時に履歴を消去します。",
+            (_, "desc_graph_interval") => "Milliseconds. Arrows adjust by 100 ms; Enter edits an integer, Enter saves, Esc cancels. Range: 1000–86400000 ms. Mihomo normally supplies one traffic sample per second. The graph averages incoming samples; changes clear history.",
             (Lang::Zh, "set_refresh") => "界面刷新率",
             (Lang::En, "set_refresh") => "Refresh Rate",
             (Lang::Ja, "set_refresh") => "リフレッシュレート",
@@ -1660,7 +1675,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     }
                 }
                 CEvent::Paste(text) => {
-                    if app.screen == Screen::Setup && app.setup_phase == SetupPhase::Editing {
+                    if app.screen == Screen::Settings && app.setting_input.is_some() {
+                        let text = text.trim();
+                        if text.len() <= 8 && text.chars().all(|c| c.is_ascii_digit()) {
+                            app.setting_input = Some(text.to_string());
+                        }
+                    } else if app.screen == Screen::Setup && app.setup_phase == SetupPhase::Editing
+                    {
                         app.setup_editor.insert(&text);
                     } else if app.screen == Screen::Dashboard && app.overlay == Overlay::Probe {
                         app.probe_editor.insert(&text);
@@ -1741,6 +1762,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
     if key.code == KeyCode::Char('!')
+        && app.setting_input.is_none()
         && !app.dns_editing
         && !app.rule_editing
         && !app.log_editing
@@ -2207,33 +2229,69 @@ fn handle_rule_edit_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
-    let len = app.settings_rows().len();
+    if let Some(input) = &mut app.setting_input {
+        match key.code {
+            KeyCode::Esc => app.setting_input = None,
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
+            KeyCode::Char(c) if c.is_ascii_digit() && input.len() < 8 => input.push(c),
+            KeyCode::Enter => {
+                if let Ok(ms @ 1000..=86_400_000) = input.parse::<u64>() {
+                    app.set_graph_interval(ms);
+                    app.setting_input = None;
+                    app.save_preferences();
+                } else {
+                    app.set_status("1000–86400000 ms", true);
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+    let rows = app.settings_rows();
+    let category = rows[app.setting_index].category;
+    let indices: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.category == category)
+        .map(|(i, _)| i)
+        .collect();
+    let pos = indices
+        .iter()
+        .position(|i| *i == app.setting_index)
+        .unwrap_or(0);
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') | KeyCode::Char('S') => {
-            app.screen = Screen::Dashboard;
+            app.screen = Screen::Dashboard
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            app.setting_index = app.setting_index.checked_sub(1).unwrap_or(len - 1);
+            app.setting_index = indices[(pos + indices.len() - 1) % indices.len()]
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.setting_index = (app.setting_index + 1) % len;
+            app.setting_index = indices[(pos + 1) % indices.len()]
         }
         KeyCode::Left | KeyCode::Char('h') => app.adjust_setting(-1),
-        KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => app.adjust_setting(1),
-        KeyCode::Tab => {
-            let rows = app.settings_rows();
-            let cur_cat = rows
-                .get(app.setting_index)
-                .map(|r| r.category)
-                .unwrap_or(SettingCategory::Core);
-            let next_cat = match cur_cat {
-                SettingCategory::Core => SettingCategory::Appearance,
-                SettingCategory::Appearance => SettingCategory::Subscription,
-                SettingCategory::Subscription => SettingCategory::Core,
+        KeyCode::Right | KeyCode::Char('l') => app.adjust_setting(1),
+        KeyCode::Enter if app.setting_index == 7 => app.setting_input = Some(String::new()),
+        KeyCode::Enter => app.adjust_setting(1),
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('1'..='3') => {
+            let categories = [
+                SettingCategory::Core,
+                SettingCategory::Appearance,
+                SettingCategory::Subscription,
+            ];
+            let current = categories.iter().position(|c| *c == category).unwrap_or(0);
+            let next = match key.code {
+                KeyCode::Char(c) => (c as u8 - b'1') as usize,
+                KeyCode::BackTab => (current + 2) % 3,
+                _ => (current + 1) % 3,
             };
-            if let Some(pos) = rows.iter().position(|r| r.category == next_cat) {
-                app.setting_index = pos;
-            }
+            app.setting_index = rows
+                .iter()
+                .position(|r| r.category == categories[next])
+                .unwrap();
         }
         _ => {}
     }
@@ -2401,9 +2459,61 @@ mod tests {
     }
 
     #[test]
+    fn settings_tabs_filter_rows_and_navigation_stays_in_category() {
+        let mut app = offline_app();
+        app.screen = Screen::Settings;
+        for (width, height) in [(42, 12), (80, 24), (120, 30)] {
+            app.setting_index = 0;
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.setting_index, 4);
+            let view = render_text(&mut app, width, height);
+            assert!(!view.contains(app.t("set_download_core")));
+            press(&mut app, KeyCode::Up);
+            assert_eq!(app.setting_index, 8);
+            press(&mut app, KeyCode::Down);
+            assert_eq!(app.setting_index, 4);
+            press(&mut app, KeyCode::BackTab);
+            assert_eq!(app.setting_index, 0);
+            press(&mut app, KeyCode::Char('3'));
+            assert_eq!(app.setting_index, 9);
+            let view = render_text(&mut app, width, height);
+            assert!(!view.contains(app.t("set_theme")));
+        }
+    }
+
+    #[test]
+    fn millisecond_setting_edits_cancel_and_preserves_existing_config() {
+        let mut app = offline_app();
+        app.screen = Screen::Settings;
+        app.setting_index = 7;
+        press(&mut app, KeyCode::Enter);
+        for c in "1250".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.setting_input.as_deref(), Some("1250"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.setting_input.is_none());
+        assert_eq!(app.screen, Screen::Settings);
+        assert_eq!(app.config.settings.graph_interval_ms(), 1000);
+        app.set_graph_interval(1250);
+        app.graph_samples = (125.0, 250.0, 1);
+        app.advance_graph(Duration::from_millis(1249));
+        assert_eq!(*app.up_history.last().unwrap(), 0.0);
+        app.advance_graph(Duration::from_millis(1));
+        assert_eq!(*app.up_history.last().unwrap(), 125.0);
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old.as_object_mut().unwrap().remove("graph_interval_ms");
+        old["graph_interval_secs"] = 5.into();
+        let loaded: Settings = serde_json::from_value(old).unwrap();
+        let saved: Settings =
+            serde_json::from_str(&serde_json::to_string(&loaded).unwrap()).unwrap();
+        assert_eq!(saved.graph_interval_ms(), 5000);
+    }
+
+    #[test]
     fn graph_interval_averages_samples_without_delaying_live_rates() {
         let mut app = offline_app();
-        app.config.settings.graph_interval_secs = 2;
+        app.config.settings.graph_interval_ms = Some(2000);
         app.tx
             .send(BackendEvent::Traffic { up: 100, down: 400 })
             .unwrap();
