@@ -31,6 +31,11 @@
   <img src="assets/terc-hero.svg" alt="复古终端里的 terc：圆角标题切口、盲文上下行速率图、开关条和节点列表" width="100%">
 </p>
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ghostty-org/ghostty/main/images/icons/icon_128.png" alt="Ghostty 终端图标" width="22" height="22">
+  &nbsp;与 <a href="https://ghostty.org"><strong>Ghostty</strong></a> 搭配体验最佳 —— 任何支持 24-bit 真彩色的终端都能跑。
+</p>
+
 ## 每天用的那些开关
 
 Surge 把 TUN、嗅探、分流和 DNS 放进菜单。`terc` 把它们留在同一排键上：按下去就生效，屏上同时看见速率、进程、规则链和解析结果。

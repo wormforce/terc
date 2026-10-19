@@ -31,6 +31,11 @@
   <img src="assets/terc-hero.svg" alt="terc in a retro terminal: rounded title cutouts, a braille up/down graph, the toggle rail, and the proxy list" width="100%">
 </p>
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ghostty-org/ghostty/main/images/icons/icon_128.png" alt="Ghostty terminal emulator logo" width="22" height="22">
+  &nbsp;Works best with <a href="https://ghostty.org"><strong>Ghostty</strong></a> — any 24-bit color terminal will do.
+</p>
+
 ## The switches you actually use
 
 Surge keeps TUN, sniffing, routing, and DNS inside menus. `terc` leaves them on one key rail: the press takes effect, and the same screen already shows rate, process, rule chain, and DNS.
