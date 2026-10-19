@@ -25,9 +25,9 @@
 </p>
 
 <p align="center">
-  <a href="#快速开始"><strong>开始使用</strong></a> &nbsp; · &nbsp;
-  <a href="docs/使用说明.md">使用说明</a> &nbsp; · &nbsp;
-  <a href="#显示内容">功能一览</a> &nbsp; · &nbsp;
+  <a href="#快速开始"><strong>开始使用</strong></a> &nbsp; / &nbsp;
+  <a href="docs/使用说明.md">使用说明</a> &nbsp; / &nbsp;
+  <a href="#显示内容">功能一览</a> &nbsp; / &nbsp;
   <a href="#快捷键">快捷键</a>
 </p>
 
@@ -90,7 +90,9 @@ cargo run --release --locked
 
 </details>
 
-底部只保留一行当前页面的快捷键提示。操作结果显示在内容区，按 Backspace 收起，按 `!` 查看全文；按 `?` 打开帮助，支持上下键和翻页。连接页按 Enter 可在窄窗口打开完整详情。日志页用 `P` 暂停/继续、`/` 搜索、Enter 阅读全文。
+底部只保留一行当前页面的快捷键提示。操作结果以浮动通知显示，普通通知 4 秒、错误通知 8 秒后自动收起；Backspace 可提前收起，按 `!` 仍可查看全文；按 `?` 打开帮助，支持上下键和翻页。连接页按 Enter 可在窄窗口打开完整详情。日志页用 `P` 暂停/继续、`/` 搜索、Enter 阅读全文。
+
+鼠标点击策略组查看节点，点击节点直接切换；滚轮移动所在列表的选择，不会激活节点。当前焦点使用亮色粗边框、▶ 标记与选中行下划线。
 
 ## 快捷键
 
@@ -112,7 +114,7 @@ cargo run --release --locked
 | 面板 | t | 显示或隐藏顶部「实时速率」与「内核状态」面板 |
 | 面板 | s | 打开双栏设置面板。设置里再按一次回到面板 |
 | 设置 | ← →、h l 或 Enter | 调整并保存当前设置项，或执行动作 |
-| 设置 | Tab / Shift+Tab / 1 2 3 | 切换设置分类页（`内核与代理` · `视觉与主题` · `订阅管理`） |
+| 设置 | Tab / Shift+Tab / 1 2 3 | 切换设置分类页（`内核与代理` / `视觉与主题` / `订阅管理`） |
 | 任意页面 | ? | 打开快捷键帮助，再按一次回到面板 |
 | 面板 | q | 退出 `terc`（后台内核保持运行） |
 | 面板 | Esc | 子页面回到节点页；退出请按 q |
@@ -139,7 +141,7 @@ cargo run --release --locked
 
 ## 配置
 
-按 s 打开**设置**。修改即时保存到 `~/.config/terc/config.json`。界面支持 **中文 · English · 日本語**。
+按 s 打开**设置**。修改即时保存到 `~/.config/terc/config.json`。界面支持 **中文 / English / 日本語**。
 
 | 分类 | 可调内容 |
 | --- | --- |
@@ -158,7 +160,7 @@ cargo run --release --locked
 ```mermaid
 flowchart LR
     A[Mihomo 内核 :9090] -->|分块 JSON 实时流| B[原生 TcpStream 线程]
-    B -->|/traffic · /memory · /logs| C[上下行速率历史]
+    B -->|/traffic / /memory / /logs| C[上下行速率历史]
     D[系统代理 macOS networksetup / Linux gsettings] <-->|系统代理状态| E[控制器 API]
     C --> F[Ratatui 同步帧渲染]
     E --> F

@@ -23,28 +23,70 @@ use crate::{
 
 pub fn draw_toggle_strip(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
-    let inner = draw_panel(
-        frame,
-        area,
-        theme,
-        Some(panel_title(app.t("controls").to_string(), theme)),
-        false,
-    );
-    if inner.width < 8 || inner.height < 1 {
-        return;
-    }
-    let spans = vec![
-        flag(theme, "␣", "Proxy", app.snapshot.sysproxy_enabled),
-        mode_flag(theme, &app.snapshot.mode),
-        flag(theme, "T", app.t("tun"), app.snapshot.tun_enabled),
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 3); 3])
+        .split(area);
+    let proxy = if area.width < 72 {
+        if app.lang() == crate::Lang::Zh {
+            "␣ 代理"
+        } else {
+            "␣ Proxy"
+        }
+    } else if app.lang() == crate::Lang::Zh {
+        "Space 系统代理"
+    } else {
+        "Space Proxy"
+    };
+    let mode = if area.width < 72 && app.lang() == crate::Lang::Zh {
+        "m 模式"
+    } else if app.lang() == crate::Lang::Zh {
+        "m 分流模式"
+    } else {
+        "m Mode"
+    };
+    for (i, (label, value, enabled)) in [
+        (
+            proxy,
+            if app.snapshot.sysproxy_enabled {
+                "ON"
+            } else {
+                "OFF"
+            },
+            app.snapshot.sysproxy_enabled,
+        ),
+        (mode, app.snapshot.mode.as_str(), true),
+        (
+            "T TUN",
+            if app.snapshot.tun_enabled {
+                "ON"
+            } else {
+                "OFF"
+            },
+            app.snapshot.tun_enabled,
+        ),
     ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(fit_line(spans, inner.width as usize)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
+    .iter()
+    .enumerate()
+    {
+        let inner = draw_panel(
+            frame,
+            cols[i],
+            theme,
+            Some(panel_title(label.to_string(), theme)),
+            false,
+        );
+        frame.render_widget(
+            Paragraph::new(*value)
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(if *enabled { theme.peak } else { theme.muted })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            inner,
+        );
+    }
 }
 
 pub fn draw_dns(frame: &mut Frame, app: &App, area: Rect) {
@@ -99,7 +141,7 @@ pub fn draw_rules(frame: &mut Frame, app: &App, area: Rect) {
                     "  "
                 };
                 let hits = if rule.hit_count == 0 {
-                    "  · ".to_string()
+                    "   ".to_string()
                 } else {
                     format!("{:>3}×", rule.hit_count.min(999))
                 };
@@ -228,7 +270,7 @@ pub fn draw_connections(frame: &mut Frame, app: &mut App, area: Rect) {
         (area, None)
     };
     let title = format!(
-        "{} ({}) · x  X",
+        "{} ({})  x  X",
         app.t("connections"),
         app.snapshot.connections.len()
     );
@@ -412,7 +454,7 @@ fn draw_dns_query(frame: &mut Frame, app: &App, area: Rect) {
         });
         let lines: Vec<Line> = if app.dns_lines.is_empty() {
             vec![Line::styled(
-                "e  ·  Enter  ·  F  ·  [ ]",
+                "e    Enter    F    [ ]",
                 Style::default().fg(theme.muted),
             )]
         } else {
@@ -473,7 +515,7 @@ fn draw_connection_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         area,
         theme,
         Some(panel_title(
-            format!("{} · Enter/Esc 返回 · ↑↓ scroll", app.t("connections")),
+            format!("{}  Enter/Esc 返回  ↑↓ scroll", app.t("connections")),
             theme,
         )),
         false,
@@ -763,7 +805,7 @@ fn draw_probe(frame: &mut Frame, app: &App, area: Rect) {
         .split(inner);
     frame.render_widget(
         Paragraph::new(Line::styled(
-            format!("{} · {}", app.t("ov_probe"), app.selected_proxy_name()),
+            format!("{}  {}", app.t("ov_probe"), app.selected_proxy_name()),
             Style::default().fg(theme.muted),
         )),
         rows[0],
@@ -960,56 +1002,6 @@ fn kv(theme: Theme, key: &str, value: &str) -> Line<'static> {
         Span::styled(format!("{key:<8}"), Style::default().fg(theme.muted)),
         Span::styled(value.to_string(), Style::default().fg(theme.text)),
     ])
-}
-
-fn flag(theme: Theme, key: &str, label: &str, on: bool) -> Vec<Span<'static>> {
-    text_flag(theme, key, label, on)
-}
-
-fn text_flag(theme: Theme, key: &str, label: &str, on: bool) -> Vec<Span<'static>> {
-    let mark = if on { "●" } else { "○" };
-    let state = if on { theme.peak } else { theme.muted };
-    vec![
-        Span::styled(
-            format!(" {key} "),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(label.to_string(), Style::default().fg(theme.text)),
-        Span::styled(format!(" {mark} "), Style::default().fg(state)),
-    ]
-}
-
-fn mode_flag(theme: Theme, mode: &str) -> Vec<Span<'static>> {
-    vec![
-        Span::styled(
-            " m ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{mode} "),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]
-}
-
-fn fit_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
-    let mut kept = Vec::new();
-    let mut used = 0usize;
-    for span in spans {
-        let next = span.width();
-        if used + next > width && !kept.is_empty() {
-            break;
-        }
-        used += next;
-        kept.push(span);
-    }
-    Line::from(kept)
 }
 
 fn module_name(app: &App, module: &ModuleSnippet) -> String {

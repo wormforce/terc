@@ -144,11 +144,15 @@ impl Panel {
 
     fn border_style(&self) -> Style {
         let color = if self.focused {
-            blend_color(self.theme.border, self.theme.accent, 0.36)
+            self.theme.accent
         } else {
             self.theme.border
         };
-        Style::default().fg(color)
+        Style::default().fg(color).add_modifier(if self.focused {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        })
     }
 
     fn render_title(&self, area: Rect, buf: &mut Buffer, title: &Line<'_>) {
@@ -288,6 +292,8 @@ pub fn format_rate(bytes_per_sec: u64) -> String {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
+    app.proxy_hits.clear();
+    app.toast_area = None;
     let theme = app.theme();
     frame
         .buffer_mut()
@@ -301,37 +307,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    if !app.status_message.is_empty() {
-        let title = match app.lang() {
-            Lang::Zh => "操作结果 · ! 全文 · Backspace 收起",
-            Lang::Ja => "操作結果 · ! 詳細",
-            Lang::En => "Result · ! details · Backspace dismiss",
-        };
-        let inner = draw_panel(
-            frame,
-            Rect::new(size.x, size.y, size.width, 3),
-            app.theme(),
-            Some(panel_title(title.into(), app.theme())),
-            false,
-        );
-        frame.render_widget(
-            Paragraph::new(app.status_message.replace('\n', " · ")).style(Style::default().fg(
-                if app.status_is_error {
-                    app.theme().accent
-                } else {
-                    app.theme().muted
-                },
-            )),
-            inner,
-        );
-    }
-    let notice_h = if app.status_message.is_empty() { 0 } else { 3 };
-    let content = Rect::new(
-        size.x,
-        size.y + notice_h,
-        size.width,
-        size.height - notice_h,
-    );
+    let content = size;
     match app.screen {
         Screen::Dashboard => {
             draw_dashboard(frame, app, content);
@@ -355,6 +331,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_setup(frame, app, content);
         }
     }
+    if app.toast_visible() && !app.status_detail {
+        let width = size.width.saturating_sub(4).min(64);
+        let message = Paragraph::new(app.status_message.clone()).wrap(Wrap { trim: true });
+        let height = (message.line_count(width.saturating_sub(2)) as u16 + 2)
+            .clamp(3, 6)
+            .min(size.height.saturating_sub(2));
+        let popup = Rect::new(size.right() - width - 1, size.y + 1, width, height);
+        app.toast_area = Some(popup);
+        frame.render_widget(Clear, popup);
+        let title = if app.lang() == Lang::Zh {
+            "通知  ! 全文  Backspace 收起"
+        } else {
+            "Notice  ! details  Backspace dismiss"
+        };
+        let inner = draw_panel(
+            frame,
+            popup,
+            theme,
+            Some(panel_title(title.into(), theme)),
+            true,
+        );
+        frame.render_widget(
+            message.style(Style::default().fg(if app.status_is_error {
+                theme.accent
+            } else {
+                theme.text
+            })),
+            inner,
+        );
+    }
     if app.status_detail {
         let popup = centered_rect(92, 84, content);
         frame.render_widget(Clear, popup);
@@ -362,7 +368,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame,
             popup,
             theme,
-            Some(panel_title("Status · ↑↓ scroll · Esc".into(), theme)),
+            Some(panel_title("Status  ↑↓ scroll  Esc".into(), theme)),
             true,
         );
         let paragraph = Paragraph::new(app.status_message.clone()).wrap(Wrap { trim: false });
@@ -537,7 +543,7 @@ fn draw_traffic_graph(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let label = format!(
-        "max {} · {}ms",
+        "max {}  {}ms",
         format_rate(axis_max as u64),
         app.config.settings.graph_interval_ms()
     );
@@ -757,7 +763,7 @@ fn draw_overview_panel(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_proxies_main(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_proxies_main(frame: &mut Frame, app: &mut App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
@@ -767,10 +773,21 @@ fn draw_proxies_main(frame: &mut Frame, app: &App, area: Rect) {
     draw_nodes_panel(frame, app, cols[1]);
 }
 
-fn draw_groups_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_groups_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme();
     let focused = app.focus == FocusPane::Groups;
-    let title = module_title_line(theme, app.lang(), '1', "Groups", app.t("groups"));
+    let mut title = module_title_line(theme, app.lang(), '1', "Groups", app.t("groups"));
+    if focused {
+        title.spans.insert(
+            0,
+            Span::styled(
+                "▶ ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
     let inner = draw_panel(frame, area, theme, Some(title), focused);
     if inner.width < 6 || inner.height < 1 {
         return;
@@ -793,6 +810,8 @@ fn draw_groups_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     let visible_h = inner.height as usize;
     let start = visible_list_start(app.group_index, app.snapshot.groups.len(), visible_h);
+    app.proxy_hits
+        .push((inner, FocusPane::Groups, start, app.snapshot.groups.len()));
     let max_w = inner.width.saturating_sub(2) as usize;
 
     let items: Vec<ListItem> = app
@@ -804,8 +823,14 @@ fn draw_groups_panel(frame: &mut Frame, app: &App, area: Rect) {
         .take(visible_h)
         .map(|(idx, g)| {
             let selected = idx == app.group_index;
-            let prefix = if selected { "› " } else { "  " };
-            let name_style = if selected {
+            let prefix = if selected && focused {
+                "▶ "
+            } else if selected {
+                "› "
+            } else {
+                "  "
+            };
+            let name_style = if selected && focused {
                 Style::default()
                     .fg(theme.accent)
                     .add_modifier(Modifier::BOLD)
@@ -829,6 +854,11 @@ fn draw_groups_panel(frame: &mut Frame, app: &App, area: Rect) {
                 Span::raw(" ".repeat(gap)),
                 Span::styled(right, now_style),
             ]))
+            .style(if selected && focused {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default()
+            })
         })
         .collect();
 
@@ -843,18 +873,18 @@ fn draw_groups_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_nodes_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme();
     let focused = app.focus == FocusPane::Nodes;
     let current_group: Option<&ProxyGroup> = app.snapshot.groups.get(app.group_index);
 
     let title_str = match current_group {
-        Some(g) => format!("{} · {} ({})", app.t("nodes"), g.name, g.all.len()),
+        Some(g) => format!("{}  {} ({})", app.t("nodes"), g.name, g.all.len()),
         None => app.t("nodes").to_string(),
     };
     let title = Line::from(vec![
         Span::styled(
-            "[2] ",
+            if focused { "▶ [2] " } else { "[2] " },
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -876,6 +906,8 @@ fn draw_nodes_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     let visible_h = inner.height as usize;
     let start = visible_list_start(app.node_index, group.all.len(), visible_h);
+    app.proxy_hits
+        .push((inner, FocusPane::Nodes, start, group.all.len()));
     let max_w = inner.width.saturating_sub(2) as usize;
 
     let items: Vec<ListItem> = group
@@ -890,9 +922,9 @@ fn draw_nodes_panel(frame: &mut Frame, app: &App, area: Rect) {
             let is_info = is_info_pseudo_node(node_name);
 
             let cursor = if selected && focused {
-                "› "
+                "▶ "
             } else if selected {
-                "· "
+                "› "
             } else {
                 "  "
             };
@@ -952,6 +984,11 @@ fn draw_nodes_panel(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(proto_tag, Style::default().fg(theme.muted)),
                 Span::styled(delay_str, Style::default().fg(delay_color(theme, delay))),
             ]))
+            .style(if selected && focused {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default()
+            })
         })
         .collect();
 
@@ -974,10 +1011,7 @@ fn draw_logs_main(frame: &mut Frame, app: &mut App, area: Rect) {
         area,
         theme,
         Some(panel_title(
-            format!(
-                "{} · {mode} · P pause · / search · Enter detail",
-                app.t("logs")
-            ),
+            format!("{}  {mode}  P pause  / search  Enter detail", app.t("logs")),
             theme,
         )),
         true,
@@ -985,7 +1019,7 @@ fn draw_logs_main(frame: &mut Frame, app: &mut App, area: Rect) {
     let logs = app.filtered_logs();
     if app.log_detail {
         if let Some((level, text)) = logs.get(app.log_index) {
-            let paragraph = Paragraph::new(format!("{level} · Esc back · ↑↓ scroll\n\n{text}"))
+            let paragraph = Paragraph::new(format!("{level}  Esc back  ↑↓ scroll\n\n{text}"))
                 .wrap(Wrap { trim: false });
             let max = paragraph
                 .line_count(inner.width)
@@ -1129,8 +1163,8 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
 
 fn settings_hint(app: &App) -> &'static str {
     match (app.lang(), app.setting_input.is_some()) {
-        (Lang::Zh, true) => "Enter 保存 · Esc 取消 · Ctrl+U 清空",
-        (_, true) => "Enter Save · Esc Cancel · Ctrl+U Clear",
+        (Lang::Zh, true) => "Enter 保存  Esc 取消  Ctrl+U 清空",
+        (_, true) => "Enter Save  Esc Cancel  Ctrl+U Clear",
         (Lang::Zh, false) => "Tab 分类  ↑↓ 选择  ←→ 调整  ↵ 编辑  Esc",
         (_, false) => "Tab Tabs  ↑↓ Select  ←→ Adjust  ↵ Edit  Esc",
     }
@@ -1319,7 +1353,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         popup,
         theme,
         Some(panel_title(
-            format!("{} · ↑↓ / PgUp PgDn", app.t("help")),
+            format!("{}  ↑↓ / PgUp PgDn", app.t("help")),
             theme,
         )),
         true,
@@ -1334,7 +1368,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("↑↓ jk", app.t("help_jk")),
         ("c / L / p", app.t("help_tabs")),
         ("t / s", app.t("help_t")),
-        ("K", "启动/停止 terc 管理的内核 · Start/stop managed core"),
+        ("K", "启动/停止 terc 管理的内核  Start/stop managed core"),
         ("", "进阶与排查 / Advanced & diagnostics"),
         ("T / n / i", app.t("help_tun")),
         ("D", app.t("help_dns_key")),
@@ -1344,11 +1378,11 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("F", app.t("help_flush")),
         (
             "Logs: P / Enter",
-            "日志：暂停、搜索、全文 · Logs: pause, search, full text",
+            "日志：暂停、搜索、全文  Logs: pause, search, full text",
         ),
         (
             "! / Backspace",
-            "操作结果：全文 / 收起 · Result: details / dismiss",
+            "操作结果：全文 / 收起  Result: details / dismiss",
         ),
         ("q", app.t("help_q")),
         ("Esc", app.t("help_esc")),
@@ -1442,7 +1476,7 @@ pub fn editor_line_spans(
 }
 
 fn setup_step_line(theme: Theme, index: usize, text: String, done: bool) -> Line<'static> {
-    let mark = if done { "✓" } else { "·" };
+    let mark = if done { "✓" } else { "○" };
     let mark_color = if done { theme.peak } else { theme.accent };
     Line::from(vec![
         Span::styled(
@@ -1514,14 +1548,14 @@ fn draw_setup(frame: &mut Frame, app: &App, area: Rect) {
         setup_step_line(
             theme,
             1,
-            format!("{} · {}", app.t("setup_step_sub"), sub_state),
+            format!("{}  {}", app.t("setup_step_sub"), sub_state),
             has_config,
         ),
         setup_step_line(
             theme,
             2,
             format!(
-                "{} · {} · {}",
+                "{}  {}  {}",
                 app.t("setup_step_core"),
                 core_state,
                 truncate_str(&app.snapshot.core_bin_path, 28)
@@ -1531,7 +1565,7 @@ fn draw_setup(frame: &mut Frame, app: &App, area: Rect) {
         setup_step_line(
             theme,
             3,
-            format!("{} · {}", app.t("setup_step_run"), run_state),
+            format!("{}  {}", app.t("setup_step_run"), run_state),
             app.snapshot.running,
         ),
     ];

@@ -18,8 +18,8 @@ pub mod ui;
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event as CEvent, KeyCode, KeyEvent,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as CEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
@@ -336,6 +336,9 @@ pub struct App {
     pub down_history: Vec<f32>,
     pub pulse_phase: f32,
     pub logs: Vec<(String, String)>,
+    pub toast_started: Option<Instant>,
+    pub toast_area: Option<ratatui::layout::Rect>,
+    pub proxy_hits: Vec<(ratatui::layout::Rect, FocusPane, usize, usize)>,
     pub status_message: String,
     pub status_is_error: bool,
     pub tx: Sender<BackendEvent>,
@@ -422,6 +425,9 @@ impl App {
             down_history: vec![0.0; HISTORY_LEN],
             pulse_phase: 0.0,
             logs: Vec::new(),
+            toast_started: None,
+            toast_area: None,
+            proxy_hits: Vec::new(),
             status_message: String::new(),
             status_is_error: false,
             tx,
@@ -493,6 +499,7 @@ impl App {
     }
 
     pub fn set_status(&mut self, text: &str, is_error: bool) {
+        self.toast_started = Some(Instant::now());
         self.status_message = text.to_string();
         self.status_is_error = is_error;
     }
@@ -503,7 +510,15 @@ impl App {
         }
     }
 
+    pub fn toast_visible(&self) -> bool {
+        !self.status_message.is_empty()
+            && self.toast_started.is_some_and(|at| {
+                at.elapsed() < Duration::from_secs(if self.status_is_error { 8 } else { 4 })
+            })
+    }
+
     pub fn clear_status(&mut self) {
+        self.toast_started = None;
         self.status_message.clear();
         self.status_is_error = false;
     }
@@ -662,8 +677,7 @@ impl App {
                     }
                 }
                 BackendEvent::GroupTestDone { group } => {
-                    self.status_message = format!("Latency test complete: {group}");
-                    self.status_is_error = false;
+                    self.set_status(&format!("Latency test complete: {group}"), false);
                     if self.pending_best_group.as_deref() == Some(&group) {
                         self.pending_best_group = None;
                         if let Some(index) =
@@ -681,8 +695,7 @@ impl App {
                     }
                 }
                 BackendEvent::StatusMessage { text, is_error } => {
-                    self.status_message = text;
-                    self.status_is_error = is_error;
+                    self.set_status(&text, is_error);
                 }
                 BackendEvent::CoreDownloadDone { ok } => {
                     self.core_downloading = false;
@@ -853,11 +866,13 @@ impl App {
     }
 
     pub fn test_current_group(&mut self) {
-        let Some(group) = self.snapshot.groups.get(self.group_index) else {
+        let Some(group) = self.snapshot.groups.get(self.group_index).cloned() else {
             return;
         };
-        self.status_message = format!("Testing {} ({})...", group.name, group.all.len());
-        self.status_is_error = false;
+        self.set_status(
+            &format!("Testing {} ({})...", group.name, group.all.len()),
+            false,
+        );
         test_group_delays_async(
             self.config.controller.clone(),
             group.name.clone(),
@@ -1163,9 +1178,9 @@ impl App {
             (Lang::Zh, "no_groups") => "暂无策略组",
             (Lang::En, "no_groups") => "No proxy groups",
             (Lang::Ja, "no_groups") => "グループなし",
-            (Lang::Zh, "core_stopped_hint") => "Mihomo 内核未运行 · 按 K 启动内核，按 u 更新订阅（首次使用请按提示添加订阅）",
-            (Lang::En, "core_stopped_hint") => "Mihomo core is stopped · K starts it, u updates the subscription (first run: add one below)",
-            (Lang::Ja, "core_stopped_hint") => "Mihomo停止中 · Kで起動、uでサブスク更新（初回は登録を追加）",
+            (Lang::Zh, "core_stopped_hint") => "Mihomo 内核未运行  按 K 启动内核，按 u 更新订阅（首次使用请按提示添加订阅）",
+            (Lang::En, "core_stopped_hint") => "Mihomo core is stopped  K starts it, u updates the subscription (first run: add one below)",
+            (Lang::Ja, "core_stopped_hint") => "Mihomo停止中  Kで起動、uでサブスク更新（初回は登録を追加）",
             (Lang::Zh, "no_connections") => "当前没有活跃连接",
             (Lang::En, "no_connections") => "No active connections",
             (Lang::Ja, "no_connections") => "アクティブな接続はありません",
@@ -1331,9 +1346,9 @@ impl App {
             (Lang::Zh, "setup_paste_hint") => "可直接粘贴机场订阅链接（Ctrl+U 清空，Ctrl+D 下载内核）",
             (Lang::En, "setup_paste_hint") => "Paste your subscription link (Ctrl+U clears, Ctrl+D downloads the core)",
             (Lang::Ja, "setup_paste_hint") => "リンクを貼り付け可能（Ctrl+U クリア、Ctrl+D でコア導入）",
-            (Lang::Zh, "setup_keys") => "Enter 保存并启动内核 · Esc 稍后再说",
-            (Lang::En, "setup_keys") => "Enter saves & starts the core · Esc for later",
-            (Lang::Ja, "setup_keys") => "Enter で保存して起動 · Esc で後で",
+            (Lang::Zh, "setup_keys") => "Enter 保存并启动内核  Esc 稍后再说",
+            (Lang::En, "setup_keys") => "Enter saves & starts the core  Esc for later",
+            (Lang::Ja, "setup_keys") => "Enter で保存して起動  Esc で後で",
             (Lang::Zh, "setup_sysproxy_note") => "提示：系统代理不会自动开启，确认网络正常后按 Space 手动接管。",
             (Lang::En, "setup_sysproxy_note") => "Note: the system proxy is never enabled automatically — press Space when you are ready.",
             (Lang::Ja, "setup_sysproxy_note") => "注意：システムプロキシは自動で有効になりません。準備できたら Space を押してください。",
@@ -1349,18 +1364,18 @@ impl App {
             (Lang::Zh, "setup_err_scheme") => "订阅链接必须以 http:// 或 https:// 开头",
             (Lang::En, "setup_err_scheme") => "The link must start with http:// or https://",
             (Lang::Ja, "setup_err_scheme") => "リンクは http:// または https:// で始めてください",
-            (Lang::Zh, "setup_msg_saved") => "订阅已保存 · 内核未安装：按 Ctrl+D 下载，启动后按 K",
-            (Lang::En, "setup_msg_saved") => "Subscription saved · no core binary: press Ctrl+D, then K to start",
-            (Lang::Ja, "setup_msg_saved") => "サブスク保存済み · コア未導入：Ctrl+D で導入、K で起動",
+            (Lang::Zh, "setup_msg_saved") => "订阅已保存  内核未安装：按 Ctrl+D 下载，启动后按 K",
+            (Lang::En, "setup_msg_saved") => "Subscription saved  no core binary: press Ctrl+D, then K to start",
+            (Lang::Ja, "setup_msg_saved") => "サブスク保存済み  コア未導入：Ctrl+D で導入、K で起動",
             (Lang::Zh, "setup_msg_starting") => "内核启动中，就绪后自动关闭本窗口…",
             (Lang::En, "setup_msg_starting") => "Starting core; this window closes once it answers…",
             (Lang::Ja, "setup_msg_starting") => "コア起動中。応答するとこの窓は閉じます…",
             (Lang::Zh, "setup_msg_start_failed") => "内核启动失败",
             (Lang::En, "setup_msg_start_failed") => "Core failed to start",
             (Lang::Ja, "setup_msg_start_failed") => "コア起動に失敗",
-            (Lang::Zh, "setup_msg_still_starting") => "内核仍未响应 · 按 Ctrl+D 重新下载内核，或 Esc 查看日志",
-            (Lang::En, "setup_msg_still_starting") => "Core still not answering · Ctrl+D re-downloads it, Esc shows the logs",
-            (Lang::Ja, "setup_msg_still_starting") => "コアが応答しません · Ctrl+D で再導入、Esc でログ",
+            (Lang::Zh, "setup_msg_still_starting") => "内核仍未响应  按 Ctrl+D 重新下载内核，或 Esc 查看日志",
+            (Lang::En, "setup_msg_still_starting") => "Core still not answering  Ctrl+D re-downloads it, Esc shows the logs",
+            (Lang::Ja, "setup_msg_still_starting") => "コアが応答しません  Ctrl+D で再導入、Esc でログ",
             (Lang::Zh, "help_space") => "开关系统代理。macOS 用 networksetup，Linux 用 GNOME gsettings",
             (Lang::En, "help_space") => "Toggle the system proxy (networksetup, or GNOME gsettings)",
             (Lang::Ja, "help_space") => "システムプロキシを切替（networksetup または GNOME gsettings）",
@@ -1437,9 +1452,9 @@ impl App {
             (Lang::Zh, "st_dns_off") => "DNS 已关闭",
             (Lang::En, "st_dns_off") => "DNS off",
             (Lang::Ja, "st_dns_off") => "DNS オフ",
-            (Lang::Zh, "st_dns_missing") => "配置里没有 dns 块 · 按 o 打开片段库",
-            (Lang::En, "st_dns_missing") => "No dns block · o opens snippets",
-            (Lang::Ja, "st_dns_missing") => "dns ブロックがありません · o でスニペット",
+            (Lang::Zh, "st_dns_missing") => "配置里没有 dns 块  按 o 打开片段库",
+            (Lang::En, "st_dns_missing") => "No dns block  o opens snippets",
+            (Lang::Ja, "st_dns_missing") => "dns ブロックがありません  o でスニペット",
             (Lang::Zh, "st_dns_empty") => "先输入要查询的域名",
             (Lang::En, "st_dns_empty") => "Type a name to look up",
             (Lang::Ja, "st_dns_empty") => "検索する名前を入力してください",
@@ -1449,12 +1464,12 @@ impl App {
             (Lang::Zh, "st_dns_flushing") => "正在清空 DNS / Fake-IP 缓存…",
             (Lang::En, "st_dns_flushing") => "Flushing DNS / Fake-IP cache…",
             (Lang::Ja, "st_dns_flushing") => "DNS / Fake-IP キャッシュを消去中…",
-            (Lang::Zh, "st_core_down") => "内核未运行 · 按 K 启动",
-            (Lang::En, "st_core_down") => "Core is stopped · press K",
-            (Lang::Ja, "st_core_down") => "コア停止中 · K で起動",
-            (Lang::Zh, "st_saved_core_down") => "已写入配置 · 内核未运行，启动后生效",
-            (Lang::En, "st_saved_core_down") => "Saved · applies when the core is running",
-            (Lang::Ja, "st_saved_core_down") => "保存済み · コア起動後に反映",
+            (Lang::Zh, "st_core_down") => "内核未运行  按 K 启动",
+            (Lang::En, "st_core_down") => "Core is stopped  press K",
+            (Lang::Ja, "st_core_down") => "コア停止中  K で起動",
+            (Lang::Zh, "st_saved_core_down") => "已写入配置  内核未运行，启动后生效",
+            (Lang::En, "st_saved_core_down") => "Saved  applies when the core is running",
+            (Lang::Ja, "st_saved_core_down") => "保存済み  コア起動後に反映",
             (Lang::Zh, "st_reloading") => "正在热重载配置…",
             (Lang::En, "st_reloading") => "Hot-reloading config…",
             (Lang::Ja, "st_reloading") => "設定を再読み込み中…",
@@ -1569,18 +1584,18 @@ impl App {
             (Lang::Zh, "ov_modules") => "片段会追加到配置末尾，关闭后恢复原文",
             (Lang::En, "ov_modules") => "Snippets append to the config and restore it when removed",
             (Lang::Ja, "ov_modules") => "スニペットは末尾に追加され、外すと元に戻ります",
-            (Lang::Zh, "ov_profiles") => "Enter 切换并热重载 · c 保存当前副本 · r 重载",
-            (Lang::En, "ov_profiles") => "Enter switches and reloads · c saves a copy · r reloads",
-            (Lang::Ja, "ov_profiles") => "Enter で切替 · c で複製 · r で再読込",
+            (Lang::Zh, "ov_profiles") => "Enter 切换并热重载  c 保存当前副本  r 重载",
+            (Lang::En, "ov_profiles") => "Enter switches and reloads  c saves a copy  r reloads",
+            (Lang::Ja, "ov_profiles") => "Enter で切替  c で複製  r で再読込",
             (Lang::Zh, "ov_probe") => "对当前节点做 DNS 查询和延迟测试",
             (Lang::En, "ov_probe") => "DNS lookup plus a latency test of the selected node",
             (Lang::Ja, "ov_probe") => "選択中ノードの DNS と遅延を計測",
             (Lang::Zh, "ov_runtime") => "TUN、进程查找，以及 WireGuard 出站",
             (Lang::En, "ov_runtime") => "TUN, process lookup, and WireGuard outbounds",
             (Lang::Ja, "ov_runtime") => "TUN、プロセス検索、WireGuard 出口",
-            (Lang::Zh, "no_rules") => "还没有规则 · 内核运行后按 F 刷新",
-            (Lang::En, "no_rules") => "No rules yet · F refreshes once the core is up",
-            (Lang::Ja, "no_rules") => "ルールがありません · コア起動後に F で更新",
+            (Lang::Zh, "no_rules") => "还没有规则  内核运行后按 F 刷新",
+            (Lang::En, "no_rules") => "No rules yet  F refreshes once the core is up",
+            (Lang::Ja, "no_rules") => "ルールがありません  コア起動後に F で更新",
             (Lang::Zh, "no_providers") => "没有 Provider",
             (Lang::En, "no_providers") => "No providers",
             (Lang::Ja, "no_providers") => "プロバイダがありません",
@@ -1636,7 +1651,12 @@ fn main() -> io::Result<()> {
 fn run(app: &mut App) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_app(&mut terminal, app);
@@ -1645,6 +1665,7 @@ fn run(app: &mut App) -> io::Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -1672,6 +1693,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 CEvent::Key(key) => {
                     if handle_key(app, key) {
                         return Ok(());
+                    }
+                }
+                CEvent::Mouse(mouse) => {
+                    if proxy_mouse_action(app, mouse) {
+                        app.activate_selected_node();
                     }
                 }
                 CEvent::Paste(text) => {
@@ -2228,6 +2254,73 @@ fn handle_rule_edit_key(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+// Hit regions come from the rendered list, including its scroll offset.
+// Return true only when a node row was clicked; the caller performs activation.
+fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
+    if app.screen != Screen::Dashboard
+        || app.main_tab != MainTab::Proxies
+        || app.overlay != Overlay::None
+        || app.status_detail
+    {
+        return false;
+    }
+    let point = ratatui::layout::Position::new(mouse.column, mouse.row);
+    if app.toast_visible() && app.toast_area.is_some_and(|r| r.contains(point)) {
+        return false;
+    }
+    let Some((area, focus, start, len)) = app
+        .proxy_hits
+        .iter()
+        .copied()
+        .find(|(r, _, _, _)| r.contains(point))
+    else {
+        return false;
+    };
+    if len == 0 {
+        return false;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let index = start + (mouse.row - area.y) as usize;
+            if index >= len {
+                return false;
+            }
+            app.focus = focus;
+            match focus {
+                FocusPane::Groups => {
+                    app.group_index = index;
+                    app.sync_node_cursor_to_active();
+                }
+                FocusPane::Nodes => {
+                    app.node_index = index;
+                    return true;
+                }
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            app.focus = focus;
+            let current = match focus {
+                FocusPane::Groups => app.group_index,
+                FocusPane::Nodes => app.node_index,
+            };
+            let next = if mouse.kind == MouseEventKind::ScrollUp {
+                current.saturating_sub(1)
+            } else {
+                (current + 1).min(len - 1)
+            };
+            match focus {
+                FocusPane::Groups => {
+                    app.group_index = next;
+                    app.sync_node_cursor_to_active();
+                }
+                FocusPane::Nodes => app.node_index = next,
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
     if let Some(input) = &mut app.setting_input {
         match key.code {
@@ -2536,6 +2629,97 @@ mod tests {
     }
 
     #[test]
+    fn toast_expires_without_moving_lists_and_keeps_full_result() {
+        let mut app = offline_app();
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "Group".into(),
+            kind: "Selector".into(),
+            now: "node".into(),
+            all: vec!["node".into()],
+        });
+        render_text(&mut app, 80, 24);
+        let before = app.proxy_hits.clone();
+        app.set_status("TOAST_SENTINEL", false);
+        render_text(&mut app, 80, 24);
+        assert_eq!(before, app.proxy_hits);
+        assert!(app.toast_area.is_some());
+        app.toast_started = Some(Instant::now() - Duration::from_secs(5));
+        assert!(!render_text(&mut app, 80, 24).contains("TOAST_SENTINEL"));
+        assert!(app.toast_area.is_none());
+        press(&mut app, KeyCode::Char('!'));
+        assert!(render_text(&mut app, 80, 24).contains("TOAST_SENTINEL"));
+        press(&mut app, KeyCode::Esc);
+        app.set_status("ERROR_SENTINEL", true);
+        app.toast_started = Some(Instant::now() - Duration::from_secs(5));
+        assert!(app.toast_visible());
+        app.toast_started = Some(Instant::now() - Duration::from_secs(9));
+        assert!(!app.toast_visible());
+    }
+
+    #[test]
+    fn mouse_selects_rendered_rows_scrolls_and_respects_overlays() {
+        let mut app = offline_app();
+        app.snapshot.groups = (0..2)
+            .map(|i| mihomo::ProxyGroup {
+                name: format!("Group{i}"),
+                kind: "Selector".into(),
+                now: "Node0".into(),
+                all: (0..40).map(|n| format!("Node{n}")).collect(),
+            })
+            .collect();
+        for (width, height) in [(42, 12), (80, 24), (120, 30)] {
+            app.node_index = 30;
+            render_text(&mut app, width, height);
+            let (area, _, start, _) = app
+                .proxy_hits
+                .iter()
+                .copied()
+                .find(|(_, f, _, _)| *f == FocusPane::Nodes)
+                .unwrap();
+            assert!(start > 0);
+            let mut event = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x + 1,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(proxy_mouse_action(&mut app, event));
+            assert_eq!(app.node_index, start);
+            assert_eq!(app.focus, FocusPane::Nodes);
+            event.kind = MouseEventKind::ScrollDown;
+            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(app.node_index, start + 1);
+            app.overlay = Overlay::Probe;
+            event.kind = MouseEventKind::Down(MouseButton::Left);
+            assert!(!proxy_mouse_action(&mut app, event));
+            app.overlay = Overlay::None;
+            app.set_status("Notice", false);
+            render_text(&mut app, width, height);
+            let toast = app.toast_area.unwrap();
+            event.column = toast.x + 1;
+            event.row = toast.y + 1;
+            assert!(!proxy_mouse_action(&mut app, event));
+            app.clear_status();
+            render_text(&mut app, width, height);
+            let (group_area, _, _, _) = app
+                .proxy_hits
+                .iter()
+                .copied()
+                .find(|(_, f, _, _)| *f == FocusPane::Groups)
+                .unwrap();
+            event.column = group_area.x + 1;
+            event.row = group_area.y + 1;
+            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(app.group_index, 1);
+            assert_eq!(app.node_index, 0);
+            assert_eq!(app.focus, FocusPane::Groups);
+            event.row = group_area.y + 2;
+            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(app.group_index, 1);
+        }
+    }
+
+    #[test]
     fn notification_leaves_one_footer_and_can_be_dismissed() {
         let mut app = offline_app();
         app.set_status("TEST_RESULT", false);
@@ -2557,8 +2741,7 @@ mod tests {
     fn status_help_and_connection_detail_remain_accessible_in_small_windows() {
         let mut app = offline_app();
         app.config.settings.show_traffic = false;
-        app.status_message = "REVIEW_ERROR_SENTINEL".into();
-        app.status_is_error = true;
+        app.set_status("REVIEW_ERROR_SENTINEL", true);
         for (width, height) in [(60, 18), (80, 24), (120, 30)] {
             assert!(render_text(&mut app, width, height).contains("REVIEW_ERROR_SENTINEL"));
             app.screen = Screen::Help;

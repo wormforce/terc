@@ -25,9 +25,9 @@
 </p>
 
 <p align="center">
-  <a href="#quick-start"><strong>Get started</strong></a> &nbsp; · &nbsp;
-  <a href="docs/usage.en.md">User guide</a> &nbsp; · &nbsp;
-  <a href="#what-it-shows">Features</a> &nbsp; · &nbsp;
+  <a href="#quick-start"><strong>Get started</strong></a> &nbsp; / &nbsp;
+  <a href="docs/usage.en.md">User guide</a> &nbsp; / &nbsp;
+  <a href="#what-it-shows">Features</a> &nbsp; / &nbsp;
   <a href="#controls">Key bindings</a>
 </p>
 
@@ -90,7 +90,9 @@ Transparency follows your terminal profile. `terc` leaves the background at its 
 
 </details>
 
-The footer has one line of shortcuts. Operation results appear in the content area: Backspace dismisses them; `!` opens the full result. Help scrolls with arrow keys or Page Up/Down. In Connections, Enter opens full details even in a narrow terminal. In Logs, use `P` to pause/resume, `/` to search, and Enter to read the full message.
+The footer has one line of shortcuts. Floating notifications disappear after 4 seconds (8 seconds for errors). Backspace dismisses them early; `!` still opens the full result afterward. Help scrolls with arrow keys or Page Up/Down. In Connections, Enter opens full details even in a narrow terminal. In Logs, use `P` to pause/resume, `/` to search, and Enter to read the full message.
+
+Click a group to browse its nodes; click a node to activate it. Scrolling moves the selection without activating nodes. A bright bold border, ▶ marker, and underlined selected row identify the focused pane.
 
 ## Controls
 
@@ -112,7 +114,7 @@ The footer has one line of shortcuts. Operation results appear in the content ar
 | Dashboard | <kbd>t</kbd> | Show or hide the top Traffic & Overview panels |
 | Dashboard | <kbd>s</kbd> | Open the dual-pane Settings board. Press again there to return |
 | Settings | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Enter</kbd> | Adjust setting or trigger action |
-| Settings | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> / <kbd>1</kbd>–<kbd>3</kbd> | Switch category pages (`Core & Proxy` · `Appearance` · `Subscription`) |
+| Settings | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> / <kbd>1</kbd>–<kbd>3</kbd> | Switch category pages (`Core & Proxy` / `Appearance` / `Subscription`) |
 | Any view | <kbd>?</kbd> | Open keyboard shortcut help. Press again to return to the dashboard |
 | Dashboard | <kbd>q</kbd> | Quit (`mihomo` stays running in the background) |
 | Dashboard | <kbd>Esc</kbd> | Return to the proxy list; press q to quit |
@@ -141,7 +143,7 @@ Logs: `P` pauses/resumes display while capture continues, `/` searches, and Ente
 
 ## Configuration
 
-Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terc/config.json`. The interface supports **中文 · English · 日本語**.
+Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terc/config.json`. The interface supports **中文 / English / 日本語**.
 
 | Category | Options |
 | --- | --- |
@@ -160,7 +162,7 @@ Instead of pulling in a heavy async HTTP stack, `terc` speaks raw HTTP/1.1 over 
 ```mermaid
 flowchart LR
     A[Mihomo Core :9090] -->|Chunked JSON streams| B[Raw TcpStream workers]
-    B -->|/traffic · /memory · /logs| C[Up/down rate history]
+    B -->|/traffic / /memory / /logs| C[Up/down rate history]
     D[SysProxy macOS networksetup / Linux gsettings] <-->|SysProxy state| E[Controller API]
     C --> F[Synchronized Ratatui frame]
     E --> F

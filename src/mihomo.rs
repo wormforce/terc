@@ -966,7 +966,7 @@ pub fn discover_mihomo_binary() -> Option<PathBuf> {
 
 pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     let bin = discover_mihomo_binary()
-        .ok_or("mihomo binary not found · download the managed core first")?;
+        .ok_or("mihomo binary not found  download the managed core first")?;
     let config_file = config_yaml_path(cfg);
     if !config_file.is_file() {
         return Err(format!("config not found: {}", config_file.display()));
@@ -1533,7 +1533,7 @@ pub fn flush_dns(cfg: &ControllerConfig) -> Result<String, String> {
         }
     }
     if done.is_empty() {
-        Err(errors.join(" · "))
+        Err(errors.join("  "))
     } else {
         Ok(format!("flushed {}", done.join(" + ")))
     }
@@ -1591,7 +1591,7 @@ pub fn refresh_provider_async(
         let result = refresh_provider(&cfg, &kind, &name);
         let ok = result.is_ok();
         let text = match result {
-            Ok(()) => format!("provider updated · {name}"),
+            Ok(()) => format!("provider updated  {name}"),
             Err(err) => err,
         };
         if ok {
@@ -1620,7 +1620,7 @@ pub fn refresh_all_providers_async(cfg: ControllerConfig, tx: Sender<BackendEven
         let fresh = fetch_snapshot(&cfg);
         let _ = tx.send(BackendEvent::Snapshot(Box::new(fresh)));
         let _ = tx.send(BackendEvent::StatusMessage {
-            text: format!("providers {ok} updated · {failed} failed"),
+            text: format!("providers {ok} updated  {failed} failed"),
             is_error: ok == 0 && failed > 0,
         });
     });
@@ -1690,7 +1690,7 @@ pub fn run_probe(cfg: &ControllerConfig, node: &str, raw: &str) -> ProbeReport {
                 Ok(msg) => {
                     dns_ok = true;
                     if msg.answers.is_empty() {
-                        lines.push(format!("dns {qtype}  no answer · rcode {}", msg.status));
+                        lines.push(format!("dns {qtype}  no answer  rcode {}", msg.status));
                     }
                     for answer in msg.answers {
                         lines.push(format!("dns {qtype}  {}  {}s", answer.data, answer.ttl));
