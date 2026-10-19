@@ -1384,13 +1384,132 @@ fn detect_macos_sysproxy() -> (String, bool) {
     (service, false)
 }
 
+fn network_services(output: &str) -> Vec<(String, String)> {
+    let mut services = Vec::new();
+    let mut pending = None;
+    for line in output.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix('(') {
+            if let Some((number, name)) = rest.split_once(") ") {
+                if number.parse::<usize>().is_ok() {
+                    pending = (!name.starts_with('*')).then(|| name.to_string());
+                    continue;
+                }
+            }
+        }
+        if let Some((_, device)) = line.split_once("Device: ") {
+            let device = device.trim_end_matches(')').trim();
+            if let Some(name) = pending.take() {
+                if !device.is_empty() {
+                    services.push((name, device.to_string()));
+                }
+            }
+        }
+    }
+    services
+}
+
+fn active_nwi_interfaces(output: &str) -> Vec<String> {
+    let mut interfaces = Vec::new();
+    for line in output.lines().map(str::trim) {
+        if let Some((name, flags)) = line.split_once(" : flags") {
+            if flags.contains("IPv4") || flags.contains("IPv6") {
+                let name = name.trim();
+                if !interfaces.iter().any(|n| n == name) {
+                    interfaces.push(name.to_string());
+                }
+            }
+        }
+    }
+    interfaces
+}
+
+fn select_network_service(
+    services: &[(String, String)],
+    primary: Option<&str>,
+    active: &[String],
+) -> Option<String> {
+    if let Some(primary) = primary {
+        if let Some((name, _)) = services.iter().find(|(_, device)| device == primary) {
+            return Some(name.clone());
+        }
+    }
+    services
+        .iter()
+        .find(|(_, device)| active.contains(device))
+        .map(|(name, _)| name.clone())
+}
+
 fn active_macos_network_service() -> Option<String> {
-    let primary = scutil_value("State:/Network/Global/IPv4", "PrimaryService")
-        .or_else(|| scutil_value("State:/Network/Global/IPv6", "PrimaryService"))?;
-    scutil_value(
-        &format!("Setup:/Network/Service/{primary}"),
-        "UserDefinedName",
+    let primary_interface = scutil_value("State:/Network/Global/IPv4", "PrimaryInterface")
+        .or_else(|| scutil_value("State:/Network/Global/IPv6", "PrimaryInterface"));
+    // A packet tunnel can be PrimaryService without a Setup/UserDefinedName.
+    // Map the active underlying hardware interface to its actual service name.
+    let output = Command::new("/usr/sbin/networksetup")
+        .arg("-listnetworkserviceorder")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let services = network_services(&String::from_utf8_lossy(&output.stdout));
+    if let Some(name) = select_network_service(&services, primary_interface.as_deref(), &[]) {
+        return Some(name);
+    }
+    let output = Command::new("/usr/sbin/scutil")
+        .arg("--nwi")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    select_network_service(
+        &services,
+        None,
+        &active_nwi_interfaces(&String::from_utf8_lossy(&output.stdout)),
     )
+}
+
+pub(crate) fn macos_tun_route_conflict() -> Option<String> {
+    let output = Command::new("/usr/sbin/scutil")
+        .args(["--nc", "list"])
+        .output()
+        .ok()?;
+    let connections = connected_vpns(&String::from_utf8_lossy(&output.stdout));
+    if connections.is_empty() {
+        return None;
+    }
+    let route = Command::new("/sbin/route")
+        .args(["-n", "get", "1.0.0.1"])
+        .output()
+        .ok()?;
+    if conflicting_tun_route(&String::from_utf8_lossy(&route.stdout)) {
+        Some(format!("TUN 路由冲突：{} 已连接并占用 1.0.0.0/8 所在的虚拟网卡路由。请先在该 VPN 中断开，再开启 terc TUN；未删除任何路由 / Disconnect the other VPN before enabling terc TUN: {}", connections.join(", "), connections.join(", ")))
+    } else {
+        None
+    }
+}
+
+fn connected_vpns(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|line| line.contains("(Connected)"))
+        .filter_map(|line| {
+            let (_, rest) = line.split_once('"')?;
+            Some(rest.split_once('"')?.0.to_string())
+        })
+        .collect()
+}
+
+fn conflicting_tun_route(output: &str) -> bool {
+    let field = |name| {
+        output.lines().find_map(|line| {
+            let (key, value) = line.trim().split_once(':')?;
+            (key == name).then(|| value.trim())
+        })
+    };
+    field("destination") == Some("1.0.0.0")
+        && field("mask") == Some("255.0.0.0")
+        && field("interface").is_some_and(|name| name.starts_with("utun"))
 }
 
 fn scutil_value(key: &str, field: &str) -> Option<String> {
@@ -1898,6 +2017,46 @@ fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vpn_primary_interface_uses_connected_hardware_service() {
+        let services = network_services("An asterisk (*) denotes that a network service is disabled.\n(1) Ethernet\n(Hardware Port: USB LAN, Device: en5)\n(2) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en0)\n(3) Shadowrocket\n(Hardware Port: com.liguangming.Shadowrocket, Device: )\n(4) *Disabled Ethernet\n(Hardware Port: USB LAN, Device: en8)\n");
+        let active = active_nwi_interfaces("IPv4 network interface information\n   utun7 : flags      : 0x7 (IPv4,IPv6,DNS)\n     en0 : flags      : 0x7 (IPv4,IPv6,DNS)\nIPv6 network interface information\n   utun7 : flags      : 0x7 (IPv4,IPv6,DNS)\n     en0 : flags      : 0x7 (IPv4,IPv6,DNS)\n");
+        assert_eq!(
+            select_network_service(&services, Some("utun7"), &active).as_deref(),
+            Some("Wi-Fi")
+        );
+        assert_eq!(
+            select_network_service(&services, Some("en5"), &active).as_deref(),
+            Some("Ethernet")
+        );
+        assert!(select_network_service(&services, None, &["en8".into()]).is_none());
+    }
+
+    #[test]
+    fn tun_conflict_requires_an_existing_specific_tunnel_route() {
+        assert_eq!(connected_vpns("* (Disconnected) UUID VPN (x) \"Tailscale\"\n* (Connected) UUID VPN (y) \"Shadowrocket\" [VPN:y]\n"), vec!["Shadowrocket"]);
+        assert!(conflicting_tun_route(
+            "destination: 1.0.0.0\nmask: 255.0.0.0\ninterface: utun7\n"
+        ));
+        assert!(!conflicting_tun_route(
+            "destination: default\nmask: default\ninterface: en0\n"
+        ));
+        assert!(!conflicting_tun_route(
+            "destination: 1.0.0.0\nmask: 255.0.0.0\ninterface: en0\n"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "read-only diagnosis of active network service and conflicting VPN routes"]
+    fn live_macos_network_service_and_tun_conflict_read_only() {
+        let service = active_macos_network_service().expect("Connected hardware network service");
+        eprintln!("Detected physical network service: {service}");
+        if let Some(conflict) = macos_tun_route_conflict() {
+            eprintln!("{conflict}");
+        }
+    }
 
     #[test]
     fn mixed_listener_supplies_both_system_proxy_protocols() {

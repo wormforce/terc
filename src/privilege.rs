@@ -296,6 +296,9 @@ fn restore_pid_record(path: &Path, previous: Option<&[u8]>) -> std::io::Result<(
 }
 
 pub(crate) fn start_core(cfg: &ControllerConfig, old_pid: Option<u32>) -> Result<String, String> {
+    if let Some(conflict) = mihomo::macos_tun_route_conflict() {
+        return Err(conflict);
+    }
     let old_core = old_pid.map(process_details).transpose()?;
     let bin = match &old_core {
         Some((_, _, executable)) => executable.clone(),
@@ -415,6 +418,11 @@ pub(crate) fn set_tun(
         }
     }
     if running {
+        if cfg!(target_os = "macos") && enable {
+            if let Some(conflict) = mihomo::macos_tun_route_conflict() {
+                return Err(conflict);
+            }
+        }
         mihomo::set_tun_enabled(cfg, enable).map_err(|e| {
             if cfg!(target_os = "macos") && managed_core(cfg).is_err() {
                 format!("TUN change failed: {e}. 该内核由外部程序管理，请通过原服务授权；或先在原程序停止内核，再按 K 由 terc 启动 / Authorize the external core through its service manager, or stop it there and press K to start a terc-managed core.")
