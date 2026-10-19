@@ -104,7 +104,7 @@ Click a group to browse its nodes; click a node to activate it. Scrolling moves 
 | Any list | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd> | Move the selection |
 | Nodes | <kbd>Enter</kbd> | Activate the highlighted node in the current group |
 | Proxies | <kbd>r</kbd> | Run concurrent URL latency tests for the current group |
-| Proxies | <kbd>a</kbd> | Auto-select the lowest-latency node in the current group |
+| Proxies | <kbd>a</kbd> | Choose all countries or the connected node’s country, then test and select the fastest node |
 | Dashboard | <kbd>m</kbd> | Cycle routing mode (`Rule` → `Global` → `Direct`) |
 | Dashboard | <kbd>u</kbd> | Fetch latest subscription YAML and hot-reload core (`PUT /configs?force=true`); opens the setup window when no URL is saved |
 | Setup window | <kbd>Enter</kbd> | Save the subscription URL, write the config and start the core |
@@ -140,6 +140,8 @@ Click a group to browse its nodes; click a node to activate it. Scrolling moves 
 Install the core before submitting the first subscription (`Ctrl+D` in Setup downloads it). Subscription, snippet and profile changes are validated with `mihomo -t` before replacing the configuration; rejected reloads restore the previous file. Enabled snippets are reapplied on subscription updates and profile switches. `K` stops only a core started by terc; use the service manager for external cores.
 
 Logs: `P` pauses/resumes display while capture continues, `/` searches, and Enter opens full text. Connections: Enter opens full details on narrow terminals. Results remain accessible with graphs hidden; `!` opens the full result and Backspace dismisses it. Help supports arrows and Page Up/Down.
+
+Best-node selection compares selectable proxy nodes in the current Selector group. Country hints come from the connected node’s flag, country name, or standalone country code, not IP geolocation. Unknown country or no reachable candidate leaves the current connection unchanged.
 
 ## Configuration
 

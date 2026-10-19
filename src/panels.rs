@@ -368,7 +368,79 @@ pub fn draw_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Overlay::Profiles => draw_profiles(frame, app, area),
         Overlay::Probe => draw_probe(frame, app, area),
         Overlay::Runtime => draw_runtime(frame, app, area),
+        Overlay::Best => draw_best(frame, app, area),
     }
+}
+
+fn draw_best(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let popup = centered_rect(88, 70, area);
+    frame.render_widget(Clear, popup);
+    let zh = app.lang() == crate::Lang::Zh;
+    let inner = draw_panel(
+        frame,
+        popup,
+        theme,
+        Some(panel_title(
+            if zh {
+                "优选范围"
+            } else {
+                "Best-node scope"
+            }
+            .into(),
+            theme,
+        )),
+        true,
+    );
+    let country = crate::best::active_country(&app.snapshot, app.group_index)
+        .unwrap_or_else(|| if zh { "未识别" } else { "Unknown" }.into());
+    let choices = if zh {
+        ["1  全球优选".to_string(), format!("2  当前国家  {country}")]
+    } else {
+        [
+            "1  All countries".to_string(),
+            format!("2  Current country  {country}"),
+        ]
+    };
+    let mut lines: Vec<Line> = choices
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            Line::styled(
+                format!(
+                    "{}{}",
+                    if i == app.best_scope_index {
+                        "▶ "
+                    } else {
+                        "  "
+                    },
+                    text
+                ),
+                Style::default().fg(if i == app.best_scope_index {
+                    theme.accent
+                } else {
+                    theme.text
+                }),
+            )
+        })
+        .collect();
+    lines.push(Line::default());
+    lines.push(Line::from(if zh {
+        "仅比较当前策略组的可选节点，重新测速后切换。"
+    } else {
+        "Test selectable nodes in this group, then switch to the fastest."
+    }));
+    lines.push(Line::from(if zh {
+        "国家根据节点名称识别，以已连接节点为准。"
+    } else {
+        "Country is inferred from the connected node's label."
+    }));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[0]);
+    frame.render_widget(Paragraph::new("↑↓ / 1 2   Enter   Esc"), rows[1]);
 }
 
 fn draw_dns_status(frame: &mut Frame, app: &App, area: Rect) {

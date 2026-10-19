@@ -1362,7 +1362,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     let shortcuts = [
         ("Space", app.t("help_space")),
         ("m", app.t("help_m")),
-        ("r / a", app.t("help_r")),
+        ("r", app.t("help_r")),
+        ("a", app.t("help_a")),
         ("u", app.t("help_u")),
         ("Enter", app.t("help_enter")),
         ("↑↓ jk", app.t("help_jk")),

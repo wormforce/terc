@@ -51,6 +51,10 @@ pub enum BackendEvent {
     GroupTestDone {
         group: String,
     },
+    BestTestDone {
+        group: String,
+        results: Vec<(String, Option<u16>)>,
+    },
     StatusMessage {
         text: String,
         is_error: bool,
@@ -880,7 +884,27 @@ pub fn test_group_delays_async(
     nodes: Vec<String>,
     tx: Sender<BackendEvent>,
 ) {
+    test_delays_async(cfg, group_name, nodes, tx, false);
+}
+
+pub fn test_best_delays_async(
+    cfg: ControllerConfig,
+    group_name: String,
+    nodes: Vec<String>,
+    tx: Sender<BackendEvent>,
+) {
+    test_delays_async(cfg, group_name, nodes, tx, true);
+}
+
+fn test_delays_async(
+    cfg: ControllerConfig,
+    group_name: String,
+    nodes: Vec<String>,
+    tx: Sender<BackendEvent>,
+    best: bool,
+) {
     thread::spawn(move || {
+        let mut results = Vec::new();
         let mut handles = Vec::new();
         let chunk_size = 8;
         for chunk in nodes.chunks(chunk_size) {
@@ -919,16 +943,26 @@ pub fn test_group_delays_async(
                     });
                     let _ = tx_clone.send(BackendEvent::DelayResult {
                         group: group_clone,
-                        node,
+                        node: node.clone(),
                         delay,
                     });
+                    (node, delay)
                 }));
             }
             for h in handles.drain(..) {
-                let _ = h.join();
+                if let Ok(result) = h.join() {
+                    results.push(result);
+                }
             }
         }
-        let _ = tx.send(BackendEvent::GroupTestDone { group: group_name });
+        let _ = tx.send(if best {
+            BackendEvent::BestTestDone {
+                group: group_name,
+                results,
+            }
+        } else {
+            BackendEvent::GroupTestDone { group: group_name }
+        });
     });
 }
 

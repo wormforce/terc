@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod best;
 pub mod control;
 pub mod mihomo;
 pub mod ops;
@@ -81,6 +82,7 @@ pub enum Overlay {
     Profiles,
     Probe,
     Runtime,
+    Best,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,7 +304,8 @@ pub struct App {
     pub log_editing: bool,
     pub log_detail: bool,
     pub log_index: usize,
-    pub pending_best_group: Option<String>,
+    pub pending_best_group: Option<(String, Option<String>)>,
+    pub best_scope_index: usize,
     pub action_busy: bool,
     pub snapshot_pending: bool,
     pub setting_index: usize,
@@ -392,6 +395,7 @@ impl App {
             log_detail: false,
             log_index: 0,
             pending_best_group: None,
+            best_scope_index: 0,
             action_busy: false,
             snapshot_pending: false,
             setting_index: 0,
@@ -678,15 +682,21 @@ impl App {
                 }
                 BackendEvent::GroupTestDone { group } => {
                     self.set_status(&format!("Latency test complete: {group}"), false);
-                    if self.pending_best_group.as_deref() == Some(&group) {
-                        self.pending_best_group = None;
+                }
+                BackendEvent::BestTestDone { group, results } => {
+                    if self
+                        .pending_best_group
+                        .as_ref()
+                        .is_some_and(|(name, _)| name == &group)
+                    {
+                        let (_, country) = self.pending_best_group.take().unwrap();
                         if let Some(index) =
                             self.snapshot.groups.iter().position(|g| g.name == group)
                         {
                             let previous_group = self.group_index;
                             let previous_node = self.node_index;
                             self.group_index = index;
-                            self.select_best_node_in_group_after_test();
+                            self.select_best_node_in_group_after_test(country.as_deref(), &results);
                             if previous_group != index {
                                 self.group_index = previous_group;
                                 self.node_index = previous_node;
@@ -866,6 +876,10 @@ impl App {
     }
 
     pub fn test_current_group(&mut self) {
+        if self.pending_best_group.is_some() {
+            self.set_status("优选测速进行中 / Best-node test is running", true);
+            return;
+        }
         let Some(group) = self.snapshot.groups.get(self.group_index).cloned() else {
             return;
         };
@@ -882,40 +896,67 @@ impl App {
     }
 
     pub fn select_best_node_in_group(&mut self) {
-        if let Some(group) = self.snapshot.groups.get(self.group_index) {
-            if !group
-                .all
-                .iter()
-                .any(|n| self.snapshot.nodes.get(n).and_then(|n| n.delay).is_some())
-            {
-                self.pending_best_group = Some(group.name.clone());
-                self.test_current_group();
-                return;
-            }
+        if self.pending_best_group.is_some() {
+            self.set_status("优选测速进行中 / Best-node test is running", true);
+            return;
         }
-        self.select_best_node_in_group_after_test();
+        self.overlay = Overlay::Best;
     }
 
-    fn select_best_node_in_group_after_test(&mut self) {
+    pub fn start_best_selection(&mut self) {
         let Some(group) = self.snapshot.groups.get(self.group_index) else {
             return;
         };
-        let mut best: Option<(usize, String, u16)> = None;
-        for (idx, name) in group.all.iter().enumerate() {
-            if is_info_pseudo_node(name) {
-                continue;
-            }
-            if let Some(delay) = self.snapshot.nodes.get(name).and_then(|n| n.delay) {
-                if delay > 0 && best.as_ref().map(|b| delay < b.2).unwrap_or(true) {
-                    best = Some((idx, name.clone(), delay));
+        if !group.kind.eq_ignore_ascii_case("selector") {
+            self.set_status(
+                "请选择可手动切换的策略组 / Select a manual Selector group",
+                true,
+            );
+            return;
+        }
+        let country = if self.best_scope_index == 1 {
+            match best::active_country(&self.snapshot, self.group_index) {
+                Some(code) => Some(code),
+                None => {
+                    self.set_status("无法识别已连接节点的国家，请检查节点名称 / Cannot identify the active node's country", true);
+                    return;
                 }
             }
+        } else {
+            None
+        };
+        let candidates = best::candidates(&self.snapshot, self.group_index, country.as_deref());
+        if candidates.is_empty() {
+            self.set_status(
+                "范围内没有可选代理节点 / No selectable proxy nodes in this scope",
+                true,
+            );
+            return;
         }
-        if let Some((idx, _, _)) = best {
-            self.node_index = idx;
+        let group_name = group.name.clone();
+        self.pending_best_group = Some((group_name.clone(), country));
+        self.overlay = Overlay::None;
+        self.set_status("正在测速并优选 / Testing candidates…", false);
+        mihomo::test_best_delays_async(
+            self.config.controller.clone(),
+            group_name,
+            candidates.into_iter().map(|(_, name)| name).collect(),
+            self.tx.clone(),
+        );
+    }
+
+    fn select_best_node_in_group_after_test(
+        &mut self,
+        country: Option<&str>,
+        results: &[(String, Option<u16>)],
+    ) {
+        let candidates = best::candidates(&self.snapshot, self.group_index, country);
+        let selected = best::fastest(&candidates, results);
+        if let Some(index) = selected {
+            self.node_index = index;
             self.activate_selected_node();
         } else {
-            self.set_status("No reachable node found", true);
+            self.set_status("范围内没有可达节点 / No reachable node in this scope", true);
         }
     }
 
@@ -1383,7 +1424,8 @@ impl App {
             (_, "help_jk") => "Navigate up / down in current list",
             (_, "help_enter") => "Activate highlighted node in current group",
             (_, "help_r") => "Concurrent URL latency test for current group",
-            (_, "help_a") => "Auto-select lowest latency node in current group",
+            (Lang::Zh, "help_a") => "选择全球或当前国家范围，测速后优选",
+            (_, "help_a") => "Choose all countries or current country, test and select fastest",
             (_, "help_m") => "Cycle routing mode (Rule / Global / Direct)",
             (_, "help_u") => "Fetch subscription & hot-reload (u opens the setup window when unset)",
             (_, "help_tabs") => "Switch view: [p] Proxies  [c] Connections  [L] Logs",
@@ -2100,6 +2142,16 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
     }
     match app.overlay {
         Overlay::None => {}
+        Overlay::Best => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Char('j' | 'k') => {
+                app.best_scope_index = 1 - app.best_scope_index
+            }
+            KeyCode::Char('1') => app.best_scope_index = 0,
+            KeyCode::Char('2') => app.best_scope_index = 1,
+            KeyCode::Enter => app.start_best_selection(),
+            _ => {}
+        },
         Overlay::Modules => match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('o') => app.close_overlay(),
             KeyCode::Up | KeyCode::Char('k') => {
@@ -2626,6 +2678,31 @@ mod tests {
         let previous = app.up_history.clone();
         app.advance_graph(Duration::from_secs(2));
         assert_eq!(app.up_history, previous);
+    }
+
+    #[test]
+    fn best_scope_popup_uses_active_country_and_rejects_unknown_country() {
+        let mut app = offline_app();
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "Main".into(),
+            kind: "Selector".into(),
+            now: "Unknown".into(),
+            all: vec!["US 01".into()],
+        });
+        for (width, height) in [(42, 12), (80, 24)] {
+            press(&mut app, KeyCode::Char('a'));
+            assert_eq!(app.overlay, Overlay::Best);
+            let view = render_text(&mut app, width, height);
+            assert!(view.contains("Enter"));
+            press(&mut app, KeyCode::Char('2'));
+            press(&mut app, KeyCode::Enter);
+            assert!(app.pending_best_group.is_none());
+            assert!(!app.action_busy);
+            assert!(app.status_is_error);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.overlay, Overlay::None);
+            app.clear_status();
+        }
     }
 
     #[test]
