@@ -29,7 +29,7 @@ use crossterm::{
 };
 use mihomo::{
     close_connection, config_file_exists, download_managed_core_async, fetch_snapshot,
-    is_info_pseudo_node, select_group_node, set_macos_sysproxy, spawn_stream_workers,
+    is_info_pseudo_node, mihomo_asset_label, select_group_node, set_sysproxy, spawn_stream_workers,
     start_core_service, stop_core_service, switch_routing_mode, test_group_delays_async,
     update_subscription_async, BackendEvent, ControllerConfig, CoreSnapshot,
 };
@@ -51,7 +51,6 @@ pub enum Lang {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
-    Menu,
     Dashboard,
     Settings,
     Help,
@@ -261,10 +260,8 @@ impl LineEditor {
 pub struct App {
     pub config: Config,
     pub screen: Screen,
-    pub settings_origin: Screen,
     pub main_tab: MainTab,
     pub focus: FocusPane,
-    pub menu_index: usize,
     pub group_index: usize,
     pub node_index: usize,
     pub conn_index: usize,
@@ -322,13 +319,16 @@ impl App {
             stop_flag.clone(),
         );
 
+        let screen = launch_screen(
+            &config.controller.subscription_url,
+            initial_snapshot.running,
+            config_file_exists(&config.controller),
+        );
         let mut app = Self {
             config,
-            screen: Screen::Dashboard,
-            settings_origin: Screen::Dashboard,
+            screen,
             main_tab: MainTab::Proxies,
             focus: FocusPane::Groups,
-            menu_index: 0,
             group_index: 0,
             node_index: 0,
             conn_index: 0,
@@ -374,16 +374,18 @@ impl App {
         };
         app.dns_editor.load("example.com");
         app.sync_node_cursor_to_active();
-        if app.needs_setup() {
+        if app.screen == Screen::Setup {
             app.open_setup(Screen::Dashboard);
         }
         app
     }
 
     pub fn needs_setup(&self) -> bool {
-        self.config.controller.subscription_url.trim().is_empty()
-            && !self.snapshot.running
-            && !config_file_exists(&self.config.controller)
+        needs_setup_state(
+            &self.config.controller.subscription_url,
+            self.snapshot.running,
+            config_file_exists(&self.config.controller),
+        )
     }
 
     pub fn core_binary_found(&self) -> bool {
@@ -671,14 +673,18 @@ impl App {
 
     pub fn toggle_sysproxy(&mut self) {
         let target = !self.snapshot.sysproxy_enabled;
-        match set_macos_sysproxy(target, self.snapshot.http_port, self.snapshot.socks_port) {
+        match set_sysproxy(target, self.snapshot.http_port, self.snapshot.socks_port) {
             Ok(msg) => {
                 self.snapshot.sysproxy_enabled = target;
                 self.status_message = msg;
                 self.status_is_error = false;
             }
             Err(err) => {
-                self.status_message = err;
+                self.status_message = if err == "sysproxy_unavailable" {
+                    self.t("sysproxy_unavailable").to_string()
+                } else {
+                    err
+                };
                 self.status_is_error = true;
             }
         }
@@ -778,7 +784,7 @@ impl App {
                 category: SettingCategory::Core,
                 label: self.t("set_download_core").to_string(),
                 value: "Enter / →".to_string(),
-                description: self.t("desc_download_core").to_string(),
+                description: format!("{}\n{}", self.t("desc_download_core"), mihomo_asset_label()),
             },
             SettingRow {
                 category: SettingCategory::Appearance,
@@ -887,18 +893,6 @@ impl App {
     pub fn t(&self, key: &str) -> &'static str {
         match (self.config.settings.lang, key) {
             (_, "too_small") => "Terminal window too small",
-            (Lang::Zh, "menu_dashboard") => "进入面板",
-            (Lang::En, "menu_dashboard") => "Dashboard",
-            (Lang::Ja, "menu_dashboard") => "ダッシュボード",
-            (Lang::Zh, "menu_settings") => "设置",
-            (Lang::En, "menu_settings") => "Settings",
-            (Lang::Ja, "menu_settings") => "設定",
-            (Lang::Zh, "menu_help") => "快捷键说明",
-            (Lang::En, "menu_help") => "Help",
-            (Lang::Ja, "menu_help") => "ヘルプ",
-            (Lang::Zh, "menu_quit") => "退出",
-            (Lang::En, "menu_quit") => "Quit",
-            (Lang::Ja, "menu_quit") => "終了",
             (Lang::Zh, "traffic") => "实时速率",
             (Lang::En, "traffic") => "Traffic",
             (Lang::Ja, "traffic") => "トラフィック",
@@ -986,12 +980,15 @@ impl App {
             (Lang::Zh, "desc_core_state") => "一键启动或停止后台 Mihomo 进程。即使退出 terc，后台内核依然稳定保持运行。",
             (Lang::En, "desc_core_state") => "Start or stop background Mihomo daemon. Continues running after quitting terc.",
             (Lang::Ja, "desc_core_state") => "バックグラウンドのMihomoを起動・停止します。",
-            (Lang::Zh, "set_sysproxy") => "macOS 系统代理",
-            (Lang::En, "set_sysproxy") => "macOS System Proxy",
-            (Lang::Ja, "set_sysproxy") => "macOS システムプロキシ",
-            (Lang::Zh, "desc_sysproxy") => "通过 networksetup 一键接管或恢复当前活跃网卡的 HTTP/HTTPS/SOCKS5 代理。",
-            (Lang::En, "desc_sysproxy") => "Toggle macOS system HTTP/HTTPS/SOCKS5 proxy via networksetup.",
-            (Lang::Ja, "desc_sysproxy") => "macOSのシステムプロキシを切り替えます。",
+            (Lang::Zh, "set_sysproxy") => "系统代理",
+            (Lang::En, "set_sysproxy") => "System Proxy",
+            (Lang::Ja, "set_sysproxy") => "システムプロキシ",
+            (Lang::Zh, "desc_sysproxy") => "macOS 用 networksetup 接管当前网卡的 HTTP/HTTPS/SOCKS。Linux 在有 GNOME 时用 gsettings（org.gnome.system.proxy）；没有则保持原样并提示。不会自动打开。",
+            (Lang::En, "desc_sysproxy") => "macOS uses networksetup for the active service. Linux uses GNOME gsettings (org.gnome.system.proxy) when it is present, and otherwise leaves the proxy unchanged. Never enabled automatically.",
+            (Lang::Ja, "desc_sysproxy") => "macOS は networksetup。Linux は GNOME の gsettings（org.gnome.system.proxy）があるときだけ変更し、なければそのままにして知らせます。",
+            (Lang::Zh, "sysproxy_unavailable") => "此 Linux 环境没有 GNOME gsettings（org.gnome.system.proxy），系统代理未改动。",
+            (Lang::En, "sysproxy_unavailable") => "System proxy unchanged: GNOME gsettings (org.gnome.system.proxy) is not available.",
+            (Lang::Ja, "sysproxy_unavailable") => "システムプロキシは未変更です。GNOME の gsettings（org.gnome.system.proxy）がありません。",
             (Lang::Zh, "set_mode") => "路由分流模式",
             (Lang::En, "set_mode") => "Routing Mode",
             (Lang::Ja, "set_mode") => "ルーティングモード",
@@ -1001,9 +998,9 @@ impl App {
             (Lang::Zh, "set_download_core") => "下载/升级内置内核",
             (Lang::En, "set_download_core") => "Download Managed Core",
             (Lang::Ja, "set_download_core") => "コアのダウンロード",
-            (Lang::Zh, "desc_download_core") => "从 GitHub 官方拉取最新 mihomo-darwin-arm64 到 ~/.config/terc/core/mihomo。",
-            (Lang::En, "desc_download_core") => "Fetch latest official mihomo-darwin-arm64 into ~/.config/terc/core/mihomo.",
-            (Lang::Ja, "desc_download_core") => "最新のmihomoバイナリをダウンロードします。",
+            (Lang::Zh, "desc_download_core") => "从 GitHub 官方 MetaCubeX/mihomo 拉取与本机系统、架构匹配的包，解压到 ~/.config/terc/core/mihomo。",
+            (Lang::En, "desc_download_core") => "Fetch the MetaCubeX/mihomo release that matches this OS and CPU into ~/.config/terc/core/mihomo.",
+            (Lang::Ja, "desc_download_core") => "この OS と CPU に合う MetaCubeX/mihomo を ~/.config/terc/core/mihomo に入れます。",
             (Lang::Zh, "set_theme") => "色彩主题",
             (Lang::En, "set_theme") => "Palette Theme",
             (Lang::Ja, "set_theme") => "カラーテーマ",
@@ -1118,9 +1115,9 @@ impl App {
             (Lang::Zh, "setup_msg_still_starting") => "内核仍未响应 · 按 Ctrl+D 重新下载内核，或 Esc 查看日志",
             (Lang::En, "setup_msg_still_starting") => "Core still not answering · Ctrl+D re-downloads it, Esc shows the logs",
             (Lang::Ja, "setup_msg_still_starting") => "コアが応答しません · Ctrl+D で再導入、Esc でログ",
-            (Lang::Zh, "help_space") => "一键开启 / 关闭 macOS 系统代理 (networksetup)",
-            (Lang::En, "help_space") => "Toggle macOS system proxy ON / OFF",
-            (Lang::Ja, "help_space") => "macOSシステムプロキシをON / OFF",
+            (Lang::Zh, "help_space") => "开关系统代理。macOS 用 networksetup，Linux 用 GNOME gsettings",
+            (Lang::En, "help_space") => "Toggle the system proxy (networksetup, or GNOME gsettings)",
+            (Lang::Ja, "help_space") => "システムプロキシを切替（networksetup または GNOME gsettings）",
             (_, "help_hl") => "Switch focus between Groups [1] and Nodes [2]",
             (_, "help_jk") => "Navigate up / down in current list",
             (_, "help_enter") => "Activate highlighted node in current group",
@@ -1131,7 +1128,12 @@ impl App {
             (_, "help_tabs") => "Switch view: [p] Proxies  [c] Connections  [L] Logs",
             (_, "help_t") => "Toggle top Traffic & Overview panels",
             (_, "help_s") => "Open Settings board (Core / Theme / Subscription)",
-            (_, "help_q") => "Back / Quit terc (background core stays running)",
+            (Lang::Zh, "help_q") => "退出 terc（后台内核继续运行）",
+            (Lang::En, "help_q") => "Quit terc (background core stays running)",
+            (Lang::Ja, "help_q") => "終了（バックグラウンドのコアは継続）",
+            (Lang::Zh, "help_esc") => "子页面回节点页，再按退出；设置与帮助回面板",
+            (Lang::En, "help_esc") => "Back to proxies, then quit. Settings and Help return here",
+            (Lang::Ja, "help_esc") => "プロキシへ戻って終了。設定とヘルプはパネルへ",
             (Lang::Zh, "controls") => "开关",
             (Lang::En, "controls") => "Controls",
             (Lang::Ja, "controls") => "スイッチ",
@@ -1456,39 +1458,44 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
     }
 }
 
+fn needs_setup_state(subscription_url: &str, core_running: bool, config_exists: bool) -> bool {
+    subscription_url.trim().is_empty() && !core_running && !config_exists
+}
+
+/// Existing config opens the dashboard. First run (no subscription, core, or
+/// config file) still opens Setup. There is no startup menu.
+pub fn launch_screen(subscription_url: &str, core_running: bool, config_exists: bool) -> Screen {
+    if needs_setup_state(subscription_url, core_running, config_exists) {
+        Screen::Setup
+    } else {
+        Screen::Dashboard
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EscStep {
+    Quit,
+    ClearQuery,
+    Proxies,
+}
+
+fn dashboard_esc(tab: MainTab, rule_query_empty: bool) -> EscStep {
+    if tab == MainTab::Rules && !rule_query_empty {
+        EscStep::ClearQuery
+    } else if tab != MainTab::Proxies {
+        EscStep::Proxies
+    } else {
+        EscStep::Quit
+    }
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     match app.screen {
-        Screen::Menu => handle_menu_key(app, key),
         Screen::Dashboard => handle_dashboard_key(app, key),
         Screen::Settings => handle_settings_key(app, key),
         Screen::Help => handle_help_key(app, key),
         Screen::Setup => handle_setup_key(app, key),
     }
-}
-
-fn handle_menu_key(app: &mut App, key: KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => return true,
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.menu_index = app.menu_index.checked_sub(1).unwrap_or(3);
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.menu_index = (app.menu_index + 1) % 4;
-        }
-        KeyCode::Enter => match app.menu_index {
-            0 => app.screen = Screen::Dashboard,
-            1 => {
-                app.settings_origin = Screen::Menu;
-                app.screen = Screen::Settings;
-            }
-            2 => app.screen = Screen::Help,
-            3 => return true,
-            _ => {}
-        },
-        KeyCode::Char(' ') => app.screen = Screen::Dashboard,
-        _ => {}
-    }
-    false
 }
 
 fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
@@ -1503,18 +1510,14 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
     }
     match key.code {
         KeyCode::Char('q') => return true,
-        KeyCode::Esc => {
-            if app.rule_query.text.is_empty() && app.main_tab == MainTab::Proxies {
-                app.screen = Screen::Menu;
-            } else if !app.rule_query.text.is_empty() && app.main_tab == MainTab::Rules {
+        KeyCode::Esc => match dashboard_esc(app.main_tab, app.rule_query.text.is_empty()) {
+            EscStep::ClearQuery => {
                 app.rule_query.clear();
                 app.rule_index = 0;
-            } else if app.main_tab != MainTab::Proxies {
-                app.main_tab = MainTab::Proxies;
-            } else {
-                app.screen = Screen::Menu;
             }
-        }
+            EscStep::Proxies => app.main_tab = MainTab::Proxies,
+            EscStep::Quit => return true,
+        },
         KeyCode::Char(' ') => app.toggle_sysproxy(),
         KeyCode::Char('T') => app.toggle_tun(),
         KeyCode::Char('n') => app.toggle_sniffing(),
@@ -1576,7 +1579,6 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             };
         }
         KeyCode::Char('s') | KeyCode::Char('S') => {
-            app.settings_origin = Screen::Dashboard;
             app.screen = Screen::Settings;
         }
         KeyCode::Char('?') => app.screen = Screen::Help,
@@ -1868,7 +1870,7 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
     let len = app.settings_rows().len();
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') | KeyCode::Char('S') => {
-            app.screen = app.settings_origin;
+            app.screen = Screen::Dashboard;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.setting_index = app.setting_index.checked_sub(1).unwrap_or(len - 1);
@@ -2058,5 +2060,25 @@ mod tests {
         assert!(cfg.enabled_modules.is_empty());
         assert!(cfg.active_profile.is_empty());
         assert_eq!(cfg.settings.theme, ThemeId::Mono);
+    }
+
+    #[test]
+    fn existing_config_lands_on_dashboard() {
+        assert_eq!(
+            launch_screen("https://example.com/sub", false, true),
+            Screen::Dashboard
+        );
+        assert_eq!(launch_screen("", false, true), Screen::Dashboard);
+        assert_eq!(launch_screen("", true, false), Screen::Dashboard);
+        assert_eq!(launch_screen("  ", false, false), Screen::Setup);
+    }
+
+    #[test]
+    fn dashboard_esc_quits_from_proxies_and_steps_back_elsewhere() {
+        assert_eq!(dashboard_esc(MainTab::Proxies, true), EscStep::Quit);
+        assert_eq!(dashboard_esc(MainTab::Rules, false), EscStep::ClearQuery);
+        assert_eq!(dashboard_esc(MainTab::Rules, true), EscStep::Proxies);
+        assert_eq!(dashboard_esc(MainTab::Providers, true), EscStep::Proxies);
+        assert_eq!(dashboard_esc(MainTab::Dns, true), EscStep::Proxies);
     }
 }

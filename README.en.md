@@ -11,6 +11,7 @@
 
 <p align="center">
   <img alt="macOS 14 or newer" src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square">
+  <img alt="Linux" src="https://img.shields.io/badge/Linux-x86__64%20%7C%20arm64-111111?style=flat-square">
   <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable-111111?style=flat-square">
   <img alt="Ratatui terminal interface" src="https://img.shields.io/badge/TUI-ratatui-FFA4A4?style=flat-square">
   <img alt="Mihomo Clash.Meta core" src="https://img.shields.io/badge/Core-Mihomo-555555?style=flat-square">
@@ -18,6 +19,7 @@
 
 <p align="center">
   <a href="#quick-start"><strong>Get started</strong></a> ·
+  <a href="docs/usage.en.md"><strong>Guide</strong></a> ·
   <a href="#what-it-shows">Features</a> ·
   <a href="#controls">Controls</a> ·
   <a href="#configuration">Config</a> ·
@@ -44,7 +46,7 @@ Surge keeps TUN, sniffing, routing, and DNS inside menus. `terc` leaves them on 
 
 ## Quick Start
 
-**Requires:** macOS 14+, Rust stable, and a `mihomo` binary (either via `brew install mihomo` or downloaded directly inside `terc`).
+**Requires:** macOS 14+ or Linux (x86_64 / arm64), Rust stable, and a `mihomo` binary (`brew install mihomo` on macOS, or the matching official build from inside `terc`). See the [guide](docs/usage.en.md) and the [Chinese manual](docs/使用说明.md).
 
 ```bash
 git clone https://github.com/pentaoa/terc.git
@@ -52,9 +54,9 @@ cd terc
 cargo run --release --locked
 ```
 
-Press **Space** to toggle the macOS system proxy, or press **K** to start/stop the background `mihomo` daemon. Run `terc --version` to verify the installed version.
+`terc` opens on the dashboard. Press **Space** to toggle the system proxy (macOS `networksetup`, or Linux GNOME `gsettings` when `org.gnome.system.proxy` is present; otherwise it stays unchanged and says so), or press **K** to start/stop the background `mihomo` daemon. Run `terc --version` to verify the installed version.
 
-On first run `terc` opens a setup window that walks through three steps: paste a subscription URL, locate the `mihomo` binary (<kbd>Ctrl+D</kbd> downloads a managed core) and start the core. <kbd>Esc</kbd> dismisses it and <kbd>u</kbd> brings it back while no subscription is configured — the macOS system proxy is never switched on for you.
+Setup appears only when there is no subscription URL, no `config.yaml`, and the core is not running: paste a subscription URL, locate `mihomo` (<kbd>Ctrl+D</kbd> downloads `darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` for this machine) and start the core. An existing config skips that and lands on the dashboard. <kbd>Esc</kbd> dismisses Setup and <kbd>u</kbd> brings it back while no subscription is configured — the system proxy is never switched on for you.
 
 > [!NOTE]
 > `terc` decouples the UI lifecycle from the proxy core. Closing `terc` with <kbd>q</kbd> immediately frees all terminal UI resources while your background `mihomo` tunnel continues running uninterrupted.
@@ -72,7 +74,7 @@ Transparency follows your terminal profile. `terc` leaves the background at its 
 | **Connections** | Process, inbound, sniff host, rule payload, chain, and geo/ASN, with one-key close |
 | **DNS** | Resolver status from the config, live lookup, and DNS / Fake-IP flush |
 | **Rules** | Ordered list with live hit counts, local explain, and runtime disable |
-| **Providers** | Proxy and rule providers, refresh one or all, latency health check |
+| **Providers (`v`)** | `proxy-providers` and `rule-providers`, not the airport subscription URL. Refresh one or all; proxy providers can run a health check |
 | **Snippets** | YAML overlays for TUN, sniffer, Fake-IP, process lookup, TCP racing, and IPv6 |
 | **Profiles** | Switch another YAML onto the running config and hot-reload |
 | **Probe** | DNS answers plus a delay test of the selected node |
@@ -86,7 +88,7 @@ The toolbar stays one row. Narrow terminals keep the key letters and drop the la
 
 | Where | Key | Action |
 | --- | --- | --- |
-| Dashboard / Settings | <kbd>Space</kbd> | Toggle macOS system proxy (`networksetup` HTTP / HTTPS / SOCKS5). Never toggled for you |
+| Dashboard / Settings | <kbd>Space</kbd> | Toggle the system proxy. macOS uses `networksetup`; Linux uses GNOME `gsettings` and otherwise leaves it unchanged. Never toggled for you |
 | Dashboard | <kbd>T</kbd> / <kbd>n</kbd> / <kbd>i</kbd> | Toggle TUN, sniffer, or IPv6. Runtime `PATCH`, then the same value is written back |
 | Dashboard | <kbd>D</kbd> | Toggle `dns.enable` in the config and hot-reload |
 | Dashboard | <kbd>d</kbd> / <kbd>g</kbd> / <kbd>v</kbd> | DNS, rules, providers |
@@ -109,11 +111,13 @@ The toolbar stays one row. Narrow terminals keep the key letters and drop the la
 | Dashboard | <kbd>p</kbd> / <kbd>c</kbd> / <kbd>L</kbd> | Switch main pane: **Proxies** / **Connections** / **Logs** |
 | Connections | <kbd>x</kbd> / <kbd>X</kbd> | Close selected connection / close all active connections |
 | Dashboard | <kbd>t</kbd> | Show or hide the top Traffic & Overview panels |
-| Menu / Dashboard | <kbd>s</kbd> | Open the dual-pane Settings board |
+| Dashboard | <kbd>s</kbd> | Open the dual-pane Settings board. Press again there to return |
 | Settings | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Enter</kbd> | Adjust setting or trigger action |
 | Settings | <kbd>Tab</kbd> | Cycle setting categories (`Core & Proxy` · `Appearance` · `Subscription`) |
-| Any view | <kbd>?</kbd> | Open keyboard shortcut help |
-| Dashboard / Menu | <kbd>q</kbd> or <kbd>Esc</kbd> | Return or quit (`mihomo` stays running in background) |
+| Any view | <kbd>?</kbd> | Open keyboard shortcut help. Press again to return to the dashboard |
+| Dashboard | <kbd>q</kbd> | Quit (`mihomo` stays running in the background) |
+| Dashboard | <kbd>Esc</kbd> | Leave a subview for the proxy list; quit from that list |
+| Settings / Help | <kbd>Esc</kbd> | Return to the dashboard |
 
 ## Configuration
 
@@ -121,7 +125,7 @@ Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terc
 
 | Category | Options |
 | --- | --- |
-| **Core & Proxy** | Start/stop `mihomo`, toggle the macOS system proxy, switch routing mode, download `mihomo-darwin-arm64` into `~/.config/terc/core/mihomo` |
+| **Core & Proxy** | Start/stop `mihomo`, toggle the system proxy, switch routing mode, download `mihomo-darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` into `~/.config/terc/core/mihomo` |
 | **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling appends a marked block; disabling removes only that block |
 | **Profiles** | YAML files in the config directory and `~/.config/terc/profiles`. Enter copies one onto `config.yaml` and reloads |
 | **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), refresh rate (`15` / `30` / `60` / `120 Hz`), UI language |
@@ -129,13 +133,13 @@ Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terc
 
 ## How It Works
 
-Instead of pulling in a heavy async HTTP stack, `terc` speaks raw HTTP/1.1 over `std::net::TcpStream` to the local controller (`127.0.0.1:9090`). Background threads read `/traffic`, `/memory`, and `/logs`. Toggles use `PATCH /configs` (`tun.enable`, `sniffing`, `ipv6`). DNS lookup is `GET /dns/query`, flush is `POST /cache/dns/flush` and `POST /cache/fakeip/flush`, and provider refresh is `PUT /providers/...`. Remote subscription downloads still go through `/usr/bin/curl`.
+Instead of pulling in a heavy async HTTP stack, `terc` speaks raw HTTP/1.1 over `std::net::TcpStream` to the local controller (`127.0.0.1:9090`). Background threads read `/traffic`, `/memory`, and `/logs`. Toggles use `PATCH /configs` (`tun.enable`, `sniffing`, `ipv6`). DNS lookup is `GET /dns/query`, flush is `POST /cache/dns/flush` and `POST /cache/fakeip/flush`, and provider refresh is `PUT /providers/...`. Remote subscription and core downloads go through the system `curl`.
 
 ```mermaid
 flowchart LR
     A[Mihomo Core :9090] -->|Chunked JSON streams| B[Raw TcpStream workers]
     B -->|/traffic · /memory · /logs| C[Up/down rate history]
-    D[macOS networksetup] <-->|SysProxy state| E[Controller API]
+    D[SysProxy macOS networksetup / Linux gsettings] <-->|SysProxy state| E[Controller API]
     C --> F[Synchronized Ratatui frame]
     E --> F
 ```
@@ -150,7 +154,7 @@ src/ui.rs                      Rounded cutout Panel, palettes, Braille/Blocks gr
 src/panels.rs                  Controls, DNS, rules, providers, overlays
 src/control.rs                 Toggle, reload, profile, and probe actions
 src/ops.rs                     YAML overlays, rule explain, DNS/rule parsers
-src/mihomo.rs                  HTTP/1.1 over TcpStream, streams, networksetup
+src/mihomo.rs                  HTTP/1.1 over TcpStream, streams, networksetup and gsettings
 ```
 
 </details>
