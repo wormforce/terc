@@ -11,7 +11,7 @@ use crate::{
         dns_query_async, flush_dns_async, is_info_pseudo_node, normalize_subscription,
         persist_nested_bool, probe_async, provider_healthcheck, read_config_text,
         refresh_all_providers_async, refresh_provider_async, set_bool_config, set_rule_disabled,
-        set_tun_enabled, test_group_delays_async, test_node_async, ProxyNode,
+        test_group_delays_async, test_node_async, ProxyNode,
     },
     ops::{
         apply_enabled_modules, enabled_snippets, explain_rules, is_runtime_tunnel, list_profiles,
@@ -87,7 +87,14 @@ impl App {
     }
 
     pub fn toggle_tun(&mut self) {
-        self.runtime_switch(&["tun", "enable"], "tun", !self.snapshot.tun_enabled);
+        let next = !self.snapshot.tun_enabled;
+        let running = self.snapshot.running;
+        self.run_action(
+            "正在设置 TUN，macOS 可能请求管理员授权 / Applying TUN…",
+            None,
+            None,
+            move |cfg| crate::privilege::set_tun(&cfg, next, running),
+        );
     }
 
     pub fn toggle_sniffing(&mut self) {
@@ -104,12 +111,8 @@ impl App {
         let running = self.snapshot.running;
         self.run_action("Applying runtime switch…", None, None, move |cfg| {
             if running {
-                if field == "tun" {
-                    set_tun_enabled(&cfg, next)
-                } else {
-                    set_bool_config(&cfg, &field, next)
-                }
-                .map_err(|err| format!("Runtime change rejected: {err}"))?;
+                set_bool_config(&cfg, &field, next)
+                    .map_err(|err| format!("Runtime change rejected: {err}"))?;
             }
             let refs: Vec<&str> = path.iter().map(String::as_str).collect();
             persist_nested_bool(&cfg, &refs, next).map_err(|err| {

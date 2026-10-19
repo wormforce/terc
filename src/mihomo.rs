@@ -19,8 +19,8 @@ use serde_json::Value;
 
 use crate::ops::{
     apply_general_json, bool_patch_body, parse_dns_message, parse_probe_target,
-    parse_providers_json, parse_rules_json, parse_yaml_flags, rule_disable_body, tun_patch_body,
-    DnsMessage, DnsStatus, ProbeTarget, ProviderInfo, RuleInfo, RuntimeFlags,
+    parse_providers_json, parse_rules_json, parse_yaml_flags, rule_disable_body, DnsMessage,
+    DnsStatus, ProbeTarget, ProviderInfo, RuleInfo, RuntimeFlags,
 };
 
 #[derive(Clone, Debug)]
@@ -1018,6 +1018,9 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     ) {
         return Ok("Mihomo controller is already running".into());
     }
+    if cfg!(target_os = "macos") && local_flags(cfg).tun_enabled {
+        return crate::privilege::start_core(cfg, None);
+    }
     let log_path = Path::new(&cfg.config_dir).join("terc-core.log");
     let log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let mut child = Command::new(&bin)
@@ -1076,50 +1079,35 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
 }
 
 pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
-    let pid_path = Path::new(&cfg.config_dir).join("terc-core.pid");
-    let pid: u32 = fs::read_to_string(&pid_path)
-        .map_err(|_| {
-            "This core is managed externally; stop it with its service manager".to_string()
-        })?
-        .trim()
-        .parse()
-        .map_err(|_| "Invalid managed core PID".to_string())?;
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .map_err(|e| e.to_string())?;
-    let command = String::from_utf8_lossy(&output.stdout);
-    let expected = format!(
-        " -d {} -f {}",
-        cfg.config_dir,
-        config_yaml_path(cfg).display()
-    );
-    if !output.status.success() || !command.contains(&expected) {
-        return Err("Managed core is no longer running; no other process was stopped".into());
+    let (pid, uid) = crate::privilege::managed_core(cfg)?;
+    if cfg!(target_os = "macos") && uid == 0 {
+        crate::privilege::stop_core(cfg, pid)?;
+    } else {
+        let output = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        let mut stopped = false;
+        for _ in 0..25 {
+            if crate::privilege::managed_core(cfg).is_err() {
+                stopped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if !stopped {
+            return Err("Stop requested, but managed Mihomo process has not exited".into());
+        }
     }
+    let _ = fs::remove_file(Path::new(&cfg.config_dir).join("terc-core.pid"));
     let (_, enabled) = detect_sysproxy();
     if enabled {
         set_sysproxy(false, 0, 0)?;
     }
-    let output = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-    }
-    for _ in 0..25 {
-        let status = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !status.status.success() {
-            let _ = fs::remove_file(&pid_path);
-            return Ok("Stopped managed Mihomo core".into());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Err("Stop requested, but managed Mihomo process has not exited".into())
+    Ok("Stopped managed Mihomo core".into())
 }
 
 pub fn fetch_subscription(
@@ -1438,8 +1426,39 @@ pub fn patch_configs(cfg: &ControllerConfig, body: &str) -> io::Result<()> {
     }
 }
 
+pub(crate) fn read_runtime_config(cfg: &ControllerConfig) -> io::Result<Value> {
+    let (status, body) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "GET",
+        "/configs",
+        None,
+        Duration::from_millis(1500),
+    )?;
+    if status != 200 {
+        return Err(io::Error::other(format!(
+            "Read runtime config: HTTP {status}"
+        )));
+    }
+    serde_json::from_str(&body).map_err(io::Error::other)
+}
+
 pub fn set_tun_enabled(cfg: &ControllerConfig, enable: bool) -> io::Result<()> {
-    patch_configs(cfg, &tun_patch_body(enable))
+    // Mihomo replaces nested TUN settings on PATCH; preserve the complete object.
+    let current = read_runtime_config(cfg)?;
+    let body = crate::ops::tun_patch_from_config(&current, enable).map_err(io::Error::other)?;
+    let offset = fs::metadata(Path::new(&cfg.config_dir).join("terc-core.log"))
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
+    patch_configs(cfg, &body)?;
+    let actual = read_runtime_config(cfg)?;
+    if let Some(error) = crate::privilege::tun_log_error(cfg, offset) {
+        return Err(io::Error::other(error));
+    }
+    if actual.pointer("/tun/enable").and_then(Value::as_bool) != Some(enable) {
+        return Err(io::Error::other("Mihomo accepted the request but TUN did not reach the requested state. Check core logs and administrator permissions; external cores must be authorized by their service manager."));
+    }
+    Ok(())
 }
 
 pub fn set_bool_config(cfg: &ControllerConfig, field: &str, enable: bool) -> io::Result<()> {
@@ -1903,6 +1922,77 @@ mod tests {
                 "''"
             ]));
         assert_eq!(commands.last().unwrap()[3], "mode");
+    }
+
+    #[test]
+    fn tun_patch_preserves_settings_and_checks_the_result() {
+        use std::{net::TcpListener, time::Instant};
+        for actual in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let cfg = ControllerConfig {
+                addr: listener.local_addr().unwrap().to_string(),
+                config_dir: "/terc-mock-tun".into(),
+                ..ControllerConfig::default()
+            };
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut requests = 0;
+                let mut patch = String::new();
+                while requests < 3 && Instant::now() < deadline {
+                    let (stream, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(e) => panic!("{e}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut bytes = vec![0; length];
+                    reader.read_exact(&mut bytes).unwrap();
+                    let (status, body) = if requests == 1 {
+                        assert!(first.starts_with("PATCH /configs "));
+                        patch = String::from_utf8(bytes).unwrap();
+                        (204, String::new())
+                    } else {
+                        assert!(first.starts_with("GET /configs "));
+                        (200, serde_json::json!({"tun": {"enable": requests == 2 && actual, "stack": "mixed", "auto-route": true, "mtu": 1400}}).to_string())
+                    };
+                    write!(reader.get_mut(), "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    requests += 1;
+                }
+                assert_eq!(requests, 3);
+                let value: Value = serde_json::from_str(&patch).unwrap();
+                assert_eq!(value["tun"]["enable"], true);
+                assert_eq!(value["tun"]["mtu"], 1400);
+                assert_eq!(value["tun"]["auto-route"], true);
+            });
+            let result = set_tun_enabled(&cfg, true);
+            server.join().unwrap();
+            assert_eq!(result.is_ok(), actual);
+            if !actual {
+                assert!(result.unwrap_err().to_string().contains("did not reach"));
+            }
+        }
     }
 
     #[test]

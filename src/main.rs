@@ -15,6 +15,7 @@ pub mod control;
 pub mod mihomo;
 pub mod ops;
 pub mod panels;
+mod privilege;
 pub mod ui;
 
 use crossterm::{
@@ -611,6 +612,14 @@ impl App {
                     self.memory_inuse = inuse;
                 }
                 BackendEvent::Log { level, payload } => {
+                    if level.eq_ignore_ascii_case("error")
+                        && payload.contains("Start TUN listening error")
+                    {
+                        self.set_status(
+                            &format!("TUN 启动失败 / TUN startup failed: {payload}"),
+                            true,
+                        );
+                    }
                     self.logs.push((level, payload));
                     if self.logs.len() > 300 {
                         self.logs.remove(0);

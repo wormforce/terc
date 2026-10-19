@@ -902,8 +902,14 @@ pub fn ip_in_cidr(ip: &str, cidr: &str) -> Option<bool> {
     Some((ip & mask) == (net & mask))
 }
 
-pub fn tun_patch_body(enable: bool) -> String {
-    format!(r#"{{"tun":{{"enable":{enable}}}}}"#)
+pub fn tun_patch_from_config(config: &serde_json::Value, enable: bool) -> Result<String, String> {
+    let mut tun = config
+        .get("tun")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .ok_or("Mihomo did not return its TUN configuration")?;
+    tun.insert("enable".into(), enable.into());
+    Ok(serde_json::json!({"tun": tun}).to_string())
 }
 
 pub fn bool_patch_body(field: &str, enable: bool) -> String {
@@ -1248,7 +1254,7 @@ fn top_level_key(line: &str) -> Option<String> {
     Some(key.to_string())
 }
 
-fn set_top_scalar(doc: &str, key: &str, literal: &str) -> String {
+pub(crate) fn set_top_scalar(doc: &str, key: &str, literal: &str) -> String {
     let mut chunks = split_chunks(doc);
     if let Some(chunk) = chunks
         .iter_mut()
@@ -1672,7 +1678,13 @@ ipv6: false
 
     #[test]
     fn patch_bodies_only_touch_the_requested_field() {
-        assert_eq!(tun_patch_body(true), r#"{"tun":{"enable":true}}"#);
+        let current = serde_json::json!({"tun": {"enable": false, "stack": "mixed", "mtu": 1400, "auto-route": true, "dns-hijack": ["any:53"]}, "mode": "direct"});
+        let patch: serde_json::Value =
+            serde_json::from_str(&tun_patch_from_config(&current, true).unwrap()).unwrap();
+        let mut expected = current["tun"].clone();
+        expected["enable"] = true.into();
+        assert_eq!(patch, serde_json::json!({"tun": expected}));
+        assert!(tun_patch_from_config(&serde_json::json!({}), true).is_err());
         assert_eq!(bool_patch_body("sniffing", false), r#"{"sniffing":false}"#);
         assert_eq!(rule_disable_body(4, true), r#"{"4":true}"#);
     }

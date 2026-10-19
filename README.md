@@ -58,6 +58,8 @@ cargo run --release --locked
 
 按 <kbd>Space</kbd> 开启或关闭系统代理（macOS 用 `networksetup`，Linux 在有 GNOME `gsettings` 时用 `org.gnome.system.proxy`，否则不动并提示），按 <kbd>K</kbd> 启动或停止 terc 管理的后台 `mihomo`。
 
+macOS 按 <kbd>T</kbd> 开启 TUN 时，terc 会弹出系统管理员授权窗口，并以管理员权限重启自己管理的 Mihomo；现有连接会短暂中断，界面继续以普通用户运行。取消授权会保留原内核并恢复配置。以后按 <kbd>K</kbd> 停止这个内核时也可能需要授权；若配置已开启 TUN，启动内核时会直接请求授权。TUN 启动失败会显示内核错误，不再仅凭 API 返回成功就提示已开启。外部程序启动的内核，请通过对应服务管理器提权。Linux 请自行通过系统服务或所需网络权限运行 Mihomo。
+
 运行 `terc --version` 可查看已安装版本。
 
 > [!NOTE]  
@@ -125,7 +127,7 @@ cargo run --release --locked
 
 | 页面 | 按键 | 操作 |
 | --- | --- | --- |
-| 面板 | T / n / i | 开关 TUN、嗅探或 IPv6。先 `PATCH` 运行时，再写回配置 |
+| 面板 | T / n / i | 开关 TUN、嗅探或 IPv6。TUN 在 macOS 必要时请求管理员授权；运行时生效后保存配置 |
 | 面板 | D | 切换配置里的 `dns.enable` 并热重载 |
 | 面板 | d / g / v | DNS、规则、Provider |
 | 面板 | o / f / b / w | 片段库、配置档案、探测、WireGuard / 运行时 |

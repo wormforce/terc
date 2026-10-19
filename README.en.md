@@ -54,7 +54,11 @@ cd terc
 cargo run --release --locked
 ```
 
-`terc` opens on the dashboard. Press **Space** to toggle the system proxy (macOS `networksetup`, or Linux GNOME `gsettings` when `org.gnome.system.proxy` is present; otherwise it stays unchanged and says so), or press **K** to start/stop the background `mihomo` daemon. Run `terc --version` to verify the installed version.
+`terc` opens on the dashboard. Press **Space** to toggle the system proxy (macOS `networksetup`, or Linux GNOME `gsettings` when `org.gnome.system.proxy` is present; otherwise it stays unchanged and says so), or press **K** to start/stop the background `mihomo` daemon.
+
+On macOS, <kbd>T</kbd> opens the system administrator authorization dialog when enabling TUN requires elevated privileges. After approval, terc restarts its managed Mihomo as administrator; existing connections briefly disconnect, while the TUI stays an ordinary user process. Cancelling preserves the original core and restores the configuration. Stopping the elevated core with <kbd>K</kbd> may also require authorization; starting a core with TUN already enabled requests authorization immediately. TUN failures show the core error rather than reporting success from the API response alone. External cores must be authorized through their own service manager. On Linux, run Mihomo through a system service or grant the required network privileges.
+
+Run `terc --version` to verify the installed version.
 
 Setup appears only when there is no subscription URL, no `config.yaml`, and the core is not running: locate or download `mihomo` first, then paste a subscription URL (<kbd>Ctrl+D</kbd> downloads `darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` for this machine) and start the core. An existing config skips that and lands on the dashboard. <kbd>Esc</kbd> dismisses Setup and <kbd>u</kbd> brings it back while no subscription is configured — the system proxy is never switched on for you.
 
@@ -125,7 +129,7 @@ Click a group to browse its nodes; click a node to activate it. Scrolling moves 
 
 | Where | Key | Action |
 | --- | --- | --- |
-| Dashboard | <kbd>T</kbd> / <kbd>n</kbd> / <kbd>i</kbd> | Toggle TUN, sniffer, or IPv6. Runtime `PATCH`, then the same value is written back |
+| Dashboard | <kbd>T</kbd> / <kbd>n</kbd> / <kbd>i</kbd> | Toggle TUN, sniffer, or IPv6. TUN requests macOS administrator authorization when needed; effective changes are saved |
 | Dashboard | <kbd>D</kbd> | Toggle `dns.enable` in the config and hot-reload |
 | Dashboard | <kbd>d</kbd> / <kbd>g</kbd> / <kbd>v</kbd> | DNS, rules, providers |
 | Dashboard | <kbd>o</kbd> / <kbd>f</kbd> / <kbd>b</kbd> / <kbd>w</kbd> | Snippet gallery, profiles, probe, WireGuard / runtime |
