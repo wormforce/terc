@@ -785,17 +785,34 @@ fn is_httpupgrade(token: &str) -> bool {
     t.eq_ignore_ascii_case("httpupgrade")
 }
 
-/// Where and what to insert so the flow map `map` sets `v2ray-http-upgrade`:
-/// an empty insert when it already does, None when `map` is no flow map.
-fn upgrade_flag_insert(map: &str) -> Option<(usize, &'static str)> {
+/// A YAML null: `~`, `null` or nothing.
+fn is_null(token: &str) -> bool {
+    matches!(token.trim(), "" | "~" | "null" | "Null" | "NULL")
+}
+
+/// The value that sets a key whose value spans `start..end`; an empty span
+/// sits right after the colon.
+fn true_value(start: usize, end: usize) -> &'static str {
+    if start == end {
+        " true"
+    } else {
+        "true"
+    }
+}
+
+/// The edit (byte range in `map`, replacement) that makes the flow map `map`
+/// set `v2ray-http-upgrade: true`; None when `map` is no flow map.
+/// `network: httpupgrade` means HTTPUpgrade, so an explicit `false` becomes true.
+fn upgrade_flag_edit(map: &str) -> Option<(usize, usize, &'static str)> {
     if !(map.starts_with('{') && map.ends_with('}')) {
         return None;
     }
-    if flow_key_value(map, "v2ray-http-upgrade").is_some() {
-        return Some((1, ""));
+    if let Some((s, e)) = flow_key_value(map, "v2ray-http-upgrade") {
+        return Some((s, e, true_value(s, e)));
     }
     let empty = map[1..map.len() - 1].trim().is_empty();
     Some((
+        1,
         1,
         if empty {
             "v2ray-http-upgrade: true"
@@ -821,19 +838,26 @@ fn normalize_flow_item(line: &mut String) -> Option<String> {
     if !is_httpupgrade(&flow[vs..ve]) {
         return None;
     }
-    let (at, text) = match flow_key_value(flow, "ws-opts") {
+    let (at, end, text) = match flow_key_value(flow, "ws-opts") {
+        Some((os, oe)) if is_null(&flow[os..oe]) => (os, oe, "{v2ray-http-upgrade: true}"),
         Some((os, oe)) => {
-            let (at, text) = upgrade_flag_insert(&flow[os..oe])?;
-            (os + at, text)
+            let (s, e, text) = upgrade_flag_edit(&flow[os..oe])?;
+            (os + s, os + e, text)
         }
-        None => (
-            flow[..flow.len() - 1].trim_end().len(),
-            ", ws-opts: {v2ray-http-upgrade: true}",
-        ),
+        None => {
+            // A trailing comma is valid in a flow map; `,,` is not.
+            let body = flow[..flow.len() - 1].trim_end();
+            let text = if body.ends_with(',') {
+                " ws-opts: {v2ray-http-upgrade: true}"
+            } else {
+                ", ws-opts: {v2ray-http-upgrade: true}"
+            };
+            (body.len(), body.len(), text)
+        }
     };
     let name = flow_value(&flow[1..], "name").unwrap_or_else(|| "?".into());
     // The later edit first, so the earlier offsets stay valid.
-    let mut edits = [(open + vs, open + ve, "ws"), (open + at, open + at, text)];
+    let mut edits = [(open + vs, open + ve, "ws"), (open + at, open + end, text)];
     edits.sort_by_key(|e| std::cmp::Reverse(e.0));
     for (s, e, text) in edits {
         line.replace_range(s..e, text);
@@ -877,26 +901,31 @@ fn normalize_block_item(lines: &mut Vec<String>, start: usize, end: usize) -> Op
     let mut insert = None;
     match find(lines, "ws-opts") {
         Some((i, (s, e))) if s == e => {
-            let children: Vec<&String> = lines[i + 1..end]
-                .iter()
-                .take_while(|l| skip(l) || leading_spaces(l) > key_indent)
-                .filter(|l| !skip(l))
+            let children: Vec<usize> = (i + 1..end)
+                .take_while(|&j| skip(&lines[j]) || leading_spaces(&lines[j]) > key_indent)
+                .filter(|&j| !skip(&lines[j]))
                 .collect();
             let indent = children
                 .first()
-                .map_or(key_indent + 2, |l| leading_spaces(l));
-            let set = children.iter().any(|l| {
-                leading_spaces(l) == indent
-                    && block_value(l, indent, "v2ray-http-upgrade").is_some()
+                .map_or(key_indent + 2, |&j| leading_spaces(&lines[j]));
+            let flag = children.iter().find_map(|&j| {
+                let value = block_value(&lines[j], indent, "v2ray-http-upgrade")?;
+                (leading_spaces(&lines[j]) == indent).then_some((j, value))
             });
-            if !set {
-                let line = format!("{}v2ray-http-upgrade: true", " ".repeat(indent));
-                insert = Some((i + 1, vec![line]));
+            match flag {
+                Some((j, (fs, fe))) => inline = Some((j, fs, fe, true_value(fs, fe))),
+                None => {
+                    let line = format!("{}v2ray-http-upgrade: true", " ".repeat(indent));
+                    insert = Some((i + 1, vec![line]));
+                }
             }
         }
+        Some((i, (s, e))) if is_null(&lines[i][s..e]) => {
+            inline = Some((i, s, e, "{v2ray-http-upgrade: true}"));
+        }
         Some((i, (s, e))) => {
-            let (at, text) = upgrade_flag_insert(&lines[i][s..e])?;
-            inline = Some((i, s + at, text));
+            let (a, b, text) = upgrade_flag_edit(&lines[i][s..e])?;
+            inline = Some((i, s + a, s + b, text));
         }
         None => {
             let pad = " ".repeat(key_indent);
@@ -910,8 +939,8 @@ fn normalize_block_item(lines: &mut Vec<String>, start: usize, end: usize) -> Op
         }
     }
     lines[net].replace_range(vs..ve, "ws");
-    if let Some((i, at, text)) = inline {
-        lines[i].insert_str(at, text);
+    if let Some((i, s, e, text)) = inline {
+        lines[i].replace_range(s..e, text);
     }
     if let Some((at, new)) = insert {
         lines.splice(at..at, new);
@@ -1834,11 +1863,21 @@ mod tests {
             "    network: ws",
             "    ws-opts:",
             "      path: /ws",
-            "  - name: Odd",
+            "  - name: Null",
             "    network: httpupgrade",
             "    ws-opts: ~",
+            "  - name: Off",
+            "    network: httpupgrade",
+            "    ws-opts:",
+            "      v2ray-http-upgrade: false  # converter default",
+            "  - name: Odd",
+            "    network: httpupgrade",
+            "    ws-opts: [1]",
         ]);
-        assert_eq!(names, ["Nested", "Bare", "Inline", "Set", "First"]);
+        assert_eq!(
+            names,
+            ["Nested", "Bare", "Inline", "Set", "First", "Null", "Off"]
+        );
         assert_eq!(
             out,
             [
@@ -1873,10 +1912,19 @@ mod tests {
                 "    network: ws",
                 "    ws-opts:",
                 "      path: /ws",
+                // A null ws-opts becomes the flag, as in `normalize_ws_network`.
+                "  - name: Null",
+                "    network: ws",
+                "    ws-opts: {v2ray-http-upgrade: true}",
+                // `network: httpupgrade` wins over an explicit false.
+                "  - name: Off",
+                "    network: ws",
+                "    ws-opts:",
+                "      v2ray-http-upgrade: true  # converter default",
                 // ws-opts it cannot read: left alone rather than half rewritten.
                 "  - name: Odd",
                 "    network: httpupgrade",
-                "    ws-opts: ~",
+                "    ws-opts: [1]",
             ]
         );
         // Other chunks are never touched.
@@ -1903,8 +1951,20 @@ mod tests {
             "  - {name: 'a, network: httpupgrade', network: grpc}",
             "  - {name: N, ws-opts: {headers: {network: httpupgrade}}, network: tcp}",
             r#"  - {"name":"J","type":"vless","network":"httpupgrade","ws-opts":{"path":"/j"}}"#,
+            "  - {name: T, network: httpupgrade, }",
+            "  - {name: U, network: httpupgrade, ws-opts: null}",
+            "  - {name: V, network: httpupgrade, ws-opts: {v2ray-http-upgrade: false}}",
         ]);
-        assert_eq!(names, ["F1", "F2", "F3", "F4", "J"]);
+        assert_eq!(names, ["F1", "F2", "F3", "F4", "J", "T", "U", "V"]);
+        assert_eq!(
+            out[8..],
+            [
+                // A trailing comma stays valid YAML (no `,,`).
+                "  - {name: T, network: ws, ws-opts: {v2ray-http-upgrade: true} }",
+                "  - {name: U, network: ws, ws-opts: {v2ray-http-upgrade: true}}",
+                "  - {name: V, network: ws, ws-opts: {v2ray-http-upgrade: true}}",
+            ]
+        );
         assert_eq!(
             out[..7],
             [

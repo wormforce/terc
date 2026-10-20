@@ -1456,7 +1456,8 @@ pub fn normalize_ws_network(node: &mut Value) -> bool {
         *opts = json!({});
     }
     let opts = opts.as_object_mut().unwrap();
-    opts.entry("v2ray-http-upgrade").or_insert(json!(true));
+    // `network: httpupgrade` means HTTPUpgrade, even next to an explicit false.
+    opts.insert("v2ray-http-upgrade".into(), json!(true));
     let legacy = legacy.as_ref().and_then(Value::as_object);
     if let Some(path) = legacy.and_then(|l| l.get("path")).filter(|p| p.is_string()) {
         opts.entry("path").or_insert_with(|| path.clone());
@@ -2653,6 +2654,10 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
         let mut odd = json!({"network": "httpupgrade", "ws-opts": null});
         assert!(normalize_ws_network(&mut odd));
         assert_eq!(odd["ws-opts"], json!({"v2ray-http-upgrade": true}));
+        // `network: httpupgrade` wins over a converter's default false.
+        let mut off = json!({"network": "httpupgrade", "ws-opts": {"v2ray-http-upgrade": false}});
+        assert!(normalize_ws_network(&mut off));
+        assert_eq!(off["ws-opts"], json!({"v2ray-http-upgrade": true}));
         for other in [
             json!({"network": "ws", "ws-opts": {"path": "/?ed=2048"}}),
             json!({"network": "grpc", "grpc-opts": {"grpc-service-name": "s"}}),
