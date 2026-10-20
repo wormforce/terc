@@ -11,7 +11,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -1187,41 +1187,122 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
         let _ = child.wait();
         return Err(err.to_string());
     }
-    for _ in 0..20 {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            let _ = fs::remove_file(&pid_path);
-            return Err(format!(
-                "Mihomo exited ({status}): {}",
-                fs::read_to_string(&log_path).unwrap_or_default()
-            ));
-        }
-        if matches!(
-            http_request(
-                &cfg.addr,
-                &cfg.secret,
-                "GET",
-                "/version",
-                None,
-                Duration::from_millis(200)
+    // A first start may download GeoIP/GeoSite data before the controller
+    // listens, so wait on a deadline while the process stays alive.
+    let started = Instant::now();
+    loop {
+        let exited = child.try_wait().map_err(|e| e.to_string())?;
+        let step = core_startup_step(
+            exited.is_some(),
+            || {
+                classify_probe(&http_request(
+                    &cfg.addr,
+                    &cfg.secret,
+                    "GET",
+                    "/version",
+                    None,
+                    Duration::from_millis(200),
+                ))
+            },
+            started.elapsed(),
+            || log_suggests_download(&core_log_excerpt(cfg)),
+        );
+        let reason = match step {
+            StartupStep::Wait => {
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            StartupStep::Exited => {
+                let _ = fs::remove_file(&pid_path);
+                return Err(format!(
+                    "Mihomo exited ({}): {}",
+                    exited.map(|s| s.to_string()).unwrap_or_default(),
+                    fs::read_to_string(&log_path).unwrap_or_default()
+                ));
+            }
+            StartupStep::Ready | StartupStep::StillStarting => {
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                if step == StartupStep::Ready {
+                    return Ok(format!("Started mihomo ({})", bin.display()));
+                }
+                // The PID record stays, so the managed-core guard blocks a second launch.
+                return Ok(format!(
+                    "Mihomo is still starting (downloading geodata?); the controller will come up when it finishes. Log: {}",
+                    log_path.display()
+                ));
+            }
+            StartupStep::Rejected(code) => {
+                format!("Mihomo controller rejected the request (HTTP {code})")
+            }
+            StartupStep::TimedOut => format!(
+                "Mihomo controller was not ready after {}s",
+                CORE_START_DEADLINE.as_secs()
             ),
-            Ok((200, _))
-        ) {
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return Ok(format!("Started mihomo ({})", bin.display()));
-        }
-        thread::sleep(Duration::from_millis(200));
+        };
+        // A failed start must not leave an orphan that collides with the next attempt.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(&pid_path);
+        return Err(format!(
+            "{reason}; the failed startup was stopped. Log: {}\n{}",
+            log_path.display(),
+            core_log_excerpt(cfg)
+        ));
     }
-    // A failed start must not leave an orphan that collides with the next attempt.
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_file(&pid_path);
-    Err(format!(
-        "Mihomo controller was not ready; the failed startup was stopped. Log: {}\n{}",
-        log_path.display(),
-        core_log_excerpt(cfg)
-    ))
+}
+
+/// Overall window for a fresh core to bring up its controller.
+const CORE_START_DEADLINE: Duration = Duration::from_secs(60);
+
+#[derive(Debug, PartialEq, Eq)]
+enum CoreProbe {
+    Ready,
+    Rejected(u16),
+    Pending,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupStep {
+    Ready,
+    Exited,
+    Rejected(u16),
+    Wait,
+    StillStarting,
+    TimedOut,
+}
+
+fn classify_probe(result: &io::Result<(u16, String)>) -> CoreProbe {
+    match result {
+        Ok((200, _)) => CoreProbe::Ready,
+        Ok((code @ (401 | 403), _)) => CoreProbe::Rejected(*code),
+        _ => CoreProbe::Pending,
+    }
+}
+
+// The probe and the log are evaluated lazily: an exited core is not probed,
+// and the log is only read once the deadline has passed.
+fn core_startup_step(
+    exited: bool,
+    probe: impl FnOnce() -> CoreProbe,
+    elapsed: Duration,
+    downloading: impl FnOnce() -> bool,
+) -> StartupStep {
+    if exited {
+        return StartupStep::Exited;
+    }
+    match probe() {
+        CoreProbe::Ready => StartupStep::Ready,
+        CoreProbe::Rejected(code) => StartupStep::Rejected(code),
+        CoreProbe::Pending if elapsed < CORE_START_DEADLINE => StartupStep::Wait,
+        CoreProbe::Pending if downloading() => StartupStep::StillStarting,
+        CoreProbe::Pending => StartupStep::TimedOut,
+    }
+}
+
+fn log_suggests_download(log: &str) -> bool {
+    log.to_ascii_lowercase().contains("download")
 }
 
 pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
@@ -2341,7 +2422,7 @@ mod tests {
 
     #[test]
     fn tun_patch_preserves_settings_and_checks_the_result() {
-        use std::{net::TcpListener, time::Instant};
+        use std::net::TcpListener;
         for actual in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -2675,5 +2756,67 @@ mod listener_tests {
         ))
         .unwrap_err()
         .contains("DNS"));
+    }
+
+    #[test]
+    fn slow_core_start_waits_while_alive_and_returns_once_ready() {
+        let early = Duration::from_secs(5);
+        let never = || -> bool { panic!("log is only checked at the deadline") };
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Pending, early, never),
+            StartupStep::Wait
+        );
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Pending, Duration::from_secs(45), never),
+            StartupStep::Wait
+        );
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Ready, Duration::from_secs(30), never),
+            StartupStep::Ready
+        );
+        assert_eq!(
+            core_startup_step(true, || panic!("exited core is not probed"), early, never),
+            StartupStep::Exited
+        );
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Rejected(401), early, never),
+            StartupStep::Rejected(401)
+        );
+    }
+
+    #[test]
+    fn core_past_the_deadline_is_kept_only_while_downloading_geodata() {
+        let late = CORE_START_DEADLINE;
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Ready, late, || false),
+            StartupStep::Ready
+        );
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Pending, late, || true),
+            StartupStep::StillStarting
+        );
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Pending, late, || false),
+            StartupStep::TimedOut
+        );
+        assert!(log_suggests_download(
+            "INFO Can't find GeoSite.dat, start download\n"
+        ));
+        assert!(!log_suggests_download("INFO Start initial configuration\n"));
+    }
+
+    #[test]
+    fn controller_probe_separates_ready_rejected_and_pending() {
+        assert_eq!(classify_probe(&Ok((200, String::new()))), CoreProbe::Ready);
+        assert_eq!(
+            classify_probe(&Ok((401, String::new()))),
+            CoreProbe::Rejected(401)
+        );
+        assert_eq!(
+            classify_probe(&Ok((503, String::new()))),
+            CoreProbe::Pending
+        );
+        let refused = Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert_eq!(classify_probe(&refused), CoreProbe::Pending);
     }
 }
