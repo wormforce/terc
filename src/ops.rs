@@ -123,9 +123,9 @@ pub struct DnsAnswer {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct YamlChunk {
-    key: Option<String>,
-    lines: Vec<String>,
+pub(crate) struct YamlChunk {
+    pub(crate) key: Option<String>,
+    pub(crate) lines: Vec<String>,
 }
 
 pub fn builtin_modules() -> Vec<ModuleSnippet> {
@@ -299,23 +299,31 @@ pub fn has_subscription_source(doc: &str) -> bool {
 }
 
 pub fn apply_enabled_modules(doc: &str, modules: &[ModuleSnippet]) -> Result<String, String> {
-    let base = strip_marked_modules(doc);
+    apply_modules_with_switches(&strip_marked_modules(doc), modules, &saved_switches(doc))
+}
+
+/// Overlay modules on a fresh base while keeping switch states saved earlier.
+pub fn apply_modules_with_switches(
+    base: &str,
+    modules: &[ModuleSnippet],
+    switches: &[(Vec<String>, bool)],
+) -> Result<String, String> {
+    let base = base.to_string();
     if modules.is_empty() {
         return Ok(base);
     }
-    let switches = saved_switches(doc);
     let mut merged = base.clone();
     for module in modules {
         merged = merge_yaml_mapping(&merged, &module.body)?;
     }
-    for (path, value) in &switches {
+    for (path, value) in switches {
         let refs: Vec<&str> = path.iter().map(String::as_str).collect();
         merged = set_nested_bool(&merged, &refs, *value);
     }
     Ok(format!(
         "{BASE_PREFIX}{}\n# terc-switches: {}\n{merged}",
         serde_json::to_string(&base).unwrap(),
-        serde_json::to_string(&switches).unwrap()
+        serde_json::to_string(switches).unwrap()
     ))
 }
 
@@ -413,7 +421,7 @@ pub fn strip_marked_modules(doc: &str) -> String {
     join_lines(&out)
 }
 
-fn saved_switches(doc: &str) -> Vec<(Vec<String>, bool)> {
+pub(crate) fn saved_switches(doc: &str) -> Vec<(Vec<String>, bool)> {
     doc.lines()
         .nth(1)
         .and_then(|l| l.strip_prefix("# terc-switches: "))
@@ -1211,7 +1219,7 @@ fn join_lines(lines: &[String]) -> String {
     text
 }
 
-fn split_chunks(doc: &str) -> Vec<YamlChunk> {
+pub(crate) fn split_chunks(doc: &str) -> Vec<YamlChunk> {
     let mut chunks = Vec::new();
     let mut current: Option<YamlChunk> = None;
     for line in split_lines(doc) {
@@ -1312,7 +1320,7 @@ fn set_block_scalar(doc: &str, block: &str, key: &str, literal: &str) -> String 
     join_chunks(&chunks)
 }
 
-fn join_chunks(chunks: &[YamlChunk]) -> String {
+pub(crate) fn join_chunks(chunks: &[YamlChunk]) -> String {
     let mut lines = Vec::new();
     for chunk in chunks {
         lines.extend(chunk.lines.iter().cloned());
@@ -1383,7 +1391,7 @@ fn split_kv(trimmed: &str) -> Option<(&str, &str)> {
     Some((key, value.trim()))
 }
 
-fn clean_scalar(value: &str) -> String {
+pub(crate) fn clean_scalar(value: &str) -> String {
     let value = value.split('#').next().unwrap_or(value).trim();
     value
         .trim_matches('"')
@@ -1400,7 +1408,7 @@ fn parse_yaml_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn leading_spaces(line: &str) -> usize {
+pub(crate) fn leading_spaces(line: &str) -> usize {
     line.chars().take_while(|c| *c == ' ').count()
 }
 

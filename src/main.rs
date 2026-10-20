@@ -11,11 +11,13 @@ use std::{
 };
 
 pub mod best;
+pub mod compose;
 pub mod control;
 pub mod mihomo;
 pub mod ops;
 pub mod panels;
 mod privilege;
+pub mod subconv;
 pub mod ui;
 
 use crossterm::{
@@ -842,11 +844,12 @@ impl App {
         )));
         let modules = crate::ops::enabled_snippets(&catalog, &self.config.enabled_modules);
         let running = self.snapshot.running;
+        let zh = self.lang() == Lang::Zh;
         self.run_action(
             "Fetching and validating subscription…",
             None,
             None,
-            move |cfg| mihomo::fetch_subscription(&cfg, &modules, running),
+            move |cfg| mihomo::regenerate_config(&cfg, &modules, running, true, zh),
         );
     }
 

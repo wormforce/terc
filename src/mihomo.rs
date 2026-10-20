@@ -1110,11 +1110,7 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     Ok("Stopped managed Mihomo core".into())
 }
 
-pub fn fetch_subscription(
-    cfg: &ControllerConfig,
-    modules: &[crate::ops::ModuleSnippet],
-    running: bool,
-) -> Result<String, String> {
+pub fn download_subscription(cfg: &ControllerConfig) -> Result<String, String> {
     if cfg.subscription_url.trim().is_empty() {
         return Err("Subscription URL is empty".into());
     }
@@ -1139,19 +1135,61 @@ pub fn fetch_subscription(
             brief(&String::from_utf8_lossy(&output.stderr))
         ));
     }
-    let raw = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-    if !crate::ops::has_subscription_source(&raw) {
-        return Err("Subscription must contain proxies or proxy-providers".into());
-    }
-    let normalized = normalize_subscription(&raw, &cfg.addr);
-    let generated = crate::ops::apply_enabled_modules(&normalized, modules)?;
-    install_config(cfg, &generated, running)?;
-    Ok(if running {
-        "Subscription updated & hot-reloaded"
+    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+}
+
+/// Download (when `refresh`) and compose subscription + own nodes + private
+/// rules into `config.yaml`, validate it with `mihomo -t`, and hot-reload.
+pub fn regenerate_config(
+    cfg: &ControllerConfig,
+    modules: &[crate::ops::ModuleSnippet],
+    running: bool,
+    refresh: bool,
+    zh: bool,
+) -> Result<String, String> {
+    use crate::compose;
+    let dir = compose::terc_dir();
+    let old = read_config_text(cfg).ok();
+    let has_url = !cfg.subscription_url.trim().is_empty();
+    let need_download = refresh
+        || (has_url
+            && !compose::cache_path(&dir).is_file()
+            && old.as_deref().map_or(true, compose::is_generated));
+    let fresh = if need_download && has_url {
+        Some(download_subscription(cfg)?)
     } else {
-        "Subscription validated & saved; core stopped"
+        None
+    };
+    let sub = compose::load_subscription_source(&dir, fresh, old.as_deref())?;
+    let manual = compose::load_manual_nodes(&dir);
+    if !compose::rules_path(&dir).is_file() {
+        compose::PrivateRules::default().save(&dir)?;
     }
-    .into())
+    let rules = compose::PrivateRules::load(&dir);
+    let (base, report) = compose::compose(&compose::ComposeInput {
+        subscription: sub.as_ref(),
+        manual: &manual,
+        rules: &rules,
+        controller_addr: &cfg.addr,
+        secret: &cfg.secret,
+        test_url: &cfg.test_url,
+    })?;
+    let (base, switches) = match old.as_deref() {
+        Some(doc) => (
+            compose::carry_runtime_state(&crate::ops::strip_marked_modules(doc), &base),
+            crate::ops::saved_switches(doc),
+        ),
+        None => (base, Vec::new()),
+    };
+    let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
+    install_config(cfg, &generated, running)?;
+    let tail = match (running, zh) {
+        (true, true) => " — 已校验并热重载",
+        (true, false) => " — validated & hot-reloaded",
+        (false, true) => " — 已校验保存，内核未运行",
+        (false, false) => " — validated & saved; core stopped",
+    };
+    Ok(format!("{}{tail}{}", report.summary(zh), report.details()))
 }
 
 /// Validate before replacing the active file. Keep disk and runtime on the old
