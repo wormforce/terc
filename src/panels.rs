@@ -392,92 +392,237 @@ pub fn draw_connections(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         (area, None)
     };
-    let title = format!(
-        "{} ({})  x  X",
-        app.t("connections"),
-        app.snapshot.connections.len()
+    let now_ms = crate::conns::now_ms();
+    let lang = app.lang();
+    let (base, suffix) = if app.conn_closed_view {
+        (
+            app.t("conn_closed_title"),
+            format!(" ({})  d", app.conns.closed().len()),
+        )
+    } else {
+        let filter = if app.conn_filter {
+            format!("  {}", app.t("conn_filter_sessions"))
+        } else {
+            String::new()
+        };
+        (
+            app.t("connections"),
+            format!(
+                " ({}/{})  {}{filter}  o f d x X",
+                app.conn_view.len(),
+                app.snapshot.connections.len(),
+                app.t(app.conn_sort.key())
+            ),
+        )
+    };
+    let mut title = module_title_line(theme, lang, 'c', base, base);
+    title.spans.push(Span::styled(
+        suffix,
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    ));
+    let inner = draw_panel(frame, list_area, theme, Some(title), true);
+    let body = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
     );
-    let inner = draw_panel(
-        frame,
-        list_area,
-        theme,
-        Some(module_title_line(
-            theme,
-            app.lang(),
-            'c',
-            "Connections",
-            &title,
-        )),
-        true,
-    );
-    if app.snapshot.connections.is_empty() {
+    let visible = inner.height as usize;
+    let max_w = body.width as usize;
+    // Truncate, then pad to exactly `w` cells.
+    let fit = |s: &str, w: usize| {
+        let mut out = truncate_str(s, w);
+        while out.width() > w {
+            out.pop();
+        }
+        let pad = w - out.width();
+        out.extend(std::iter::repeat_n(' ', pad));
+        out
+    };
+    let tag = |ai: bool| {
+        if ai {
+            Span::styled("AI ", Style::default().fg(theme.peak))
+        } else {
+            Span::raw("   ")
+        }
+    };
+    let row_style = |selected: bool| {
+        if selected {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        }
+    };
+    let empty = if app.conn_closed_view {
+        app.conns
+            .closed()
+            .is_empty()
+            .then(|| app.t("conn_closed_empty"))
+    } else if app.snapshot.connections.is_empty() {
+        Some(app.t("no_connections"))
+    } else if app.conn_view.is_empty() {
+        Some(app.t("conn_none_filtered"))
+    } else {
+        None
+    };
+    if let Some(text) = empty {
         frame.render_widget(
-            Paragraph::new(app.t("no_connections")).style(Style::default().fg(theme.muted)),
+            Paragraph::new(text)
+                .style(Style::default().fg(theme.muted))
+                .wrap(Wrap { trim: true }),
             inner,
         );
-    } else if inner.width > 4 && inner.height > 0 {
-        let visible = inner.height as usize;
-        let start = visible_list_start(app.conn_index, app.snapshot.connections.len(), visible);
-        let max_w = inner.width.saturating_sub(2) as usize;
-        let items: Vec<ListItem> = app
-            .snapshot
-            .connections
+    } else if inner.width > 4 && inner.height > 0 && app.conn_closed_view {
+        let closed = app.conns.closed();
+        // Marker, time since close, AI tag and lifetime are fixed; the host
+        // takes what is left up to 24 cells, then bytes, then the cause.
+        let mut avail = max_w.saturating_sub(2 + 11 + 3 + 7);
+        let show_bytes = avail >= 12 + 22;
+        if show_bytes {
+            avail -= 22;
+        }
+        let host_w = avail.min(24);
+        let cause_w = avail - host_w;
+        let ago = app.t("conn_ago");
+        let start = visible_list_start(app.closed_index, closed.len(), visible);
+        let items: Vec<ListItem> = closed
             .iter()
             .enumerate()
             .skip(start)
             .take(visible)
+            .map(|(index, c)| {
+                let selected = index == app.closed_index;
+                let since = crate::conns::fmt_age((now_ms - c.closed_ms) / 1000);
+                let since = if lang == crate::Lang::En {
+                    format!("{since} {ago}")
+                } else {
+                    format!("{since}{ago}")
+                };
+                let life = c
+                    .lifetime_secs
+                    .map_or("—".to_string(), crate::conns::fmt_age);
+                let mut spans = vec![
+                    Span::styled(if selected { "› " } else { "  " }, row_style(selected)),
+                    Span::styled(fit(&since, 10), Style::default().fg(theme.muted)),
+                    Span::raw(" "),
+                    tag(c.ai),
+                    Span::styled(fit(&c.host, host_w), row_style(selected)),
+                    Span::styled(format!(" {life:>6}"), Style::default().fg(theme.muted)),
+                ];
+                if show_bytes {
+                    spans.push(Span::styled(
+                        format!(
+                            " ↑{:>9} ↓{:>9}",
+                            format_bytes(c.upload),
+                            format_bytes(c.download)
+                        ),
+                        Style::default().fg(theme.muted),
+                    ));
+                }
+                if cause_w >= 8 {
+                    spans.push(Span::styled(
+                        format!(" {}", truncate_str(&c.describe(lang), cause_w - 1)),
+                        Style::default().fg(theme.peak),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        frame.render_widget(List::new(items), body);
+    } else if inner.width > 4 && inner.height > 0 {
+        let rate = app.conn_sort == crate::conns::SortKey::Rate;
+        // Marker, AI tag and age are fixed; the host gets up to 24 cells
+        // before the metric, rule, process and inbound columns appear.
+        let metric_w = if rate { 26 } else { 22 };
+        let mut avail = max_w.saturating_sub(5 + 7);
+        let show_metric = avail >= 12 + metric_w;
+        if show_metric {
+            avail -= metric_w;
+        }
+        let show_rule = avail >= 24 + 13;
+        if show_rule {
+            avail -= 13;
+        }
+        let show_process = avail >= 24 + 13;
+        if show_process {
+            avail -= 13;
+        }
+        let show_inbound = max_w >= 70 && avail >= 24 + 7;
+        if show_inbound {
+            avail -= 7;
+        }
+        let host_w = avail.min(24);
+        let pad = avail - host_w;
+        let start = visible_list_start(app.conn_index, app.conn_view.len(), visible);
+        let items: Vec<ListItem> = app
+            .conn_view
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .filter_map(|(index, &i)| Some((index, app.snapshot.connections.get(i)?)))
             .map(|(index, conn)| {
                 let selected = index == app.conn_index;
-                let style = if selected {
+                let style = row_style(selected);
+                let mut left = String::new();
+                if show_process {
+                    left.push_str(&fit(&conn.process, 12));
+                    left.push(' ');
+                }
+                left.push_str(&fit(&conn.host, host_w));
+                if show_inbound {
+                    let inbound = if conn.inbound.is_empty() {
+                        &conn.network
+                    } else {
+                        &conn.inbound
+                    };
+                    left.push(' ');
+                    left.push_str(&fit(inbound, 6));
+                }
+                left.extend(std::iter::repeat_n(' ', pad));
+                let age = crate::conns::age_secs(conn.start_ms, now_ms);
+                let age_style = if age.is_some_and(|a| a >= crate::conns::LONG_SECS) {
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme.text)
+                    Style::default().fg(theme.muted)
                 };
-                let process = if conn.process.is_empty() {
-                    String::new()
-                } else {
-                    format!("{} ", truncate_str(&conn.process, 12))
-                };
-                let inbound = if conn.inbound.is_empty() {
-                    conn.network.clone()
-                } else {
-                    conn.inbound.clone()
-                };
-                let traffic = format!(
-                    "↑{} ↓{}",
-                    format_bytes(conn.upload),
-                    format_bytes(conn.download)
-                );
-                let mid = format!(
-                    "{}{} {} {}",
-                    if selected { "› " } else { "  " },
-                    process,
-                    truncate_str(&conn.host, 28),
-                    truncate_str(&inbound, 8)
-                );
-                let rule = truncate_str(&conn.rule, 14);
-                let used = mid.width() + rule.width() + traffic.width() + 2;
-                let pad = max_w.saturating_sub(used).max(1);
-                ListItem::new(Line::from(vec![
-                    Span::styled(mid, style),
-                    Span::raw(" ".repeat(pad)),
-                    Span::styled(rule, Style::default().fg(theme.peak)),
-                    Span::raw(" "),
-                    Span::styled(traffic, Style::default().fg(theme.muted)),
-                ]))
+                let age = age.map_or("—".to_string(), crate::conns::fmt_age);
+                let mut spans = vec![
+                    Span::styled(if selected { "› " } else { "  " }, style),
+                    tag(conn.ai),
+                    Span::styled(left, style),
+                    Span::styled(format!(" {age:>6}"), age_style),
+                ];
+                if show_rule {
+                    spans.push(Span::styled(
+                        format!(" {}", fit(&conn.rule, 12)),
+                        Style::default().fg(theme.peak),
+                    ));
+                }
+                if show_metric {
+                    let metric = if rate {
+                        format!(
+                            " ↑{:>9}/s ↓{:>9}/s",
+                            format_bytes(conn.up_rate),
+                            format_bytes(conn.down_rate)
+                        )
+                    } else {
+                        format!(
+                            " ↑{:>9} ↓{:>9}",
+                            format_bytes(conn.upload),
+                            format_bytes(conn.download)
+                        )
+                    };
+                    spans.push(Span::styled(metric, Style::default().fg(theme.muted)));
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect();
-        frame.render_widget(
-            List::new(items),
-            Rect::new(
-                inner.x + 1,
-                inner.y,
-                inner.width.saturating_sub(2),
-                inner.height,
-            ),
-        );
+        frame.render_widget(List::new(items), body);
     }
     if let Some(detail) = detail_area {
         draw_connection_detail(frame, app, detail);
@@ -723,6 +868,65 @@ fn draw_rule_query(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_connection_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme();
+    let now_ms = crate::conns::now_ms();
+    if app.conn_closed_view {
+        let inner = draw_panel(
+            frame,
+            area,
+            theme,
+            Some(panel_title(app.t("conn_closed_title").to_string(), theme)),
+            false,
+        );
+        let Some(c) = app.conns.closed().get(app.closed_index) else {
+            return;
+        };
+        let dash = |s: &str| {
+            if s.is_empty() {
+                "—".to_string()
+            } else {
+                s.to_string()
+            }
+        };
+        let since = crate::conns::fmt_age((now_ms - c.closed_ms) / 1000);
+        let since = if app.lang() == crate::Lang::En {
+            format!("{since} {}", app.t("conn_ago"))
+        } else {
+            format!("{since}{}", app.t("conn_ago"))
+        };
+        let mut lines = vec![
+            kv(theme, "host", &c.host),
+            kv(theme, "proc", &dash(&c.process)),
+            kv(theme, "chain", &dash(&c.chains)),
+        ];
+        if !c.provider.is_empty() {
+            lines.push(kv(theme, "prov", &c.provider));
+        }
+        lines.extend([
+            kv(
+                theme,
+                "life",
+                &c.lifetime_secs
+                    .map_or("—".to_string(), crate::conns::fmt_age),
+            ),
+            kv(
+                theme,
+                "xfer",
+                &format!("↑{}  ↓{}", format_bytes(c.upload), format_bytes(c.download)),
+            ),
+            kv(theme, "closed", &since),
+            kv(theme, "cause", &c.describe(app.lang())),
+        ]);
+        if c.ai {
+            lines.push(kv(theme, "ai", "yes"));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            app.t("conn_closed_note"),
+            Style::default().fg(theme.muted),
+        ));
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+        return;
+    }
     let inner = draw_panel(
         frame,
         area,
@@ -733,7 +937,7 @@ fn draw_connection_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         )),
         false,
     );
-    let Some(conn) = app.snapshot.connections.get(app.conn_index) else {
+    let Some(conn) = app.selected_connection() else {
         return;
     };
     let process = if conn.process.is_empty() {
@@ -790,16 +994,38 @@ fn draw_connection_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                 &conn.chains
             },
         ),
-        kv(
-            theme,
-            "xfer",
-            &format!(
-                "↑{}  ↓{}",
-                format_bytes(conn.upload),
-                format_bytes(conn.download)
-            ),
-        ),
     ];
+    if !conn.provider.is_empty() {
+        lines.push(kv(theme, "prov", &conn.provider));
+    }
+    lines.push(kv(
+        theme,
+        "xfer",
+        &format!(
+            "↑{}  ↓{}",
+            format_bytes(conn.upload),
+            format_bytes(conn.download)
+        ),
+    ));
+    lines.push(kv(
+        theme,
+        "rate",
+        &format!(
+            "↑{}/s  ↓{}/s",
+            format_bytes(conn.up_rate),
+            format_bytes(conn.down_rate)
+        ),
+    ));
+    if let Some(age) = crate::conns::age_secs(conn.start_ms, now_ms) {
+        let mut text = crate::conns::fmt_age(age);
+        if age >= crate::conns::LONG_SECS {
+            text = format!("{text} ({})", app.t("conn_long_lived"));
+        }
+        lines.push(kv(theme, "age", &text));
+    }
+    if conn.ai {
+        lines.push(kv(theme, "ai", "yes"));
+    }
     if !conn.dest_geo.is_empty() || !conn.dest_asn.is_empty() {
         lines.push(kv(
             theme,

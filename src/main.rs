@@ -12,6 +12,7 @@ use std::{
 
 pub mod best;
 pub mod compose;
+mod conns;
 pub mod control;
 pub mod manage;
 pub mod mihomo;
@@ -397,6 +398,14 @@ pub struct App {
     pub conn_index: usize,
     pub connection_detail: bool,
     pub detail_scroll: u16,
+    pub conns: conns::Tracker,
+    /// Indices into `snapshot.connections` in display order; `conn_index` points here.
+    pub conn_view: Vec<usize>,
+    pub conn_sort: conns::SortKey,
+    pub conn_filter: bool,
+    pub conn_closed_view: bool,
+    pub closed_index: usize,
+    pub session_toast_at: Option<Instant>,
     pub help_scroll: u16,
     pub logs_paused: bool,
     pub frozen_logs: Vec<(String, String)>,
@@ -509,6 +518,13 @@ impl App {
             conn_index: 0,
             connection_detail: false,
             detail_scroll: 0,
+            conns: conns::Tracker::default(),
+            conn_view: (0..initial_snapshot.connections.len()).collect(),
+            conn_sort: conns::SortKey::default(),
+            conn_filter: false,
+            conn_closed_view: false,
+            closed_index: 0,
+            session_toast_at: None,
             help_scroll: 0,
             logs_paused: false,
             frozen_logs: Vec::new(),
@@ -796,6 +812,7 @@ impl App {
                     profile,
                 } => {
                     self.action_busy = false;
+                    self.conns.action_finished(Instant::now());
                     let ok = result.is_ok();
                     match &result {
                         Ok(text) => self.set_status(text, false),
@@ -968,29 +985,126 @@ impl App {
         }
     }
 
-    pub fn accept_snapshot(&mut self, snapshot: CoreSnapshot) {
+    pub fn accept_snapshot(&mut self, mut snapshot: CoreSnapshot) {
         if self.snapshot.running && !snapshot.running {
             self.load_core_log();
         }
-        let selected = self
-            .snapshot
-            .connections
-            .get(self.conn_index)
-            .map(|c| c.id.clone());
-        let was_empty = self.snapshot.connections.is_empty();
+        let fresh = std::mem::take(&mut snapshot.connections);
+        snapshot.connections = std::mem::take(&mut self.snapshot.connections);
+        // A transient /connections failure while the core runs keeps the last
+        // list, so its sessions are not reported as closed.
+        let keep = snapshot.running && !snapshot.connections_ok;
+        if keep {
+            snapshot.upload_total = self.snapshot.upload_total;
+            snapshot.download_total = self.snapshot.download_total;
+        }
         self.snapshot = snapshot;
-        self.conn_index = selected
-            .and_then(|id| self.snapshot.connections.iter().position(|c| c.id == id))
-            .unwrap_or(if was_empty {
-                0
-            } else {
-                self.snapshot.connections.len()
-            });
-        // An expired selection stays empty until the user navigates again.
+        if !keep {
+            self.install_connections(fresh, self.snapshot.running);
+        }
         self.group_index = self
             .group_index
             .min(self.snapshot.groups.len().saturating_sub(1));
         self.clamp_aux();
+    }
+
+    fn install_connections(&mut self, mut list: Vec<mihomo::ConnectionItem>, running: bool) {
+        let selected = self.selected_connection().map(|c| c.id.clone());
+        let was_empty = self.conn_view.is_empty();
+        let now_ms = conns::now_ms();
+        let closed = self
+            .conns
+            .observe(&mut list, running, Instant::now(), now_ms);
+        self.snapshot.connections = list;
+        self.rebuild_conn_view();
+        // An expired selection stays empty until the user navigates again.
+        self.reselect_connection(selected, was_empty);
+        if closed.is_empty() {
+            return;
+        }
+        let lang = self.lang();
+        let age = |c: &conns::ClosedConn| c.lifetime_secs.map_or("—".into(), conns::fmt_age);
+        if closed.len() > 5 {
+            let level = if closed.iter().any(|c| c.ai) {
+                "warning"
+            } else {
+                "info"
+            };
+            let payload = format!(
+                "terc: {} long-lived/AI connections closed ({})",
+                closed.len(),
+                closed[0].describe(lang)
+            );
+            self.logs.push((level.into(), payload));
+        } else {
+            for c in &closed {
+                let payload = format!(
+                    "terc: closed {} after {} ↑{} ↓{} via {} ({})",
+                    c.host,
+                    age(c),
+                    ui::format_bytes(c.upload),
+                    ui::format_bytes(c.download),
+                    if c.chains.is_empty() {
+                        "—"
+                    } else {
+                        &c.chains
+                    },
+                    c.describe(lang)
+                );
+                let level = if c.ai { "warning" } else { "info" };
+                self.logs.push((level.into(), payload));
+            }
+        }
+        if self.logs.len() > 300 {
+            self.logs.drain(..self.logs.len() - 300);
+        }
+        let quiet =
+            |at: Option<Instant>| at.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+        if !self.action_busy && quiet(self.session_toast_at) && !self.toast_visible() {
+            if let Some(c) = closed.iter().find(|c| c.ai && c.cause.is_none()) {
+                let text = format!(
+                    "{}: {} ({})",
+                    self.t("conn_toast_ai_closed"),
+                    conns::host_only(&c.host),
+                    age(c)
+                );
+                self.set_status(&text, false);
+                self.session_toast_at = Some(Instant::now());
+            }
+        }
+    }
+
+    pub fn rebuild_conn_view(&mut self) {
+        let now_ms = conns::now_ms();
+        let list = &self.snapshot.connections;
+        let filter = self.conn_filter;
+        self.conn_view.clear();
+        self.conn_view
+            .extend((0..list.len()).filter(|&i| !filter || conns::is_session(&list[i], now_ms)));
+        match self.conn_sort {
+            // mihomo.rs already sorts by total bytes.
+            conns::SortKey::Bytes => {}
+            conns::SortKey::Age => self
+                .conn_view
+                .sort_by_key(|&i| list[i].start_ms.filter(|&ms| ms > 0).unwrap_or(i64::MAX)),
+            conns::SortKey::Rate => self.conn_view.sort_by_key(|&i| {
+                std::cmp::Reverse(list[i].up_rate.saturating_add(list[i].down_rate))
+            }),
+        }
+    }
+
+    pub fn selected_connection(&self) -> Option<&mihomo::ConnectionItem> {
+        self.conn_view
+            .get(self.conn_index)
+            .and_then(|&i| self.snapshot.connections.get(i))
+    }
+
+    /// Points `conn_index` back at `id`; a vanished or hidden one leaves no selection.
+    fn reselect_connection(&mut self, id: Option<String>, was_empty: bool) {
+        let list = &self.snapshot.connections;
+        self.conn_index = id
+            .and_then(|id| self.conn_view.iter().position(|&i| list[i].id == id))
+            .unwrap_or(if was_empty { 0 } else { self.conn_view.len() });
     }
 
     pub fn refresh_snapshot_now(&mut self) {
@@ -1286,6 +1400,42 @@ impl App {
             (Lang::Zh, "no_connections") => "当前没有活跃连接",
             (Lang::En, "no_connections") => "No active connections",
             (Lang::Ja, "no_connections") => "アクティブな接続はありません",
+            (Lang::Zh, "conn_sort_bytes") => "按流量",
+            (Lang::En, "conn_sort_bytes") => "by bytes",
+            (Lang::Ja, "conn_sort_bytes") => "転送量順",
+            (Lang::Zh, "conn_sort_age") => "按时长",
+            (Lang::En, "conn_sort_age") => "by age",
+            (Lang::Ja, "conn_sort_age") => "経過時間順",
+            (Lang::Zh, "conn_sort_rate") => "按速率",
+            (Lang::En, "conn_sort_rate") => "by rate",
+            (Lang::Ja, "conn_sort_rate") => "速度順",
+            (Lang::Zh, "conn_filter_sessions") => "仅长连接/AI",
+            (Lang::En, "conn_filter_sessions") => "long & AI only",
+            (Lang::Ja, "conn_filter_sessions") => "長時間/AI のみ",
+            (Lang::Zh, "conn_closed_title") => "最近断开的长连接/AI 连接",
+            (Lang::En, "conn_closed_title") => "Recently closed long-lived & AI connections",
+            (Lang::Ja, "conn_closed_title") => "最近切断された長時間/AI 接続",
+            (Lang::Zh, "conn_closed_empty") => "还没有长连接或 AI 连接断开",
+            (Lang::En, "conn_closed_empty") => "No long-lived or AI connection has closed yet",
+            (Lang::Ja, "conn_closed_empty") => "長時間/AI 接続の切断はまだありません",
+            (Lang::Zh, "conn_none_filtered") => "没有存活 60 秒以上或访问 AI 服务的连接（f 显示全部）",
+            (Lang::En, "conn_none_filtered") => "No connection older than 60 s or to an AI service (f shows all)",
+            (Lang::Ja, "conn_none_filtered") => "60 秒以上または AI サービスへの接続はありません（f で全表示）",
+            (Lang::Zh, "conn_closed_note") => "Mihomo 不提供断开原因；原因由 terc 根据自己的操作推断",
+            (Lang::En, "conn_closed_note") => "Mihomo reports no close reason; terc infers it from its own actions",
+            (Lang::Ja, "conn_closed_note") => "Mihomo は切断理由を返しません。terc が自身の操作から推定します",
+            (Lang::Zh, "conn_toast_ai_closed") => "AI 长连接已断开",
+            (Lang::En, "conn_toast_ai_closed") => "AI session closed",
+            (Lang::Ja, "conn_toast_ai_closed") => "AI 長時間接続が切断されました",
+            (Lang::Zh, "conn_long_lived") => "长连接",
+            (Lang::En, "conn_long_lived") => "long-lived",
+            (Lang::Ja, "conn_long_lived") => "長時間接続",
+            (Lang::Zh, "conn_ago") => "前",
+            (Lang::En, "conn_ago") => "ago",
+            (Lang::Ja, "conn_ago") => "前",
+            (Lang::Zh, "help_conn_keys") => "连接：o 排序（流量/时长/速率）  f 仅长连接/AI  d 最近断开",
+            (Lang::En, "help_conn_keys") => "Connections: o sort (bytes/age/rate)  f long & AI only  d recently closed",
+            (Lang::Ja, "help_conn_keys") => "接続：o 並べ替え（転送量/経過時間/速度）  f 長時間/AI のみ  d 最近の切断",
             (Lang::Zh, "no_logs") => "等待实时日志流...",
             (Lang::En, "no_logs") => "Waiting for live logs...",
             (Lang::Ja, "no_logs") => "ログ待機中...",
@@ -2105,12 +2255,18 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                     }
                 }
             },
+            MainTab::Connections if app.conn_closed_view => {
+                let len = app.conns.closed().len();
+                if len > 0 {
+                    app.closed_index = app.closed_index.checked_sub(1).unwrap_or(len - 1);
+                }
+            }
             MainTab::Connections => {
-                if !app.snapshot.connections.is_empty() {
+                if !app.conn_view.is_empty() {
                     app.conn_index = app
                         .conn_index
                         .checked_sub(1)
-                        .unwrap_or(app.snapshot.connections.len() - 1);
+                        .unwrap_or(app.conn_view.len() - 1);
                 }
             }
             MainTab::Logs => {
@@ -2149,12 +2305,18 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                     }
                 }
             },
+            MainTab::Connections if app.conn_closed_view => {
+                let len = app.conns.closed().len();
+                if len > 0 {
+                    app.closed_index = (app.closed_index + 1) % len;
+                }
+            }
             MainTab::Connections => {
-                if !app.snapshot.connections.is_empty() {
-                    app.conn_index = if app.conn_index >= app.snapshot.connections.len() {
+                if !app.conn_view.is_empty() {
+                    app.conn_index = if app.conn_index >= app.conn_view.len() {
                         0
                     } else {
-                        (app.conn_index + 1) % app.snapshot.connections.len()
+                        (app.conn_index + 1) % app.conn_view.len()
                     };
                 }
             }
@@ -2187,6 +2349,8 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                 app.detail_scroll = 0;
             }
             MainTab::Providers => app.refresh_selected_provider(),
+            // The closed view already shows its entry on the right.
+            MainTab::Connections if app.conn_closed_view => {}
             MainTab::Connections => {
                 app.connection_detail = true;
                 app.detail_scroll = 0;
@@ -2197,10 +2361,31 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                 app.detail_scroll = 0;
             }
         },
+        KeyCode::Char('o') if app.main_tab == MainTab::Connections => {
+            let id = app.selected_connection().map(|c| c.id.clone());
+            let was_empty = app.conn_view.is_empty();
+            app.conn_sort = app.conn_sort.next();
+            app.rebuild_conn_view();
+            app.reselect_connection(id, was_empty);
+        }
+        KeyCode::Char('f') if app.main_tab == MainTab::Connections => {
+            let id = app.selected_connection().map(|c| c.id.clone());
+            let was_empty = app.conn_view.is_empty();
+            app.conn_filter = !app.conn_filter;
+            app.rebuild_conn_view();
+            app.reselect_connection(id, was_empty);
+        }
+        KeyCode::Char('d') if app.main_tab == MainTab::Connections => {
+            app.conn_closed_view = !app.conn_closed_view;
+            app.closed_index = 0;
+        }
         KeyCode::Char('x') if app.main_tab == MainTab::Rules => app.toggle_selected_rule(),
-        KeyCode::Char('x') if app.main_tab == MainTab::Connections => {
-            if let Some(c) = app.snapshot.connections.get(app.conn_index) {
+        KeyCode::Char('x') if app.main_tab == MainTab::Connections && !app.conn_closed_view => {
+            if let Some(c) = app.selected_connection() {
                 let id = c.id.clone();
+                if !app.action_busy {
+                    app.conns.note(conns::Cause::UserClose, Some(id.clone()));
+                }
                 app.run_action("Closing connection…", None, None, move |cfg| {
                     close_connection(&cfg, Some(&id)).map_err(|e| e.to_string())?;
                     Ok("Connection closed".into())
@@ -2208,6 +2393,9 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Char('X') if app.main_tab == MainTab::Connections => {
+            if !app.action_busy {
+                app.conns.note(conns::Cause::CloseAll, None);
+            }
             app.run_action("Closing all connections…", None, None, |cfg| {
                 close_connection(&cfg, None).map_err(|e| e.to_string())?;
                 Ok("All connections closed".into())
@@ -2568,19 +2756,23 @@ mod tests {
             mihomo::connection_from_value(&serde_json::json!({"id": id, "metadata": {"host": id}}))
                 .unwrap()
         };
-        app.snapshot.connections = vec![connection("a"), connection("b")];
+        let snapshot = |ids: &[&str]| CoreSnapshot {
+            running: true,
+            connections_ok: true,
+            connections: ids.iter().map(|id| connection(id)).collect(),
+            ..Default::default()
+        };
+        app.accept_snapshot(snapshot(&["a", "b"]));
+        assert_eq!(app.conn_index, 0);
         app.conn_index = 1;
-        let mut next = app.snapshot.clone();
-        next.connections.reverse();
-        app.accept_snapshot(next);
-        assert_eq!(app.snapshot.connections[app.conn_index].id, "b");
-        let mut next = app.snapshot.clone();
-        next.connections.remove(0);
-        app.accept_snapshot(next);
-        assert!(app.snapshot.connections.get(app.conn_index).is_none());
+        app.accept_snapshot(snapshot(&["b", "a"]));
+        assert_eq!(app.selected_connection().unwrap().id, "b");
+        assert_eq!(app.conn_index, 0);
+        app.accept_snapshot(snapshot(&["a"]));
+        assert!(app.selected_connection().is_none());
         app.main_tab = MainTab::Connections;
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.snapshot.connections[app.conn_index].id, "a");
+        assert_eq!(app.selected_connection().unwrap().id, "a");
     }
 
     #[test]
@@ -3027,11 +3219,15 @@ mod tests {
             assert_eq!(app.help_scroll, previous.saturating_sub(1));
             app.screen = Screen::Dashboard;
         }
-        app.snapshot.connections = vec![mihomo::connection_from_value(
+        let mut conn = mihomo::connection_from_value(
             &serde_json::json!({"id":"a", "metadata":{"host":"visible.test", "process":"curl"}}),
         )
-        .unwrap()];
-        app.snapshot.connections[0].host = "visible.test".into();
+        .unwrap();
+        conn.host = "visible.test".into();
+        app.accept_snapshot(CoreSnapshot {
+            connections: vec![conn],
+            ..Default::default()
+        });
         app.main_tab = MainTab::Connections;
         app.conn_index = 0;
         press(&mut app, KeyCode::Enter);
@@ -3230,5 +3426,295 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(!app.ai_picker);
         assert_eq!(app.overlay, Overlay::PrivateRules);
+    }
+
+    fn live_conn(
+        id: &str,
+        host: &str,
+        age_secs: Option<i64>,
+        bytes: u64,
+    ) -> mihomo::ConnectionItem {
+        let mut conn =
+            mihomo::connection_from_value(&serde_json::json!({ "id": id, "rule": "Match" }))
+                .unwrap();
+        conn.host = host.into();
+        conn.chains = "PROXY › HK-01".into();
+        conn.start_ms = age_secs.map(|secs| conns::now_ms() - secs * 1000);
+        conn.download = bytes;
+        conn
+    }
+
+    fn live_snapshot(conns: Vec<mihomo::ConnectionItem>) -> CoreSnapshot {
+        CoreSnapshot {
+            running: true,
+            connections_ok: true,
+            connections: conns,
+            ..Default::default()
+        }
+    }
+
+    fn sample_connections() -> Vec<mihomo::ConnectionItem> {
+        vec![
+            live_conn("big", "cdn.example.com:443", Some(5), 9000),
+            live_conn("ai", "api.openai.com:443", Some(2), 500),
+            live_conn("long", "ws.example.com:443", Some(90), 100),
+        ]
+    }
+
+    #[test]
+    fn sort_key_cycles_and_keeps_the_selected_connection() {
+        let mut app = offline_app();
+        app.main_tab = MainTab::Connections;
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        let order = |app: &App| {
+            app.conn_view
+                .iter()
+                .map(|&i| app.snapshot.connections[i].id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(order(&app), "big,ai,long");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_connection().unwrap().id, "ai");
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.conn_sort, conns::SortKey::Age);
+        assert_eq!(order(&app), "long,big,ai");
+        assert_eq!(app.selected_connection().unwrap().id, "ai");
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.conn_sort, conns::SortKey::Rate);
+        assert_eq!(app.selected_connection().unwrap().id, "ai");
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.conn_sort, conns::SortKey::Bytes);
+        assert_eq!(order(&app), "big,ai,long");
+        assert_eq!(app.selected_connection().unwrap().id, "ai");
+    }
+
+    #[test]
+    fn session_filter_hides_short_rows_and_close_targets_the_visible_row() {
+        let mut app = offline_app();
+        app.main_tab = MainTab::Connections;
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        assert_eq!(app.selected_connection().unwrap().id, "big");
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.conn_view.len(), 2);
+        // The selected row was hidden, so nothing is selected until the user moves.
+        assert!(app.selected_connection().is_none());
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_connection().unwrap().id, "ai");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_connection().unwrap().id, "long");
+        let text = render_text(&mut app, 100, 30);
+        assert!(!text.contains("cdn.example.com"), "{text}");
+        assert!(text.contains("(2/3)"), "{text}");
+
+        // `x` reads the same row; a busy app refuses it without noting a cause,
+        // so this does not reach the controller.
+        app.action_busy = true;
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.status_message, "Another operation is still running");
+        app.action_busy = false;
+        app.accept_snapshot(live_snapshot(vec![live_conn(
+            "ai",
+            "api.openai.com:443",
+            Some(2),
+            500,
+        )]));
+        assert_eq!(app.conns.closed()[0].host, "ws.example.com:443");
+        assert_eq!(app.conns.closed()[0].cause, None);
+
+        press(&mut app, KeyCode::Char('f'));
+        assert!(!app.conn_filter);
+        assert_eq!(app.conn_view.len(), 1);
+        app.accept_snapshot(live_snapshot(vec![live_conn(
+            "s",
+            "a.test:443",
+            Some(1),
+            1,
+        )]));
+        press(&mut app, KeyCode::Char('f'));
+        assert!(app.conn_view.is_empty());
+        let text = render_text(&mut app, 100, 30);
+        assert!(text.contains("没有存活60秒以上"), "{text}");
+    }
+
+    #[test]
+    fn failed_connection_fetch_keeps_the_list_and_reports_no_closures() {
+        let mut app = offline_app();
+        let mut snapshot = live_snapshot(sample_connections());
+        snapshot.upload_total = 77;
+        app.accept_snapshot(snapshot);
+        let logs = app.logs.len();
+        app.accept_snapshot(CoreSnapshot {
+            running: true,
+            mode: "Rule".into(),
+            ..Default::default()
+        });
+        assert_eq!(app.snapshot.connections.len(), 3);
+        assert_eq!(app.snapshot.upload_total, 77);
+        assert_eq!(app.snapshot.mode, "Rule");
+        assert_eq!(app.conn_view.len(), 3);
+        assert!(app.conns.closed().is_empty());
+        assert_eq!(app.logs.len(), logs);
+
+        // A real empty list closes them; the long-lived and AI ones are kept.
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        assert!(app.snapshot.connections.is_empty());
+        assert_eq!(app.conns.closed().len(), 2);
+        let lines: Vec<_> = app.logs[logs..].iter().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().any(|(level, text)| level == "warning"
+            && text.starts_with("terc: closed api.openai.com:443 after 2s")));
+        assert!(lines.iter().any(|(level, text)| level == "info"
+            && text.contains("ws.example.com:443 after 1m3")
+            && text.contains("via PROXY › HK-01")));
+        // The AI session closed for no known reason: one quiet toast.
+        assert!(app
+            .status_message
+            .starts_with("AI 长连接已断开: api.openai.com"));
+        assert!(!app.status_is_error);
+
+        // A second one inside 30 s does not toast again, and a stop is attributed.
+        app.clear_status();
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        assert!(app.status_message.is_empty());
+        assert_eq!(app.conns.closed()[0].cause, None);
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        app.accept_snapshot(CoreSnapshot::default());
+        assert!(app.status_message.is_empty());
+        assert_eq!(app.conns.closed()[0].cause, Some(conns::Cause::CoreStopped));
+    }
+
+    #[test]
+    fn closing_many_sessions_logs_one_summary_line() {
+        let mut app = offline_app();
+        let many = (0..7)
+            .map(|i| live_conn(&i.to_string(), &format!("h{i}.test:443"), Some(120), 1))
+            .collect();
+        app.accept_snapshot(live_snapshot(many));
+        let logs = app.logs.len();
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        assert_eq!(app.logs.len(), logs + 1);
+        let (level, text) = app.logs.last().unwrap();
+        assert_eq!(level, "info");
+        assert!(
+            text.starts_with("terc: 7 long-lived/AI connections closed (同时断开 7 条"),
+            "{text}"
+        );
+        assert_eq!(app.conns.closed().len(), 7);
+        assert!(app.conns.closed().iter().all(|c| c.bulk == 7));
+    }
+
+    #[test]
+    fn connections_view_shows_ai_tags_ages_and_closed_sessions() {
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            for (width, height) in [(80, 24), (100, 30), (160, 40)] {
+                let mut app = offline_app();
+                app.config.settings.lang = lang;
+                app.config.settings.show_traffic = false;
+                app.main_tab = MainTab::Connections;
+                app.accept_snapshot(live_snapshot(sample_connections()));
+                let text = render_text(&mut app, width, height);
+                let row = |needle: &str| {
+                    text.lines()
+                        .find(|line| line.contains(needle))
+                        .unwrap_or_else(|| panic!("{lang:?} {width}: {needle}\n{text}"))
+                        .to_string()
+                };
+                assert!(row("api.openai.com").contains("AIapi.openai.com"), "{text}");
+                assert!(!row("ws.example.com").contains("AIws"), "{text}");
+                assert!(row("ws.example.com").contains("1m3"), "{text}");
+                assert!(row("cdn.example.com").contains("5s"), "{text}");
+                assert!(text.contains("(3/3)"), "{lang:?} {width}\n{text}");
+                let sort = app.t("conn_sort_bytes").replace(' ', "");
+                assert!(text.contains(&sort), "{lang:?} {width}\n{text}");
+                let sel = text.lines().find(|l| l.contains("›")).unwrap();
+                assert!(sel.contains("cdn.example.com"), "{text}");
+
+                press(&mut app, KeyCode::Char('o'));
+                press(&mut app, KeyCode::Char('o'));
+                let text = render_text(&mut app, width, height);
+                let sort = app.t("conn_sort_rate").replace(' ', "");
+                assert!(text.contains(&sort), "{lang:?} {width}\n{text}");
+                if width >= 100 {
+                    assert!(text.contains("0B/s"), "{lang:?} {width}\n{text}");
+                }
+
+                app.accept_snapshot(live_snapshot(vec![live_conn(
+                    "big",
+                    "cdn.example.com:443",
+                    Some(5),
+                    9000,
+                )]));
+                app.clear_status();
+                press(&mut app, KeyCode::Char('d'));
+                assert!(app.conn_closed_view);
+                let text = render_text(&mut app, width, height);
+                assert!(text.contains("ws.example.com"), "{lang:?} {width}\n{text}");
+                assert!(
+                    !text.contains("cdn.example.com"),
+                    "{lang:?} {width}\n{text}"
+                );
+                assert!(row_has(&text, "api.openai.com", "AI"), "{text}");
+                let ago = app.t("conn_ago");
+                assert!(
+                    text.contains(&format!("0s{ago}")),
+                    "{lang:?} {width}\n{text}"
+                );
+                // The note wraps inside the right pane.
+                assert!(text.contains("Mihomo"), "{lang:?} {width}\n{text}");
+                let footer = text.lines().last().unwrap();
+                assert!(footer.starts_with("↑↓"), "{lang:?} {width}\n{text}");
+
+                press(&mut app, KeyCode::Down);
+                assert_eq!(app.closed_index, 1);
+                press(&mut app, KeyCode::Enter);
+                assert!(!app.connection_detail);
+                press(&mut app, KeyCode::Char('x'));
+                assert!(!app.action_busy);
+                press(&mut app, KeyCode::Char('d'));
+                assert!(!app.conn_closed_view);
+                assert_eq!(app.closed_index, 0);
+            }
+        }
+    }
+
+    fn prefix(text: &str, chars: usize) -> String {
+        text.chars().take(chars).collect()
+    }
+
+    fn row_has(text: &str, needle: &str, other: &str) -> bool {
+        text.lines()
+            .any(|line| line.contains(needle) && line.contains(other))
+    }
+
+    #[test]
+    fn connection_detail_shows_age_rate_provider_and_ai() {
+        let mut app = offline_app();
+        app.main_tab = MainTab::Connections;
+        let mut conn = live_conn("ai", "api.openai.com:443", Some(75), 10);
+        conn.provider = "sub".into();
+        app.accept_snapshot(live_snapshot(vec![conn]));
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            press(&mut app, KeyCode::Enter);
+            let text = render_text(&mut app, 80, 30);
+            let long = app.t("conn_long_lived").replace(' ', "");
+            assert!(text.contains(&format!("({long})")), "{text}");
+            assert!(text.contains("age1m1"), "{text}");
+            assert!(text.contains("rate↑0B/s↓0B/s"), "{text}");
+            assert!(text.contains("provsub"), "{text}");
+            assert!(text.contains("aiyes"), "{text}");
+            press(&mut app, KeyCode::Esc);
+        }
+        app.screen = Screen::Help;
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            let help = app.t("help_conn_keys").replace(' ', "");
+            assert!(
+                render_text(&mut app, 160, 60).contains(&prefix(&help, 9)),
+                "{lang:?}"
+            );
+        }
     }
 }
