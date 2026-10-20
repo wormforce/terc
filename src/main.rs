@@ -132,10 +132,18 @@ pub struct Settings {
     pub graph_interval_ms: Option<u64>,
     pub show_traffic: bool,
     pub show_toolbar: bool,
+    /// Without a serde default an older config.json would fail to load and be
+    /// replaced by `Config::default()` on the next save.
+    #[serde(default = "default_true")]
+    pub connections_stream: bool,
 }
 
 fn default_graph_interval() -> u64 {
     1
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Settings {
@@ -157,6 +165,7 @@ impl Default for Settings {
             graph_interval_ms: Some(1000),
             show_traffic: true,
             show_toolbar: true,
+            connections_stream: true,
         }
     }
 }
@@ -466,6 +475,10 @@ pub struct App {
     pub tx: Sender<BackendEvent>,
     pub rx: Receiver<BackendEvent>,
     pub stop_flag: Arc<AtomicBool>,
+    /// Switch shared with the `/connections` WebSocket worker.
+    pub conn_stream: Arc<mihomo::ConnStream>,
+    /// When the last pushed `/connections` snapshot arrived.
+    pub conn_stream_at: Option<Instant>,
     pub last_snapshot_poll: Instant,
     pub setup_origin: Screen,
     pub setup_editor: LineEditor,
@@ -494,6 +507,7 @@ impl App {
             app.config.controller.secret.clone(),
             app.tx.clone(),
             app.stop_flag.clone(),
+            app.conn_stream.clone(),
         );
         app
     }
@@ -501,6 +515,9 @@ impl App {
     fn from_snapshot(config: Config, initial_snapshot: CoreSnapshot) -> Self {
         let (tx, rx) = mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let conn_stream = Arc::new(mihomo::ConnStream {
+            enabled: AtomicBool::new(config.settings.connections_stream),
+        });
         let screen = launch_screen(
             &config.controller.subscription_url,
             initial_snapshot.running,
@@ -585,6 +602,8 @@ impl App {
             tx,
             rx,
             stop_flag,
+            conn_stream,
+            conn_stream_at: None,
             last_snapshot_poll: Instant::now(),
             setup_origin: Screen::Dashboard,
             setup_editor: LineEditor::default(),
@@ -874,6 +893,17 @@ impl App {
                         }
                     }
                 }
+                // Live data: accepted even while an action runs.
+                BackendEvent::Connections {
+                    items,
+                    upload_total,
+                    download_total,
+                } => {
+                    self.conn_stream_at = Some(Instant::now());
+                    self.snapshot.upload_total = upload_total;
+                    self.snapshot.download_total = download_total;
+                    self.install_connections(items, true);
+                }
                 BackendEvent::SnapshotDone(snap) => {
                     self.snapshot_pending = false;
                     if !self.action_busy {
@@ -978,16 +1008,33 @@ impl App {
             self.last_snapshot_poll = Instant::now();
             let cfg = self.config.controller.clone();
             let tx = self.tx.clone();
+            // Pushed snapshots already cover /connections; skip that GET.
+            let include_connections = !self.stream_live();
             thread::spawn(move || {
                 let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
-                done.set(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
+                let snap = mihomo::fetch_snapshot_with(&cfg, include_connections);
+                done.set(BackendEvent::SnapshotDone(Box::new(snap)));
             });
         }
+    }
+
+    /// `/connections` pushes are arriving; a gap of 3 s (three missed pushes)
+    /// hands the list back to HTTP polling.
+    pub fn stream_live(&self) -> bool {
+        self.conn_stream.enabled.load(Ordering::Relaxed)
+            && self
+                .conn_stream_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
     }
 
     pub fn accept_snapshot(&mut self, mut snapshot: CoreSnapshot) {
         if self.snapshot.running && !snapshot.running {
             self.load_core_log();
+        }
+        // A poll may have started before the latest push: never let it replace
+        // fresher pushed data or report sessions as closed.
+        if self.stream_live() {
+            snapshot.connections_ok = false;
         }
         let fresh = std::mem::take(&mut snapshot.connections);
         snapshot.connections = std::mem::take(&mut self.snapshot.connections);
@@ -1514,6 +1561,9 @@ impl App {
             (Lang::Zh, "desc_theme") => "与 terb 同款的克制低饱和配色：Spring（浅青珊瑚）、Vintage（苔绿陶土）、Mono（极简黑白）。",
             (Lang::En, "desc_theme") => "Restrained palettes matching terb: Spring, Vintage, and Mono.",
             (Lang::Ja, "desc_theme") => "terbと同じ配色テーマ（Spring / Vintage / Mono）。",
+            (Lang::Zh, "desc_conn_stream") => "用 WebSocket 接收 Mihomo 每秒推送的连接列表，单连接速率更准；握手失败、数据过大或中断时自动改回 HTTP 轮询。",
+            (Lang::En, "desc_conn_stream") => "Receive Mihomo's per-second connection list over WebSocket for more accurate per-connection rates; falls back to HTTP polling on handshake failure, oversized data or drops.",
+            (Lang::Ja, "desc_conn_stream") => "Mihomo が毎秒送る接続一覧を WebSocket で受信し、接続ごとの速度をより正確にします。ハンドシェイク失敗・サイズ超過・切断時は自動で HTTP ポーリングに戻ります。",
             (Lang::Zh, "set_renderer") => "速率图样式",
             (Lang::En, "set_renderer") => "Rate Graph Style",
             (Lang::Ja, "set_renderer") => "グラフスタイル",
@@ -3346,6 +3396,109 @@ mod tests {
         assert!(cfg.active_profile.is_empty());
         assert_eq!(cfg.settings.theme, ThemeId::Mono);
         assert_eq!(cfg.settings.graph_interval_secs, 1);
+        assert!(cfg.settings.connections_stream);
+    }
+
+    #[test]
+    fn pushed_connections_are_not_overwritten_by_an_older_poll() {
+        let mut app = offline_app();
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        let ids = |app: &App| {
+            app.conn_view
+                .iter()
+                .map(|&i| app.snapshot.connections[i].id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(!app.stream_live());
+        // Pushes are live data and land even while an action runs.
+        app.action_busy = true;
+        app.tx
+            .send(BackendEvent::Connections {
+                items: vec![
+                    live_conn("ai", "api.openai.com:443", Some(2), 800),
+                    live_conn("new", "chatgpt.com:443", Some(1), 50),
+                ],
+                upload_total: 5,
+                download_total: 9,
+            })
+            .unwrap();
+        app.drain_events();
+        app.action_busy = false;
+        assert!(app.stream_live());
+        assert_eq!(ids(&app), ["ai", "new"]);
+        assert_eq!(
+            (app.snapshot.upload_total, app.snapshot.download_total),
+            (5, 9)
+        );
+        // `long` was a long-lived session the push no longer lists.
+        let closed = app.conns.closed().len();
+        assert_eq!(app.conns.closed()[0].host, "ws.example.com:443");
+
+        // A poll that started before the push carries the older list.
+        app.snapshot_pending = true;
+        let mut stale = live_snapshot(sample_connections());
+        stale.mode = "Global".into();
+        stale.upload_total = 1;
+        app.tx
+            .send(BackendEvent::SnapshotDone(Box::new(stale)))
+            .unwrap();
+        app.drain_events();
+        assert!(!app.snapshot_pending);
+        assert_eq!(app.snapshot.mode, "Global");
+        assert_eq!(ids(&app), ["ai", "new"]);
+        assert_eq!(app.snapshot.upload_total, 5);
+        assert_eq!(app.conns.closed().len(), closed);
+
+        // Three seconds without a push hand the list back to polling.
+        app.conn_stream_at = Instant::now().checked_sub(Duration::from_secs(4));
+        assert!(!app.stream_live());
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        assert_eq!(ids(&app), ["big", "ai", "long"]);
+        // Switched off, a fresh push does not count as live.
+        app.conn_stream_at = Some(Instant::now());
+        app.config.settings.connections_stream = false;
+        app.conn_stream.enabled.store(false, Ordering::Relaxed);
+        assert!(!app.stream_live());
+    }
+
+    #[test]
+    fn live_connection_stream_row_shows_its_transport() {
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            for (width, height) in [(80, 24), (160, 40)] {
+                let mut app = offline_app();
+                app.config.settings.lang = lang;
+                app.screen = Screen::Settings;
+                app.setting_index = app
+                    .settings_rows()
+                    .iter()
+                    .position(|r| r.id == crate::settings::SettingId::ConnStream)
+                    .unwrap();
+                assert_eq!(
+                    app.settings_rows()[app.setting_index].category,
+                    SettingCategory::Diagnostics
+                );
+                let label = match lang {
+                    Lang::Zh => "连接实时推送",
+                    _ => "Liveconnectionstream",
+                };
+                let desc = prefix(&app.t("desc_conn_stream").replace(' ', ""), 8);
+                // The list may put the value under the label; the detail pane
+                // states it on one line.
+                let shows = |app: &mut App, value: &str| {
+                    let text = render_text(app, width, height);
+                    let state = format!("{}:{value}", app.t("current_value"));
+                    assert!(text.contains(label), "{lang:?} {width}\n{text}");
+                    assert!(text.contains(&state), "{lang:?} {width} {value}\n{text}");
+                    assert!(text.contains(&desc), "{lang:?} {width}\n{text}");
+                };
+                shows(&mut app, "ON·HTTP");
+                app.conn_stream_at = Some(Instant::now());
+                shows(&mut app, "ON·WebSocket");
+                app.config.settings.connections_stream = false;
+                app.conn_stream.enabled.store(false, Ordering::Relaxed);
+                shows(&mut app, "OFF");
+            }
+        }
     }
 
     #[test]
