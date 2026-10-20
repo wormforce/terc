@@ -1646,7 +1646,10 @@ fn append_manual_members(groups: &mut YamlChunk, names: &[String]) {
         if let Ok(mut value) =
             serde_json::from_str::<Value>(block[0].trim_start().trim_start_matches('-').trim())
         {
-            if value["type"] == "select" && value["include-all"] != true {
+            if value["type"] == "select"
+                && value["include-all"] != true
+                && value["include-all-proxies"] != true
+            {
                 if let Some(members) = value["proxies"].as_array_mut() {
                     members.extend(names.iter().map(|n| json!(n)));
                     groups.lines[*start] = format!("{}- {value}", " ".repeat(indent));
@@ -1661,9 +1664,11 @@ fn append_manual_members(groups: &mut YamlChunk, names: &[String]) {
             .join(", ");
         let flow = block[0].trim_start().trim_start_matches('-').trim();
         if flow.starts_with('{') {
-            if flow_value(flow.trim_start_matches('{'), "type").as_deref() == Some("select")
-                && flow_value(flow.trim_start_matches('{'), "include-all").as_deref()
-                    != Some("true")
+            let inner = flow.trim_start_matches('{');
+            if flow_value(inner, "type").as_deref() == Some("select")
+                && ["include-all", "include-all-proxies"]
+                    .iter()
+                    .all(|k| flow_value(inner, k).as_deref() != Some("true"))
             {
                 let pad = " ".repeat(indent);
                 if let Some((open, close)) = flow_key_list(flow, "proxies") {
@@ -1690,7 +1695,10 @@ fn append_manual_members(groups: &mut YamlChunk, names: &[String]) {
             continue;
         }
         if !block.iter().any(|l| l.trim() == "type: select")
-            || block.iter().any(|l| l.trim() == "include-all: true")
+            || block.iter().any(|l| {
+                let t = l.trim().trim_start_matches('-').trim_start();
+                t == "include-all: true" || t == "include-all-proxies: true"
+            })
         {
             continue;
         }
@@ -1910,6 +1918,16 @@ mod profile_tests {
         ) + "proxy-providers:\n  prov: {type: file, path: ./prov.yaml}\n";
         let yaml = build(Some(&convert_subscription(&block).unwrap()), &manual());
         assert!(yaml.contains("    proxies: [HK, \"Own\"] # [note]\n    use: [prov]\n"));
+        let flow = CLASH.replace(
+            "  - name: Airport\n    type: select\n    proxies: [HK]",
+            "  - {name: Airport, type: select, proxies: [HK], use: [P]}\n  - {name: All, type: select, include-all-proxies: true, use: [P]}\n  - name: Block\n    type: select\n    include-all-proxies: true\n    use: [P]\n  - {\"name\":\"Json\",\"type\":\"select\",\"include-all-proxies\":true,\"proxies\":[\"HK\"]}",
+        ) + "proxy-providers:\n  P: {type: file, path: ./p.yaml}\n";
+        let yaml = build(Some(&convert_subscription(&flow).unwrap()), &manual());
+        assert!(yaml.contains("- {name: Airport, type: select, proxies: [HK, \"Own\"], use: [P]}"));
+        assert!(yaml.contains("- {name: All, type: select, include-all-proxies: true, use: [P]}"));
+        assert!(yaml.contains("    include-all-proxies: true\n    use: [P]\n"));
+        assert!(!yaml.contains("[\"HK\",\"Own\"]"));
+        assert_eq!(yaml.matches("\"Own\"").count(), 2, "{yaml}");
         let tricky = "{name: \"a, proxies: [x]\", note: it's, proxies: [\"]\", HK], use: [p]}";
         let (open, close) = flow_key_list(tricky, "proxies").unwrap();
         assert_eq!(&tricky[open..=close], "[\"]\", HK]");
