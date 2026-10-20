@@ -87,7 +87,7 @@ macOS 按 <kbd>T</kbd> 开启 TUN 时，terc 会弹出系统管理员授权窗�
 
 | 视图 | 内容 |
 | --- | --- |
-| **活跃连接** | 进程、入站、嗅探域名、规则载荷、链路、Geo/ASN，可单条或全部断开 |
+| **活跃连接** | 进程、入站、嗅探域名、规则载荷、链路、Geo/ASN；时长、单连接速率、AI 标记，最近断开的长连接/AI 连接及推断原因；可单条或全部断开，会断线的操作先确认 |
 | **DNS** | 从配置读出的解析状态、即时查询，以及 DNS / Fake-IP 缓存清空 |
 | **规则** | 顺序列表、实时命中次数、本机解释，以及运行时禁用 |
 | **远程资源（设置 → 排查）** | `proxy-providers` 与 `rule-providers`，不是机场订阅链接。可单条或全部刷新，代理源可做健康检查 |
@@ -138,6 +138,7 @@ macOS 按 <kbd>T</kbd> 开启 TUN 时，terc 会弹出系统管理员授权窗�
 | DNS | Enter / F / [ ] | 查询、清空 DNS 与 Fake-IP、切换记录类型 |
 | Provider | Enter / F / H | 刷新当前项、刷新全部，或对代理源做健康检查 |
 | 连接监控 | x / X | 断开当前选中连接 / 一键断开全部活跃连接 |
+| 连接监控 | o / f / d | 按流量、时长、速率排序 / 只看长连接和 AI 连接 / 最近断开 |
 
 </details>
 
@@ -161,7 +162,7 @@ macOS 按 <kbd>T</kbd> 开启 TUN 时，terc 会弹出系统管理员授权窗�
 
 ## 工作原理
 
-`terc` 不用异步 HTTP 运行时，而是用标准库 `std::net::TcpStream` 连接本机 `127.0.0.1:9090`。后台线程读取 `/traffic`、`/memory` 和 `/logs`。开关走 `PATCH /configs`（`tun.enable`、`sniffing`、`ipv6`）。DNS 查询是 `GET /dns/query`，清空是 `POST /cache/dns/flush` 与 `POST /cache/fakeip/flush`，Provider 刷新是 `PUT /providers/...`。远端订阅和内核包通过系统 `curl` 下载。
+`terc` 不用异步 HTTP 运行时，而是用标准库 `std::net::TcpStream` 连接本机 `127.0.0.1:9090`。后台线程读取 `/traffic`、`/memory` 和 `/logs`；`/connections` 走 WebSocket 推送（`src/ws.rs`，只用标准库），不可用时回退到轮询。开关走 `PATCH /configs`（`tun.enable`、`sniffing`、`ipv6`）。DNS 查询是 `GET /dns/query`，清空是 `POST /cache/dns/flush` 与 `POST /cache/fakeip/flush`，Provider 刷新是 `PUT /providers/...`。远端订阅和内核包通过系统 `curl` 下载。
 
 ```mermaid
 flowchart LR

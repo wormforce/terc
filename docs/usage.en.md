@@ -43,6 +43,8 @@ Press `s` → Sources & Routing to see the named proxy list directly. Tab switch
 
 Press `a` for the unified Add proxy form. Choose Subscription, Single proxy, or Import links/configuration. Enter a name and the relevant URL or server, port, credentials, cipher and TLS/SNI fields. Supported form protocols: SS, Trojan, VMess, VLESS, SOCKS5, HTTP, Hysteria2 and TUIC. Other supported protocols can be imported. Arrows/Tab select fields, left/right cycle options, Enter edits, Ctrl+S saves and uses the entry. Passwords are masked. `e` edits the selected entry, `n` renames, `u` updates the active subscription, and `v` manages attached nodes. Failed saves restore the old source record and configuration.
 
+WebSocket and HTTPUpgrade nodes: for VMess, VLESS and Trojan, Transport cycles through TCP, WebSocket and HTTPUpgrade. Both show Path and an optional Host header; when the server is an IP or sits behind a CDN, put your domain in Host. VMess and VLESS also use Host as SNI when TLS is on and SNI is empty; Trojan does not, so fill in SNI as well behind a CDN. WebSocket adds optional Early data (bytes), HTTPUpgrade adds Fast open. Saving changes only these keys; other `ws-opts` such as custom headers or the early-data header name are kept, and a rename or port change leaves the early-data mode alone. `network: httpupgrade` written by other tools is rewritten to Mihomo's `network: ws` plus `v2ray-http-upgrade: true` when the config is generated, and the result names the nodes it changed; the raw subscription cache is not touched. Other transports (grpc, h2 and so on) open in the raw editor.
+
 Routing lists subscription routing, Proxy all, routing cached by each source and named saved plans. Enter assigns a plan to the active proxy; `c` saves current routing for reuse. Nodes always come from the active source.
 
 For example, source A can use its own routing and manual source B can use a shared plan. Switching restores each assignment. Updating B's nodes keeps its routing and never imports A's nodes. Original source caches remain separate. Validation failures keep the current configuration and routing assignment. Previous local snapshots remain selectable as policy only. Custom rule editing is still paused.
@@ -55,11 +57,27 @@ Proxy settings include mixed / HTTP / SOCKS ports, LAN access, TUN, DNS, IPv6, s
 
 Appearance includes theme, graph style, UI refresh rate, graph interval, language, top panels and the shortcut footer. The graph interval stays in Settings rather than cluttering the traffic graph.
 
-Diagnostics contains the log level, core download, snippets, probe, runtime details, rules and providers. Startup errors include a core-log excerpt. The Logs view also reads `terc-core.log`; the preceding startup log is kept as `terc-core.previous.log`. An occupied controller or an unresponsive managed process blocks another launch. A startup timeout cleans up the newly launched process.
+Diagnostics contains the log level, core download, snippets, probe, runtime details, rules, providers and Live connection stream. Startup errors include a core-log excerpt. The Logs view also reads `terc-core.log`; the preceding startup log is kept as `terc-core.previous.log`. An occupied controller or an unresponsive managed process blocks another launch. A startup timeout cleans up the newly launched process.
 
 ## Sniffer
 
 Settings → Proxy toggles the Mihomo sniffer. Many flows arrive with only an IP. The sniffer reads the HTTP Host, TLS SNI, or QUIC name from the start of the flow and fills the domain back in, so domain rules can match. The connections view shows that sniffed host. It does not store page contents, and it is not a packet capture.
+
+## Connections
+
+Press `c`. Each row shows the connection's age, in bold once it has been open 60 s (long-lived). Connections to AI services are tagged `AI`: the destination or sniffed host matches the AI preset rules, or the chain passes through the `AI` group. When the pane is narrow, columns appear in this order: the current sort value (total bytes or total rate), process, rule, separate up/down, inbound. The host gets the rest.
+
+- `o` cycles sorting by bytes, age and rate
+- `f` shows only long-lived and AI connections; press again for all
+- `x` closes the selected row, `X` closes all
+- Enter opens full details (process, path, inbound, rule, chain, provider, age, rate), also in a narrow terminal
+- `d` lists recently closed long-lived and AI connections (up to 50), with how long ago, lifetime, bytes and the inferred cause. Enter opens one entry; `d` returns to the live list
+
+Mihomo reports no close reason, so terc infers it from its own actions: closed in terc, closed all, core stopped or restarted, config reload (only connections through proxy-provider nodes), TUN rebuilt (only connections that entered through TUN). A regeneration that leaves the config unchanged is not reloaded and is not blamed. Three or more unexplained closures in one refresh suggest a network change, sleep or node failure. An AI request that ends on its own within 10 s is not recorded. An unexplained AI closure shows one quiet toast, at most every 30 s.
+
+Close all, TUN off, enabling TUN where macOS must restart the core, stopping the core, and reloads (switching a profile or routing plan, Reload, updating a subscription, editing the active subscription URL, DNS and snippet toggles) first show how many long-lived and AI connections would drop; press the same key again within 6 s to go ahead. A reload counts only proxy-provider connections and may be skipped when nothing changed, so its prompt says "may drop". Settings Mihomo applies live (LAN access, ports, concurrent TCP, process matching, log level) are sent with `PATCH /configs` without a reload, so existing connections stay.
+
+The core pushes the connection list over WebSocket once a second. If the push is unavailable, terc falls back to polling every 2.2 s and logs one line, and another when it recovers; a core stop or restart logs nothing. Settings → Diagnostics → Live connection stream turns the push off and shows `OFF`, `ON · WebSocket` or `ON · HTTP` (on, but polling). A changed controller address or secret applies to the push after restarting terc.
 
 ## Other views
 

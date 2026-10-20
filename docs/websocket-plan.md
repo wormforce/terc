@@ -1,6 +1,6 @@
 # terc 与 WebSocket：调研结论与分阶段计划
 
-- 状态：阶段 2–4 已完成，另加“保护长连接”一批改动（见 §2.8）。分支 `claude/websocket-groundwork`（PR #4），最初基线 `7975ab3`。
+- 状态：阶段 0、2、3、4 已完成，另加“保护长连接”一批改动（§2.8），并按集成后的审查意见做了修正（§11）。阶段 1（实测）待用户完成。分支 `claude/websocket-groundwork`（PR #4），最初基线 `7975ab3`。
 - 日期：2026-10-20
 - Mihomo 源码出处：`MetaCubeX/mihomo` 的 `Meta` 分支，commit `88dcbf7f1614a67c3b36b848ee3592dfa92ada36`
   （2026-09-30 +0800 提交）。下文 Mihomo 的行号都以这个 commit 为准。
@@ -8,7 +8,7 @@
 - 文档出处：`MetaCubeX/Meta-Docs`（`docs/config/general.md`、`docs/config/proxies/transport.md`、`docs/api/index.md`），
   地址为 `https://raw.githubusercontent.com/MetaCubeX/Meta-Docs/main/docs/...`。
 - 下文结论都来自读源码，还没有在真实环境里验证（原因见 §9）。需要实测的地方都标了“待实测”。
-- terc 的行号以本分支当前代码为准。
+- terc 的行号以本分支当前代码为准（已按审查修正后的代码重新核对）。
 
 ## 0. 结论速览
 
@@ -49,8 +49,8 @@
 
 ### 2.2 重载配置会不会断开已建立的连接
 
-terc 保存配置后会调用 `install_config`（`src/mihomo.rs:1574`），再由 `reload_config`
-发送 `PUT /configs?force=true`（`src/mihomo.rs:2265`）。在 Mihomo 端：
+terc 保存配置后会调用 `install_config`（`src/mihomo.rs:2326`），再由 `reload_config`
+发送 `PUT /configs?force=true`（`src/mihomo.rs:3023`）。在 Mihomo 端：
 
 1. `updateConfigs` 读取 `force`，解析配置后调用 `executor.ApplyConfig(cfg, force)`
    （`hub/route/configs.go:401`–`450`，`hub/executor/executor.go:84`–`123`）。
@@ -76,8 +76,8 @@ terc 保存配置后会调用 `install_config`（`src/mihomo.rs:1574`），再�
 5. TUN：每次重载都会调用 `ReCreateTun`（`executor.go:108`、`:210`–`212`）。配置不变时只调用 `OnReload()`
    （`listener.go:515`–`519`）；配置变了就执行 `closeTunListener()`（`:522`、`:720`–`724`），
    关闭 tun 栈和网卡（`listener/sing_tun/server.go:670`–`688`）。**TUN 一旦重建，经 TUN 转发的连接全部中断。**
-   terc 的 TUN 开关（`set_tun_enabled`，`src/mihomo.rs:2209`）走 `PATCH /configs` → `ReCreateTun`（`configs.go:377`），效果相同。
-   macOS 上非 root 内核开启 TUN 时，terc 会改写配置并重启内核（`src/privilege.rs:386`–`440`），所有连接都会断开。
+   terc 的 TUN 开关（`set_tun_enabled`，`src/mihomo.rs:2966`）走 `PATCH /configs` → `ReCreateTun`（`configs.go:377`），效果相同。
+   macOS 上非 root 内核开启 TUN 时，terc 会改写配置并重启内核（`src/privilege.rs:386`–`443`），所有连接都会断开。
 6. `PATCH /configs`（`configs.go:330`–`399`）先调用 `SetAllowLan` / `SetBindAddress`，再用当前或新值调用各个 `ReCreate*`
    （`:371`–`380`），只重建真正变化的部分。`allow-lan`、各端口、`tcp-concurrent`、`find-process-mode`、`log-level`
    都在这里实时生效，**不挂起隧道，也不重新初始化 provider**。改 TUN（包括开关）会重建 TUN（`:377`）。
@@ -90,8 +90,8 @@ terc 保存配置后会调用 `install_config`（`src/mihomo.rs:1574`），再�
 - 经 TUN 的连接：TUN 配置变化或开关时全部中断。
 - 以上仍是读源码的结论，**待实测**（§6 阶段 1、§10）。
 
-terc 自己的行为：在分组里选节点（`src/main.rs:1203` → `src/mihomo.rs:917`）不会关闭连接。
-用户在连接视图里主动关闭时（`src/main.rs:2393` 单条、`:2405` 全部）、重载配置时（provider 节点）、
+terc 自己的行为：在分组里选节点（`src/main.rs:1273` → `src/mihomo.rs:1669`）不会关闭连接。
+用户在连接视图里主动关闭时（`src/main.rs:2468` 单条、`:2481` 全部）、重载配置时（provider 节点）、
 切换 TUN 时和停止内核时会关闭。§2.8 说明 terc 怎样减少和提示这些情况。
 
 ### 2.3 选节点与 url-test 自动切换
@@ -109,8 +109,8 @@ terc 自己的行为：在分组里选节点（`src/main.rs:1203` → `src/mihom
 - 所以分组切换不会断开已建立的 WebSocket。但如果是**节点本身**故障导致切换，连接早已断了，
   重连可能换到新节点（url-test 或 fallback），出口 IP 随之变化。部分服务可能因此要求重新认证或触发风控（可能，不确定）。
   fallback，或者调大 url-test 的 tolerance，出口会更稳定。
-- terc 默认的 AI 组是 `url-test`、`interval: 300`、`tolerance: 50`（`src/compose.rs:1181`–`1189`），
-  AUTO 组也是 url-test（`src/compose.rs:1227`–`1235`）。
+- terc 默认的 AI 组是 `url-test`、`interval: 300`、`tolerance: 50`（`src/compose.rs:1209`–`1218`），
+  AUTO 组也是 url-test（`src/compose.rs:1256`–`1264`）。
   如果更在意出口稳定，用户可以在 `rules.conf` 的 `[ai]` 里设置 `type = fallback`，或者固定成员。
   本分支**不改默认值**，由用户决定（§8）。
 
@@ -155,28 +155,44 @@ Mihomo 不提供任何断开原因：`Manager.Leave` 只删除 id（`tunnel/stat
 2. 单连接速率：`Tracker::observe` 按连接 id 对相邻快照求差，间隔不足 500 毫秒的快照不更新速率。
 3. 存活 60 秒以上的连接标为“长连接”；目标、嗅探域名或 `AI` 分组命中 AI 预设规则时标为 AI。
    `o` 在字节数、时长、速率三种排序之间切换，`f` 只看长连接和 AI 连接。
+   列宽不够时按优先级取舍：先显示当前排序的数值（字节或速率的合计），再依次加进程、规则、上下行分开、入站，
+   每加一列都要给目标地址留够 18 格，剩下的宽度归目标地址（最多 48 格），不再留空白（`src/panels.rs` `draw_connections`）。
 4. 长连接或 AI 连接消失时，记入断开记录（`d` 查看，最多 50 条）并写一行日志，包括 host、链路、provider、存活时长和字节数。
-   原因来自 terc 自己的操作：单条断开、全部断开、内核停止，以及 §2.8 新增的配置重载和 TUN 重建；
+   AI 连接只有存活满 10 秒，或者是被 terc 的操作断开时才记录；1 秒的普通请求、正常结束的 keep-alive 不算（`AI_SESSION_SECS`）。
+   原因来自 terc 自己的操作：单条断开、全部断开、内核停止或重启，以及 §2.8 的配置重载和 TUN 重建；
    同一次观察里有 3 条以上没有原因的断开时，提示可能是网络切换、睡眠或节点故障。
    AI 连接无故断开时会弹出一次安静的提示（30 秒内不重复）。
+   断开记录在没有右侧详情栏的窄窗口里优先显示原因；Enter 打开整条记录；新记录插到前面时光标仍停在原来那一条。
 5. `providerChains` 已解析，详情里显示 provider，§2.8 用它判断哪些连接会被重载断开。
+6. “内核停止”的判定：一次 `GET /version` 超过 700 毫秒或失败，快照也会是 `running: false`
+   （`fetch_core_snapshot`，以及线程崩溃时 `SendOnDrop` 发出的默认快照）。所以 `accept_snapshot`（`src/main.rs:1038`）
+   连续两次轮询都没看到内核、并且没有 `/connections` 推送时才清空列表；推送正常时轮询怎么说都不清空。
+   代价是真正的停止晚一个轮询周期（2.2 秒）才记入断开记录。
+   另外，Mihomo 的 `uploadTotal` / `downloadTotal` 在同一进程里只增不减；变小说明内核在两次观察之间重启过
+   （例如被 launchd 或 systemd 秒级拉起），这次观察里的断开记为“内核已停止或重启”（`Tracker::note_totals`）。
 
 ### 2.8 保护长连接（已完成）
 
-1. **不做不必要的重载。** `regenerate_routing`（`src/mihomo.rs:1423`）生成配置后，先按运行时模式得到最终文本；
+1. **不做不必要的重载。** `regenerate_routing`（`src/mihomo.rs:2175`）生成配置后，先按运行时模式得到最终文本；
    如果和当前 `config.yaml` 完全相同，就跳过 `mihomo -t` 和 `PUT /configs`，但照常写订阅缓存、分流选择和
    `generated/<profile>.yaml`，结果提示“配置未变化，未重载，现有连接不受影响”。判断在 `reload_needed`
-   （`src/mihomo.rs:2295`）。上一次重载没有得到明确答复时（`RELOAD_UNCERTAIN`），下一次即使内容相同也会重载。
+   （`src/mihomo.rs:3078`）。上一次重载没有得到明确答复时（`RELOAD_UNCERTAIN`），下一次即使内容相同也会重载。
    用户手动“重载配置”仍然总是重载。
 2. **能实时改的设置用 `PATCH`。** 内核运行时，`allow-lan`、`port`、`socks-port`、`mixed-port`、`tcp-concurrent`、
-   `find-process-mode`、`log-level` 先用 `mihomo -t` 校验并保存（`install_config_keep_mode`，`src/mihomo.rs:2301`），
-   再 `PATCH /configs` 并读回 `GET /configs` 核对（`patch_config_value`，`src/mihomo.rs:2310`）。
-   PATCH 失败、读回不一致，或者模块覆盖了这个键时，退回完整重载（`apply_core_setting`，`src/settings.rs:431`）。
+   `find-process-mode`、`log-level` 先用 `mihomo -t` 校验并保存（`install_config_keep_mode`，`src/mihomo.rs:3084`），
+   再 `PATCH /configs` 并读回 `GET /configs` 核对（`patch_config_value`，`src/mihomo.rs:3093`）。
+   PATCH 失败、读回不一致，或者模块覆盖了这个键时，退回完整重载（`apply_core_setting`，`src/settings.rs:459`）。
+   这次退回的重载也失败时，文件已是新值而内核可能还是旧值，所以设置 `RELOAD_UNCERTAIN`，下一次重新生成一定重载。
 3. **会断线的操作先确认**（`src/guard.rs`）。全部断开、关闭 TUN、macOS 上会重启内核的开启 TUN、停止内核，
-   以及重载配置（切换配置或分流方案、重载、DNS / 模块开关、手动更新订阅）在会影响长连接或 AI 连接时，
+   以及重载配置（切换配置或分流方案、重载、DNS / 模块开关、手动更新订阅、修改当前订阅地址）在会影响长连接或 AI 连接时，
    先弹出一行提示，说明会断开多少条、其中 AI 多少条；6 秒内再按一次才执行。
    重载只统计经 provider 节点的连接，关闭 TUN 只统计 TUN 入站的连接。没有受影响的连接、内核未运行或在首次设置流程里时不提示。
-   确认后，断开记录里会标出“配置重载（订阅提供者节点）”“TUN 重建”或“内核已停止或重启”。
+   重载可能因为内容不变而被跳过，所以重载的提示写“可能断开”。
+4. **原因只记在真正被断开的连接上。** 确认时只记“内核停止”（全部断开由 `X` 自己记）。重载和 TUN 改动由执行它的
+   `run_action` 线程在发出请求的前一刻通知界面（`announce_disruption`，`src/mihomo.rs:3069`，经线程局部的发送端
+   `report_disruptions`，`:3063`）：`reload_config` 发 `PUT` 之前记“配置重载”，只给经 provider 节点的连接；
+   `set_tun_enabled` 发 `PATCH` 之前记“TUN 重建”，只给 TUN 入站的连接；macOS 为开启 TUN 重启内核之前记给所有连接。
+   内容不变而跳过重载、`mihomo -t` 拒绝、没有 DNS 块等提前失败的情况都不会发通知，也就不会把同时自然结束的连接算到重载头上。
 
 ## 3. B：使用 WebSocket 传输的节点
 
@@ -199,7 +215,9 @@ ws-opts:
 
 - 运行时会自动把路径里的 `?ed=N` 解析成早期数据设置（`transport/vmess/websocket.go:492`–`503`）。
   `max-early-data > 0` 时走早期数据路径（`:505`–`507`）；`early-data-header-name` 为空时早期数据拼在路径里（`:428`–`432`）。
-- `headers.Host` 覆盖 HTTP 的 Host（`websocket.go:404`–`411`）；开启 TLS 但没写 servername 时也用作 SNI（`vmess.go:197`–`203`）。
+- `headers.Host` 覆盖 HTTP 的 Host（`websocket.go:404`–`411`）；vmess 和 vless 开启 TLS 但没写 servername 时也用作 SNI
+  （`vmess.go:197`–`203`、`vless.go:179`–`182`）。**trojan 不会**：`sni` 为空时取 `server`（`trojan.go:286`–`287`），
+  ws 的 TLS 用的就是这个 SNI（`trojan.go:135`）。所以经 CDN 的 trojan ws 节点要同时填写 `sni`。
 - 开启 `v2ray-http-upgrade` 时不发送 `Sec-WebSocket-Key` 和 `Version`，收到 101 后直接返回原始连接
   （`websocket.go:414`–`425`、`:471`–`473`）；`fast-open` 推迟读取 101（`:446`–`458`）。
 - **Mihomo 没有 `network: httpupgrade`。** vmess 只认 ws/http/h2/grpc/mekya（`vmess.go:175`–`283`，默认分支 `:278`–`281`），
@@ -214,21 +232,21 @@ ws-opts:
 
 | 输入 | 位置 | 处理 |
 | --- | --- | --- |
-| Clash YAML 订阅 | `src/subconv.rs:134` 原样透传；生成配置时 `normalize_httpupgrade_items`（`src/compose.rs:742`，`compose_profile_reserving` `:2002` 调用） | 其他字段保留；`network: httpupgrade` 原地改写为 `network: ws` + `ws-opts.v2ray-http-upgrade: true`，块和单行 flow 两种写法都处理，注释和其他键不变；原始订阅缓存不改；结果里列出被改写的节点 |
-| 粘贴的 JSON / Clash 节点、手动节点、节点列表 | `normalize_ws_network`（`src/subconv.rs:1445`） | 同上，并把非标准的 `httpupgrade-opts {path, host}` 并入 `ws-opts` |
+| Clash YAML 订阅 | `src/subconv.rs:134` 原样透传；生成配置时 `normalize_httpupgrade_items`（`src/compose.rs:742`，`compose_profile_reserving` `:2077` 调用） | 其他字段保留；`network: httpupgrade` 原地改写为 `network: ws` + `ws-opts.v2ray-http-upgrade: true`，块和单行 flow 两种写法都处理，注释和其他键不变；`ws-opts: ~` / `null` 换成带这个键的映射；已有的 `v2ray-http-upgrade: false` 改为 `true`；flow 末尾有逗号时不会写出 `,,`；原始订阅缓存不改；结果里列出被改写的节点 |
+| 粘贴的 JSON / Clash 节点、手动节点、节点列表 | `normalize_ws_network`（`src/subconv.rs:1445`） | 同上（`false` 同样改为 `true`），并把非标准的 `httpupgrade-opts {path, host}` 并入 `ws-opts` |
 | vless / trojan 链接 `type=ws` | `src/subconv.rs:1349` `transport()` | `path`、`host`；`ed` → `max-early-data` + `Sec-WebSocket-Protocol`，`eh` 覆盖头名 |
 | vless / trojan 链接 `type=httpupgrade` | 同上 | `network: ws` + `v2ray-http-upgrade`；带 `ed` 时加 `fast-open` |
-| vmess JSON `net: ws` / `net: httpupgrade` | `src/subconv.rs:1788` `parse_vmess` | 与上游转换器一致，从路径中取出 `ed` 并写入字段；httpupgrade 同 vless 的处理 |
+| vmess JSON `net: ws` / `net: httpupgrade` | `src/subconv.rs:1789` `parse_vmess` | 与上游转换器一致，从路径中取出 `ed` 并写入字段；httpupgrade 同 vless 的处理 |
 | Surge `ws=true` | `src/subconv.rs:858` | `ws-path`、`ws-headers`（`A:b\|C:d`）（Surge 没有早期数据，也没有 HTTPUpgrade） |
-| 手动表单 | `src/proxy_form.rs` | “传输”在 TCP / WebSocket / HTTPUpgrade 之间切换，并显示路径、Host 头，以及早期数据（WebSocket）或 Fast open（HTTPUpgrade）。保存时只改表单管理的键，自定义头和未知 `ws-opts` 键保留；在 vmess、vless、trojan 之间切换时保留 `ws-opts`。已保存的 `network: httpupgrade` 节点按 HTTPUpgrade 打开，按 Mihomo 的 ws 写法保存。其他传输方式（grpc、h2 等）进入原始编辑器 |
+| 手动表单 | `src/proxy_form.rs` | “传输”在 TCP / WebSocket / HTTPUpgrade 之间切换，并显示路径、Host 头，以及早期数据（WebSocket）或 Fast open（HTTPUpgrade）。保存时只改表单管理的键，自定义头和未知 `ws-opts` 键保留；早期数据的大小没改时不补 `early-data-header-name`（没有头名就是拼在路径里的早期数据），改了或新填时才补 `Sec-WebSocket-Protocol`；Host 头的提示对 trojan 单独说明它不会当作 SNI；在 vmess、vless、trojan 之间切换时保留 `ws-opts`。已保存的 `network: httpupgrade` 节点按 HTTPUpgrade 打开，按 Mihomo 的 ws 写法保存。其他传输方式（grpc、h2 等）进入原始编辑器 |
 
 公共逻辑在 `ws_transport()`（`src/subconv.rs:1380`）和 `split_path_ed()`（`:1421`）。
-测试：`websocket_early_data_and_http_upgrade_links`（`src/subconv.rs:2373`）；
+测试：`websocket_early_data_and_http_upgrade_links`（`src/subconv.rs:2374`）；
 `httpupgrade_block_items_are_rewritten_in_place`、`httpupgrade_flow_items_are_rewritten_in_place`、
-`compose_rewrites_httpupgrade_proxies_and_names_them`（`src/compose.rs:1809`、`:1896`、`:1930`）；
+`compose_rewrites_httpupgrade_proxies_and_names_them`（`src/compose.rs:1838`、`:1944`、`:1990`）；
 `ws_form_edits_only_the_keys_it_manages`、`http_upgrade_mode_saves_mihomo_keys`、
-`legacy_httpupgrade_nodes_open_in_the_structured_form`、`edit_keeps_transports_the_form_cannot_show`
-（`src/proxy_form.rs:934`、`:994`、`:1019`、`:841`）。
+`legacy_httpupgrade_nodes_open_in_the_structured_form`、`edit_keeps_transports_the_form_cannot_show`、
+`trojan_host_hint_asks_for_sni`（`src/proxy_form.rs:947`、`:1020`、`:1045`、`:854`、`:1203`）。
 `ed` 不是数字时，与上游 `v.go:118`–`121` 一样直接报错。
 
 ### 3.3 已修复的问题
@@ -239,13 +257,15 @@ ws-opts:
 4. 表单编辑 grpc 或 h2 节点时不再静默改成 TCP（这类节点进入原始编辑器）。
 5. 其他工具写出的 `network: httpupgrade`（Clash YAML 订阅、粘贴的节点）在生成配置时改写为 Mihomo 能用的 ws 写法。
 6. 表单可以填写 Host 头，切换 HTTPUpgrade，设置早期数据或 Fast open。
+7. 审查后修正：表单原样保存时不再把路径式早期数据改成头部式；trojan 的 Host 提示不再说会用作 SNI；
+   `ws-opts: null`、显式 `v2ray-http-upgrade: false` 和 flow 末尾逗号三种写法都能正确改写。
 
 ### 3.4 剩余缺口
 
 1. 不加随机 `User-Agent`。上游转换器会为 ws 节点加一个（`v.go:113`、`converter.go:197`），
    有些 CDN 或 WAF 可能在意这一点（不确定）。需要时再加。
 2. 不属于 ws 但相邻的缺口：vless / trojan 的 `type=h2|http|xhttp`、vmess 的 `net: http`
-   仍然报“unsupported”（`src/subconv.rs:1372`、`:1865`）；trojan 链接的 `alpn` 没有解析。
+   仍然报“unsupported”（`src/subconv.rs:1372`、`:1866`）；trojan 链接的 `alpn` 没有解析。
 3. 表单不能编辑自定义头（Host 以外）和早期数据的头名，这两项只会被保留。
 
 ## 4. C：terc 的控制器客户端改用 WebSocket
@@ -282,11 +302,11 @@ ws-opts:
 
 ### 4.2 terc 的实现
 
-- `/traffic`、`/memory`、`/logs` 仍由 `stream_json_lines`（`src/mihomo.rs:399`）读 chunked 的按行 JSON。
-- `spawn_stream_workers`（`src/mihomo.rs:329`）多启动一个线程 `stream_connections`（`:545`）：
+- `/traffic`、`/memory`、`/logs` 仍由 `stream_json_lines`（`src/mihomo.rs:405`）读 chunked 的按行 JSON。
+- `spawn_stream_workers`（`src/mihomo.rs:335`）多启动一个线程 `stream_connections`（`:555`）：
   - 用 `ws::connect` 连 `ws://{控制器}/connections?interval=1000`，secret 非空时带 `Authorization: Bearer …`。
     连接超时 1.5 秒，读超时 2 秒。
-  - 每个 text 帧用 serde_json 解析，交给 `connections_from_snapshot_json`（`:702`，轮询也用它），
+  - 每个 text 帧用 serde_json 解析，交给 `connections_from_snapshot_json`（`:726`，轮询也用它），
     以 `BackendEvent::Connections` 发给界面。界面和轮询走同一个 `install_connections`，
     所以连接时长、单连接速率、长连接与关闭记录都不变，只是采样变成每秒一次、间隔更稳。
   - 会话在这些情况下结束，结束时直接丢掉 socket，**不发 close、不等 pong 或 close**：
@@ -299,8 +319,10 @@ ws-opts:
     “terc: /connections WebSocket 不可用，改用 HTTP 轮询 / unavailable, polling over HTTP: 原因”，
     从不可用恢复时一条 `info`“… 已连接 / connected”。重复的相同失败不再刷屏。
     TCP 连接被拒绝（内核没在运行）不算 WebSocket 故障，不写日志，只按退避重试。
+    收到过快照之后遇到 EOF、连接重置或 close 帧，是内核停止或重启时的样子，也不写日志（`SessionEnd::Ended`）：
+    内核没起来时下一次连接会被拒绝，同样不写；之后的其他失败照常写。推送卡住（6 秒没有快照）或内容无法解析仍然写。
 - 界面（`src/main.rs`）：
-  - `stream_live()`（`:1023`）= 开关打开且最近一次推送在 3 秒以内。
+  - `stream_live()`（`:1031`）= 开关打开且最近一次推送在 3 秒以内。
   - `tick` 在推送正常时调用 `fetch_snapshot_with(cfg, false)`，跳过 `/connections` 的 GET；
     这样得到的快照 `connections_ok == false`，`accept_snapshot` 会保留当前列表。
     推送超过 3 秒没来，下一次 2.2 秒的轮询就自动带上 `/connections`。
@@ -314,7 +336,9 @@ ws-opts:
 - 测试（`src/mihomo.rs` 的 `mod stream_tests`，只连 `127.0.0.1:0` 上的模拟控制器，时间按毫秒缩放）：
   两份快照（含 `connections: null` 和字符串端口）、404 握手只警告一次并按退避重试、
   超大帧触发长暂停、静默 3 次读超时后重连并记录恢复、退出标志和开关能及时结束线程、
-  退避序列，以及 `connections_from_snapshot_json` 与原轮询解析结果一致。
+  退避序列、内核停止再重启不写日志，以及 `connections_from_snapshot_json` 与原轮询解析结果一致。
+  `src/main.rs` 的 `polls_skip_the_connections_get_only_while_pushes_arrive` 用一个记录请求路径的模拟控制器驱动 `tick()`，
+  确认推送正常时轮询不请求 `/connections`，推送中断后会请求。
 
 ### 4.3 收益与成本
 
@@ -347,8 +371,11 @@ ws-opts:
 ## 5. 推荐范围
 
 - **已完成：** `src/ws.rs`；§3.3 的转换修复和规范化；表单的 Host / HTTPUpgrade / 早期数据；
-  §2.7 的连接视图；§2.8 的保护长连接；`/connections` 推送（阶段 3，见 §4）；本文档。
+  §2.7 的连接视图；§2.8 的保护长连接；`/connections` 推送（阶段 3，见 §4）；§11 的审查修正；本文档和使用说明。
 - **下一步：** 阶段 1 的实测，用来确认 §2.2 的结论，尤其是 provider 节点在重载时断开这一条。
+  实测时可以顺便看断开记录：经 provider 节点的连接应标为“配置重载”，顶层节点和 DIRECT 的连接不应被标上。
+- **可以再做：** 新增或保存代理（`save_source_record`，表单的 Ctrl+S 和导入）在内核运行时也会重载，目前不提示，
+  因为表单在调用前就进入“提交中”状态，需要先改这一流程；相关断开仍会正确标为“配置重载”。
 - **不做：** 默认修改 keep-alive；切换节点时自动关闭连接；任何系统代理相关的自动操作。
 
 ## 6. 分阶段计划
@@ -361,6 +388,7 @@ ws-opts:
 | 3 | `/connections?interval=1000` 改用 `ws.rs` 推送；失败时回退到现有轮询；设置里提供开关（§4） | 用模拟服务端测试回退和重连；不依赖 pong | 完成（`ai/ws-stream` 批次） |
 | 4 | 表单增加 Host 和 HTTPUpgrade；规范化 `network: httpupgrade`（§3.2） | 有转换测试；用 `mihomo -t` 校验（已有的 ignored 测试） | 完成 |
 | 2.8 | 跳过内容不变的重载；实时设置走 `PATCH`；会断线的操作先确认 | 用模拟控制器测试 PATCH 读回和回退；不运行真实 mihomo | 完成 |
+| 审查修正 | §11 列出的问题 | 每项有测试（`apply_core_setting` 的回退除外，见 §11）；`cargo test`、`clippy`、`fmt --check` 通过 | 完成 |
 | 5（可选） | 在高级设置里提供 keep-alive；AI 组的稳定性选项（fallback 或固定节点）做成可见的设置 | 默认值不变，由用户选择 | 未做 |
 
 ## 7. 风险
@@ -371,6 +399,9 @@ ws-opts:
   在内核运行时第一次重新生成通常还会重载一次（运行时模式的写法不同），之后才会命中。
   这是偏保守的方向：宁可多重载一次，也不让运行中的配置与文件不一致。
 - **PATCH 读回只能确认字段值。** 端口被占用时 Mihomo 可能只在日志里报错；旧版本内核不返回某个字段时按“已确认”处理。
+- **原因通知走线程局部变量。** 只有 `run_action` 的线程设置了发送端；别的线程里调用 `reload_config` 不会通知，
+  断开会显示为原因未知，而不是错误的原因。`PUT` 被拒绝时通知已经发出，6 秒宽限期内自然结束的 provider 连接可能被误标。
+- **内核停止要连续两次轮询确认。** 真正的停止晚 2.2 秒才进入断开记录；这期间面板已显示内核未运行，连接列表仍是上一份。
 - **确认提示基于上一次快照。** 计数可能落后一个轮询周期；macOS 开启 TUN 时无法提前知道内核是否以 root 运行，所以总是按“会重启”提示。
 - **`ws.rs` 接入后的风险：** 写超时可能写出半个帧，导致流错位，遇到写错误时应该直接重连。
   大型 `/connections` 快照（上千条连接）可能有几 MB，超过上限时应该回退到 HTTP，而不是报错。
@@ -386,7 +417,7 @@ ws-opts:
 - 是否开启 TUN，是否设置系统代理，是否给 CLI 配置 `HTTPS_PROXY` / `ALL_PROXY`。
 - 手动关闭连接（连接视图），以及在确认提示后是否继续会断线的操作。
 - keep-alive：terc 模板不写这些键（`src/compose.rs:659`）；重新生成配置时只沿用 TUN、嗅探、DNS、IPv6
-  的开关和路由模式（`src/compose.rs:1389` `carry_runtime_state`）。手写的 `keep-alive-*` 在重新生成后能否保留，需要另外确认或实现。
+  的开关和路由模式（`src/compose.rs:1418` `carry_runtime_state`）。手写的 `keep-alive-*` 在重新生成后能否保留，需要另外确认或实现。
 - 阶段 1 的实测由用户在自己的机器上完成，不在 AI 代理会话里做。
 
 ## 9. AGENTS.md 合规
@@ -394,6 +425,8 @@ ws-opts:
 - 没有新增依赖，`Cargo.toml` 和 `Cargo.lock` 都没改。`thiserror` 本来就在依赖里。
   不用 `tokio`、`reqwest`、`openssl`，网络只用 `std::net::TcpStream`。
 - 没有运行 `networksetup` 或 `gsettings`，没有修改系统代理，没有启动真实的 mihomo，没有做实时路由测试。
+  测试里按键会走真实的操作线程，线程结束时会读一次快照；`detect_sysproxy` 在 `cfg(test)` 下直接返回“没有系统代理”，
+  所以测试也不会去调用这两个工具。
   WebSocket 和 PATCH 测试只连接 `127.0.0.1:0` 上的本地模拟服务端；跳过重载的测试用一个假的 `mihomo -t` 脚本。
 - 需要 mihomo 或修改 `HOME` 的测试仍然标着 `#[ignore]`。
 - 新增的提示复用现有的通知框，面板组件、圆角边框和三套配色都没动；文字有 zh / en / ja 三种。
@@ -413,3 +446,33 @@ DIRECT 出站同样会被 Mihomo 记录为一条连接，足以观察重载的�
    预期：旧连接不受影响，新连接走新节点。
 6. 如果连接经 TUN 转发，切换 TUN 开关。预期：连接断开，断开记录里标为“TUN 重建”（§2.2 第 5 条）。
 7. 把每一步的结果和 Mihomo 版本号（`/version`）记录到本文 §2.2。
+
+## 11. 集成后的审查修正
+
+按集成后（`42ee19d`）的审查意见逐条核对，下面是确认后修正的问题，每条都有单独的提交和测试。
+
+| 问题 | 修正 |
+| --- | --- |
+| 一次 `/version` 超时或失败就被当作内核停止：所有长连接记为“内核已停止”，下一次又当作新连接，真正断开时再记一次 | 连续两次轮询都没看到内核、且没有推送时才清空（§2.7 第 6 条） |
+| 1 秒的 AI 请求也算会话：弹出“AI 长连接已断开”，写 warning，三条同时结束被说成网络切换 | AI 连接自己结束时要存活满 10 秒才记录；被 terc 断开的照记（§2.7 第 4 条） |
+| 连接列表在 80 列看不到字节和速率，120 列看不到进程和规则，却留着空白 | 按优先级加列，余下宽度给目标地址（§2.7 第 3 条） |
+| 重载和 TUN 的原因记在所有连接上，而且在没有重载时也记 | 原因带范围，由真正发出请求的代码在发请求前通知（§2.8 第 4 条） |
+| trojan 的 Host 提示说会用作 SNI | trojan 单独提示要填 SNI（§3.1） |
+| 表单原样保存会补上 `early-data-header-name`，把路径式早期数据改成头部式 | 只在大小新填或改动时补（§3.2） |
+| 窄窗口的断开记录看不到原因，Enter 无效，底栏写着用不了的键；新记录插入后光标指向别的条目 | 窄窗口先显示原因，Enter 打开整条，底栏换成断开记录的按键，光标跟着原条目（§2.7 第 4 条） |
+| 秒级重启（launchd / systemd）不会被识别为内核重启 | 总流量变小时记为“内核已停止或重启”（§2.7 第 6 条） |
+| flow 末尾逗号写出 `,,`；`ws-opts: null` 不改写；显式 `false` 变成普通 WebSocket | 三种写法都正确改写（§3.2） |
+| 主动停止或重启内核时日志里出现 WebSocket 不可用和已连接两行 | EOF / close 不写日志（§4.2） |
+| 设置的退回重载被拒绝后，文件和内核不一致，之后内容相同的生成被跳过 | 任何退回失败都设置 `RELOAD_UNCERTAIN`（§2.8 第 2 条） |
+| 日文确认提示在 42×12 被截掉最后一个字 | 缩短日文文案，渲染测试加上 42×12 和两位数计数 |
+| 修改当前订阅地址会重载却不提示 | 先确认，输入框保持打开，再按 Enter 执行 |
+| 缺少测试：`x` 是否断开高亮那一行；推送正常时轮询是否跳过 `/connections` | 已补测试（§4.2） |
+| 本文的 terc 行号在合并后过期 | 已按当前代码更新 |
+
+没有改的：
+
+- `apply_core_setting` 新分支的端到端测试和 `unchanged_regeneration_skips_the_check_and_the_reload` 仍然是 `#[ignore]`：
+  它们要改 `HOME` 或写真实的 `config.json`，在默认测试里跑会动到用户文件。退回逻辑的改动只有一行，没有加测试。
+- 设置开关 `connections_stream` 的按键路径没有加测试：它会调用 `save_preferences` 写真实的配置文件。
+- 新增或保存代理时的重载仍不提示（§5）。
+

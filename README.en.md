@@ -89,7 +89,7 @@ Press `s` → Sources & Routing for the named proxy list; Tab opens routing plan
 
 | View | What you get |
 | --- | --- |
-| **Connections** | Process, inbound, sniff host, rule payload, chain, and geo/ASN, with one-key close |
+| **Connections** | Process, inbound, sniff host, rule payload, chain, and geo/ASN; age, per-connection rate, AI tags, and recently closed long-lived/AI connections with an inferred cause; one-key close, with a prompt before actions that cut sessions |
 | **DNS** | Resolver status from the config, live lookup, and DNS / Fake-IP flush |
 | **Rules** | Ordered list with live hit counts, local explain, and runtime disable |
 | **Providers (Settings → Tools)** | `proxy-providers` and `rule-providers`, not the airport subscription URL. Refresh one or all; proxy providers can run a health check |
@@ -140,6 +140,7 @@ Click a group to browse its nodes; click a node to activate it. Scrolling moves 
 | DNS | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>[</kbd> <kbd>]</kbd> | Look up, flush DNS and Fake-IP, cycle record type |
 | Providers | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>H</kbd> | Refresh the selected provider, refresh all, or health-check a proxy provider |
 | Connections | <kbd>x</kbd> / <kbd>X</kbd> | Close selected connection / close all active connections |
+| Connections | <kbd>o</kbd> / <kbd>f</kbd> / <kbd>d</kbd> | Sort by bytes, age or rate / long-lived and AI only / recently closed |
 
 </details>
 
@@ -165,7 +166,7 @@ The graph interval is set in milliseconds. Mihomo normally supplies one traffic 
 
 ## How It Works
 
-Instead of pulling in a heavy async HTTP stack, `terc` speaks raw HTTP/1.1 over `std::net::TcpStream` to the local controller (`127.0.0.1:9090`). Background threads read `/traffic`, `/memory`, and `/logs`. Toggles use `PATCH /configs` (`tun.enable`, `sniffing`, `ipv6`). DNS lookup is `GET /dns/query`, flush is `POST /cache/dns/flush` and `POST /cache/fakeip/flush`, and provider refresh is `PUT /providers/...`. Remote subscription and core downloads go through the system `curl`.
+Instead of pulling in a heavy async HTTP stack, `terc` speaks raw HTTP/1.1 over `std::net::TcpStream` to the local controller (`127.0.0.1:9090`). Background threads read `/traffic`, `/memory`, and `/logs`; `/connections` arrives as a WebSocket push (`src/ws.rs`, std only) with a fallback to polling. Toggles use `PATCH /configs` (`tun.enable`, `sniffing`, `ipv6`). DNS lookup is `GET /dns/query`, flush is `POST /cache/dns/flush` and `POST /cache/fakeip/flush`, and provider refresh is `PUT /providers/...`. Remote subscription and core downloads go through the system `curl`.
 
 ```mermaid
 flowchart LR
