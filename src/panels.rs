@@ -477,9 +477,14 @@ pub fn draw_connections(frame: &mut Frame, app: &mut App, area: Rect) {
     } else if inner.width > 4 && inner.height > 0 && app.conn_closed_view {
         let closed = app.conns.closed();
         // Marker, time since close, AI tag and lifetime are fixed; the host
-        // takes what is left up to 24 cells, then bytes, then the cause.
+        // takes what is left up to 24 cells, then bytes, then the cause. With
+        // no detail pane the cause comes before bytes.
         let mut avail = max_w.saturating_sub(2 + 11 + 3 + 7);
-        let show_bytes = avail >= 12 + 22;
+        let show_bytes = if detail_area.is_some() {
+            avail >= 12 + 22
+        } else {
+            avail >= 24 + 22 + 24
+        };
         if show_bytes {
             avail -= 22;
         }
@@ -533,28 +538,34 @@ pub fn draw_connections(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(List::new(items), body);
     } else if inner.width > 4 && inner.height > 0 {
         let rate = app.conn_sort == crate::conns::SortKey::Rate;
-        // Marker, AI tag and age are fixed; the host gets up to 24 cells
-        // before the metric, rule, process and inbound columns appear.
-        let metric_w = if rate { 26 } else { 22 };
+        // Marker, AI tag and age are fixed. The sort metric comes first as one
+        // total, then process, rule, the ↑/↓ split and inbound, each only while
+        // the host keeps `HOST_MIN` cells; the host takes what is left, up to
+        // 48 cells so wide windows keep the columns together.
+        const HOST_MIN: usize = 18;
+        let (total_w, split_w) = if rate { (12, 26) } else { (10, 22) };
         let mut avail = max_w.saturating_sub(5 + 7);
-        let show_metric = avail >= 12 + metric_w;
+        let show_metric = avail >= 12 + total_w;
         if show_metric {
-            avail -= metric_w;
+            avail -= total_w;
         }
-        let show_rule = avail >= 24 + 13;
-        if show_rule {
-            avail -= 13;
-        }
-        let show_process = avail >= 24 + 13;
+        let show_process = show_metric && avail >= HOST_MIN + 13;
         if show_process {
             avail -= 13;
         }
-        let show_inbound = max_w >= 70 && avail >= 24 + 7;
+        let show_rule = show_process && avail >= HOST_MIN + 13;
+        if show_rule {
+            avail -= 13;
+        }
+        let split_metric = show_rule && avail >= HOST_MIN + split_w - total_w;
+        if split_metric {
+            avail -= split_w - total_w;
+        }
+        let show_inbound = split_metric && avail >= HOST_MIN + 7;
         if show_inbound {
             avail -= 7;
         }
-        let host_w = avail.min(24);
-        let pad = avail - host_w;
+        let host_w = avail.min(48);
         let start = visible_list_start(app.conn_index, app.conn_view.len(), visible);
         let items: Vec<ListItem> = app
             .conn_view
@@ -581,7 +592,6 @@ pub fn draw_connections(frame: &mut Frame, app: &mut App, area: Rect) {
                     left.push(' ');
                     left.push_str(&fit(inbound, 6));
                 }
-                left.extend(std::iter::repeat_n(' ', pad));
                 let age = crate::conns::age_secs(conn.start_ms, now_ms);
                 let age_style = if age.is_some_and(|a| a >= crate::conns::LONG_SECS) {
                     Style::default()
@@ -604,18 +614,20 @@ pub fn draw_connections(frame: &mut Frame, app: &mut App, area: Rect) {
                     ));
                 }
                 if show_metric {
-                    let metric = if rate {
+                    let (up, down) = if rate {
+                        (conn.up_rate, conn.down_rate)
+                    } else {
+                        (conn.upload, conn.download)
+                    };
+                    let unit = if rate { "/s" } else { "" };
+                    let metric = if split_metric {
                         format!(
-                            " ↑{:>9}/s ↓{:>9}/s",
-                            format_bytes(conn.up_rate),
-                            format_bytes(conn.down_rate)
+                            " ↑{:>9}{unit} ↓{:>9}{unit}",
+                            format_bytes(up),
+                            format_bytes(down)
                         )
                     } else {
-                        format!(
-                            " ↑{:>9} ↓{:>9}",
-                            format_bytes(conn.upload),
-                            format_bytes(conn.download)
-                        )
+                        format!(" {:>9}{unit}", format_bytes(up.saturating_add(down)))
                     };
                     spans.push(Span::styled(metric, Style::default().fg(theme.muted)));
                 }

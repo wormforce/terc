@@ -1074,6 +1074,7 @@ impl App {
         let selected = self.selected_connection().map(|c| c.id.clone());
         let was_empty = self.conn_view.is_empty();
         let now_ms = conns::now_ms();
+        let had_closed = !self.conns.closed().is_empty();
         let closed = self
             .conns
             .observe(&mut list, running, Instant::now(), now_ms);
@@ -1083,6 +1084,11 @@ impl App {
         self.reselect_connection(selected, was_empty);
         if closed.is_empty() {
             return;
+        }
+        // New entries go in front; keep the closed-view cursor on its entry.
+        if had_closed {
+            self.closed_index =
+                (self.closed_index + closed.len()).min(self.conns.closed().len().saturating_sub(1));
         }
         let lang = self.lang();
         let age = |c: &conns::ClosedConn| c.lifetime_secs.map_or("—".into(), conns::fmt_age);
@@ -2420,8 +2426,9 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                 app.detail_scroll = 0;
             }
             MainTab::Providers => app.refresh_selected_provider(),
-            // The closed view already shows its entry on the right.
-            MainTab::Connections if app.conn_closed_view => {}
+            // In the closed view this shows the entry, its cause and the note
+            // full-width, which narrow windows have no right pane for.
+            MainTab::Connections if app.conn_closed_view && app.conns.closed().is_empty() => {}
             MainTab::Connections => {
                 app.connection_detail = true;
                 app.detail_scroll = 0;
@@ -2449,6 +2456,7 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('d') if app.main_tab == MainTab::Connections => {
             app.conn_closed_view = !app.conn_closed_view;
             app.closed_index = 0;
+            app.connection_detail = false;
         }
         KeyCode::Char('x') if app.main_tab == MainTab::Rules => app.toggle_selected_rule(),
         KeyCode::Char('x') if app.main_tab == MainTab::Connections && !app.conn_closed_view => {
@@ -3909,6 +3917,14 @@ mod tests {
                 press(&mut app, KeyCode::Down);
                 assert_eq!(app.closed_index, 1);
                 press(&mut app, KeyCode::Enter);
+                assert!(app.connection_detail);
+                let text = render_text(&mut app, width, height);
+                assert!(
+                    text.contains("cause"),
+                    "{lang:?} {width}
+{text}"
+                );
+                press(&mut app, KeyCode::Enter);
                 assert!(!app.connection_detail);
                 press(&mut app, KeyCode::Char('x'));
                 assert!(!app.action_busy);
@@ -3917,6 +3933,71 @@ mod tests {
                 assert_eq!(app.closed_index, 0);
             }
         }
+    }
+
+    #[test]
+    fn connection_rows_fill_the_width_by_priority() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        app.config.settings.show_traffic = false;
+        app.main_tab = MainTab::Connections;
+        let mut conn = live_conn("c", "cdn.example.com:443", Some(5), 3 << 20);
+        conn.process = "Cursor Helper".into();
+        conn.rule = "DomainSuffix".into();
+        conn.inbound = "Mixed".into();
+        conn.upload = 1 << 20;
+        app.accept_snapshot(live_snapshot(vec![conn]));
+        let row = |app: &mut App, width: u16| {
+            let text = render_text(app, width, 30);
+            let line = text
+                .lines()
+                .find(|l| l.contains("cdn.example.com"))
+                .unwrap();
+            // Only the list pane, not the detail pane on the right.
+            line.split('│').nth(1).unwrap().to_string()
+        };
+        // At 80 columns the sort metric shows as one total.
+        let narrow = row(&mut app, 80);
+        assert!(narrow.contains("4.0MB"), "{narrow}");
+        assert!(!narrow.contains("CursorHelp"), "{narrow}");
+        let mid = row(&mut app, 120);
+        for part in ["CursorHelp", "DomainSuffix", "5s", "4.0MB"] {
+            assert!(mid.contains(part), "{part}: {mid}");
+        }
+        let wide = row(&mut app, 160);
+        for part in ["CursorHelp", "DomainSuffix", "↑1.0MB", "↓3.0MB", "Mixed"] {
+            assert!(wide.contains(part), "{part}: {wide}");
+        }
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('o'));
+        assert!(row(&mut app, 80).contains("0B/s"));
+    }
+
+    #[test]
+    fn narrow_closed_view_shows_the_cause_and_keeps_its_cursor() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        app.config.settings.show_traffic = false;
+        app.main_tab = MainTab::Connections;
+        let long = |id: &str| live_conn(id, &format!("{id}.test:443"), Some(90), 1);
+        app.accept_snapshot(live_snapshot(vec![long("a"), long("b"), long("c")]));
+        app.accept_snapshot(live_snapshot(vec![long("c")]));
+        press(&mut app, KeyCode::Char('d'));
+        let text = render_text(&mut app, 70, 24);
+        assert!(row_has(&text, "a.test", "closedbytheapp"), "{text}");
+        assert!(
+            text.contains("Enterdetail") && !text.contains("Xall"),
+            "{text}"
+        );
+        press(&mut app, KeyCode::Down);
+        let host = |app: &App| app.conns.closed()[app.closed_index].host.clone();
+        let picked = host(&app);
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        assert_eq!(app.conns.closed().len(), 3);
+        assert_eq!(host(&app), picked);
+        press(&mut app, KeyCode::Enter);
+        let text = render_text(&mut app, 70, 24);
+        assert!(text.contains("Mihomo"), "{text}");
     }
 
     fn prefix(text: &str, chars: usize) -> String {

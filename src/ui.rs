@@ -1096,11 +1096,17 @@ fn draw_logs_main(frame: &mut Frame, app: &mut App, area: Rect) {
 fn toolbar_line(app: &App, width: u16) -> Line<'static> {
     let theme = app.theme();
     let context = match app.main_tab {
+        MainTab::Connections if app.conn_closed_view => Some(crate::manage::l3(
+            app,
+            "↑↓ 选择  Enter 详情  d 返回连接列表  Esc 返回",
+            "↑↓ select  Enter detail  d back to live list  Esc back",
+            "↑↓ 選択  Enter 詳細  d 接続一覧へ戻る  Esc 戻る",
+        )),
         MainTab::Connections => Some(crate::manage::l3(
             app,
             "↑↓ 选择  Enter 详情  o 排序  f 长连接/AI  d 已断开  x 断开  X 全部断开  Esc 返回",
-            "↑↓ select  Enter detail  o sort  f long/AI  d closed  x close  X close all  Esc back",
-            "↑↓ 選択  Enter 詳細  o 並べ替え  f 長時間/AI  d 切断履歴  x 切断  X 全切断  Esc 戻る",
+            "↑↓ select  Enter detail  o sort  f long/AI  d closed  x close  X all  Esc back",
+            "↑↓ 選択  Enter 詳細  o 並べ替え  f 長時間/AI  d 履歴  x 切断  X 全切断  Esc 戻る",
         )),
         MainTab::Logs => Some("↑↓ 阅读  P 暂停/继续  / 搜索  Enter 全文  Esc 返回"),
         MainTab::Dns => Some("e 编辑  Enter 查询  [ ] 类型  F 清缓存  Esc 返回"),
