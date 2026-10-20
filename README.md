@@ -155,7 +155,7 @@ macOS 按 <kbd>T</kbd> 开启 TUN 时，terc 会弹出系统管理员授权窗�
 | **片段** | 内置 YAML 叠加，以及 `~/.config/terc/modules` 里的文件。开启时递归合并映射，关闭时还原原配置；应用前由内核验证 |
 | **配置档案** | 配置目录和 `~/.config/terc/profiles` 中的 YAML。Enter 会把它写成 `config.yaml` 并热重载 |
 | **视觉与主题** | 色彩主题（`Spring` / `Vintage` / `Mono`）、速率图样式（`Braille` / `Blocks`）、界面刷新率（`15` / `30` / `60` / `120 Hz`）、图表更新间隔（`1000–86400000 ms`，方向键每次调 `100 ms`，Enter 可直接输入；取期间平均速率，改变间隔会清空旧图）、界面语言 |
-| **订阅管理** | 一键拉取远端 AnyTLS / Clash.Meta 订阅配置并通过 `PUT /configs?force=true` 热重载 |
+| **订阅管理** | 自动识别 Clash / Surge / 节点链接订阅，与自有节点（`N`）和私有规则、AI 分流（`R`）合成配置，`mihomo -t` 校验后通过 `PUT /configs?force=true` 热重载 |
 
 图表间隔按毫秒设置；Mihomo 流量流通常每秒提供一份数据，因此最小间隔为 1000 ms。
 
