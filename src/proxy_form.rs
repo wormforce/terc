@@ -748,6 +748,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(if app.action_busy {
             "正在校验并保存…"
+        } else if fields.get(f.index) == Some(&Field::WsHost) && TYPES[f.protocol] == "trojan" {
+            // Mihomo's trojan falls back to the server address for SNI, never to Host.
+            l3(
+                app,
+                "节点地址是 IP 或经 CDN 时填写域名；trojan 不会把 Host 用作 SNI，请同时填写 SNI",
+                "Fill in the domain when the server is an IP or behind a CDN; trojan never uses Host as SNI, so fill in SNI too",
+                "サーバーが IP や CDN 経由の場合はドメインを入力。trojan は Host を SNI に使わないため SNI も入力してください",
+            )
         } else if fields.get(f.index) == Some(&Field::WsHost) {
             l3(
                 app,
@@ -1189,6 +1197,27 @@ mod tests {
                 let f = app.proxy_form.as_ref().unwrap();
                 assert!(f.ws && !f.upgrade);
             }
+        }
+    }
+    #[test]
+    fn trojan_host_hint_asks_for_sni() {
+        let mut app = crate::App::from_snapshot(Default::default(), Default::default());
+        let mut record = ws_record(json!({"path": "/p", "headers": {"Host": "my.domain"}}));
+        record.nodes[0] = json!({"name": "T", "type": "trojan", "server": "192.0.2.9",
+            "port": 443, "password": "pw", "udp": true, "network": "ws",
+            "ws-opts": {"path": "/p", "headers": {"Host": "my.domain"}}});
+        for (lang, hint) in [
+            (crate::Lang::Zh, "trojan不会把Host用作SNI"),
+            (crate::Lang::En, "trojanneverusesHostasSNI"),
+            (crate::Lang::Ja, "trojanはHostをSNIに使わない"),
+        ] {
+            app.config.settings.lang = lang;
+            app.proxy_form = Some(Form::from_record("proxy-001".into(), record.clone()));
+            assert_eq!(TYPES[app.proxy_form.as_ref().unwrap().protocol], "trojan");
+            select(&mut app, Field::WsHost);
+            let view = render(&app, 120);
+            assert!(view.contains(hint), "{lang:?}\n{view}");
+            assert!(!view.contains("也用作SNI") && !view.contains("alsousedasSNI"));
         }
     }
 }
