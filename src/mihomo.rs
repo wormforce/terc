@@ -124,6 +124,8 @@ pub struct ProxyNode {
     pub kind: String,
     pub udp: bool,
     pub delay: Option<u16>,
+    /// Owning proxy provider, used for the provider healthcheck delay route.
+    pub provider: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -585,6 +587,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
                             kind,
                             udp,
                             delay,
+                            provider: None,
                         },
                     );
                 }
@@ -700,6 +703,16 @@ fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
         timeout,
     ) {
         providers.extend(parse_providers_json(&body, "proxy"));
+        for found in crate::ops::parse_provider_nodes(&body) {
+            let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
+                name: found.name,
+                kind: found.kind,
+                udp: found.udp,
+                delay: found.delay,
+                provider: None,
+            });
+            node.provider.get_or_insert(found.provider);
+        }
     }
     if let Ok((200, body)) = http_request(
         &cfg.addr,
