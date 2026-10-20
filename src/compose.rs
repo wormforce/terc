@@ -25,7 +25,17 @@ pub const GENERATED_MARK: &str =
 pub const DEFAULT_AI_FILTER: &str = "(?i)(🇺🇸|🇯🇵|🇸🇬|🇹🇼|美国|美國|日本|新加坡|狮城|獅城|台湾|台灣|\\b(US|USA|JP|SG|TW|SEA|LAX|SJC|NRT|HND|SIN|TPE)\\b|United States|Japan|Tokyo|Osaka|Singapore|Taiwan|Taipei|Seattle|Los Angeles|San Jose|Silicon Valley|New York|Chicago|Dallas|Ashburn)";
 pub const DEFAULT_AI_EXCLUDE: &str =
     "(?i)(🇭🇰|港|\\bHK\\b|Hong ?Kong|🇨🇳|中国|回国|剩余|到期|流量|过期|官网|套餐|expire|traffic)";
-const INFO_EXCLUDE: &str = "(?i)(剩余|到期|流量|过期|官网|套餐|expire|traffic)";
+pub(crate) const INFO_EXCLUDE: &str = "(?i)(剩余|到期|流量|过期|官网|套餐|expire|traffic)";
+
+/// Plain-text form of INFO_EXCLUDE, for code that has no regex engine.
+pub(crate) fn is_info_name(name: &str) -> bool {
+    let name = name.to_lowercase();
+    [
+        "剩余", "到期", "流量", "过期", "官网", "套餐", "expire", "traffic",
+    ]
+    .iter()
+    .any(|w| name.contains(w))
+}
 
 /// AI services routed to the AI group. Kept as data so the UI and docs agree.
 pub const AI_PRESET: &[(&str, &[&str])] = &[
@@ -787,7 +797,7 @@ fn append_items(chunk: &mut YamlChunk, items: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn pick_name(base: &str, taken: &HashSet<String>) -> String {
+pub(crate) fn pick_name(base: &str, taken: &HashSet<String>) -> String {
     if !taken.contains(base) {
         return base.to_string();
     }
@@ -1466,6 +1476,15 @@ mod tests {
 /// Preserve the source's routing policy. Node-only sources get one simple selector.
 /// This is the only composition path exposed while custom routing is paused.
 pub fn compose_profile(input: &ComposeInput) -> Result<(String, ComposeReport), String> {
+    compose_profile_reserving(input, &HashSet::new())
+}
+
+/// compose_profile, with `reserved` group names (from the routing scheme that
+/// will replace the source's) kept free of manual node names.
+pub fn compose_profile_reserving(
+    input: &ComposeInput,
+    reserved: &HashSet<String>,
+) -> Result<(String, ComposeReport), String> {
     let mut report = ComposeReport::default();
     let mut chunks = match input.subscription.and_then(|s| s.clash_doc.as_deref()) {
         Some(doc) => split_chunks(doc),
@@ -1520,6 +1539,7 @@ pub fn compose_profile(input: &ComposeInput) -> Result<(String, ComposeReport), 
     report.sub_nodes = names.len();
     // Manual nodes must not reuse a proxy or group name.
     let mut taken = names.clone();
+    taken.extend(reserved.iter().cloned());
     if let Some(c) = chunks
         .iter()
         .find(|c| c.key.as_deref() == Some("proxy-groups"))
@@ -1947,6 +1967,19 @@ mod profile_tests {
         let yaml = build(Some(&convert_subscription(surge).unwrap()), &nodes);
         assert!(yaml.contains("\"name\":\"Airport (2)\""));
         assert!(!yaml.contains("\"name\":\"Airport\",\"server\""));
+        let (yaml, _) = compose_profile_reserving(
+            &ComposeInput {
+                subscription: None,
+                manual: &manual(),
+                rules: &PrivateRules::default(),
+                controller_addr: "127.0.0.1:9090",
+                secret: "",
+                test_url: "https://example.org",
+            },
+            &HashSet::from(["Own".to_string(), "Own (2)".to_string()]),
+        )
+        .unwrap();
+        assert!(yaml.contains("\"name\":\"Own (3)\""), "{yaml}");
     }
 
     #[test]
