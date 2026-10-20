@@ -8,7 +8,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::Sender,
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -1528,15 +1528,20 @@ pub fn install_config(cfg: &ControllerConfig, text: &str, running: bool) -> Resu
         .map_err(|failure| failure.message)
 }
 
-/// How long `mihomo -t` may run, and how long the controller may stay silent
-/// after an unanswered reload before its outcome is reported as unknown.
+/// How long `mihomo -t` may run, how long once its output shows a geodata
+/// download, and how long the controller may stay silent after an unanswered
+/// reload before its outcome is reported as unknown.
 struct InstallLimits {
     check: Duration,
+    download: Duration,
     settle: Duration,
 }
 
 const INSTALL_LIMITS: InstallLimits = InstallLimits {
     check: Duration::from_secs(60),
+    // A first check fetches missing GeoIP/GeoSite files before it can finish;
+    // stopping it discards the partial file, so a slow link never gets past.
+    download: Duration::from_secs(600),
     settle: Duration::from_secs(30),
 };
 
@@ -1582,7 +1587,7 @@ fn install_config_with(
     let result = (|| {
         let bin =
             find_bin().ok_or("Install the managed Mihomo core before saving a configuration")?;
-        check_candidate(&bin, cfg, &candidate, limits.check)?;
+        check_candidate(&bin, cfg, &candidate, limits)?;
         let path = config_yaml_path(cfg);
         let previous = match fs::read(&path) {
             Ok(bytes) => Some(bytes),
@@ -1628,7 +1633,7 @@ fn check_candidate(
     bin: &Path,
     cfg: &ControllerConfig,
     candidate: &Path,
-    limit: Duration,
+    limits: &InstallLimits,
 ) -> Result<(), String> {
     let mut child = Command::new(bin)
         .arg("-t")
@@ -1641,29 +1646,51 @@ fn check_candidate(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
-    // Drain both pipes so a chatty check cannot block on a full buffer.
-    fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<Vec<u8>> {
+    // Drain both pipes so a chatty check cannot block on a full buffer; the
+    // output read so far shows whether the check is downloading geodata.
+    fn drain(
+        pipe: Option<impl Read + Send + 'static>,
+        out: &Arc<Mutex<Vec<u8>>>,
+    ) -> thread::JoinHandle<()> {
+        let out = Arc::clone(out);
         thread::spawn(move || {
-            let mut out = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut out);
+            let Some(mut pipe) = pipe else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut out) = out.lock() {
+                    out.extend_from_slice(&buf[..n]);
+                }
             }
-            out
         })
     }
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
+    let (out, err) = (Arc::default(), Arc::default());
+    let stdout = drain(child.stdout.take(), &out);
+    let stderr = drain(child.stderr.take(), &err);
+    let text = |buf: &Arc<Mutex<Vec<u8>>>| {
+        buf.lock()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             break status;
         }
-        if started.elapsed() >= limit {
+        let elapsed = started.elapsed();
+        if elapsed >= limits.check
+            && (elapsed >= limits.download
+                || !log_suggests_download(&format!("{}{}", text(&out), text(&err))))
+        {
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!(
                 "Configuration check did not finish within {}s and was stopped",
-                limit.as_secs()
+                elapsed.as_secs()
             ));
         }
         thread::sleep(Duration::from_millis(50));
@@ -1671,12 +1698,12 @@ fn check_candidate(
     if status.success() {
         return Ok(());
     }
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
+    let _ = (stdout.join(), stderr.join());
+    let (stdout, stderr) = (text(&out), text(&err));
     Err(format!(
         "Configuration rejected: {} {}",
-        String::from_utf8_lossy(&stdout).trim(),
-        String::from_utf8_lossy(&stderr).trim()
+        stdout.trim(),
+        stderr.trim()
     ))
 }
 
@@ -3334,6 +3361,7 @@ mod listener_tests {
 
     const TEST_LIMITS: InstallLimits = InstallLimits {
         check: Duration::from_secs(10),
+        download: Duration::from_secs(10),
         settle: Duration::from_millis(600),
     };
 
@@ -3427,6 +3455,42 @@ mod listener_tests {
         assert!(failure.message.contains("did not finish"));
         assert_eq!(read_config_text(&cfg).unwrap(), "mode: rule\n");
         assert!(!dir.join(".terc-candidate.yaml").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn config_check_downloading_geodata_gets_more_time() {
+        let limits = InstallLimits {
+            check: Duration::from_millis(200),
+            download: Duration::from_secs(10),
+            ..TEST_LIMITS
+        };
+        let script = "echo 'Can not find GeoSite.dat, start download'; sleep 1; exit 0";
+        let (dir, bin) = install_fixture("download", script);
+        let cfg = ControllerConfig {
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        assert!(install_config_with(&cfg, "mode: global\n", false, || Some(bin), &limits).is_ok());
+        assert_eq!(read_config_text(&cfg).unwrap(), "mode: global\n");
+        fs::remove_dir_all(dir).unwrap();
+        // The longer deadline still stops a download that never ends.
+        let limits = InstallLimits {
+            download: Duration::from_millis(600),
+            ..limits
+        };
+        let (dir, bin) = install_fixture("download-hung", "echo downloading; exec sleep 30");
+        let cfg = ControllerConfig {
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let started = Instant::now();
+        let failure = install_config_with(&cfg, "mode: global\n", false, || Some(bin), &limits)
+            .err()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(failure.message.contains("did not finish"));
         fs::remove_dir_all(dir).unwrap();
     }
 
