@@ -97,9 +97,7 @@ impl Form {
         f.name.load(&source.name);
         f.url.load(&source.subscription_url);
         if source.subscription_url.is_empty() {
-            if source.nodes.len() == 1
-                && TYPES.contains(&source.nodes[0]["type"].as_str().unwrap_or(""))
-            {
+            if source.nodes.len() == 1 && fits_form(&source.nodes[0]) {
                 f.kind = 1;
                 let n = &source.nodes[0];
                 f.protocol = TYPES
@@ -219,12 +217,16 @@ impl Form {
         let mut result = self.original.clone();
         result.name = self.name.trimmed();
         result.subscription_url.clear();
-        result.kind = if self.kind == 0 {
-            "subscription"
-        } else {
-            "proxy"
+        // Migrated configs keep subscription.yaml; form nodes become its manual extras.
+        let imported = self.kind != 0 && self.original.kind == "imported";
+        if !imported {
+            result.kind = if self.kind == 0 {
+                "subscription"
+            } else {
+                "proxy"
+            }
+            .into();
         }
-        .into();
         if result.routing.is_empty() {
             result.routing = "subscription".into();
         }
@@ -257,7 +259,7 @@ impl Form {
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| crate::subconv::parse_node_line(l))
                 .collect::<Result<_, _>>()?;
-            if result.nodes.is_empty() {
+            if result.nodes.is_empty() && !imported {
                 return Err("请粘贴节点链接或配置".into());
             }
         } else {
@@ -275,19 +277,8 @@ impl Form {
             if !matches!(p, "socks5" | "http") && self.secret.text.is_empty() {
                 return Err("请填写密码或 UUID".into());
             }
-            if matches!(p, "vmess" | "vless" | "tuic") {
-                let uuid = self.secret.trimmed();
-                if uuid.len() != 36
-                    || !uuid.chars().enumerate().all(|(i, c)| {
-                        if [8, 13, 18, 23].contains(&i) {
-                            c == '-'
-                        } else {
-                            c.is_ascii_hexdigit()
-                        }
-                    })
-                {
-                    return Err("UUID 格式不正确".into());
-                }
+            if matches!(p, "vmess" | "vless" | "tuic") && !valid_uuid(&self.secret.trimmed()) {
+                return Err("UUID 格式不正确".into());
             }
             let mut n = self
                 .original
@@ -298,6 +289,10 @@ impl Form {
                 .unwrap_or_else(|| json!({}));
             n["name"] = json!(result.name);
             n["type"] = json!(p);
+            if matches!(p, "ss" | "trojan" | "vmess" | "vless" | "socks5") && n.get("udp").is_none()
+            {
+                n["udp"] = json!(true);
+            }
             n["server"] = json!(self.server.trimmed());
             n["port"] = json!(port);
             if matches!(p, "vmess" | "vless" | "tuic") {
@@ -311,6 +306,7 @@ impl Form {
                 }
                 n["password"] = json!(self.password.text);
                 n["congestion-controller"] = json!("bbr");
+                n.as_object_mut().unwrap().remove("token");
             }
             if matches!(p, "http" | "socks5") {
                 n["username"] = json!(self.user.text);
@@ -337,7 +333,10 @@ impl Form {
             if !self.sni.trimmed().is_empty() {
                 n[sni_key] = json!(self.sni.trimmed());
             }
-            if matches!(p, "vmess" | "vless" | "trojan") {
+            // Leave grpc/h2 alone unless the user switches Transport to WebSocket.
+            if matches!(p, "vmess" | "vless" | "trojan")
+                && (self.ws || matches!(n["network"].as_str(), None | Some("tcp" | "ws")))
+            {
                 n["network"] = json!(if self.ws { "ws" } else { "tcp" });
                 if self.ws {
                     n["ws-opts"]["path"] = json!(self.path.text);
@@ -355,6 +354,27 @@ impl Form {
         }
         Ok(result)
     }
+}
+fn valid_uuid(uuid: &str) -> bool {
+    uuid.len() == 36
+        && uuid.chars().enumerate().all(|(i, c)| {
+            if [8, 13, 18, 23].contains(&i) {
+                c == '-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+}
+/// Whether the structured form can show and save `n` without losing settings.
+fn fits_form(n: &Value) -> bool {
+    let p = n["type"].as_str().unwrap_or("");
+    TYPES.contains(&p)
+        && matches!(n["network"].as_str(), None | Some("tcp" | "ws"))
+        && match p {
+            "tuic" => n["uuid"].is_string() && n.get("token").is_none(),
+            "vmess" | "vless" => n["uuid"].as_str().is_some_and(valid_uuid),
+            _ => true,
+        }
 }
 pub fn handle(app: &mut App, key: KeyEvent) {
     let Some(form) = app.proxy_form.as_mut() else {
@@ -638,6 +658,82 @@ mod tests {
         f.name.load("机场 A");
         f.url.load("https://airport.test/sub?token=secret");
         assert_eq!(f.record().unwrap().subscription_url, f.url.text);
+    }
+    fn pasted(line: &str) -> ProfileSource {
+        let mut f = Form {
+            kind: 2,
+            ..Default::default()
+        };
+        f.name.load("导入");
+        f.url.load(line);
+        f.record().unwrap()
+    }
+    #[test]
+    fn imported_sources_keep_their_kind_when_edited() {
+        for nodes in [vec![], filled(4).record().unwrap().nodes] {
+            let source = ProfileSource {
+                name: "原配置".into(),
+                kind: "imported".into(),
+                nodes: nodes.clone(),
+                ..Default::default()
+            };
+            let mut f = Form::from_record("imported-001".into(), source);
+            f.name.load("改名");
+            let saved = f.record().unwrap();
+            assert_eq!(saved.kind, "imported");
+            assert_eq!(saved.name, "改名");
+            assert_eq!(saved.nodes.len(), nodes.len());
+        }
+    }
+    #[test]
+    fn edit_keeps_transports_the_form_cannot_show() {
+        let record = pasted(
+            "vless://12345678-1234-1234-1234-123456789abc@example.com:443\
+             ?security=reality&pbk=PK&sid=ab&type=grpc&serviceName=svc#R",
+        );
+        assert_eq!(record.nodes[0]["network"], "grpc");
+        let edited = Form::from_record("proxy-001".into(), record.clone())
+            .record()
+            .unwrap();
+        assert_eq!(edited.nodes[0]["network"], "grpc");
+        assert_eq!(edited.nodes[0]["grpc-opts"], record.nodes[0]["grpc-opts"]);
+    }
+    #[test]
+    fn edit_saves_nodes_outside_the_structured_form() {
+        for line in [
+            "T = tuic, 192.0.2.5, 443, token=abc",
+            "vless://not-a-uuid@example.com:443?security=tls#X",
+        ] {
+            let record = pasted(line);
+            let edited = Form::from_record("proxy-001".into(), record.clone())
+                .record()
+                .unwrap_or_else(|e| panic!("{line}: {e}"));
+            assert_eq!(edited.nodes, record.nodes);
+        }
+        let mut f = Form::from_record(
+            "proxy-001".into(),
+            ProfileSource {
+                name: "T".into(),
+                nodes: vec![json!({"name": "T", "type": "tuic", "server": "192.0.2.5",
+                    "port": 443, "uuid": "12345678-1234-1234-1234-123456789abc",
+                    "password": "pw"})],
+                ..Default::default()
+            },
+        );
+        assert_eq!(f.kind, 1);
+        f.original.nodes[0]["token"] = json!("stale");
+        assert!(f.record().unwrap().nodes[0].get("token").is_none());
+    }
+    #[test]
+    fn new_nodes_enable_udp_where_mihomo_needs_it() {
+        for (i, p) in TYPES.iter().enumerate() {
+            let node = &filled(i).record().unwrap().nodes[0];
+            match *p {
+                "ss" | "trojan" | "vmess" | "vless" | "socks5" => assert_eq!(node["udp"], true),
+                "http" => assert!(node.get("udp").is_none()),
+                _ => {}
+            }
+        }
     }
     #[test]
     #[ignore = "requires Mihomo; only validates temporary config files"]
