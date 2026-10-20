@@ -3630,7 +3630,7 @@ mod tests {
     fn sample_connections() -> Vec<mihomo::ConnectionItem> {
         vec![
             live_conn("big", "cdn.example.com:443", Some(5), 9000),
-            live_conn("ai", "api.openai.com:443", Some(2), 500),
+            live_conn("ai", "api.openai.com:443", Some(20), 500),
             live_conn("long", "ws.example.com:443", Some(90), 100),
         ]
     }
@@ -3652,7 +3652,7 @@ mod tests {
         assert_eq!(app.selected_connection().unwrap().id, "ai");
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.conn_sort, conns::SortKey::Age);
-        assert_eq!(order(&app), "long,big,ai");
+        assert_eq!(order(&app), "long,ai,big");
         assert_eq!(app.selected_connection().unwrap().id, "ai");
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.conn_sort, conns::SortKey::Rate);
@@ -3737,7 +3737,7 @@ mod tests {
         let lines: Vec<_> = app.logs[logs..].iter().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines.iter().any(|(level, text)| level == "warning"
-            && text.starts_with("terc: closed api.openai.com:443 after 2s")));
+            && text.starts_with("terc: closed api.openai.com:443 after 20s")));
         assert!(lines.iter().any(|(level, text)| level == "info"
             && text.contains("ws.example.com:443 after 1m3")
             && text.contains("via PROXY › HK-01")));
@@ -3806,6 +3806,23 @@ mod tests {
         }
         assert_eq!(app.snapshot.connections.len(), 3);
         assert_eq!(ws(&app).len(), 2);
+    }
+
+    #[test]
+    fn short_ai_requests_closing_normally_stay_quiet() {
+        let mut app = offline_app();
+        let short = |id: &str, host: &str| live_conn(id, host, Some(1), 10);
+        app.accept_snapshot(live_snapshot(vec![
+            short("page", "chatgpt.com:443"),
+            short("ab", "ab.chatgpt.com:443"),
+            short("cdn", "cdn.oaistatic.com:443"),
+        ]));
+        assert!(app.snapshot.connections.iter().all(|c| c.ai));
+        let logs = app.logs.len();
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        assert!(app.conns.closed().is_empty());
+        assert_eq!(app.logs.len(), logs);
+        assert!(app.status_message.is_empty());
     }
 
     #[test]

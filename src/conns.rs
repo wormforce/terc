@@ -11,6 +11,9 @@ use crate::{mihomo::ConnectionItem, Lang};
 
 /// A connection older than this counts as long-lived.
 pub const LONG_SECS: i64 = 60;
+/// An AI connection that ends on its own sooner than this was an ordinary
+/// request (a page load, a finished keep-alive), not a broken session.
+const AI_SESSION_SECS: i64 = 10;
 const CLOSED_CAP: usize = 50;
 /// How long a cause still applies after the action behind it finished.
 const CAUSE_GRACE: Duration = Duration::from_secs(6);
@@ -420,11 +423,14 @@ impl Tracker {
                 return true;
             }
             let lifetime = age_secs(seen.start_ms, now_ms);
-            if seen.ai || lifetime.is_some_and(|age| age >= LONG_SECS) {
-                let cause = pending
-                    .filter(|p| p.id.as_deref().is_none_or(|want| want == id))
-                    .map(|p| p.cause)
-                    .or(stopped.then_some(Cause::CoreStopped));
+            let cause = pending
+                .filter(|p| p.id.as_deref().is_none_or(|want| want == id))
+                .map(|p| p.cause)
+                .or(stopped.then_some(Cause::CoreStopped));
+            // A short AI request is recorded only when terc cut it.
+            let ai_session =
+                seen.ai && (cause.is_some() || lifetime.is_none_or(|age| age >= AI_SESSION_SECS));
+            if ai_session || lifetime.is_some_and(|age| age >= LONG_SECS) {
                 closed.push(ClosedConn {
                     host: std::mem::take(&mut seen.host),
                     process: std::mem::take(&mut seen.process),
@@ -651,7 +657,8 @@ mod tests {
         );
 
         let closed = tracker.observe(&mut [], true, t0 + Duration::from_secs(1), NOW_MS + 1000);
-        assert_eq!(closed.len(), 2);
+        // The 3-second AI request ended on its own: not a session.
+        assert_eq!(closed.len(), 1);
         assert!(tracker.seen.is_empty());
         let long = tracker
             .closed()
@@ -666,6 +673,30 @@ mod tests {
         assert_eq!(long.bulk, 0);
         assert!(tracker.closed().iter().all(|c| c.host != "example.com:443"));
         assert_eq!(long.describe(Lang::En), "closed by the app or remote");
+    }
+
+    #[test]
+    fn short_ai_requests_count_only_when_terc_cut_them() {
+        let mut tracker = Tracker::default();
+        let t0 = Instant::now();
+        let mut conns = vec![
+            item("page", "chatgpt.com:443", Some(NOW_MS - 1_000)),
+            item("ab", "ab.chatgpt.com:443", Some(NOW_MS - 1_000)),
+            item("cdn", "cdn.oaistatic.com:443", Some(NOW_MS - 1_000)),
+            item("ws", "api.openai.com:443", Some(NOW_MS - 15_000)),
+        ];
+        tracker.observe(&mut conns, true, t0, NOW_MS);
+        let closed = tracker.observe(&mut [], true, t0 + Duration::from_secs(1), NOW_MS);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].host, "api.openai.com:443");
+        assert_eq!((closed[0].cause, closed[0].bulk), (None, 0));
+
+        let mut conns = vec![item("page", "chatgpt.com:443", Some(NOW_MS - 1_000))];
+        tracker.observe(&mut conns, true, t0, NOW_MS);
+        tracker.note(Cause::CloseAll, None);
+        let closed = tracker.observe(&mut [], true, t0 + Duration::from_secs(1), NOW_MS);
+        assert_eq!(closed[0].cause, Some(Cause::CloseAll));
+        assert_eq!(tracker.closed().len(), 2);
     }
 
     #[test]
