@@ -1,13 +1,12 @@
 //! Minimal RFC 6455 WebSocket client on `std::net::TcpStream`.
 //!
-//! Groundwork for reading Mihomo's controller streams (`/traffic`, `/memory`,
-//! `/logs`, `/connections?interval=`) over WebSocket instead of chunked HTTP.
+//! Reads Mihomo's `/connections?interval=` push (`mihomo::stream_connections`);
+//! `/traffic`, `/memory` and `/logs` stay on chunked HTTP, which is no slower.
 //! Plain `ws://` only: the controller is local, and remote HTTPS stays with
 //! the system `curl`. No extensions or subprotocols are negotiated.
 //!
 //! Mihomo's controller only writes: it never answers pings or close frames
 //! (`hub/route/common.go`), so callers must not wait for either.
-#![allow(dead_code)] // Not wired into the app yet; see docs/websocket-plan.md.
 
 use crate::subconv::encode_base64;
 use std::{
@@ -404,10 +403,8 @@ impl<S: Read + Write> Client<S> {
         &self.stream
     }
 
-    pub fn get_mut(&mut self) -> &mut S {
-        &mut self.stream
-    }
-
+    // Only tests ask; the app drops the client instead of reusing it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_closed(&self) -> bool {
         self.closed
     }
@@ -423,6 +420,9 @@ impl<S: Read + Write> Client<S> {
     }
 
     /// Send one unfragmented message. Control payloads are capped at 125 bytes.
+    // Mihomo never reads client frames, so the app sends none; kept for tests
+    // and for controllers that do read.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn send(&mut self, msg: &Message) -> Result<(), WsError> {
         match msg {
             Message::Text(t) => self.write_frame(true, OP_TEXT, t.as_bytes()),
@@ -440,6 +440,7 @@ impl<S: Read + Write> Client<S> {
     }
 
     /// Send a text or binary message split into frames of at most `size` bytes.
+    #[cfg_attr(not(test), allow(dead_code))] // As `send`.
     pub fn send_fragmented(&mut self, msg: &Message, size: usize) -> Result<(), WsError> {
         let (opcode, data) = match msg {
             Message::Text(t) => (OP_TEXT, t.as_bytes()),

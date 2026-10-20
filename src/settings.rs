@@ -31,6 +31,7 @@ pub enum SettingId {
     Timeout,
     Traffic,
     Toolbar,
+    ConnStream,
     Modules,
     Probe,
     Runtime,
@@ -289,6 +290,22 @@ impl App {
             "显示一行常用快捷键。",
             "Show the single-line shortcut footer.",
         );
+        let stream = if !self.config.settings.connections_stream {
+            "OFF"
+        } else if self.stream_live() {
+            "ON · WebSocket"
+        } else {
+            "ON · HTTP"
+        };
+        add(
+            ConnStream,
+            C::Diagnostics,
+            "连接实时推送",
+            "Live connection stream",
+            stream.into(),
+            self.t("desc_conn_stream"),
+            self.t("desc_conn_stream"),
+        );
         for (id, zh, en) in [
             (Modules, "配置片段", "Config snippets"),
             (Probe, "连接探测", "Connection probe"),
@@ -407,6 +424,17 @@ impl App {
             }
             Toolbar => {
                 self.config.settings.show_toolbar = !self.config.settings.show_toolbar;
+                self.save_preferences();
+            }
+            ConnStream => {
+                let on = !self.config.settings.connections_stream;
+                self.config.settings.connections_stream = on;
+                self.conn_stream
+                    .enabled
+                    .store(on, std::sync::atomic::Ordering::Relaxed);
+                if !on {
+                    self.conn_stream_at = None;
+                }
                 self.save_preferences();
             }
             Modules => self.open_modules(),

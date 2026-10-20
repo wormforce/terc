@@ -43,6 +43,12 @@ pub enum BackendEvent {
         payload: String,
     },
     Snapshot(Box<CoreSnapshot>),
+    /// A `/connections` snapshot pushed over WebSocket.
+    Connections {
+        items: Vec<ConnectionItem>,
+        upload_total: u64,
+        download_total: u64,
+    },
     DelayResult {
         group: String,
         node: String,
@@ -325,7 +331,22 @@ pub fn spawn_stream_workers(
     secret: String,
     tx: Sender<BackendEvent>,
     stop: Arc<AtomicBool>,
+    conn_stream: Arc<ConnStream>,
 ) {
+    let tx_conns = tx.clone();
+    let addr_conns = addr.clone();
+    let secret_conns = secret.clone();
+    let stop_conns = stop.clone();
+    thread::spawn(move || {
+        stream_connections(
+            &addr_conns,
+            &secret_conns,
+            &tx_conns,
+            &stop_conns,
+            &conn_stream,
+        );
+    });
+
     let tx_traffic = tx.clone();
     let addr_traffic = addr.clone();
     let secret_traffic = secret.clone();
@@ -424,6 +445,742 @@ fn stream_json_lines<F>(
     }
 }
 
+/// The settings switch for the `/connections` WebSocket worker, shared with it.
+pub struct ConnStream {
+    pub enabled: AtomicBool,
+}
+
+/// Push path. `interval` must be a positive integer: Mihomo answers a bad
+/// value with 101 and then silence, and panics on `<= 0` (88dcbf7
+/// `hub/route/connections.go:36`-`64`).
+const CONNECTIONS_WS_PATH: &str = "/connections?interval=1000";
+
+/// Waits and limits of the `/connections` worker; tests scale them to ms.
+struct StreamTiming {
+    connect: Duration,
+    read: Duration,
+    /// Consecutive read timeouts that end a session; Mihomo pushes every second.
+    idle_reads: u32,
+    /// Pause after a session that delivered snapshots.
+    retry: Duration,
+    /// Pauses after consecutive failed attempts; the last one repeats.
+    backoff: [Duration; 5],
+    /// Pause after an oversized frame; HTTP polling reads that core meanwhile.
+    too_large: Duration,
+    /// How often a switched-off worker looks at the switch again.
+    disabled: Duration,
+    /// Sleep step for noticing `stop` and the switch.
+    slice: Duration,
+    max_frame: usize,
+    max_message: usize,
+}
+
+const STREAM_TIMING: StreamTiming = StreamTiming {
+    connect: Duration::from_millis(1500),
+    read: Duration::from_secs(2),
+    idle_reads: 3,
+    retry: Duration::from_secs(1),
+    backoff: [
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+        Duration::from_secs(16),
+        Duration::from_secs(30),
+    ],
+    too_large: Duration::from_secs(300),
+    disabled: Duration::from_millis(500),
+    slice: Duration::from_millis(100),
+    max_frame: crate::ws::DEFAULT_MAX_FRAME,
+    max_message: crate::ws::DEFAULT_MAX_MESSAGE,
+};
+
+#[derive(Debug, PartialEq)]
+enum SessionEnd {
+    /// `stop` rose or the app hung up: the worker exits.
+    Exit,
+    /// The switch went off.
+    Disabled,
+    /// Snapshots arrived, then the stream ended.
+    Dropped(String),
+    /// The core refused the TCP connection. It is not running, so polling
+    /// has nothing to fetch either and this is not worth a log line.
+    Unreachable(String),
+    /// No snapshot arrived: handshake rejected, silence or garbage.
+    Failed(String),
+    /// A frame or message exceeded the size limit.
+    TooLarge(String),
+}
+
+/// Pause before the next attempt; `failures` counts consecutive failed ones.
+fn retry_delay(end: &SessionEnd, failures: &mut usize, t: &StreamTiming) -> Duration {
+    match end {
+        SessionEnd::Dropped(_) => {
+            *failures = 0;
+            t.retry
+        }
+        SessionEnd::TooLarge(_) => t.too_large,
+        SessionEnd::Failed(_) | SessionEnd::Unreachable(_) => {
+            let wait = t.backoff[(*failures).min(t.backoff.len() - 1)];
+            *failures += 1;
+            wait
+        }
+        SessionEnd::Exit | SessionEnd::Disabled => Duration::ZERO,
+    }
+}
+
+/// Sleep up to `total` in `slice` steps while `go()` holds.
+fn nap(total: Duration, slice: Duration, go: impl Fn() -> bool) {
+    let deadline = Instant::now() + total;
+    while go() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        thread::sleep(left.min(slice));
+    }
+}
+
+/// Read `/connections` pushes and forward them as `BackendEvent::Connections`.
+/// While this is down the app sees no pushes and polls over HTTP instead.
+fn stream_connections(
+    addr: &str,
+    secret: &str,
+    tx: &Sender<BackendEvent>,
+    stop: &AtomicBool,
+    conn_stream: &ConnStream,
+) {
+    stream_connections_with(addr, secret, tx, stop, conn_stream, &STREAM_TIMING);
+}
+
+fn stream_connections_with(
+    addr: &str,
+    secret: &str,
+    tx: &Sender<BackendEvent>,
+    stop: &AtomicBool,
+    conn_stream: &ConnStream,
+    t: &StreamTiming,
+) {
+    let sock_addr = parse_socket_addr(addr);
+    // A header keeps the secret out of the URL; Mihomo accepts Bearer for WS.
+    let auth = format!("Bearer {secret}");
+    let headers: Vec<(&str, &str)> = if secret.is_empty() {
+        Vec::new()
+    } else {
+        vec![("Authorization", auth.as_str())]
+    };
+    let live = || !stop.load(Ordering::Relaxed) && conn_stream.enabled.load(Ordering::Relaxed);
+    // None until a WebSocket outcome is known; logs fire only on changes.
+    let mut healthy = None;
+    let mut failures = 0;
+    while !stop.load(Ordering::Relaxed) {
+        if !conn_stream.enabled.load(Ordering::Relaxed) {
+            healthy = None;
+            failures = 0;
+            nap(t.disabled, t.slice, || !stop.load(Ordering::Relaxed));
+            continue;
+        }
+        let end = stream_session(sock_addr, &headers, tx, stop, conn_stream, &mut healthy, t);
+        match &end {
+            SessionEnd::Exit => return,
+            SessionEnd::Disabled => continue,
+            SessionEnd::Unreachable(_) => {}
+            SessionEnd::Dropped(err) | SessionEnd::Failed(err) | SessionEnd::TooLarge(err) => {
+                if healthy != Some(false) {
+                    healthy = Some(false);
+                    let payload = format!(
+                        "terc: /connections WebSocket 不可用，改用 HTTP 轮询 / unavailable, polling over HTTP: {err}"
+                    );
+                    let level = "warning".into();
+                    if tx.send(BackendEvent::Log { level, payload }).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        nap(retry_delay(&end, &mut failures, t), t.slice, live);
+    }
+}
+
+/// One connection. The client is dropped, never closed: Mihomo does not
+/// read after the handshake, so it would never answer a close frame.
+fn stream_session(
+    addr: SocketAddr,
+    headers: &[(&str, &str)],
+    tx: &Sender<BackendEvent>,
+    stop: &AtomicBool,
+    conn_stream: &ConnStream,
+    healthy: &mut Option<bool>,
+    t: &StreamTiming,
+) -> SessionEnd {
+    use crate::ws::{Message, WsError};
+    let mut client = match crate::ws::connect(addr, CONNECTIONS_WS_PATH, headers, t.connect) {
+        Ok(client) => client.with_limits(t.max_frame, t.max_message),
+        Err(WsError::Io(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            return SessionEnd::Unreachable(e.to_string())
+        }
+        Err(e) => return SessionEnd::Failed(e.to_string()),
+    };
+    if let Err(e) = client.get_ref().set_read_timeout(Some(t.read)) {
+        return SessionEnd::Failed(e.to_string());
+    }
+    let mut delivered = 0usize;
+    let mut idle = 0;
+    let mut garbled = 0;
+    let ended = |why: String, delivered: usize| {
+        if delivered > 0 {
+            SessionEnd::Dropped(why)
+        } else {
+            SessionEnd::Failed(why)
+        }
+    };
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return SessionEnd::Exit;
+        }
+        if !conn_stream.enabled.load(Ordering::Relaxed) {
+            return SessionEnd::Disabled;
+        }
+        match client.read_message() {
+            Ok(Message::Text(text)) => {
+                idle = 0;
+                let snapshot = serde_json::from_str::<Value>(&text).ok().filter(|v| {
+                    v.get("connections")
+                        .is_some_and(|c| c.is_null() || c.is_array())
+                });
+                let Some(v) = snapshot else {
+                    garbled += 1;
+                    if garbled >= 3 {
+                        return ended("3 unreadable snapshots in a row".into(), delivered);
+                    }
+                    continue;
+                };
+                garbled = 0;
+                let (items, upload_total, download_total) = connections_from_snapshot_json(&v);
+                let event = BackendEvent::Connections {
+                    items,
+                    upload_total,
+                    download_total,
+                };
+                if tx.send(event).is_err() {
+                    return SessionEnd::Exit;
+                }
+                delivered += 1;
+                if delivered == 1 {
+                    if *healthy == Some(false) {
+                        let payload = "terc: /connections WebSocket 已连接 / connected".into();
+                        let level = "info".into();
+                        if tx.send(BackendEvent::Log { level, payload }).is_err() {
+                            return SessionEnd::Exit;
+                        }
+                    }
+                    *healthy = Some(true);
+                }
+            }
+            Ok(Message::Close(_)) => return ended("closed by the controller".into(), delivered),
+            // ws.rs already answered pings; Mihomo sends none of these.
+            Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_)) => idle = 0,
+            Err(WsError::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                idle += 1;
+                if idle >= t.idle_reads {
+                    let why = format!("no snapshot for {:?}", t.read * t.idle_reads);
+                    return ended(why, delivered);
+                }
+            }
+            Err(e @ WsError::TooLarge(_)) => return SessionEnd::TooLarge(e.to_string()),
+            Err(e) => return ended(e.to_string(), delivered),
+        }
+    }
+}
+
+/// A `/connections` body, polled or pushed: items sorted by total bytes, then
+/// the upload and download totals. `connections: null` means none.
+pub fn connections_from_snapshot_json(v: &Value) -> (Vec<ConnectionItem>, u64, u64) {
+    let upload_total = v.get("uploadTotal").and_then(Value::as_u64).unwrap_or(0);
+    let download_total = v.get("downloadTotal").and_then(Value::as_u64).unwrap_or(0);
+    let mut connections = Vec::new();
+    for c in v
+        .get("connections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        // Id, rule, byte counters and the rest come from connection_from_value.
+        let Some(mut item) = connection_from_value(c) else {
+            continue;
+        };
+        let meta = c.get("metadata");
+        let field = |key: &str| {
+            meta.and_then(|m| m.get(key))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        };
+        let host = match field("host") {
+            "" => field("destinationIP"),
+            host => host,
+        };
+        item.host = format!("{host}:{}", field("destinationPort"));
+        item.network = meta
+            .and_then(|m| m.get("network"))
+            .and_then(Value::as_str)
+            .unwrap_or("tcp")
+            .to_uppercase();
+        item.chains = c
+            .get("chains")
+            .and_then(Value::as_array)
+            .map(|ch| {
+                ch.iter()
+                    .rev()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" › ")
+            })
+            .unwrap_or_default();
+        connections.push(item);
+    }
+    connections.sort_by_key(|c| std::cmp::Reverse(c.download + c.upload));
+    (connections, upload_total, download_total)
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use serde_json::json;
+    use std::{net::TcpListener, sync::mpsc};
+
+    /// Production behaviour at millisecond scale.
+    fn fast() -> StreamTiming {
+        StreamTiming {
+            connect: Duration::from_millis(500),
+            read: Duration::from_millis(100),
+            idle_reads: 3,
+            retry: Duration::from_millis(20),
+            backoff: [20, 40, 80, 160, 300].map(Duration::from_millis),
+            too_large: Duration::from_secs(60),
+            disabled: Duration::from_millis(20),
+            slice: Duration::from_millis(10),
+            ..STREAM_TIMING
+        }
+    }
+
+    struct Worker {
+        rx: mpsc::Receiver<BackendEvent>,
+        stop: Arc<AtomicBool>,
+        conn: Arc<ConnStream>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    fn start(listener: &TcpListener, timing: StreamTiming, enabled: bool) -> Worker {
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let conn = Arc::new(ConnStream {
+            enabled: AtomicBool::new(enabled),
+        });
+        let (s, c) = (stop.clone(), conn.clone());
+        let handle = thread::spawn(move || {
+            stream_connections_with(&addr, "s3cret", &tx, &s, &c, &timing);
+        });
+        Worker {
+            rx,
+            stop,
+            conn,
+            handle,
+        }
+    }
+
+    impl Worker {
+        fn next(&self) -> BackendEvent {
+            self.rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker event")
+        }
+
+        /// Raise `stop`, insist the thread ends `within`, return unread events.
+        fn finish(self, within: Duration) -> Vec<BackendEvent> {
+            self.stop.store(true, Ordering::Relaxed);
+            let deadline = Instant::now() + within;
+            while !self.handle.is_finished() {
+                assert!(Instant::now() < deadline, "worker ignored stop");
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.handle.join().unwrap();
+            self.rx.try_iter().collect()
+        }
+    }
+
+    fn accept_within(listener: &TcpListener, wait: Duration) -> Option<TcpStream> {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + wait;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return Some(stream);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    /// Accept one attempt and return it with its request head.
+    fn accept_request(listener: &TcpListener) -> (TcpStream, String) {
+        let stream = accept_within(listener, Duration::from_secs(5)).expect("connect attempt");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!((&stream).read(&mut byte).unwrap(), 1, "request cut short");
+            head.push(byte[0]);
+        }
+        (stream, String::from_utf8(head).unwrap())
+    }
+
+    /// Mihomo's 101, with Go's header casing.
+    fn upgrade(head: &str) -> Vec<u8> {
+        let key = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+            .unwrap();
+        format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-Websocket-Accept: {}\r\n\r\n",
+            crate::ws::accept_key(key)
+        )
+        .into_bytes()
+    }
+
+    /// One unfragmented, unmasked text frame, as `wsWriteServerMessage` writes.
+    fn text_frame(payload: &str) -> Vec<u8> {
+        let mut out = vec![0x81];
+        match payload.len() {
+            n if n < 126 => out.push(n as u8),
+            n if n < 65536 => {
+                out.push(126);
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+            n => {
+                out.push(127);
+                out.extend_from_slice(&(n as u64).to_be_bytes());
+            }
+        }
+        out.extend_from_slice(payload.as_bytes());
+        out
+    }
+
+    fn snapshot_json(hosts: &[&str]) -> String {
+        let conns: Vec<_> = hosts
+            .iter()
+            .enumerate()
+            .map(|(i, host)| {
+                json!({
+                    "id": format!("c{i}"),
+                    "metadata": {
+                        "network": "tcp",
+                        "host": host,
+                        "destinationIP": "203.0.113.9",
+                        "destinationPort": "443",
+                        "sourcePort": "50123",
+                    },
+                    "upload": 10 * (i + 1),
+                    "download": 100 * (i + 1),
+                    "chains": ["HK-01", "AI"],
+                })
+            })
+            .collect();
+        format!(
+            "{}\n",
+            json!({"downloadTotal": 900, "uploadTotal": 90, "connections": conns, "memory": 1})
+        )
+    }
+
+    fn logs(events: &[BackendEvent]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                BackendEvent::Log { level, payload } => Some((level.clone(), payload.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pushed_snapshots_become_connection_events() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let timing = StreamTiming {
+            read: Duration::from_secs(1),
+            ..fast()
+        };
+        let worker = start(&listener, timing, true);
+        let (mut stream, head) = accept_request(&listener);
+        assert!(
+            head.starts_with("GET /connections?interval=1000 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("\r\nUpgrade: websocket\r\n"), "{head}");
+        assert!(
+            head.contains("\r\nAuthorization: Bearer s3cret\r\n"),
+            "{head}"
+        );
+        assert!(!head.contains("token="), "{head}");
+        // Like Mihomo: the first snapshot rides with the 101.
+        let mut reply = upgrade(&head);
+        reply.extend(text_frame(&snapshot_json(&["api.openai.com", ""])));
+        stream.write_all(&reply).unwrap();
+        let BackendEvent::Connections {
+            items,
+            upload_total,
+            download_total,
+        } = worker.next()
+        else {
+            panic!("expected pushed connections");
+        };
+        let hosts: Vec<_> = items.iter().map(|c| c.host.as_str()).collect();
+        assert_eq!(hosts, ["203.0.113.9:443", "api.openai.com:443"]);
+        assert_eq!(items[1].source, "");
+        assert_eq!(items[1].chains, "AI › HK-01");
+        assert_eq!((upload_total, download_total), (90, 900));
+
+        stream
+            .write_all(&text_frame(
+                "{\"downloadTotal\":901,\"uploadTotal\":91,\"connections\":null,\"memory\":1}\n",
+            ))
+            .unwrap();
+        let BackendEvent::Connections {
+            items,
+            upload_total,
+            download_total,
+        } = worker.next()
+        else {
+            panic!("expected pushed connections");
+        };
+        assert!(items.is_empty());
+        assert_eq!((upload_total, download_total), (91, 901));
+        // The first success is not news; nothing was down before it.
+        assert!(logs(&worker.finish(Duration::from_secs(3))).is_empty());
+    }
+
+    #[test]
+    fn rejected_handshake_warns_once_and_keeps_retrying_with_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let worker = start(&listener, fast(), true);
+        let mut attempts = Vec::new();
+        for _ in 0..3 {
+            let (mut stream, _) = accept_request(&listener);
+            attempts.push(Instant::now());
+            stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        }
+        assert!(attempts[1] - attempts[0] >= Duration::from_millis(20));
+        assert!(attempts[2] - attempts[1] >= Duration::from_millis(40));
+        let events = worker.finish(Duration::from_secs(1));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, BackendEvent::Connections { .. })));
+        let logs = logs(&events);
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        assert_eq!(logs[0].0, "warning");
+        assert!(logs[0].1.contains("polling over HTTP"), "{logs:?}");
+        assert!(logs[0].1.contains("HTTP 404"), "{logs:?}");
+    }
+
+    #[test]
+    fn oversized_frame_pauses_the_stream_until_toggled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let timing = StreamTiming {
+            max_frame: 64,
+            ..fast()
+        };
+        let worker = start(&listener, timing, true);
+        let (mut stream, head) = accept_request(&listener);
+        let mut reply = upgrade(&head);
+        // A header announcing 1024 bytes; the guard fires before the payload.
+        reply.extend([0x81, 126, 0x04, 0x00]);
+        reply.extend([b'{'; 16]);
+        stream.write_all(&reply).unwrap();
+        let BackendEvent::Log { level, payload } = worker.next() else {
+            panic!("expected a warning");
+        };
+        assert_eq!(level, "warning");
+        assert!(payload.contains("exceeds the limit"), "{payload}");
+        // The short backoff would retry within 20 ms; the long pause holds.
+        assert!(accept_within(&listener, Duration::from_millis(300)).is_none());
+        // Switching it off and on again retries at once.
+        worker.conn.enabled.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(50));
+        worker.conn.enabled.store(true, Ordering::Relaxed);
+        let (_again, head) = accept_request(&listener);
+        assert!(head.starts_with("GET /connections?interval=1000 "));
+        worker.finish(Duration::from_secs(1));
+
+        let mut failures = 0;
+        let too_large = SessionEnd::TooLarge(String::new());
+        assert_eq!(
+            retry_delay(&too_large, &mut failures, &STREAM_TIMING),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn silent_stream_ends_after_three_read_timeouts_and_reconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let worker = start(&listener, fast(), true);
+        let (mut first, head) = accept_request(&listener);
+        let mut reply = upgrade(&head);
+        reply.extend(text_frame(&snapshot_json(&["a.test"])));
+        first.write_all(&reply).unwrap();
+        let sent = Instant::now();
+        assert!(matches!(worker.next(), BackendEvent::Connections { .. }));
+        // `first` stays open and silent, as a wedged controller would.
+        let (mut second, head) = accept_request(&listener);
+        assert!(sent.elapsed() >= Duration::from_millis(300));
+        let BackendEvent::Log { level, payload } = worker.next() else {
+            panic!("expected a warning");
+        };
+        assert_eq!(level, "warning");
+        assert!(payload.contains("no snapshot for 300ms"), "{payload}");
+        let mut reply = upgrade(&head);
+        reply.extend(text_frame(&snapshot_json(&["b.test"])));
+        second.write_all(&reply).unwrap();
+        assert!(matches!(worker.next(), BackendEvent::Connections { .. }));
+        let BackendEvent::Log { level, payload } = worker.next() else {
+            panic!("expected the recovery line");
+        };
+        assert_eq!(level, "info");
+        assert!(
+            payload.ends_with("WebSocket 已连接 / connected"),
+            "{payload}"
+        );
+        worker.finish(Duration::from_secs(1));
+        drop(first);
+    }
+
+    #[test]
+    fn stop_and_the_switch_end_the_worker_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Switched off: no attempt at all, and stop still ends the thread.
+        let idle = start(&listener, fast(), false);
+        assert!(accept_within(&listener, Duration::from_millis(150)).is_none());
+        assert!(idle.finish(Duration::from_millis(300)).is_empty());
+
+        // Mid-session: stop ends a live stream within about one read timeout.
+        let worker = start(&listener, fast(), false);
+        worker.conn.enabled.store(true, Ordering::Relaxed);
+        let (mut stream, head) = accept_request(&listener);
+        let mut reply = upgrade(&head);
+        reply.extend(text_frame(&snapshot_json(&["a.test"])));
+        stream.write_all(&reply).unwrap();
+        assert!(matches!(worker.next(), BackendEvent::Connections { .. }));
+        worker.finish(Duration::from_millis(500));
+
+        // A refused connection (core not running) backs off without a log line.
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let conn = ConnStream {
+            enabled: AtomicBool::new(true),
+        };
+        let s = stop.clone();
+        let stopper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            s.store(true, Ordering::Relaxed);
+        });
+        stream_connections_with(&addr.to_string(), "", &tx, &stop, &conn, &fast());
+        stopper.join().unwrap();
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn backoff_doubles_to_a_cap_and_resets_after_a_good_session() {
+        let t = &STREAM_TIMING;
+        let mut failures = 0;
+        let failed = SessionEnd::Failed(String::new());
+        let waits: Vec<_> = (0..6)
+            .map(|_| retry_delay(&failed, &mut failures, t).as_secs())
+            .collect();
+        assert_eq!(waits, [2, 4, 8, 16, 30, 30]);
+        let dropped = SessionEnd::Dropped(String::new());
+        assert_eq!(retry_delay(&dropped, &mut failures, t).as_secs(), 1);
+        assert_eq!(retry_delay(&failed, &mut failures, t).as_secs(), 2);
+        // Six silent seconds at a one-second push interval end a session.
+        assert_eq!(t.read * t.idle_reads, Duration::from_secs(6));
+    }
+
+    #[test]
+    fn snapshot_parser_matches_the_polled_list() {
+        // The shape Mihomo 88dcbf7 writes: ports as strings, chains leaf first.
+        let v: Value = serde_json::from_str(
+            r#"{"downloadTotal":5000,"uploadTotal":700,"memory":1,"connections":[
+              {"id":"small","metadata":{"network":"udp","type":"Tun","sourceIP":"198.18.0.1",
+               "destinationIP":"1.1.1.1","sourcePort":"53000","destinationPort":"53","host":"",
+               "dnsMode":"normal","process":"mDNSResponder"},
+               "upload":1,"download":2,"start":"2026-10-20T04:34:56.1234Z",
+               "chains":["DIRECT"],"providerChains":[""],"rule":"Match","rulePayload":""},
+              {"id":"big","metadata":{"network":"tcp","type":"Mixed","sourceIP":"127.0.0.1",
+               "destinationIP":"104.18.33.45","sourcePort":"51234","destinationPort":"443",
+               "host":"api.openai.com","sniffHost":"","processPath":"/usr/bin/codex"},
+               "upload":300,"download":4000,"start":"2026-10-20T12:34:56.123456789+08:00",
+               "chains":["HK-01","AI","PROXY"],"providerChains":["sub","",""],
+               "rule":"DomainSuffix","rulePayload":"openai.com"},
+              {"id":"bare","metadata":{"destinationIP":"203.0.113.7","destinationPort":"8443"},
+               "upload":10,"download":10}
+            ]}"#,
+        )
+        .unwrap();
+        let (items, up, down) = connections_from_snapshot_json(&v);
+        assert_eq!((up, down), (700, 5000));
+        fn row(c: &ConnectionItem) -> (&str, &str, &str, &str, &str, u64, u64) {
+            (
+                c.id.as_str(),
+                c.host.as_str(),
+                c.network.as_str(),
+                c.chains.as_str(),
+                c.rule.as_str(),
+                c.upload,
+                c.download,
+            )
+        }
+        assert_eq!(
+            items.iter().map(row).collect::<Vec<_>>(),
+            [
+                (
+                    "big",
+                    "api.openai.com:443",
+                    "TCP",
+                    "PROXY › AI › HK-01",
+                    "DomainSuffix",
+                    300,
+                    4000
+                ),
+                ("bare", "203.0.113.7:8443", "TCP", "", "", 10, 10),
+                ("small", "1.1.1.1:53", "UDP", "DIRECT", "Match", 1, 2),
+            ]
+        );
+        assert_eq!(items[0].source, "127.0.0.1:51234");
+        assert_eq!(items[0].rule_payload, "openai.com");
+        assert_eq!(items[0].provider, "sub");
+        assert!(items[0].start_ms.is_some());
+        assert!(items[2].start_ms.is_some());
+
+        let empty = json!({"downloadTotal": 1, "uploadTotal": 2, "connections": null});
+        assert_eq!(connections_from_snapshot_json(&empty).0.len(), 0);
+        assert_eq!(connections_from_snapshot_json(&empty).1, 2);
+    }
+}
+
 pub fn config_yaml_path(cfg: &ControllerConfig) -> PathBuf {
     Path::new(&cfg.config_dir).join("config.yaml")
 }
@@ -440,7 +1197,13 @@ fn local_flags(cfg: &ControllerConfig) -> RuntimeFlags {
 }
 
 pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
-    let mut snapshot = fetch_core_snapshot(cfg);
+    fetch_snapshot_with(cfg, true)
+}
+
+/// `include_connections: false` skips the `/connections` GET (the WebSocket
+/// push supplies it); the snapshot then has `connections_ok == false`.
+pub fn fetch_snapshot_with(cfg: &ControllerConfig, include_connections: bool) -> CoreSnapshot {
+    let mut snapshot = fetch_core_snapshot(cfg, include_connections);
     if let Ok(raw) = read_config_text(cfg) {
         for chunk in crate::ops::split_chunks(&raw) {
             if let Some(key) = chunk.key {
@@ -491,7 +1254,7 @@ pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
     snapshot
 }
 
-fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
+fn fetch_core_snapshot(cfg: &ControllerConfig, include_connections: bool) -> CoreSnapshot {
     let timeout = Duration::from_millis(700);
     let (net_service, sysproxy_enabled) = detect_sysproxy();
     let core_bin_path = discover_mihomo_binary()
@@ -635,73 +1398,13 @@ fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
     let mut upload_total = 0;
     let mut download_total = 0;
 
-    if let Ok((200, conn_body)) =
-        http_request(&cfg.addr, &cfg.secret, "GET", "/connections", None, timeout)
-    {
-        if let Ok(v) = serde_json::from_str::<Value>(&conn_body) {
-            connections_ok = true;
-            upload_total = v.get("uploadTotal").and_then(Value::as_u64).unwrap_or(0);
-            download_total = v.get("downloadTotal").and_then(Value::as_u64).unwrap_or(0);
-            if let Some(arr) = v.get("connections").and_then(Value::as_array) {
-                for c in arr {
-                    let id = c
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let meta = c.get("metadata");
-                    let host_str = meta
-                        .and_then(|m| m.get("host"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let dst_ip = meta
-                        .and_then(|m| m.get("destinationIP"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let dst_port = meta
-                        .and_then(|m| m.get("destinationPort"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let target = if !host_str.is_empty() {
-                        format!("{host_str}:{dst_port}")
-                    } else {
-                        format!("{dst_ip}:{dst_port}")
-                    };
-                    let network = meta
-                        .and_then(|m| m.get("network"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("tcp")
-                        .to_uppercase();
-                    let rule = c
-                        .get("rule")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let chains = c
-                        .get("chains")
-                        .and_then(Value::as_array)
-                        .map(|ch| {
-                            ch.iter()
-                                .rev()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(" › ")
-                        })
-                        .unwrap_or_default();
-                    let upload = c.get("upload").and_then(Value::as_u64).unwrap_or(0);
-                    let download = c.get("download").and_then(Value::as_u64).unwrap_or(0);
-                    if let Some(mut item) = connection_from_value(c) {
-                        item.id = id;
-                        item.host = target;
-                        item.network = network;
-                        item.rule = rule;
-                        item.chains = chains;
-                        item.upload = upload;
-                        item.download = download;
-                        connections.push(item);
-                    }
-                }
-                connections.sort_by(|a, b| (b.download + b.upload).cmp(&(a.download + a.upload)));
+    if include_connections {
+        if let Ok((200, conn_body)) =
+            http_request(&cfg.addr, &cfg.secret, "GET", "/connections", None, timeout)
+        {
+            if let Ok(v) = serde_json::from_str::<Value>(&conn_body) {
+                (connections, upload_total, download_total) = connections_from_snapshot_json(&v);
+                connections_ok = true;
             }
         }
     }
