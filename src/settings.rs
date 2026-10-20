@@ -556,9 +556,10 @@ impl App {
                                 ))
                             }
                             Err(e) => {
-                                if matches!(e, crate::mihomo::ReloadError::Unknown(_)) {
-                                    uncertain.store(true, Ordering::SeqCst);
-                                }
+                                // The file already holds the new value while the
+                                // core may not; the next regeneration must reload
+                                // even when its output is unchanged.
+                                uncertain.store(true, Ordering::SeqCst);
                                 Err(format!(
                                     "实时修改失败，重载也失败 / Live change failed ({err}); reload failed: {e}"
                                 ))
