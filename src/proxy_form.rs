@@ -59,6 +59,8 @@ pub struct Form {
     pub flow: LineEditor,
     pub tls: bool,
     pub ws: bool,
+    /// A transport the form cannot edit (grpc, h2, ...), kept until toggled.
+    pub kept_network: Option<String>,
 }
 impl Default for Form {
     fn default() -> Self {
@@ -83,6 +85,7 @@ impl Default for Form {
             flow: Default::default(),
             tls: false,
             ws: false,
+            kept_network: None,
         };
         f.port.load("443");
         f.cipher.load("aes-128-gcm");
@@ -117,6 +120,10 @@ impl Form {
                     .load(n["servername"].as_str().or(n["sni"].as_str()).unwrap_or(""));
                 f.tls = n["tls"].as_bool().unwrap_or(false);
                 f.ws = n["network"].as_str() == Some("ws");
+                f.kept_network = n["network"]
+                    .as_str()
+                    .filter(|net| !matches!(*net, "" | "tcp" | "ws"))
+                    .map(str::to_string);
                 f.path.load(n["ws-opts"]["path"].as_str().unwrap_or("/"));
                 f.flow.load(n["flow"].as_str().unwrap_or(""));
             } else {
@@ -170,6 +177,12 @@ impl Form {
         }
         fields.push(Save);
         fields
+    }
+    /// The original transport still applies while the protocol is unchanged.
+    fn kept_transport(&self) -> Option<&str> {
+        let original = self.original.nodes.first()?;
+        (original["type"].as_str() == Some(TYPES[self.protocol])).then_some(())?;
+        self.kept_network.as_deref()
     }
     fn editor(&mut self, field: Field) -> Option<&mut LineEditor> {
         use Field::*;
@@ -337,8 +350,12 @@ impl Form {
             if !self.sni.trimmed().is_empty() {
                 n[sni_key] = json!(self.sni.trimmed());
             }
-            if matches!(p, "vmess" | "vless" | "trojan") {
+            if matches!(p, "vmess" | "vless" | "trojan") && self.kept_transport().is_none() {
                 n["network"] = json!(if self.ws { "ws" } else { "tcp" });
+                let obj = n.as_object_mut().unwrap();
+                for key in ["grpc-opts", "h2-opts", "http-opts", "xhttp-opts"] {
+                    obj.remove(key);
+                }
                 if self.ws {
                     n["ws-opts"]["path"] = json!(self.path.text);
                 } else {
@@ -435,7 +452,11 @@ pub fn handle(app: &mut App, key: KeyEvent) {
                     (form.protocol + if back { TYPES.len() - 1 } else { 1 }) % TYPES.len();
             }
             Field::Tls => form.tls = !form.tls,
-            Field::Transport => form.ws = !form.ws,
+            Field::Transport => {
+                // Leaving a kept transport goes to plain TCP first.
+                form.ws = form.kept_transport().is_none() && !form.ws;
+                form.kept_network = None;
+            }
             _ => form.editing = true,
         }
     }
@@ -509,7 +530,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             Cipher => ("加密方式", f.cipher.text.clone()),
             Tls => ("TLS", if f.tls { "开启" } else { "关闭" }.into()),
             Sni => ("SNI（可选）", f.sni.text.clone()),
-            Transport => ("传输", if f.ws { "WebSocket" } else { "TCP" }.into()),
+            Transport => (
+                "传输",
+                match f.kept_transport() {
+                    Some(net) => format!("{net}（保持不变）"),
+                    None => if f.ws { "WebSocket" } else { "TCP" }.into(),
+                },
+            ),
             Path => ("WebSocket 路径", f.path.text.clone()),
             Flow => ("Flow（可选）", f.flow.text.clone()),
             Save => ("保存并使用", String::new()),
@@ -638,6 +665,41 @@ mod tests {
         f.name.load("机场 A");
         f.url.load("https://airport.test/sub?token=secret");
         assert_eq!(f.record().unwrap().subscription_url, f.url.text);
+    }
+    #[test]
+    fn editing_keeps_transports_the_form_cannot_show() {
+        let mut record = filled(3).record().unwrap();
+        record.nodes[0]["network"] = json!("grpc");
+        record.nodes[0]["grpc-opts"] = json!({ "grpc-service-name": "svc" });
+        let form = Form::from_record("proxy-001".into(), record.clone());
+        assert_eq!(form.kept_network.as_deref(), Some("grpc"));
+        assert!(!form.fields().contains(&Field::Path));
+        let kept = form.record().unwrap();
+        assert_eq!(kept.nodes[0]["network"], "grpc");
+        assert_eq!(kept.nodes[0]["grpc-opts"]["grpc-service-name"], "svc");
+
+        let mut other = Form::from_record("proxy-001".into(), record.clone());
+        other.protocol = 1;
+        assert_eq!(other.kept_transport(), None);
+        let other = other.record().unwrap();
+        assert_eq!(other.nodes[0]["network"], "tcp");
+        assert!(other.nodes[0].get("grpc-opts").is_none());
+
+        let mut ws = Form::from_record("proxy-001".into(), record);
+        ws.kept_network = None;
+        ws.ws = true;
+        let ws = ws.record().unwrap();
+        assert_eq!(ws.nodes[0]["network"], "ws");
+        assert!(ws.nodes[0].get("grpc-opts").is_none());
+
+        let mut upgrade = ws.clone();
+        upgrade.nodes[0]["ws-opts"]["v2ray-http-upgrade"] = json!(true);
+        upgrade.nodes[0]["ws-opts"]["headers"] = json!({ "Host": "cdn.example" });
+        let edited = Form::from_record("proxy-001".into(), upgrade)
+            .record()
+            .unwrap();
+        assert_eq!(edited.nodes[0]["ws-opts"]["v2ray-http-upgrade"], true);
+        assert_eq!(edited.nodes[0]["ws-opts"]["headers"]["Host"], "cdn.example");
     }
     #[test]
     #[ignore = "requires Mihomo; only validates temporary config files"]

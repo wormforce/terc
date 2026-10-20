@@ -24,6 +24,7 @@ mod settings;
 pub mod storage;
 pub mod subconv;
 pub mod ui;
+mod ws;
 
 use crossterm::{
     event::{

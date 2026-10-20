@@ -1352,18 +1352,15 @@ fn transport(node: &mut Map<String, Value>, url: &Url, name: &str) -> Result<(),
         .to_ascii_lowercase();
     match net.as_str() {
         "tcp" | "none" | "" => {}
-        "ws" => {
-            node.insert("network".into(), json!("ws"));
-            let mut opts = Map::new();
-            opts.insert(
-                "path".into(),
-                json!(url.q("path").unwrap_or_else(|| "/".into())),
-            );
-            if let Some(h) = url.q("host") {
-                opts.insert("headers".into(), json!({ "Host": h }));
-            }
-            node.insert("ws-opts".into(), Value::Object(opts));
-        }
+        "ws" | "httpupgrade" => ws_transport(
+            node,
+            net == "httpupgrade",
+            url.q("path").unwrap_or_default(),
+            url.q("host"),
+            url.q("ed"),
+            url.q("eh"),
+            name,
+        )?,
         "grpc" => {
             node.insert("network".into(), json!("grpc"));
             node.insert(
@@ -1374,6 +1371,69 @@ fn transport(node: &mut Map<String, Value>, url: &Url, name: &str) -> Result<(),
         other => return Err(format!("{name}: transport {other} unsupported")),
     }
     Ok(())
+}
+
+/// WebSocket or V2Ray HTTPUpgrade share-link transport. Mihomo has no
+/// `network: httpupgrade`; it is `network: ws` plus `v2ray-http-upgrade`.
+/// `ed` / `eh` are v2rayN's early-data size and header name.
+fn ws_transport(
+    node: &mut Map<String, Value>,
+    upgrade: bool,
+    path: String,
+    host: Option<String>,
+    ed: Option<String>,
+    eh: Option<String>,
+    name: &str,
+) -> Result<(), String> {
+    node.insert("network".into(), json!("ws"));
+    let mut opts = Map::new();
+    let path = if path.is_empty() { "/".into() } else { path };
+    opts.insert("path".into(), json!(path));
+    if let Some(h) = host.filter(|h| !h.is_empty()) {
+        opts.insert("headers".into(), json!({ "Host": h }));
+    }
+    if upgrade {
+        opts.insert("v2ray-http-upgrade".into(), json!(true));
+    }
+    if let Some(ed) = ed.filter(|e| !e.is_empty()) {
+        let size: u64 = ed
+            .parse()
+            .map_err(|_| format!("{name}: WebSocket early data {ed} invalid"))?;
+        if upgrade {
+            opts.insert("v2ray-http-upgrade-fast-open".into(), json!(true));
+        } else if size > 0 {
+            opts.insert("max-early-data".into(), json!(size));
+            opts.insert(
+                "early-data-header-name".into(),
+                json!("Sec-WebSocket-Protocol"),
+            );
+        }
+    }
+    if let Some(eh) = eh.filter(|h| !upgrade && !h.is_empty()) {
+        opts.insert("early-data-header-name".into(), json!(eh));
+    }
+    node.insert("ws-opts".into(), Value::Object(opts));
+    Ok(())
+}
+
+/// Split a numeric `ed=` early-data hint out of a vmess JSON WebSocket path.
+fn split_path_ed(path: &str) -> (String, Option<String>) {
+    let Some((base, query)) = path.split_once('?') else {
+        return (path.to_string(), None);
+    };
+    let mut ed = None;
+    let mut rest = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        match pair.strip_prefix("ed=") {
+            Some(v) if ed.is_none() && v.parse::<u64>().is_ok() => ed = Some(v.to_string()),
+            _ => rest.push(pair),
+        }
+    }
+    match (ed, rest.is_empty()) {
+        (None, _) => (path.to_string(), None),
+        (ed, true) => (base.to_string(), ed),
+        (ed, false) => (format!("{base}?{}", rest.join("&")), ed),
+    }
 }
 
 pub fn parse_uri(raw: &str) -> Result<Value, String> {
@@ -1740,18 +1800,17 @@ fn parse_vmess(raw: &str) -> Result<Value, String> {
     }
     match s("net").as_str() {
         "" | "tcp" => {}
-        "ws" => {
-            node.insert("network".into(), json!("ws"));
-            let mut opts = Map::new();
-            let path = s("path");
-            opts.insert(
-                "path".into(),
-                json!(if path.is_empty() { "/".into() } else { path }),
-            );
-            if !s("host").is_empty() {
-                opts.insert("headers".into(), json!({ "Host": s("host") }));
-            }
-            node.insert("ws-opts".into(), Value::Object(opts));
+        net @ ("ws" | "httpupgrade") => {
+            let (path, ed) = split_path_ed(&s("path"));
+            ws_transport(
+                &mut node,
+                net == "httpupgrade",
+                path,
+                Some(s("host")),
+                ed,
+                None,
+                &name,
+            )?;
         }
         "grpc" => {
             node.insert("network".into(), json!("grpc"));
@@ -2272,6 +2331,54 @@ FINAL,Proxy,dns-failed
         assert!(parse_uri("ssr://abc").is_err());
         assert!(parse_uri("vless://u@192.0.2.8:443?type=kcp#K").is_err());
         assert!(parse_uri("trojan://p@nohost").is_err());
+    }
+
+    #[test]
+    fn websocket_early_data_and_http_upgrade_links() {
+        let vl = parse_uri("vless://00000000-0000-0000-0000-000000000000@192.0.2.4:443?security=tls&type=ws&path=%2Fws&host=w.example&ed=2048#WS").unwrap();
+        assert_eq!(vl["network"], "ws");
+        assert_eq!(vl["ws-opts"]["path"], "/ws");
+        assert_eq!(vl["ws-opts"]["headers"]["Host"], "w.example");
+        assert_eq!(vl["ws-opts"]["max-early-data"], 2048);
+        assert_eq!(
+            vl["ws-opts"]["early-data-header-name"],
+            "Sec-WebSocket-Protocol"
+        );
+        let eh = parse_uri("vless://u@192.0.2.4:443?type=ws&ed=2048&eh=X-Early#EH").unwrap();
+        assert_eq!(eh["ws-opts"]["early-data-header-name"], "X-Early");
+        assert_eq!(eh["ws-opts"]["path"], "/");
+        let plain = parse_uri("trojan://p@192.0.2.3:443?type=ws#P").unwrap();
+        assert!(plain["ws-opts"].get("max-early-data").is_none());
+        assert!(plain["ws-opts"].get("v2ray-http-upgrade").is_none());
+
+        let up =
+            parse_uri("trojan://p@192.0.2.3:443?type=httpupgrade&path=%2Fup&host=u.example#UP")
+                .unwrap();
+        assert_eq!(up["network"], "ws");
+        assert_eq!(up["ws-opts"]["v2ray-http-upgrade"], true);
+        assert_eq!(up["ws-opts"]["headers"]["Host"], "u.example");
+        assert!(up["ws-opts"].get("v2ray-http-upgrade-fast-open").is_none());
+        let fast = parse_uri("vless://u@192.0.2.4:443?type=HTTPUpgrade&ed=2048#F").unwrap();
+        assert_eq!(fast["ws-opts"]["v2ray-http-upgrade-fast-open"], true);
+        assert!(fast["ws-opts"].get("max-early-data").is_none());
+        assert!(parse_uri("vless://u@192.0.2.4:443?type=ws&ed=lots#Bad").is_err());
+
+        let vm = |net: &str, path: &str| {
+            let body = format!(
+                r#"{{"ps":"VM","add":"192.0.2.5","port":"443","id":"x","net":"{net}","path":"{path}","host":"v.example"}}"#
+            );
+            parse_uri(&format!("vmess://{}", encode_base64(body.as_bytes()))).unwrap()
+        };
+        let ws = vm("ws", "/v?ed=2048&x=1");
+        assert_eq!(ws["ws-opts"]["path"], "/v?x=1");
+        assert_eq!(ws["ws-opts"]["max-early-data"], 2048);
+        let up = vm("httpupgrade", "/u?ed=2048");
+        assert_eq!(up["network"], "ws");
+        assert_eq!(up["ws-opts"]["path"], "/u");
+        assert_eq!(up["ws-opts"]["v2ray-http-upgrade"], true);
+        assert_eq!(up["ws-opts"]["v2ray-http-upgrade-fast-open"], true);
+        assert_eq!(vm("ws", "/k?ed=big")["ws-opts"]["path"], "/k?ed=big");
+        assert_eq!(vm("ws", "")["ws-opts"]["path"], "/");
     }
 
     #[test]
