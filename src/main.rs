@@ -3524,7 +3524,7 @@ mod tests {
         let mut app = offline_app();
         app.config.controller.addr = addr;
         app.config.controller.config_dir = "/nonexistent/terc-test".into();
-        let mut poll = |app: &mut App| {
+        let poll = |app: &mut App| {
             app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
             app.tick(Duration::from_millis(10));
             assert!(app.snapshot_pending);
