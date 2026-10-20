@@ -3498,6 +3498,55 @@ mod tests {
     }
 
     #[test]
+    fn polls_skip_the_connections_get_only_while_pushes_arrive() {
+        use std::{io::Read as _, io::Write as _, net::TcpListener};
+        // A controller on 127.0.0.1:0 that answers `{}` and records each path.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (paths_tx, paths) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+                if paths_tx.send(path).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut app = offline_app();
+        app.config.controller.addr = addr;
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        let mut poll = |app: &mut App| {
+            app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
+            app.tick(Duration::from_millis(10));
+            assert!(app.snapshot_pending);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.snapshot_pending {
+                assert!(Instant::now() < deadline, "poll never finished");
+                app.drain_events();
+                thread::sleep(Duration::from_millis(5));
+            }
+            paths.try_iter().collect::<Vec<String>>()
+        };
+        app.conn_stream_at = Some(Instant::now());
+        assert!(app.stream_live());
+        let pushed = poll(&mut app);
+        assert!(pushed.iter().any(|p| p == "/version"), "{pushed:?}");
+        assert!(!pushed.iter().any(|p| p == "/connections"), "{pushed:?}");
+        app.conn_stream_at = None;
+        let polled = poll(&mut app);
+        assert!(polled.iter().any(|p| p == "/connections"), "{polled:?}");
+    }
+
+    #[test]
     fn live_connection_stream_row_shows_its_transport() {
         for lang in [Lang::Zh, Lang::En, Lang::Ja] {
             for (width, height) in [(80, 24), (160, 40)] {
@@ -3724,6 +3773,36 @@ mod tests {
         assert!(app.conn_view.is_empty());
         let text = render_text(&mut app, 100, 30);
         assert!(text.contains("没有存活60秒以上"), "{text}");
+    }
+
+    #[test]
+    fn x_closes_and_blames_the_highlighted_row() {
+        let mut app = offline_app();
+        // Nothing listens here, so the close request cannot reach a real core.
+        app.config.controller.addr = "127.0.0.1:1".into();
+        app.main_tab = MainTab::Connections;
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('o'));
+        // Filtered and by age: row 0 is `long`, which is row 2 of the snapshot.
+        while app.selected_connection().is_none_or(|c| c.id != "long") {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.conn_index, 0);
+        assert_eq!(app.snapshot.connections[2].id, "long");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.action_busy);
+        let mut closed: Vec<_> = sample_connections();
+        closed.retain(|c| c.id == "big");
+        let gone = app
+            .conns
+            .observe(&mut closed, true, Instant::now(), conns::now_ms());
+        let cause = |host: &str| gone.iter().find(|c| c.host == host).map(|c| c.cause);
+        assert_eq!(
+            cause("ws.example.com:443"),
+            Some(Some(conns::Cause::UserClose))
+        );
+        assert_eq!(cause("api.openai.com:443"), Some(None));
     }
 
     #[test]
