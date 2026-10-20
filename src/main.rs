@@ -18,6 +18,7 @@ pub mod mihomo;
 pub mod ops;
 pub mod panels;
 mod privilege;
+mod settings;
 pub mod subconv;
 pub mod ui;
 
@@ -34,13 +35,13 @@ use crossterm::{
 };
 use mihomo::{
     close_connection, config_file_exists, download_managed_core_async, fetch_snapshot,
-    is_info_pseudo_node, mihomo_asset_label, select_group_node, set_sysproxy, spawn_stream_workers,
-    start_core_service, stop_core_service, switch_routing_mode, test_group_delays_async,
-    BackendEvent, ControllerConfig, CoreSnapshot,
+    is_info_pseudo_node, select_group_node, set_sysproxy, spawn_stream_workers, start_core_service,
+    stop_core_service, switch_routing_mode, test_group_delays_async, BackendEvent,
+    ControllerConfig, CoreSnapshot,
 };
 use ratatui::prelude::{CrosstermBackend, Terminal};
 use serde::{Deserialize, Serialize};
-use ui::{draw, theme, Theme, ThemeId, WaveRenderer, THEMES, WAVE_RENDERERS};
+use ui::{draw, theme, Theme, ThemeId, WaveRenderer, THEMES};
 
 const REFRESH_RATES: &[u16] = &[15, 30, 60, 120];
 const ROUTING_MODES: &[&str] = &["Rule", "Global", "Direct"];
@@ -102,10 +103,12 @@ pub enum SettingCategory {
     Core,
     Appearance,
     Subscription,
+    Diagnostics,
 }
 
 #[derive(Clone, Debug)]
 pub struct SettingRow {
+    pub id: settings::SettingId,
     pub category: SettingCategory,
     pub label: String,
     pub value: String,
@@ -162,6 +165,8 @@ pub struct Config {
     pub enabled_modules: Vec<String>,
     #[serde(default)]
     pub active_profile: String,
+    #[serde(default)]
+    pub active_profile_label: String,
 }
 
 impl Config {
@@ -322,6 +327,7 @@ pub struct App {
     pub provider_index: usize,
     pub module_index: usize,
     pub profile_index: usize,
+    pub profile_page: usize,
     pub tunnel_index: usize,
     pub overlay: Overlay,
     pub catalog: Vec<crate::ops::ModuleSnippet>,
@@ -333,6 +339,9 @@ pub struct App {
     pub dns_error: bool,
     pub rule_query: LineEditor,
     pub rule_editing: bool,
+    pub rule_explaining: bool,
+    pub rule_target_editor: LineEditor,
+    pub rule_detail: bool,
     pub explain: Option<crate::ops::ExplainReport>,
     pub probe_editor: LineEditor,
     pub probe_lines: Vec<String>,
@@ -376,7 +385,8 @@ pub struct App {
 impl App {
     pub fn new(config: Config) -> Self {
         let snapshot = fetch_snapshot(&config.controller);
-        let app = Self::from_snapshot(config, snapshot);
+        let mut app = Self::from_snapshot(config, snapshot);
+        app.load_core_log();
         spawn_stream_workers(
             app.config.controller.addr.clone(),
             app.config.controller.secret.clone(),
@@ -424,6 +434,7 @@ impl App {
             provider_index: 0,
             module_index: 0,
             profile_index: 0,
+            profile_page: 0,
             tunnel_index: 0,
             overlay: Overlay::None,
             catalog: Vec::new(),
@@ -435,6 +446,9 @@ impl App {
             dns_error: false,
             rule_query: LineEditor::default(),
             rule_editing: false,
+            rule_explaining: false,
+            rule_target_editor: LineEditor::default(),
+            rule_detail: false,
             explain: None,
             probe_editor: LineEditor::default(),
             probe_lines: Vec::new(),
@@ -528,7 +542,7 @@ impl App {
                 self.set_status(self.t("setup_err_scheme"), true);
                 return;
             }
-            let dir = crate::compose::terc_dir();
+            let dir = crate::compose::profile_dir(&self.config.controller);
             let mut added = 0;
             let mut last_err = String::new();
             for line in url.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -548,6 +562,7 @@ impl App {
         }
         let url = url.split_whitespace().next().unwrap_or("").to_string();
         self.config.controller.subscription_url = url;
+        self.save_profile_source();
         self.save_preferences();
         self.setup_phase = SetupPhase::Fetching;
         self.update_subscription();
@@ -684,7 +699,11 @@ impl App {
                     let ok = result.is_ok();
                     match &result {
                         Ok(text) => self.set_status(text, false),
-                        Err(err) => self.set_status(err, true),
+                        Err(err) => {
+                            self.set_status(err, true);
+                            self.logs.push(("error".into(), err.clone()));
+                            self.load_core_log();
+                        }
                     }
                     if ok {
                         if let Some(ids) = modules {
@@ -692,14 +711,25 @@ impl App {
                             self.save_preferences();
                         }
                         if let Some(name) = profile {
+                            self.config.controller.profile_id = name.clone();
+                            let source = crate::compose::ProfileSource::load(
+                                &crate::compose::profile_dir(&self.config.controller),
+                            );
+                            self.config.controller.subscription_url = source.subscription_url;
+                            self.config.active_profile_label = source.name;
                             self.config.active_profile = name;
+                            self.group_index = 0;
+                            self.node_index = 0;
+                            self.group_scroll = 0;
+                            self.node_scroll = 0;
                             self.save_preferences();
                             self.open_profiles();
                         }
                     }
-                    if self.overlay == Overlay::OwnNodes {
-                        self.own_nodes =
-                            crate::compose::load_manual_nodes(&crate::compose::terc_dir());
+                    if self.overlay == Overlay::OwnNodes || self.overlay == Overlay::Profiles {
+                        self.own_nodes = crate::compose::load_manual_nodes(
+                            &crate::compose::profile_dir(&self.config.controller),
+                        );
                     }
                     if self.pending_regen {
                         self.pending_regen = false;
@@ -829,6 +859,9 @@ impl App {
     }
 
     pub fn accept_snapshot(&mut self, snapshot: CoreSnapshot) {
+        if self.snapshot.running && !snapshot.running {
+            self.load_core_log();
+        }
         let selected = self
             .snapshot
             .connections
@@ -1057,6 +1090,10 @@ impl App {
             .position(|m| m.eq_ignore_ascii_case(&self.snapshot.mode))
             .unwrap_or(0);
         let mode = ROUTING_MODES[(index + 1) % ROUTING_MODES.len()];
+        if !self.snapshot.running {
+            self.apply_core_setting("mode", mode.to_ascii_lowercase().into());
+            return;
+        }
         self.run_action("Switching routing mode…", None, None, move |cfg| {
             switch_routing_mode(&cfg, mode).map_err(|e| e.to_string())?;
             Ok(format!("Routing mode › {mode}"))
@@ -1064,7 +1101,8 @@ impl App {
     }
 
     pub fn toggle_core_service(&mut self) {
-        let running = self.snapshot.running;
+        let running = self.snapshot.running
+            || crate::privilege::managed_core(&self.config.controller).is_ok();
         self.run_action("Updating core service…", None, None, move |cfg| {
             if running {
                 stop_core_service(&cfg)
@@ -1072,117 +1110,6 @@ impl App {
                 start_core_service(&cfg)
             }
         });
-    }
-
-    pub fn settings_rows(&self) -> Vec<SettingRow> {
-        let theme_label = match self.config.settings.theme {
-            ThemeId::Spring => "Spring",
-            ThemeId::Vintage => "Vintage",
-            ThemeId::Mono => "Mono",
-        };
-        let renderer_label = match self.config.settings.renderer {
-            WaveRenderer::Braille => "Braille",
-            WaveRenderer::Blocks => "Blocks",
-        };
-        let lang_label = match self.config.settings.lang {
-            Lang::Zh => "中文",
-            Lang::En => "English",
-            Lang::Ja => "日本語",
-        };
-
-        vec![
-            SettingRow {
-                category: SettingCategory::Core,
-                label: self.t("set_core_state").to_string(),
-                value: if self.snapshot.running {
-                    format!("Running ({})", self.snapshot.version)
-                } else {
-                    "Stopped".to_string()
-                },
-                description: format!(
-                    "{}\nBinary: {}\nConfig: {}/config.yaml",
-                    self.t("desc_core_state"),
-                    self.snapshot.core_bin_path,
-                    self.config.controller.config_dir
-                ),
-            },
-            SettingRow {
-                category: SettingCategory::Core,
-                label: self.t("set_sysproxy").to_string(),
-                value: if self.snapshot.sysproxy_enabled {
-                    format!("ON ({})", self.snapshot.network_service)
-                } else {
-                    format!("OFF ({})", self.snapshot.network_service)
-                },
-                description: self.t("desc_sysproxy").to_string(),
-            },
-            SettingRow {
-                category: SettingCategory::Core,
-                label: self.t("set_mode").to_string(),
-                value: self.snapshot.mode.clone(),
-                description: self.t("desc_mode").to_string(),
-            },
-            SettingRow {
-                category: SettingCategory::Core,
-                label: self.t("set_download_core").to_string(),
-                value: "Enter / →".to_string(),
-                description: format!("{}\n{}", self.t("desc_download_core"), mihomo_asset_label()),
-            },
-            SettingRow {
-                category: SettingCategory::Appearance,
-                label: self.t("set_theme").to_string(),
-                value: theme_label.to_string(),
-                description: self.t("desc_theme").to_string(),
-            },
-            SettingRow {
-                category: SettingCategory::Appearance,
-                label: self.t("set_renderer").to_string(),
-                value: renderer_label.to_string(),
-                description: self.t("desc_renderer").to_string(),
-            },
-            SettingRow {
-                category: SettingCategory::Appearance,
-                label: self.t("set_refresh").to_string(),
-                value: format!("{} Hz", self.config.settings.refresh_hz),
-                description: self.t("desc_refresh").to_string(),
-            },
-            SettingRow {
-                category: SettingCategory::Appearance,
-                label: self.t("set_graph_interval").into(),
-                value: self
-                    .setting_input
-                    .as_ref()
-                    .map(|s| format!("{s}▏ ms"))
-                    .unwrap_or_else(|| format!("{} ms", self.config.settings.graph_interval_ms())),
-                description: self.t("desc_graph_interval").into(),
-            },
-            SettingRow {
-                category: SettingCategory::Appearance,
-                label: self.t("set_lang").to_string(),
-                value: lang_label.to_string(),
-                description: self.t("desc_lang").to_string(),
-            },
-            SettingRow {
-                category: SettingCategory::Subscription,
-                label: self.t("set_sub_url").to_string(),
-                value: if self.config.controller.subscription_url.trim().is_empty() {
-                    self.t("sub_not_set").to_string()
-                } else {
-                    mask_url(&self.config.controller.subscription_url)
-                },
-                description: self.t("desc_sub_url").to_string(),
-            },
-            SettingRow {
-                category: SettingCategory::Subscription,
-                label: self.t("set_sub_update").to_string(),
-                value: "Enter / →".to_string(),
-                description: format!(
-                    "{}\nURL: {}",
-                    self.t("desc_sub_update"),
-                    mask_url(&self.config.controller.subscription_url)
-                ),
-            },
-        ]
     }
 
     pub fn set_graph_interval(&mut self, ms: u64) {
@@ -1193,70 +1120,10 @@ impl App {
         self.down_history.fill(0.0);
     }
 
-    pub fn adjust_setting(&mut self, dir: i32) {
-        match self.setting_index {
-            0 => self.toggle_core_service(),
-            1 => self.toggle_sysproxy(),
-            2 => self.cycle_routing_mode(),
-            3 => self.download_core(),
-            4 => {
-                let pos = THEMES
-                    .iter()
-                    .position(|t| *t == self.config.settings.theme)
-                    .unwrap_or(0);
-                let next = (pos as i32 + dir).rem_euclid(THEMES.len() as i32) as usize;
-                self.config.settings.theme = THEMES[next];
-                self.save_preferences();
-            }
-            5 => {
-                let pos = WAVE_RENDERERS
-                    .iter()
-                    .position(|r| *r == self.config.settings.renderer)
-                    .unwrap_or(0);
-                let next = (pos as i32 + dir).rem_euclid(WAVE_RENDERERS.len() as i32) as usize;
-                self.config.settings.renderer = WAVE_RENDERERS[next];
-                self.save_preferences();
-            }
-            6 => {
-                let pos = REFRESH_RATES
-                    .iter()
-                    .position(|r| *r == self.config.settings.refresh_hz)
-                    .unwrap_or(2);
-                let next = (pos as i32 + dir).rem_euclid(REFRESH_RATES.len() as i32) as usize;
-                self.config.settings.refresh_hz = REFRESH_RATES[next];
-                self.save_preferences();
-            }
-            7 => {
-                let current = self.config.settings.graph_interval_ms() as i64;
-                self.set_graph_interval((current + dir as i64 * 100).clamp(1000, 86_400_000) as u64);
-                self.save_preferences();
-            }
-            8 => {
-                let langs = [Lang::Zh, Lang::En, Lang::Ja];
-                let pos = langs
-                    .iter()
-                    .position(|l| *l == self.config.settings.lang)
-                    .unwrap_or(0);
-                let next = (pos as i32 + dir).rem_euclid(langs.len() as i32) as usize;
-                self.config.settings.lang = langs[next];
-                self.save_preferences();
-            }
-            9 => {
-                self.open_setup(Screen::Settings);
-            }
-            10 => {
-                if self.config.controller.subscription_url.trim().is_empty() {
-                    self.open_setup(Screen::Settings);
-                } else {
-                    self.update_subscription();
-                }
-            }
-            _ => {}
-        }
-    }
-
     pub fn t(&self, key: &str) -> &'static str {
         match (self.config.settings.lang, key) {
+            (Lang::Zh, "cat_diagnostics") => "排查工具",
+            (_, "cat_diagnostics") => "Diagnostics",
             (_, "too_small") => "Terminal window too small",
             (Lang::Zh, "traffic") => "实时速率",
             (Lang::En, "traffic") => "Traffic",
@@ -1321,8 +1188,8 @@ impl App {
             (Lang::Zh, "cat_appearance") => "视觉与主题",
             (Lang::En, "cat_appearance") => "Appearance",
             (Lang::Ja, "cat_appearance") => "外観・テーマ",
-            (Lang::Zh, "cat_sub") => "订阅管理",
-            (Lang::En, "cat_sub") => "Subscription",
+            (Lang::Zh, "cat_sub") => "配置方案",
+            (Lang::En, "cat_sub") => "Profiles",
             (Lang::Ja, "cat_sub") => "サブスクリプション",
             (Lang::Zh, "settings_parameters") => "配置项",
             (Lang::En, "settings_parameters") => "Parameters",
@@ -1496,8 +1363,8 @@ impl App {
             (Lang::Zh, "help_a") => "选择全球或当前国家范围，测速后优选",
             (_, "help_a") => "Choose all countries or current country, test and select fastest",
             (_, "help_m") => "Cycle routing mode (Rule / Global / Direct)",
-            (Lang::Zh, "help_u") => "拉取订阅（Clash / Surge / 节点列表），与自有节点和私有规则合成配置后热重载；未设置时打开初始设置",
-            (_, "help_u") => "Fetch subscription (Clash / Surge / URI list), compose with own nodes + private rules, hot-reload (opens setup when unset)",
+            (Lang::Zh, "help_u") => "更新当前方案的订阅，保留来源规则与策略组，校验后重载",
+            (_, "help_u") => "Update the active profile subscription; preserve source rules and groups, validate and reload",
             (_, "help_tabs") => "Switch view: [p] Proxies  [c] Connections  [L] Logs",
             (_, "help_t") => "Toggle top Traffic & Overview panels",
             (_, "help_s") => "Open Settings board (Core / Theme / Subscription)",
@@ -1815,8 +1682,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 CEvent::Paste(text) => {
                     if app.screen == Screen::Settings && app.setting_input.is_some() {
                         let text = text.trim();
-                        if text.len() <= 8 && text.chars().all(|c| c.is_ascii_digit()) {
-                            app.setting_input = Some(text.to_string());
+                        let id = app.settings_rows()[app.setting_index].id;
+                        if id == crate::settings::SettingId::TestUrl
+                            || (text.len() <= 8 && text.chars().all(|c| c.is_ascii_digit()))
+                        {
+                            app.setting_input = Some(text.trim().to_string());
                         }
                     } else if app.screen == Screen::Setup && app.setup_phase == SetupPhase::Editing
                     {
@@ -1825,8 +1695,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         } else {
                             app.setup_editor.insert_text(text.trim());
                         }
-                    } else if app.screen == Screen::Dashboard
-                        && matches!(app.overlay, Overlay::OwnNodes | Overlay::PrivateRules)
+                    } else if matches!(app.screen, Screen::Dashboard | Screen::Settings)
+                        && matches!(
+                            app.overlay,
+                            Overlay::OwnNodes | Overlay::PrivateRules | Overlay::Profiles
+                        )
                     {
                         crate::manage::handle_manage_paste(app, &text);
                     } else if app.screen == Screen::Dashboard && app.overlay == Overlay::Probe {
@@ -1840,8 +1713,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         && app.main_tab == MainTab::Rules
                         && app.rule_editing
                     {
-                        app.rule_query.insert(&text);
-                        app.rule_index = 0;
+                        if app.rule_explaining {
+                            app.rule_target_editor.insert_text(&text);
+                        } else {
+                            app.rule_query.insert_text(&text);
+                            app.rule_index = 0;
+                        }
                     } else if app.screen == Screen::Dashboard
                         && app.main_tab == MainTab::Logs
                         && app.log_editing
@@ -1966,11 +1843,13 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
     }
     if (app.main_tab == MainTab::Connections && app.connection_detail)
         || (app.main_tab == MainTab::Logs && app.log_detail)
+        || (app.main_tab == MainTab::Rules && app.rule_detail)
     {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => {
                 app.connection_detail = false;
                 app.log_detail = false;
+                app.rule_detail = false;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.detail_scroll = app.detail_scroll.saturating_sub(1)
@@ -2004,10 +1883,14 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('f') => app.open_profiles(),
         KeyCode::Char('b') => app.open_probe(),
         KeyCode::Char('w') => app.open_runtime(),
-        KeyCode::Char('N') => app.open_own_nodes(),
-        KeyCode::Char('R') => app.open_private_rules(),
+        KeyCode::Char('N') => {
+            app.profile_page = 2;
+            app.open_profiles();
+        }
+        KeyCode::Char('R') => app.main_tab = MainTab::Rules,
         KeyCode::Char('e') if app.main_tab == MainTab::Dns => app.dns_editing = true,
         KeyCode::Char('e') | KeyCode::Char('/') if app.main_tab == MainTab::Rules => {
+            app.rule_explaining = key.code == KeyCode::Char('e');
             app.rule_editing = true;
         }
         KeyCode::Char('[') if app.main_tab == MainTab::Dns => app.cycle_dns_qtype(-1),
@@ -2036,6 +1919,7 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             if app.logs_paused {
                 app.logs_paused = false;
                 app.log_detail = false;
+                app.rule_detail = false;
             } else {
                 app.pause_logs();
             }
@@ -2183,7 +2067,10 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                 FocusPane::Nodes => app.activate_selected_node(),
             },
             MainTab::Dns => app.submit_dns_query(),
-            MainTab::Rules => app.explain_selected_rule(),
+            MainTab::Rules => {
+                app.rule_detail = true;
+                app.detail_scroll = 0;
+            }
             MainTab::Providers => app.refresh_selected_provider(),
             MainTab::Connections => {
                 app.connection_detail = true;
@@ -2250,24 +2137,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected_module(),
             _ => {}
         },
-        Overlay::Profiles => match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => app.close_overlay(),
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.profile_index = app
-                    .profile_index
-                    .checked_sub(1)
-                    .unwrap_or(app.profiles.len().saturating_sub(1));
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !app.profiles.is_empty() {
-                    app.profile_index = (app.profile_index + 1) % app.profiles.len();
-                }
-            }
-            KeyCode::Enter => app.switch_selected_profile(),
-            KeyCode::Char('c') => app.save_profile_copy(),
-            KeyCode::Char('r') => app.reload_profile(),
-            _ => {}
-        },
+        Overlay::Profiles => crate::manage::handle_profiles_key(app, key),
         Overlay::Probe => {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('w'))
@@ -2350,40 +2220,42 @@ fn handle_dns_edit_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_rule_edit_key(app: &mut App, key: KeyEvent) -> bool {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-        return true;
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('w'))
+    let editor = if app.rule_explaining {
+        &mut app.rule_target_editor
+    } else {
+        &mut app.rule_query
+    };
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('u' | 'w'))
     {
-        app.rule_query.clear();
-        app.rule_index = 0;
-        return false;
+        editor.clear();
+    } else {
+        match key.code {
+            KeyCode::Esc => app.rule_editing = false,
+            KeyCode::Enter => {
+                app.rule_editing = false;
+                if app.rule_explaining {
+                    let target = app.rule_target_editor.trimmed();
+                    app.explain_target(&target);
+                }
+            }
+            KeyCode::Backspace => {
+                editor.backspace();
+            }
+            KeyCode::Delete => {
+                editor.delete();
+            }
+            KeyCode::Left => editor.move_left(),
+            KeyCode::Right => editor.move_right(),
+            KeyCode::Home => editor.move_home(),
+            KeyCode::End => editor.move_end(),
+            KeyCode::Char(ch) => {
+                editor.insert_text(&ch.to_string());
+            }
+            _ => {}
+        }
     }
-    match key.code {
-        KeyCode::Esc => app.rule_editing = false,
-        KeyCode::Enter => {
-            app.rule_editing = false;
-            app.rule_index = 0;
-            app.explain_selected_rule();
-        }
-        KeyCode::Backspace => {
-            app.rule_query.backspace();
-            app.rule_index = 0;
-        }
-        KeyCode::Delete => {
-            app.rule_query.delete();
-            app.rule_index = 0;
-        }
-        KeyCode::Left => app.rule_query.move_left(),
-        KeyCode::Right => app.rule_query.move_right(),
-        KeyCode::Home => app.rule_query.move_home(),
-        KeyCode::End => app.rule_query.move_end(),
-        KeyCode::Char(ch) => {
-            app.rule_query.insert(&ch.to_string());
-            app.rule_index = 0;
-        }
-        _ => {}
+    if !app.rule_explaining {
+        app.rule_index = 0;
     }
     false
 }
@@ -2456,73 +2328,10 @@ fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
 }
 
 fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
-    if let Some(input) = &mut app.setting_input {
-        match key.code {
-            KeyCode::Esc => app.setting_input = None,
-            KeyCode::Backspace => {
-                input.pop();
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
-            KeyCode::Char(c) if c.is_ascii_digit() && input.len() < 8 => input.push(c),
-            KeyCode::Enter => {
-                if let Ok(ms @ 1000..=86_400_000) = input.parse::<u64>() {
-                    app.set_graph_interval(ms);
-                    app.setting_input = None;
-                    app.save_preferences();
-                } else {
-                    app.set_status("1000–86400000 ms", true);
-                }
-            }
-            _ => {}
-        }
-        return false;
+    if app.overlay != Overlay::None {
+        return handle_overlay_key(app, key);
     }
-    let rows = app.settings_rows();
-    let category = rows[app.setting_index].category;
-    let indices: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.category == category)
-        .map(|(i, _)| i)
-        .collect();
-    let pos = indices
-        .iter()
-        .position(|i| *i == app.setting_index)
-        .unwrap_or(0);
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') | KeyCode::Char('S') => {
-            app.screen = Screen::Dashboard
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.setting_index = indices[(pos + indices.len() - 1) % indices.len()]
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.setting_index = indices[(pos + 1) % indices.len()]
-        }
-        KeyCode::Left | KeyCode::Char('h') => app.adjust_setting(-1),
-        KeyCode::Right | KeyCode::Char('l') => app.adjust_setting(1),
-        KeyCode::Enter if app.setting_index == 7 => app.setting_input = Some(String::new()),
-        KeyCode::Enter => app.adjust_setting(1),
-        KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('1'..='3') => {
-            let categories = [
-                SettingCategory::Core,
-                SettingCategory::Appearance,
-                SettingCategory::Subscription,
-            ];
-            let current = categories.iter().position(|c| *c == category).unwrap_or(0);
-            let next = match key.code {
-                KeyCode::Char(c) => (c as u8 - b'1') as usize,
-                KeyCode::BackTab => (current + 2) % 3,
-                _ => (current + 1) % 3,
-            };
-            app.setting_index = rows
-                .iter()
-                .position(|r| r.category == categories[next])
-                .unwrap();
-        }
-        _ => {}
-    }
-    false
+    crate::settings::handle_key(app, key)
 }
 
 fn handle_setup_key(app: &mut App, key: KeyEvent) -> bool {
@@ -2696,7 +2505,10 @@ mod tests {
             let view = render_text(&mut app, width, height);
             assert!(!view.contains(app.t("set_download_core")));
             press(&mut app, KeyCode::Up);
-            assert_eq!(app.setting_index, 8);
+            assert_eq!(
+                app.settings_rows()[app.setting_index].id,
+                crate::settings::SettingId::Toolbar
+            );
             press(&mut app, KeyCode::Down);
             assert_eq!(app.setting_index, 4);
             press(&mut app, KeyCode::BackTab);
@@ -2705,6 +2517,85 @@ mod tests {
             assert_eq!(app.setting_index, 9);
             let view = render_text(&mut app, width, height);
             assert!(!view.contains(app.t("set_theme")));
+            press(&mut app, KeyCode::Char('4'));
+            assert_eq!(
+                app.settings_rows()[app.setting_index].category,
+                SettingCategory::Diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn settings_ports_reject_invalid_input_and_profiles_work_inside_settings() {
+        let mut app = offline_app();
+        app.screen = Screen::Settings;
+        app.setting_index = app
+            .settings_rows()
+            .iter()
+            .position(|r| r.id == crate::settings::SettingId::MixedPort)
+            .unwrap();
+        press(&mut app, KeyCode::Enter);
+        for ch in "65536".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.action_busy);
+        assert!(app.setting_input.is_some());
+        press(&mut app, KeyCode::Esc);
+        app.clear_status();
+        app.overlay = Overlay::Profiles;
+        for (w, h) in [(42, 12), (80, 24), (120, 30)] {
+            app.profile_page = 0;
+            assert!(render_text(&mut app, w, h).contains("配置方案"));
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.profile_page, 1);
+            render_text(&mut app, w, h);
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.profile_page, 2);
+            render_text(&mut app, w, h);
+        }
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Settings);
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn rule_search_and_target_tests_are_separate_and_details_fit_small_terminals() {
+        let mut app = offline_app();
+        app.main_tab = MainTab::Rules;
+        app.snapshot.rules = crate::ops::parse_rules_json(
+            r#"{"rules":[{"type":"DomainSuffix","payload":"example.org","proxy":"DIRECT"},{"type":"Match","payload":"","proxy":"PROXY"}]}"#,
+        );
+        press(&mut app, KeyCode::Char('/'));
+        for c in "DIRECT".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.filtered_rule_indexes().len(), 1);
+        assert!(app.explain.is_none());
+        press(&mut app, KeyCode::Char('e'));
+        for c in "api.example.org".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.rule_query.text, "DIRECT");
+        assert_eq!(
+            app.explain
+                .as_ref()
+                .unwrap()
+                .matched
+                .as_ref()
+                .unwrap()
+                .proxy,
+            "DIRECT"
+        );
+        for (w, h) in [(42, 12), (80, 24), (120, 30)] {
+            render_text(&mut app, w, h);
+            press(&mut app, KeyCode::Enter);
+            let text = render_text(&mut app, w, h);
+            assert!(text.contains("规则详情"));
+            press(&mut app, KeyCode::Esc);
+            assert!(!app.rule_detail);
         }
     }
 
@@ -3090,7 +2981,7 @@ mod tests {
         let text = render_text(&mut app, 140, 40);
         assert!(text.contains("Fake-Own"));
         assert!(text.contains("192.0.2.10:8388"));
-        assert!(text.contains("自有节点"));
+        assert!(text.contains("手动节点"));
         // Typing in the add box keeps spaces (Surge lines need them).
         press(&mut app, KeyCode::Char('a'));
         for ch in "A = ss".chars() {

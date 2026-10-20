@@ -77,7 +77,7 @@ Transparency follows your terminal profile. `terc` leaves the background at its 
 | **Controls** | System proxy, routing mode, and TUN |
 | **Traffic graph** | btop-style dual up/down rate history on an auto-scaled, labeled axis (`max …/s`), drawn as Braille or Blocks |
 | **Overview** | Aligned core, mode, proxy, TUN, memory, and connection metrics; port and quota below |
-| **Profiles** | Switch another YAML onto the running config and hot-reload |
+| **Profiles** | Manage subscriptions, manual nodes and snapshots together; switch sources in Settings |
 | **Themes** | Spring, Vintage, and Mono; all preserve the terminal background |
 
 <details>
@@ -151,15 +151,15 @@ Best-node selection compares selectable proxy nodes in the current Selector grou
 
 ## Configuration
 
-Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terc/config.json`. The interface supports **中文 / English / 日本語**.
+Open **Settings** with <kbd>s</kbd>. UI preferences save to `~/.config/terc/config.json`; proxy settings are written to the core configuration. The interface supports **中文 / English / 日本語**.
 
 | Category | Options |
 | --- | --- |
 | **Core & Proxy** | Start/stop `mihomo`, toggle the system proxy, switch routing mode, download `mihomo-darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` into `~/.config/terc/core/mihomo` |
 | **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling recursively merges mappings; disabling restores the source. Mihomo validates candidates before applying |
-| **Profiles** | YAML files in the config directory and `~/.config/terc/profiles`. Enter copies one onto `config.yaml` and reloads |
 | **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), UI refresh rate (`15` / `30` / `60` / `120 Hz`), graph interval (`1000–86400000 ms`, arrows adjust by `100 ms`, Enter accepts a typed value; averaged rates, clears history on change), UI language |
-| **Subscription** | Auto-detects Clash / Surge / URI-list subscriptions (including WireGuard, SSH and Snell v4/v5) and composes them with own nodes (`N`) and private rules + AI routing (`R`); validated with `mihomo -t`, hot-reloaded without dropping tunnels |
+| **Profiles** | Subscriptions, manual nodes and snapshots in one manager. Preserves source groups and rules, validates and reloads. Custom rule and AI preset editing is paused |
+| **Proxy settings** | Mixed / HTTP / SOCKS ports, LAN access, TUN, DNS, IPv6, test URL and timeout; advanced tools live under Diagnostics |
 
 The graph interval is set in milliseconds. Mihomo normally supplies one traffic sample per second, so the minimum is 1000 ms.
 

@@ -17,7 +17,7 @@ There is no Windows build. The system proxy is never turned on by Setup.
 
 ## Subscription URL and Providers
 
-The airport subscription is the single URL you paste. `u` downloads it, composes it with your own nodes and private rules into `config.yaml` (below), validates, and hot-reloads the core. If no URL is saved, `u` opens Setup again.
+The airport subscription is the single URL you paste. `u` downloads it, combines it with the active profile’s manual nodes in `config.yaml`, preserving source routing, validates, and hot-reloads the core. If no URL is saved, `u` opens Setup again.
 
 `v` opens **订阅源 / Providers**. That page is `proxy-providers` and `rule-providers` inside the Mihomo config: extra URLs the core uses to refresh a node list or a rule list. It is not the airport URL. Refreshing a provider does not replace the subscription link in `~/.config/terc/config.json`.
 
@@ -37,65 +37,29 @@ Snell v4/v5 needs Mihomo v1.19.26 or newer (`Ctrl+D` fetches the latest). Mihomo
 
 Skipped, never fatal: `external`, snell v6, listen-only WireGuard sections (`listen-port` with peers lacking `endpoint`), `ssid`/`subnet` groups, `policy-path`, `USER-AGENT`, `URL-REGEX`, `RULE-SET,SYSTEM`/`LAN`, rules pointing at unknown policies, unsupported ciphers. The result toast says "N skipped"; press `!` for the list (names and types only, never secrets). Only a recognizable download replaces `~/.config/terc/subscription.cache`.
 
-## terc composes the config
+## Profiles: subscriptions and manual nodes
 
-`config.yaml` is generated from subscription nodes + your own nodes (`nodes.conf`) + terc rules. Airport groups and rules are not used unless you turn them on. Groups:
+Open Settings → Profiles, or press `f` on the dashboard. Subscriptions, VPS nodes and imported proxies share one manager.
 
-| Group | Type | Members |
-| --- | --- | --- |
-| `PROXY` | select | `AUTO`, `AI`, all nodes, `DIRECT`; the final `MATCH` |
-| `AUTO` | url-test | all nodes |
-| `AI` | url-test or fallback | US / JP / SG / TW nodes, Hong Kong excluded |
+- **Profiles**: `a` imports a subscription URL or nodes into a new profile (multi-line and WireGuard configs supported); `c` saves a copy; `n` renames; Enter applies the selection.
+- **Subscription**: `e` edits the active source; `u` updates it. Import another provider with `a` on the Profiles tab to keep both available.
+- **Manual nodes**: `a` adds, `d` removes, `r` / Enter tests, `A` tests all. Surge lines and ss / trojan / vmess / vless / hysteria2 / tuic / wireguard / ssh links are supported.
 
-Info pseudo-nodes ("remaining traffic", "expires") are left out. If a name is taken, terc uses `terc-PROXY` etc.; `PROXY` in rules still points at it. Every regeneration runs `mihomo -t` first and keeps the old file on failure. TUN, sniffer, IPv6 and DNS switches and enabled snippets survive regeneration. Do not hand-edit the generated `config.yaml` (its first line is `# terc-generated`).
+Tab / Shift+Tab or 1–3 switches pages. Esc returns to Settings. Every profile owns its source, node list and cache, so a refresh after switching profiles cannot mix the previous source into the active one. Snapshots live at `~/.config/terc/profiles/<id>.yaml`; source metadata, cache and manual nodes live in the matching directory. Node lists do not display passwords.
 
-## Private rules and AI routing (R)
+Clash and convertible Surge subscriptions preserve their own groups, rules and rule providers. Manual nodes join selectable groups. Node-only sources receive one `PROXY` selector and a `MATCH` fallback.
 
-Press `R`. Changes are saved to `~/.config/terc/rules.conf`, then the config is regenerated and hot-reloaded.
+**Custom rule and AI preset development and editing are paused.** Existing `rules.conf` files remain local. Newly generated profiles do not apply those custom rules, China-direct rules or AI presets, and do not add AUTO / AI groups. Existing live configurations change only when updated or regenerated.
 
-| Key | Action |
-| --- | --- |
-| `a` | Add a rule below the selection |
-| `d` / Delete | Delete |
-| `J` / `K` or Shift+↓ / Shift+↑ | Move down / up (higher matches first) |
-| `t` | Cycle target `PROXY` → `AI` → `AUTO` → `DIRECT` → `REJECT` |
-| `p` | AI preset on / off |
-| `y` | AI group `url-test` ↔ `fallback` |
-| `m` | Pick AI members: Space toggles, `c` clears (= auto), Enter saves |
-| `b` | Append airport groups and rules |
-| `c` | China direct (`DOMAIN-SUFFIX,cn`, `GEOIP,CN`) |
-| Enter | Re-read `rules.conf` and apply |
-| Esc / `q` / `R` | Close |
+## Common settings
 
-Rule input is `TYPE,VALUE,TARGET`: `DOMAIN-SUFFIX,example.com,AI`, `DOMAIN-KEYWORD,steam,DIRECT`, `IP-CIDR,10.8.0.0/16,DIRECT` (gets `no-resolve`), `GEOIP,JP,AUTO`, `PROCESS-NAME,Cursor,AI`. `example.com` alone means `DOMAIN-SUFFIX,example.com,PROXY`. Targets can also be any node or group name; unknown names are skipped with a note.
+Settings has four tabs: Proxy, Appearance, Profiles and Diagnostics (Tab / Shift+Tab or 1–4).
 
-Order: private rules → AI preset → LAN direct → airport rules (if `b`) → China direct → `MATCH,PROXY`.
+Proxy settings include mixed / HTTP / SOCKS ports, LAN access, TUN, DNS, IPv6, sniffing, concurrent TCP, process matching, the test URL and controller timeout. Port values range from 0 to 65535; 0 disables a listener. A mixed port supports both HTTP and SOCKS and must not duplicate another listener. Turn off system proxy before changing ports, then enable it again after saving.
 
-The AI preset covers OpenAI / ChatGPT / Sora, Anthropic / Claude, Google Gemini / AI Studio / NotebookLM, xAI / Grok, Perplexity, Cursor, GitHub Copilot, Microsoft Copilot / Bing, Midjourney, Hugging Face, Poe, Meta AI, Mistral, Cohere, Groq, OpenRouter, Together, Replicate, Windsurf / Codeium, v0, Character.AI, Suno, ElevenLabs and Runway (`AI_PRESET` in `src/compose.rs`). By default the AI group picks nodes whose names look like US, Japan, Singapore or Taiwan and excludes Hong Kong; `members`, `filter` and `exclude` in `rules.conf` change that.
+Appearance includes theme, graph style, UI refresh rate, graph interval, language, top panels and the shortcut footer. The graph interval stays in Settings rather than cluttering the traffic graph.
 
-```ini
-[ai]
-enabled = true
-type = url-test
-members =                 # empty = auto; or names separated by |
-filter = (?i)(🇺🇸|🇯🇵|…)
-exclude = (?i)(🇭🇰|港|…)
-
-[options]
-subscription-rules = false
-cn-direct = true
-
-[rules]
-DOMAIN-SUFFIX,example.com,AI
-```
-
-`[rules]` accepts any Mihomo rule. After editing by hand, press `R` then Enter. Saving from the TUI rewrites the file in canonical form.
-
-## Own nodes / VPS (N)
-
-Press `N`. `a` pastes a node (several lines at once are fine), `d` deletes, `r` / Enter tests the selected node, `A` tests all, Esc closes. Accepted: a Surge proxy line such as `My VPS = ss, 1.2.3.4, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=…, udp-relay=true, tfo=true`, or an `ss://` `trojan://` `vless://` (Reality) `vmess://` `hysteria2://` `tuic://` `anytls://` `socks5://` `http(s)://` `wireguard://` (`wg://`) `ssh://user:password@host:port` link. For WireGuard you can also paste a whole wg-quick `.conf` (`[Interface]` + one `[Peer]`) or a Surge `Name = wireguard, section-name=x` line with its `[WireGuard x]` section; terc stores it as one `wireguard://` line (multi-peer WireGuard belongs in a subscription). Bad ciphers, wrong SS2022 key lengths and bad ports are rejected on the spot.
-
-Nodes live in `~/.config/terc/nodes.conf` (one per line, mode 600, local only); you can edit it by hand and press `R`, Enter or `u` to regenerate. The list shows name, protocol and server, never the password. Own nodes join `PROXY` and `AUTO`, and `AI` when their names look US/JP/SG/TW; a clash with a subscription name becomes `Name (2)`. They work without any subscription.
+Diagnostics contains the log level, core download, snippets, probe, runtime details, rules and providers. Startup errors include a core-log excerpt. The Logs view also reads `terc-core.log`; the preceding startup log is kept as `terc-core.previous.log`. An occupied controller or an unresponsive managed process blocks another launch. A startup timeout cleans up the newly launched process.
 
 ## Sniffer
 
@@ -107,15 +71,15 @@ Nodes live in `~/.config/terc/nodes.conf` (one per line, mode 600, local only); 
 | --- | --- |
 | `T` / Space / `D` / `i` / `m` | TUN, system proxy, `dns.enable`, IPv6, routing mode |
 | `d` | DNS lookup. `F` flushes DNS and Fake-IP. `[` `]` change the record type |
-| `g` | Rules. `/` explains a target, `x` disables the selected rule |
+| `g` | Effective rules: `/` searches, `e` tests a target, Enter opens details, `x` temporarily disables the selection |
 | `o` | Snippets appended to the config (`~/.config/terc/modules`) |
 | `f` | Profiles (`~/.config/terc/profiles`). Enter switches, `c` saves a copy |
 | `b` | Probe: DNS plus a delay test of the selected node |
 | `w` | Runtime: TUN device and WireGuard / Tailscale outbounds |
-| `N` / `R` | Own nodes / private rules and AI routing |
+| `f` | Profiles: subscriptions, manual nodes and configuration switching |
 | `s` / `?` | Settings and help. Esc returns to the dashboard |
 | `q` | Quit the UI. The core keeps running. `K` starts or stops it |
-| Esc | From a subview, return to proxies. From proxies, quit |
+| Esc | From a subview, return to proxies. From proxies, stay on the dashboard; q quits |
 
 ## Linux and macOS
 

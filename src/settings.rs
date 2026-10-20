@@ -1,0 +1,606 @@
+//! Common connection controls and advanced tools live in the settings board.
+use crate::{App, Lang, Screen, SettingCategory as C, SettingRow, WaveRenderer};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingId {
+    Core,
+    SystemProxy,
+    Mode,
+    Download,
+    Theme,
+    Renderer,
+    Refresh,
+    GraphInterval,
+    Language,
+    Subscription,
+    Update,
+    Profiles,
+    MixedPort,
+    HttpPort,
+    SocksPort,
+    Lan,
+    Tun,
+    Dns,
+    Ipv6,
+    Sniff,
+    Tcp,
+    Process,
+    LogLevel,
+    TestUrl,
+    Timeout,
+    Traffic,
+    Toolbar,
+    Modules,
+    Probe,
+    Runtime,
+    Rules,
+    Providers,
+    Logs,
+}
+impl App {
+    pub fn settings_rows(&self) -> Vec<SettingRow> {
+        use SettingId::*;
+        let mut rows = Vec::new();
+        let mut add =
+            |id, category, zh: &str, en: &str, value: String, desc_zh: &str, desc_en: &str| {
+                let zh_lang = self.lang() == Lang::Zh;
+                rows.push(SettingRow {
+                    id,
+                    category,
+                    label: if zh_lang { zh } else { en }.into(),
+                    value,
+                    description: if zh_lang { desc_zh } else { desc_en }.into(),
+                });
+            };
+        let on = |v| if v { "ON" } else { "OFF" }.to_string();
+        let action = "Enter →".to_string();
+        add(
+            Core,
+            C::Core,
+            "内核服务",
+            "Core service",
+            on(self.snapshot.running),
+            "启动或停止当前内核。启动失败时请查看设置 → 排查 → 日志。",
+            "Start or stop the core. Startup errors appear under Diagnostics → Logs.",
+        );
+        add(
+            SystemProxy,
+            C::Core,
+            "系统代理",
+            "System proxy",
+            on(self.snapshot.sysproxy_enabled),
+            self.t("desc_sysproxy"),
+            self.t("desc_sysproxy"),
+        );
+        add(
+            Mode,
+            C::Core,
+            "分流模式",
+            "Routing mode",
+            self.snapshot.mode.clone(),
+            self.t("desc_mode"),
+            self.t("desc_mode"),
+        );
+        add(
+            Download,
+            C::Diagnostics,
+            "下载 / 更新内核",
+            "Download / update core",
+            action.clone(),
+            "从 Mihomo 官方发行版下载适配当前系统的内核。",
+            "Download the official Mihomo binary for this platform.",
+        );
+        add(
+            Theme,
+            C::Appearance,
+            "配色主题",
+            "Palette",
+            format!("{:?}", self.config.settings.theme),
+            self.t("desc_theme"),
+            self.t("desc_theme"),
+        );
+        add(
+            Renderer,
+            C::Appearance,
+            "速率图样式",
+            "Graph style",
+            format!("{:?}", self.config.settings.renderer),
+            self.t("desc_renderer"),
+            self.t("desc_renderer"),
+        );
+        add(
+            Refresh,
+            C::Appearance,
+            "界面刷新率",
+            "UI refresh rate",
+            format!("{} Hz", self.config.settings.refresh_hz),
+            self.t("desc_refresh"),
+            self.t("desc_refresh"),
+        );
+        add(
+            GraphInterval,
+            C::Appearance,
+            "图表更新间隔",
+            "Graph interval",
+            format!("{} ms", self.config.settings.graph_interval_ms()),
+            self.t("desc_graph_interval"),
+            self.t("desc_graph_interval"),
+        );
+        add(
+            Language,
+            C::Appearance,
+            "语言",
+            "Language",
+            match self.lang() {
+                Lang::Zh => "中文",
+                Lang::En => "English",
+                Lang::Ja => "日本語",
+            }
+            .into(),
+            self.t("desc_lang"),
+            self.t("desc_lang"),
+        );
+        add(
+            Subscription,
+            C::Subscription,
+            "订阅地址",
+            "Subscription URL",
+            if self.config.controller.subscription_url.is_empty() {
+                "—".into()
+            } else {
+                crate::mask_url(&self.config.controller.subscription_url)
+            },
+            "编辑当前配置方案的订阅地址，或导入节点。",
+            "Edit the active profile's subscription URL or import nodes.",
+        );
+        add(
+            Update,
+            C::Subscription,
+            "更新当前订阅",
+            "Update subscription",
+            action.clone(),
+            "下载并校验后应用；保留订阅自带的规则与策略组。",
+            "Download, validate and apply, preserving the subscription's rules and groups.",
+        );
+        add(Profiles,C::Subscription,"配置方案","Profiles",self.profile_display_name(),"统一管理订阅与手动节点。Enter 打开，a 导入新方案，c 保存副本，Tab 查看方案来源。不同方案分别保存节点与订阅。","Manage subscriptions and manual nodes together. Enter opens profiles; a imports; c saves a copy; Tab shows sources. Each profile has its own nodes and subscription.");
+        let port_desc="Enter 输入端口（0–65535），0 表示关闭此监听。混合端口同时支持 HTTP 和 SOCKS。保存后校验并重载。系统代理开启时请先关闭，再调整端口。";
+        let port_en="Enter a port (0–65535); 0 disables this listener. Mixed supports HTTP and SOCKS. Validate and reload on save. Turn off system proxy before changing ports.";
+        add(
+            MixedPort,
+            C::Core,
+            "混合代理端口",
+            "Mixed proxy port",
+            self.core_setting("mixed-port", "0"),
+            port_desc,
+            port_en,
+        );
+        add(
+            HttpPort,
+            C::Core,
+            "HTTP 代理端口",
+            "HTTP proxy port",
+            self.core_setting("port", "0"),
+            port_desc,
+            port_en,
+        );
+        add(
+            SocksPort,
+            C::Core,
+            "SOCKS 代理端口",
+            "SOCKS proxy port",
+            self.core_setting("socks-port", "0"),
+            port_desc,
+            port_en,
+        );
+        add(
+            Lan,
+            C::Core,
+            "允许局域网连接",
+            "Allow LAN",
+            on(self.snapshot.allow_lan),
+            "允许局域网设备使用本机代理端口。",
+            "Allow LAN devices to connect to the local proxy listeners.",
+        );
+        add(
+            Tun,
+            C::Core,
+            "TUN 虚拟网卡",
+            "TUN",
+            on(self.snapshot.tun_enabled),
+            "接管系统流量；macOS 可能弹出管理员授权。",
+            "Route system traffic through TUN. macOS may request administrator authorization.",
+        );
+        add(
+            Dns,
+            C::Core,
+            "内置 DNS",
+            "Built-in DNS",
+            on(self.snapshot.dns.enable),
+            "开启或关闭配置中的 DNS 服务。",
+            "Enable or disable the configured DNS service.",
+        );
+        add(
+            Ipv6,
+            C::Core,
+            "IPv6",
+            "IPv6",
+            on(self.snapshot.ipv6),
+            self.t("help_ipv6"),
+            self.t("help_ipv6"),
+        );
+        add(
+            Sniff,
+            C::Core,
+            "域名嗅探",
+            "Domain sniffing",
+            on(self.snapshot.sniffing),
+            self.t("help_sniff"),
+            self.t("help_sniff"),
+        );
+        add(
+            Tcp,
+            C::Core,
+            "TCP 并发连接",
+            "Concurrent TCP",
+            on(self.snapshot.tcp_concurrent),
+            "并发尝试目标 IP，加快建立连接。",
+            "Try destination IPs concurrently to establish connections faster.",
+        );
+        add(
+            Process,
+            C::Core,
+            "进程识别",
+            "Process matching",
+            self.core_setting("find-process-mode", "strict"),
+            "strict 按需识别；always 始终识别；off 关闭。",
+            "strict: on demand; always: always inspect; off: disable.",
+        );
+        add(
+            LogLevel,
+            C::Diagnostics,
+            "内核日志级别",
+            "Core log level",
+            self.core_setting("log-level", "info"),
+            "默认 info。遇到问题可临时切换 debug。",
+            "Use info normally; switch to debug while investigating issues.",
+        );
+        add(
+            TestUrl,
+            C::Core,
+            "节点测速地址",
+            "Latency test URL",
+            self.config.controller.test_url.clone(),
+            "Enter 编辑 HTTP / HTTPS 测速地址，用于手动节点测速。",
+            "Enter an HTTP / HTTPS URL for manual node latency tests.",
+        );
+        add(
+            Timeout,
+            C::Core,
+            "测速 / 查询超时",
+            "Test / query timeout",
+            format!("{} ms", self.config.controller.timeout_ms),
+            "Enter 输入 500–60000 毫秒。",
+            "Enter a timeout from 500 to 60000 milliseconds.",
+        );
+        add(
+            Traffic,
+            C::Appearance,
+            "实时速率面板",
+            "Traffic panels",
+            on(self.config.settings.show_traffic),
+            "显示或隐藏主界面上方的速率与状态面板。",
+            "Show or hide traffic and overview panels.",
+        );
+        add(
+            Toolbar,
+            C::Appearance,
+            "底栏快捷键",
+            "Shortcut footer",
+            on(self.config.settings.show_toolbar),
+            "显示一行常用快捷键。",
+            "Show the single-line shortcut footer.",
+        );
+        for (id, zh, en) in [
+            (Modules, "配置片段", "Config snippets"),
+            (Probe, "连接探测", "Connection probe"),
+            (Runtime, "运行详情", "Runtime details"),
+            (Rules, "规则浏览", "Rule browser"),
+            (Providers, "远程资源", "Providers"),
+            (Logs, "日志", "Logs"),
+        ] {
+            add(id,C::Diagnostics,zh,en,action.clone(),"Enter 打开。自有规则编辑已暂停；规则浏览以当前内核实际生效的顺序为准。","Enter to open. Custom rule editing is paused; rule browsing follows the core's effective order.");
+        }
+        // Lead the sources category with the unified manager.
+        rows.swap(9, 11);
+        if let Some(input) = &self.setting_input {
+            if let Some(row) = rows.get_mut(self.setting_index) {
+                row.value = format!("{input}▏");
+            }
+        }
+        rows
+    }
+
+    fn core_setting(&self, key: &str, default: &str) -> String {
+        self.snapshot
+            .config_values
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| default.into())
+    }
+
+    pub fn adjust_setting(&mut self, dir: i32) {
+        use SettingId::*;
+        let id = self.settings_rows()[self.setting_index].id;
+        match id {
+            Core => self.toggle_core_service(),
+            SystemProxy => self.toggle_sysproxy(),
+            Mode => self.cycle_routing_mode(),
+            Download => self.download_core(),
+            Theme => {
+                let i = crate::THEMES
+                    .iter()
+                    .position(|x| *x == self.config.settings.theme)
+                    .unwrap_or(0);
+                self.config.settings.theme = crate::THEMES[(i as i32 + dir).rem_euclid(3) as usize];
+                self.save_preferences();
+            }
+            Renderer => {
+                self.config.settings.renderer =
+                    if self.config.settings.renderer == WaveRenderer::Braille {
+                        WaveRenderer::Blocks
+                    } else {
+                        WaveRenderer::Braille
+                    };
+                self.save_preferences();
+            }
+            Refresh => {
+                let i = crate::REFRESH_RATES
+                    .iter()
+                    .position(|x| *x == self.config.settings.refresh_hz)
+                    .unwrap_or(2);
+                self.config.settings.refresh_hz =
+                    crate::REFRESH_RATES[(i as i32 + dir).rem_euclid(4) as usize];
+                self.save_preferences();
+            }
+            GraphInterval => {
+                self.set_graph_interval(
+                    (self.config.settings.graph_interval_ms() as i64 + dir as i64 * 100)
+                        .clamp(1000, 86_400_000) as u64,
+                );
+                self.save_preferences();
+            }
+            Language => {
+                let langs = [Lang::Zh, Lang::En, Lang::Ja];
+                let i = langs.iter().position(|x| *x == self.lang()).unwrap_or(0);
+                self.config.settings.lang = langs[(i as i32 + dir).rem_euclid(3) as usize];
+                self.save_preferences();
+            }
+            Subscription => self.open_setup(Screen::Settings),
+            Update => self.update_subscription(),
+            Profiles => self.open_profiles(),
+            MixedPort | HttpPort | SocksPort | TestUrl | Timeout => {
+                self.setting_input = Some(String::new());
+            }
+            Tun => self.toggle_tun(),
+            Dns => self.toggle_dns(),
+            Ipv6 => self.toggle_ipv6(),
+            Sniff => self.toggle_sniffing(),
+            Lan => self.apply_core_setting("allow-lan", (!self.snapshot.allow_lan).into()),
+            Tcp => {
+                self.apply_core_setting("tcp-concurrent", (!self.snapshot.tcp_concurrent).into())
+            }
+            Process | LogLevel => {
+                let (key, values): (&str, &[&str]) = if id == Process {
+                    ("find-process-mode", &["strict", "always", "off"])
+                } else {
+                    (
+                        "log-level",
+                        &["info", "warning", "error", "debug", "silent"],
+                    )
+                };
+                let current = self.core_setting(key, values[0]);
+                let i = values.iter().position(|s| *s == current).unwrap_or(0);
+                self.apply_core_setting(
+                    key,
+                    values[(i as i32 + dir).rem_euclid(values.len() as i32) as usize].into(),
+                );
+            }
+            Traffic => {
+                self.config.settings.show_traffic = !self.config.settings.show_traffic;
+                self.save_preferences();
+            }
+            Toolbar => {
+                self.config.settings.show_toolbar = !self.config.settings.show_toolbar;
+                self.save_preferences();
+            }
+            Modules => self.open_modules(),
+            Probe => self.open_probe(),
+            Runtime => self.open_runtime(),
+            Rules => {
+                self.screen = Screen::Dashboard;
+                self.main_tab = crate::MainTab::Rules;
+            }
+            Providers => {
+                self.screen = Screen::Dashboard;
+                self.main_tab = crate::MainTab::Providers;
+            }
+            Logs => {
+                self.load_core_log();
+                self.screen = Screen::Dashboard;
+                self.main_tab = crate::MainTab::Logs;
+            }
+        }
+    }
+
+    pub fn apply_core_setting(&mut self, key: &str, value: serde_json::Value) {
+        if matches!(key, "port" | "socks-port" | "mixed-port") && self.snapshot.sysproxy_enabled {
+            self.set_status(
+                "请先关闭系统代理再修改端口 / Turn off system proxy before changing ports",
+                true,
+            );
+            return;
+        }
+        let key = key.to_string();
+        let running = self.snapshot.running;
+        let modules = crate::ops::enabled_snippets(
+            &crate::ops::module_catalog(&crate::ops::modules_dir(&std::path::PathBuf::from(
+                std::env::var_os("HOME").unwrap_or_default(),
+            ))),
+            &self.config.enabled_modules,
+        );
+        self.run_action(
+            "正在保存并校验设置 / Saving and validating settings…",
+            None,
+            None,
+            move |cfg| {
+                let raw = crate::mihomo::read_config_text(&cfg)?;
+                let base = crate::ops::strip_marked_modules(&raw);
+                if matches!(key.as_str(), "port" | "socks-port" | "mixed-port") {
+                    let old = crate::ops::split_chunks(&base)
+                        .into_iter()
+                        .find(|c| c.key.as_deref() == Some(&key))
+                        .and_then(|c| {
+                            c.lines
+                                .first()
+                                .and_then(|l| l.split_once(':'))
+                                .map(|(_, v)| crate::ops::clean_scalar(v))
+                        })
+                        .unwrap_or_else(|| "0".into());
+                    if old == value.to_string() {
+                        return Ok("端口未改变 / Port unchanged".into());
+                    }
+                    if let Some(port) = value.as_u64().filter(|p| *p > 0) {
+                        if let Err(e) = std::net::TcpListener::bind(("127.0.0.1", port as u16)) {
+                            if e.kind() != std::io::ErrorKind::PermissionDenied {
+                                return Err(format!(
+                                    "端口 {port} 无法使用 / Port occupied or unavailable: {e}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                let base = crate::ops::set_top_scalar(&base, &key, &value.to_string());
+                let generated = crate::ops::apply_modules_with_switches(
+                    &base,
+                    &modules,
+                    &crate::ops::saved_switches(&raw),
+                )?;
+                crate::mihomo::install_config(&cfg, &generated, running)?;
+                Ok("设置已保存 / Settings saved".into())
+            },
+        );
+    }
+}
+
+pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
+    use SettingId::*;
+    let rows = app.settings_rows();
+    let id = rows[app.setting_index].id;
+    if let Some(input) = &mut app.setting_input {
+        match key.code {
+            KeyCode::Esc => app.setting_input = None,
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
+            KeyCode::Char(c)
+                if !c.is_control()
+                    && input.len() < 2048
+                    && (id == TestUrl || c.is_ascii_digit()) =>
+            {
+                input.push(c)
+            }
+            KeyCode::Enter => {
+                let text = input.trim().to_string();
+                let n = text.parse::<u64>().ok();
+                let valid = match id {
+                    GraphInterval => n.is_some_and(|n| (1000..=86_400_000).contains(&n)),
+                    MixedPort | HttpPort | SocksPort => n.is_some_and(|n| n <= 65535),
+                    Timeout => n.is_some_and(|n| (500..=60000).contains(&n)),
+                    TestUrl => text.starts_with("http://") || text.starts_with("https://"),
+                    _ => false,
+                };
+                if !valid {
+                    app.set_status(
+                        "输入不在允许范围内 / Invalid value; see setting details",
+                        true,
+                    );
+                    return false;
+                }
+                app.setting_input = None;
+                match id {
+                    GraphInterval => {
+                        app.set_graph_interval(n.unwrap());
+                        app.save_preferences();
+                    }
+                    Timeout => {
+                        app.config.controller.timeout_ms = n.unwrap();
+                        app.save_preferences();
+                    }
+                    TestUrl => {
+                        app.config.controller.test_url = text;
+                        app.save_preferences();
+                    }
+                    MixedPort | HttpPort | SocksPort => app.apply_core_setting(
+                        match id {
+                            MixedPort => "mixed-port",
+                            HttpPort => "port",
+                            _ => "socks-port",
+                        },
+                        n.unwrap().into(),
+                    ),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+    let category = rows[app.setting_index].category;
+    let indexes: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.category == category)
+        .map(|(i, _)| i)
+        .collect();
+    let pos = indexes
+        .iter()
+        .position(|i| *i == app.setting_index)
+        .unwrap_or(0);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q' | 's' | 'S') => app.screen = Screen::Dashboard,
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.setting_index = indexes[(pos + indexes.len() - 1) % indexes.len()]
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.setting_index = indexes[(pos + 1) % indexes.len()]
+        }
+        KeyCode::Left | KeyCode::Char('h') => app.adjust_setting(-1),
+        KeyCode::Right | KeyCode::Char('l') => app.adjust_setting(1),
+        KeyCode::Enter
+            if matches!(
+                id,
+                GraphInterval | MixedPort | HttpPort | SocksPort | TestUrl | Timeout
+            ) =>
+        {
+            app.setting_input = Some(String::new())
+        }
+        KeyCode::Enter => app.adjust_setting(1),
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('1'..='4') => {
+            let categories = [C::Core, C::Appearance, C::Subscription, C::Diagnostics];
+            let current = categories.iter().position(|c| *c == category).unwrap_or(0);
+            let next = match key.code {
+                KeyCode::Char(c) => (c as u8 - b'1') as usize,
+                KeyCode::BackTab => (current + 3) % 4,
+                _ => (current + 1) % 4,
+            };
+            app.setting_index = rows
+                .iter()
+                .position(|r| r.category == categories[next])
+                .unwrap();
+        }
+        _ => {}
+    }
+    false
+}

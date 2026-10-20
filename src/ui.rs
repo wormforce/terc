@@ -316,6 +316,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Settings => {
             draw_dashboard(frame, app, content);
             draw_settings(frame, app, content);
+            crate::panels::draw_overlay(frame, app, content);
         }
         Screen::Help => {
             draw_dashboard(frame, app, content);
@@ -542,11 +543,7 @@ fn draw_traffic_graph(frame: &mut Frame, app: &App, area: Rect) {
         ),
     }
 
-    let label = format!(
-        "max {}  {}ms",
-        format_rate(axis_max as u64),
-        app.config.settings.graph_interval_ms()
-    );
+    let label = format!("max {}", format_rate(axis_max as u64));
     frame.render_widget(
         Paragraph::new(Span::styled(label, Style::default().fg(theme.muted))),
         Rect::new(area.x, area.y, area.width, 1),
@@ -1100,7 +1097,7 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
         MainTab::Connections => Some("↑↓ 选择  Enter 详情  x 断开  X 全部断开  Esc 返回"),
         MainTab::Logs => Some("↑↓ 阅读  P 暂停/继续  / 搜索  Enter 全文  Esc 返回"),
         MainTab::Dns => Some("e 编辑  Enter 查询  [ ] 类型  F 清缓存  Esc 返回"),
-        MainTab::Rules => Some("/ 过滤与解释  Enter 解释  x 禁用/恢复  F 刷新  Esc 返回"),
+        MainTab::Rules => Some("/ 搜索  e 测试目标  Enter 详情  x 临时禁用/恢复  F 刷新  Esc 返回"),
         MainTab::Providers => Some("Enter 刷新当前  F 全部刷新  H 健康检查  Esc 返回"),
         MainTab::Proxies => None,
     };
@@ -1115,8 +1112,8 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
             "m 模式",
             "a 自动优选",
             "u 更新订阅",
-            "N 自有节点",
-            "R 规则",
+            "f 配置方案",
+            "T TUN",
             "s 设置",
             "? 更多",
             "q 退出",
@@ -1129,8 +1126,8 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
             "m Mode",
             "a Best",
             "u Update",
-            "N Nodes",
-            "R Rules",
+            "f Profiles",
+            "T TUN",
             "s Settings",
             "? More",
             "q Quit",
@@ -1190,21 +1187,22 @@ fn draw_settings_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 3); 3])
+        .constraints([Constraint::Ratio(1, 4); 4])
         .split(area);
     for (i, (category, key)) in [
         (SettingCategory::Core, "cat_core"),
         (SettingCategory::Appearance, "cat_appearance"),
         (SettingCategory::Subscription, "cat_sub"),
+        (SettingCategory::Diagnostics, "cat_diagnostics"),
     ]
     .iter()
     .enumerate()
     {
         let name = if area.width < 60 {
             if app.lang() == Lang::Zh {
-                ["代理", "外观", "订阅"][i]
+                ["代理", "外观", "方案", "排查"][i]
             } else {
-                ["Core", "UI", "Subs"][i]
+                ["Proxy", "UI", "Profiles", "Tools"][i]
             }
         } else {
             app.t(key)
@@ -1388,14 +1386,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("T / n / i", app.t("help_tun")),
         ("D", app.t("help_dns_key")),
         ("d g v o f b w", app.t("help_views")),
-        (
-            "N",
-            "自有节点：粘贴 Surge 行或 ss:// 等链接添加 VPS，可测速  Own nodes: paste a Surge line or URI",
-        ),
-        (
-            "R",
-            "私有规则与 AI 分流：增删排序规则、AI 预设与成员  Private rules & AI routing",
-        ),
+        ("f", "配置方案：统一管理订阅、手动节点与配置快照 / Profiles: subscriptions and manual nodes"),
+        ("g", "规则浏览：按内核顺序查看；自有规则编辑已暂停 / Inspect effective rules; custom editing paused"),
         ("e  /", app.t("help_explain")),
         ("x", app.t("help_rule_x")),
         ("F", app.t("help_flush")),

@@ -315,6 +315,9 @@ impl App {
     pub fn open_profiles(&mut self) {
         self.profiles = self.profile_list();
         self.profile_index = clamp_to(self.profile_index, self.profiles.len());
+        self.own_nodes = crate::compose::load_manual_nodes(&crate::compose::profile_dir(
+            &self.config.controller,
+        ));
         self.overlay = Overlay::Profiles;
     }
 
@@ -322,6 +325,28 @@ impl App {
         let Some(profile) = self.profiles.get(self.profile_index).cloned() else {
             return;
         };
+        if self.action_busy {
+            return;
+        }
+        if self.config.controller.profile_id.is_empty()
+            && crate::mihomo::config_file_exists(&self.config.controller)
+        {
+            self.save_profile_copy();
+            if self.config.controller.profile_id.is_empty() {
+                return;
+            }
+        }
+        // Keep the active snapshot up to date before leaving it.
+        if !self.config.controller.profile_id.is_empty() {
+            if let Ok(raw) = read_config_text(&self.config.controller) {
+                let path = profiles_dir(&home_dir())
+                    .join(format!("{}.yaml", self.config.controller.profile_id));
+                if let Err(err) = crate::compose::write_private(&path, &raw) {
+                    self.set_status(&err, true);
+                    return;
+                }
+            }
+        }
         let raw = match fs::read_to_string(&profile.path) {
             Ok(text) => text,
             Err(err) => {
@@ -334,21 +359,44 @@ impl App {
             &self.config.enabled_modules,
         );
         let running = self.snapshot.running;
+        let target_id = profile.name.clone();
+        let target_label = profile.label.clone();
         self.run_action(
             "Applying configuration profile…",
             None,
             Some(profile.name),
-            move |cfg| {
+            move |mut cfg| {
+                cfg.profile_id = target_id;
+                let source_dir = crate::compose::profile_dir(&cfg);
+                if !source_dir.join("source.json").is_file() {
+                    crate::compose::ProfileSource {
+                        name: target_label,
+                        subscription_url: String::new(),
+                    }
+                    .save(&source_dir)?;
+                    crate::compose::write_private(
+                        &crate::compose::cache_path(&source_dir),
+                        &crate::ops::strip_marked_modules(&raw),
+                    )?;
+                }
                 let base = crate::ops::strip_marked_modules(&raw);
                 let normalized = normalize_subscription(&base, &cfg.addr);
+                let normalized = crate::ops::set_top_scalar(
+                    &normalized,
+                    "secret",
+                    &serde_json::json!(cfg.secret).to_string(),
+                );
                 let generated = apply_enabled_modules(&normalized, &modules)?;
                 crate::mihomo::install_config(&cfg, &generated, running)?;
-                Ok("Profile applied".into())
+                Ok("配置方案已应用 / Profile applied".into())
             },
         );
     }
 
     pub fn save_profile_copy(&mut self) {
+        if self.action_busy {
+            return;
+        }
         let raw = match read_config_text(&self.config.controller) {
             Ok(text) => text,
             Err(err) => {
@@ -363,10 +411,51 @@ impl App {
         }
         let name = next_profile_filename(&dir);
         let path = dir.join(&name);
-        if let Err(err) = fs::write(&path, raw) {
-            self.set_status(&err.to_string(), true);
+        if let Err(err) = crate::compose::write_private(&path, &raw) {
+            self.set_status(&err, true);
             return;
         }
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("profile")
+            .to_string();
+        let source_dir = crate::compose::profile_dir(&self.config.controller);
+        let target_dir = dir.join(&id);
+        let result = (|| -> Result<(), String> {
+            let mut source = crate::compose::ProfileSource::load(&source_dir);
+            source.name = if self.config.active_profile_label.is_empty() {
+                "当前配置 / Current".into()
+            } else {
+                format!("{} 副本 / Copy", self.config.active_profile_label)
+            };
+            source.subscription_url = self.config.controller.subscription_url.clone();
+            source.save(&target_dir)?;
+            for filename in ["nodes.conf", "subscription.cache"] {
+                let from = source_dir.join(filename);
+                if from.is_file() {
+                    let text = fs::read_to_string(from).map_err(|e| e.to_string())?;
+                    crate::compose::write_private(&target_dir.join(filename), &text)?;
+                }
+            }
+            if !target_dir.join("subscription.cache").is_file()
+                && !crate::compose::is_generated(&raw)
+            {
+                crate::compose::write_private(
+                    &target_dir.join("subscription.cache"),
+                    &crate::ops::strip_marked_modules(&raw),
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir_all(&target_dir);
+            self.set_status(&err, true);
+            return;
+        }
+        self.config.controller.profile_id = id;
+        self.config.active_profile_label = crate::compose::ProfileSource::load(&target_dir).name;
         self.config.active_profile = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -471,12 +560,8 @@ impl App {
     }
 
     fn profile_list(&self) -> Vec<ProfileEntry> {
-        let config_dir = PathBuf::from(&self.config.controller.config_dir);
-        list_profiles(
-            &config_dir,
-            &profiles_dir(&home_dir()),
-            &self.config.active_profile,
-        )
+        let dir = profiles_dir(&home_dir());
+        list_profiles(&dir, &dir, &self.config.active_profile)
     }
 }
 
@@ -492,4 +577,199 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+impl App {
+    pub fn profile_display_name(&self) -> String {
+        if !self.config.active_profile_label.is_empty() {
+            self.config.active_profile_label.clone()
+        } else if self.config.active_profile.is_empty() {
+            "当前配置 / Current".into()
+        } else {
+            self.config.active_profile.clone()
+        }
+    }
+
+    pub fn save_profile_source(&mut self) {
+        let dir = crate::compose::profile_dir(&self.config.controller);
+        let mut source = crate::compose::ProfileSource::load(&dir);
+        source.subscription_url = self.config.controller.subscription_url.clone();
+        if let Err(err) = source.save(&dir) {
+            self.set_status(&err, true);
+        }
+    }
+
+    pub fn import_profile(&mut self, text: &str) {
+        if self.action_busy {
+            self.set_status("请等待当前操作完成 / Wait for the current operation", true);
+            return;
+        }
+        // Save the active plan and its sources before applying another one.
+        if self.config.controller.profile_id.is_empty()
+            && crate::mihomo::config_file_exists(&self.config.controller)
+        {
+            self.save_profile_copy();
+            if self.config.controller.profile_id.is_empty() {
+                return;
+            }
+        }
+        let root = profiles_dir(&home_dir());
+        let filename = next_profile_filename(&root);
+        let id = filename.trim_end_matches(".yaml").to_string();
+        let text = text.to_string();
+        let running = self.snapshot.running;
+        let modules = enabled_snippets(
+            &module_catalog(&modules_dir(&home_dir())),
+            &self.config.enabled_modules,
+        );
+        let next_id = id.clone();
+        self.manage_input = None;
+        self.run_action(
+            "正在导入配置方案 / Importing profile…",
+            None,
+            Some(id),
+            move |mut cfg| {
+                cfg.profile_id = next_id;
+                let dir = crate::compose::profile_dir(&cfg);
+                let is_url = text.starts_with("https://") || text.starts_with("http://");
+                cfg.subscription_url = if is_url {
+                    text.trim().into()
+                } else {
+                    String::new()
+                };
+                let result = (|| {
+                    if !is_url {
+                        let lines = crate::subconv::block_to_node_lines(&text)
+                            .transpose()?
+                            .unwrap_or_else(|| text.lines().map(str::to_string).collect());
+                        for line in lines.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                            crate::compose::add_manual_node(&dir, line)?;
+                        }
+                    }
+                    crate::compose::ProfileSource {
+                        name: if is_url {
+                            crate::mask_url(&text)
+                        } else {
+                            crate::compose::load_manual_nodes(&dir)
+                                .first()
+                                .map(|n| n.name())
+                                .unwrap_or_else(|| "手动节点 / Manual nodes".into())
+                        },
+                        subscription_url: cfg.subscription_url.clone(),
+                    }
+                    .save(&dir)?;
+                    crate::mihomo::regenerate_config(&cfg, &modules, running, is_url, true)
+                })();
+                if result.is_err() {
+                    let _ = fs::remove_dir_all(&dir);
+                }
+                result
+            },
+        );
+    }
+
+    pub fn load_core_log(&mut self) {
+        let text = crate::mihomo::core_log_excerpt(&self.config.controller);
+        for line in text.lines() {
+            let level = if line.contains("level=error") || line.contains("level=fatal") {
+                "error"
+            } else if line.contains("level=warning") {
+                "warn"
+            } else {
+                "info"
+            };
+            let entry = (level.to_string(), line.to_string());
+            if !self.logs.contains(&entry) {
+                self.logs.push(entry);
+            }
+        }
+        if self.logs.len() > 300 {
+            self.logs.drain(..self.logs.len() - 300);
+        }
+    }
+}
+
+#[cfg(test)]
+mod profile_integration_tests {
+    use super::*;
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    fn finish(app: &mut App) {
+        let start = Instant::now();
+        while app.action_busy && start.elapsed() < Duration::from_secs(15) {
+            thread::sleep(Duration::from_millis(10));
+            app.drain_events();
+        }
+        assert!(!app.action_busy, "operation did not finish");
+        assert!(!app.status_is_error, "{}", app.status_message);
+        app.drain_events();
+        // The worker sends ActionDone before its snapshot; refresh synchronously
+        // so assertions inspect the applied file rather than a queued old view.
+        let snapshot = crate::mihomo::fetch_snapshot(&app.config.controller);
+        app.accept_snapshot(snapshot);
+    }
+    #[test]
+    #[ignore = "requires Mihomo; run alone with temporary HOME, never starts a core or changes routing"]
+    fn profile_switching_keeps_sources_separate() {
+        let home = std::env::temp_dir().join(format!("terc-profile-switch-{}", std::process::id()));
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        let cfg = crate::mihomo::ControllerConfig {
+            config_dir: home.join("core").display().to_string(),
+            addr: "127.0.0.1:1".into(),
+            subscription_url: "https://source.example.test/sub".into(),
+            ..Default::default()
+        };
+        let source="mixed-port: 7897\nproxies:\n  - {name: AirportNode, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake}\nproxy-groups:\n  - {name: Airport, type: select, proxies: [AirportNode]}\nrules:\n  - MATCH,Airport\n";
+        crate::mihomo::install_config(&cfg, source, false).unwrap();
+        let mut app = App::from_snapshot(
+            crate::Config {
+                controller: cfg,
+                ..Default::default()
+            },
+            Default::default(),
+        );
+        app.save_profile_copy();
+        let original = app.config.controller.profile_id.clone();
+        assert!(!original.is_empty());
+        app.apply_core_setting("allow-lan", true.into());
+        finish(&mut app);
+        assert!(app.snapshot.allow_lan);
+        app.apply_core_setting("allow-lan", false.into());
+        finish(&mut app);
+        assert!(!app.snapshot.allow_lan);
+        app.import_profile(
+            "OwnNode = ss, 192.0.2.2, 8388, encrypt-method=aes-128-gcm, password=fake",
+        );
+        finish(&mut app);
+        let manual = app.config.controller.profile_id.clone();
+        assert_ne!(manual, original);
+        assert!(app.config.controller.subscription_url.is_empty());
+        let text = read_config_text(&app.config.controller).unwrap();
+        assert!(text.contains("OwnNode"));
+        assert!(!text.contains("AirportNode"));
+        for id in [&original, &manual] {
+            app.profile_index = app.profiles.iter().position(|p| &p.name == id).unwrap();
+            app.switch_selected_profile();
+            finish(&mut app);
+            app.apply_composed();
+            finish(&mut app);
+            let text = read_config_text(&app.config.controller).unwrap();
+            if id == &original {
+                assert!(text.contains("AirportNode"));
+                assert!(!text.contains("OwnNode"));
+                assert_eq!(
+                    app.config.controller.subscription_url,
+                    "https://source.example.test/sub"
+                );
+            } else {
+                assert!(text.contains("OwnNode"));
+                assert!(!text.contains("AirportNode"));
+                assert!(app.config.controller.subscription_url.is_empty());
+            }
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
 }

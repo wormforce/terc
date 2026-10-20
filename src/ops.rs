@@ -68,6 +68,7 @@ pub struct ModuleSnippet {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileEntry {
     pub name: String,
+    pub label: String,
     pub path: String,
     pub active: bool,
 }
@@ -813,7 +814,11 @@ pub fn parse_probe_target(raw: &str) -> ProbeTarget {
 
 pub fn list_profiles(config_dir: &Path, extra_dir: &Path, active_name: &str) -> Vec<ProfileEntry> {
     let mut found = Vec::new();
-    for dir in [config_dir, extra_dir] {
+    for dir in [config_dir, extra_dir]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, d)| (i == 0 || d != config_dir).then_some(d))
+    {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
@@ -839,7 +844,14 @@ pub fn list_profiles(config_dir: &Path, extra_dir: &Path, active_name: &str) -> 
                 .and_then(|s| s.to_str())
                 .unwrap_or(name)
                 .to_string();
+            let source = crate::compose::ProfileSource::load(&path.with_extension(""));
+            let label = if source.name.is_empty() {
+                stem.clone()
+            } else {
+                source.name
+            };
             found.push(ProfileEntry {
+                label,
                 active: !active_name.is_empty() && stem == active_name,
                 name: stem,
                 path: path.display().to_string(),

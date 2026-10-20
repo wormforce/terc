@@ -100,88 +100,211 @@ pub fn draw_dns(frame: &mut Frame, app: &App, area: Rect) {
 
 pub fn draw_rules(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
-    let title = module_title_line(theme, app.lang(), 'g', "Rules", app.t("rules"));
-    let inner = draw_panel(frame, area, theme, Some(title), true);
-    if inner.width < 12 || inner.height < 2 {
+    let indexes = app.filtered_rule_indexes();
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(if area.width >= 88 && !app.rule_detail {
+            vec![Constraint::Percentage(64), Constraint::Percentage(36)]
+        } else {
+            vec![Constraint::Percentage(100)]
+        })
+        .split(area);
+    if app.rule_detail {
+        draw_rule_detail(frame, app, area);
         return;
     }
-    let explain_h = if app.explain.is_some() { 2 } else { 0 };
-    let list_top = inner.y + 1;
-    let list_h = inner.height.saturating_sub(1 + explain_h);
-    let query_area = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), 1);
-    draw_rule_query(frame, app, query_area);
-
-    let indexes = app.filtered_rule_indexes();
-    if indexes.is_empty() {
+    let inner = draw_panel(
+        frame,
+        cols[0],
+        theme,
+        Some(panel_title(
+            format!(
+                "{}  {}/{}",
+                app.t("rules"),
+                indexes.len(),
+                app.snapshot.rules.len()
+            ),
+            theme,
+        )),
+        true,
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(if app.explain.is_some() { 3 } else { 0 }),
+        ])
+        .split(inner);
+    draw_rule_query(frame, app, rows[0]);
+    frame.render_widget(
+        Paragraph::new(if app.lang() == crate::Lang::Zh {
+            "  顺序   类型          匹配内容 → 策略"
+        } else {
+            "  Order  Type          Match → Policy"
+        })
+        .style(Style::default().fg(theme.muted)),
+        rows[1],
+    );
+    let start = visible_list_start(app.rule_index, indexes.len(), rows[2].height as usize);
+    let width = rows[2].width as usize;
+    let items: Vec<_> = indexes
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows[2].height as usize)
+        .filter_map(|(view, raw)| {
+            let rule = app.snapshot.rules.get(*raw)?;
+            let selected = view == app.rule_index;
+            let prefix = if rule.disabled {
+                "×"
+            } else if selected {
+                "▶"
+            } else {
+                " "
+            };
+            let kind_w = if width >= 55 { 13 } else { 8 };
+            let left = format!(
+                "{prefix} {:>4} {:<w$} ",
+                rule.index + 1,
+                truncate_str(&rule.kind, kind_w),
+                w = kind_w
+            );
+            let target_w = (width / 4).min(20);
+            let target = truncate_str(&rule.proxy, target_w);
+            let payload = truncate_str(
+                if rule.payload.is_empty() {
+                    "*"
+                } else {
+                    &rule.payload
+                },
+                width.saturating_sub(left.width() + target.width() + 3),
+            );
+            let pad = width.saturating_sub(left.width() + payload.width() + target.width() + 2);
+            let style = Style::default().fg(if rule.disabled {
+                theme.muted
+            } else if selected {
+                theme.accent
+            } else {
+                theme.text
+            });
+            Some(ListItem::new(Line::from(vec![
+                Span::styled(left, style),
+                Span::styled(payload, style),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(
+                    format!("→ {target}"),
+                    Style::default().fg(if selected { theme.peak } else { theme.muted }),
+                ),
+            ])))
+        })
+        .collect();
+    if items.is_empty() {
         frame.render_widget(
             Paragraph::new(app.t("no_rules")).style(Style::default().fg(theme.muted)),
-            Rect::new(
-                inner.x + 1,
-                list_top,
-                inner.width.saturating_sub(2),
-                list_h.max(1),
-            ),
+            rows[2],
         );
-    } else if list_h > 0 {
-        let start = visible_list_start(app.rule_index, indexes.len(), list_h as usize);
-        let max_w = inner.width.saturating_sub(2) as usize;
-        let items: Vec<ListItem> = indexes
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(list_h as usize)
-            .filter_map(|(view_index, raw)| {
-                let rule = app.snapshot.rules.get(*raw)?;
-                let selected = view_index == app.rule_index;
-                let prefix = if rule.disabled {
-                    "× "
-                } else if selected {
-                    "› "
-                } else {
-                    "  "
-                };
-                let hits = if rule.hit_count == 0 {
-                    "   ".to_string()
-                } else {
-                    format!("{:>3}×", rule.hit_count.min(999))
-                };
-                let style = if rule.disabled {
-                    Style::default().fg(theme.muted)
-                } else if selected {
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text)
-                };
-                let left = format!("{prefix}{hits} {:<14}", truncate_str(&rule.kind, 14));
-                let proxy = truncate_str(&rule.proxy, 16);
-                let payload_budget = max_w.saturating_sub(left.width() + proxy.width() + 2);
-                let payload = truncate_str(&rule.payload, payload_budget);
-                let pad = max_w.saturating_sub(left.width() + payload.width() + proxy.width());
-                Some(ListItem::new(Line::from(vec![
-                    Span::styled(left, style),
-                    Span::styled(payload, style),
-                    Span::raw(" ".repeat(pad)),
-                    Span::styled(
-                        proxy,
-                        Style::default().fg(if selected { theme.peak } else { theme.muted }),
-                    ),
-                ])))
-            })
-            .collect();
-        frame.render_widget(
-            List::new(items),
-            Rect::new(inner.x + 1, list_top, inner.width.saturating_sub(2), list_h),
-        );
+    } else {
+        frame.render_widget(List::new(items), rows[2]);
     }
     if let Some(report) = &app.explain {
-        let y = inner.y + inner.height.saturating_sub(explain_h);
         frame.render_widget(
-            Paragraph::new(explain_lines(app, report)),
-            Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), explain_h),
+            Paragraph::new(explain_lines(app, report)).wrap(Wrap { trim: true }),
+            rows[3],
         );
     }
+    if cols.len() > 1 {
+        draw_rule_detail(frame, app, cols[1]);
+    }
+}
+
+fn draw_rule_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let inner = draw_panel(
+        frame,
+        area,
+        theme,
+        Some(panel_title(
+            if app.lang() == crate::Lang::Zh {
+                "规则详情"
+            } else {
+                "Rule details"
+            }
+            .into(),
+            theme,
+        )),
+        false,
+    );
+    let selected = app
+        .filtered_rule_indexes()
+        .get(app.rule_index)
+        .and_then(|i| app.snapshot.rules.get(*i));
+    let Some(rule) = selected else {
+        return;
+    };
+    let zh = app.lang() == crate::Lang::Zh;
+    let mut lines = vec![
+        kv(
+            theme,
+            if zh { "顺序" } else { "Order" },
+            &format!("#{}", rule.index + 1),
+        ),
+        kv(theme, if zh { "类型" } else { "Type" }, &rule.kind),
+        kv(theme, if zh { "策略" } else { "Policy" }, &rule.proxy),
+        kv(
+            theme,
+            if zh { "状态" } else { "State" },
+            if rule.disabled { "OFF" } else { "ON" },
+        ),
+        kv(
+            theme,
+            if zh { "命中" } else { "Hits" },
+            &rule.hit_count.to_string(),
+        ),
+        Line::default(),
+        Line::styled(
+            if zh { "匹配内容" } else { "Match" },
+            Style::default().fg(theme.muted),
+        ),
+        Line::from(if rule.payload.is_empty() {
+            "*"
+        } else {
+            &rule.payload
+        }),
+        Line::default(),
+        Line::styled(
+            if zh {
+                "按顺序匹配，首条命中生效。"
+            } else {
+                "Rules run in order; the first match wins."
+            },
+            Style::default().fg(theme.muted),
+        ),
+        Line::styled(
+            if zh {
+                "当前展示内核实际规则。自有规则编辑已暂停；订阅规则更新请到配置方案。"
+            } else {
+                "These are the core's effective rules. Custom editing is paused; update subscription rules under Profiles."
+            },
+            Style::default().fg(theme.muted),
+        ),
+    ];
+    if app.rule_detail {
+        lines.push(Line::default());
+        lines.push(Line::from("Esc / Enter 返回 / Back"));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).scroll((
+            if app.rule_detail {
+                app.detail_scroll
+            } else {
+                0
+            },
+            0,
+        )),
+        inner,
+    );
 }
 
 pub fn draw_providers(frame: &mut Frame, app: &App, area: Rect) {
@@ -552,31 +675,48 @@ fn draw_dns_query(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_rule_query(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
-    if area.width == 0 {
-        return;
-    }
-    if app.rule_editing || !app.rule_query.text.is_empty() {
-        let chars = app.rule_query.chars();
+    if app.rule_editing {
+        let editor = if app.rule_explaining {
+            &app.rule_target_editor
+        } else {
+            &app.rule_query
+        };
+        let label = if app.rule_explaining { "e: " } else { "/: " };
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(theme.peak)),
+            area,
+        );
+        let input = Rect::new(
+            area.x + 3,
+            area.y,
+            area.width.saturating_sub(3),
+            area.height,
+        );
+        let chars = editor.chars();
         frame.render_widget(
             Paragraph::new(Line::from(editor_line_spans(
                 &chars,
-                app.rule_query.cursor,
+                editor.cursor,
                 theme,
-                area.width as usize,
+                input.width as usize,
             ))),
-            area,
+            input,
         );
-        if app.rule_editing {
-            if let Some(cell) = editor_cursor_cell(&chars, app.rule_query.cursor, area) {
-                frame.set_cursor_position(cell);
-            }
+        if let Some(cell) = editor_cursor_cell(&chars, editor.cursor, input) {
+            frame.set_cursor_position(cell);
         }
     } else {
+        let label = if app.rule_query.text.is_empty() {
+            if app.lang() == crate::Lang::Zh {
+                "/ 搜索  e 测试目标  Enter 详情".into()
+            } else {
+                "/ Search  e Test target  Enter Details".into()
+            }
+        } else {
+            format!("/ {}    Esc 清空 / Clear", app.rule_query.text)
+        };
         frame.render_widget(
-            Paragraph::new(Line::styled(
-                "/  filter    e  explain    x  disable    F  refresh",
-                Style::default().fg(theme.muted),
-            )),
+            Paragraph::new(label).style(Style::default().fg(theme.muted)),
             area,
         );
     }
@@ -793,69 +933,7 @@ fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_profiles(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme();
-    let popup = centered_rect(78, 70, area);
-    frame.render_widget(Clear, popup);
-    let inner = draw_panel(
-        frame,
-        popup,
-        theme,
-        Some(panel_title(app.t("profiles").to_string(), theme)),
-        true,
-    );
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(2)])
-        .split(inner);
-    if app.profiles.is_empty() {
-        frame.render_widget(
-            Paragraph::new("c  save").style(Style::default().fg(theme.muted)),
-            rows[0],
-        );
-    } else {
-        let visible = rows[0].height as usize;
-        let start = visible_list_start(app.profile_index, app.profiles.len(), visible);
-        let items: Vec<ListItem> = app
-            .profiles
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(visible)
-            .map(|(index, profile)| {
-                let selected = index == app.profile_index;
-                let style = if selected {
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text)
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "{}{} {}",
-                            if selected { "› " } else { "  " },
-                            if profile.active { "●" } else { "○" },
-                            profile.name
-                        ),
-                        style,
-                    ),
-                    Span::styled(
-                        format!("  {}", truncate_str(&profile.path, 42)),
-                        Style::default().fg(theme.muted),
-                    ),
-                ]))
-            })
-            .collect();
-        frame.render_widget(List::new(items), rows[0]);
-    }
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            app.t("ov_profiles"),
-            Style::default().fg(theme.muted),
-        )),
-        rows[1],
-    );
+    crate::manage::draw_profile_hub(frame, app, area);
 }
 
 fn draw_probe(frame: &mut Frame, app: &App, area: Rect) {

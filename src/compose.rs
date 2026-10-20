@@ -20,7 +20,7 @@ use crate::{
 };
 
 pub const GENERATED_MARK: &str =
-    "# terc-generated: edit ~/.config/terc/rules.conf and nodes.conf instead of this file";
+    "# terc-generated: managed by Settings > Profiles; subscription routing is preserved";
 
 pub const DEFAULT_AI_FILTER: &str = "(?i)(🇺🇸|🇯🇵|🇸🇬|🇹🇼|美国|美國|日本|新加坡|狮城|獅城|台湾|台灣|\\b(US|USA|JP|SG|TW|SEA|LAX|SJC|NRT|HND|SIN|TPE)\\b|United States|Japan|Tokyo|Osaka|Singapore|Taiwan|Taipei|Seattle|Los Angeles|San Jose|Silicon Valley|New York|Chicago|Dallas|Ashburn)";
 pub const DEFAULT_AI_EXCLUDE: &str =
@@ -192,6 +192,35 @@ pub fn terc_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("terc")
+}
+
+/// Existing installations keep their current sources until a profile is saved.
+pub fn profile_dir(cfg: &crate::mihomo::ControllerConfig) -> PathBuf {
+    if cfg.profile_id.is_empty() {
+        terc_dir()
+    } else {
+        terc_dir().join("profiles").join(&cfg.profile_id)
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProfileSource {
+    pub name: String,
+    pub subscription_url: String,
+}
+impl ProfileSource {
+    pub fn load(dir: &Path) -> Self {
+        fs::read_to_string(dir.join("source.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        write_private(
+            &dir.join("source.json"),
+            &serde_json::to_string_pretty(self).map_err(|e| e.to_string())?,
+        )
+    }
 }
 
 pub fn rules_path(dir: &Path) -> PathBuf {
@@ -580,28 +609,20 @@ impl ComposeReport {
         let fmt = self.format.map(SubFormat::label).unwrap_or("-");
         let mut text = if zh {
             format!(
-                "订阅 {fmt} {} 节点 · 自有 {} · 私有规则 {} · AI 预设{}",
-                self.sub_nodes,
-                self.manual_nodes,
-                self.private_rules,
-                if self.ai_enabled { "开" } else { "关" }
+                "来源 {fmt} {} 节点  手动 {}  保留来源分流",
+                self.sub_nodes, self.manual_nodes
             )
         } else {
             format!(
-                "{fmt} {} nodes · own {} · rules {} · AI preset {}",
-                self.sub_nodes,
-                self.manual_nodes,
-                self.private_rules,
-                if self.ai_enabled { "on" } else { "off" }
+                "{fmt} {} nodes  Manual {}  Source routing preserved",
+                self.sub_nodes, self.manual_nodes
             )
         };
-        let skipped = self.skipped_total();
-        if skipped > 0 {
-            text.push_str(&if zh {
-                format!(" · 跳过 {skipped} 项（按 ! 看详情）")
-            } else {
-                format!(" · {skipped} skipped (press ! for details)")
-            });
+        if self.skipped_total() > 0 {
+            text.push_str(&format!(
+                "  {} skipped / 跳过（! 详情）",
+                self.skipped_total()
+            ));
         }
         text
     }
@@ -693,6 +714,13 @@ pub(crate) fn clash_item_names(chunk: &YamlChunk) -> Vec<String> {
             continue;
         };
         if let Some(inner) = body.strip_prefix('{') {
+            if let Ok(value) = serde_json::from_str::<Value>(body) {
+                if let Some(name) = value["name"].as_str() {
+                    names.push(name.to_string());
+                    pending = false;
+                }
+                continue;
+            }
             if let Some(name) = flow_value(inner, "name") {
                 names.push(name);
                 pending = false;
@@ -1140,6 +1168,31 @@ pub fn carry_runtime_state(old_base: &str, new_base: &str) -> String {
             doc = join_chunks(&chunks);
         }
     }
+    if ["mixed-port", "port", "socks-port"]
+        .iter()
+        .any(|k| find(k).is_some())
+    {
+        for key in ["mixed-port", "port", "socks-port"] {
+            if find(key).is_none() {
+                doc = crate::ops::set_top_scalar(&doc, key, "0");
+            }
+        }
+    }
+    for key in [
+        "mixed-port",
+        "port",
+        "socks-port",
+        "allow-lan",
+        "log-level",
+        "find-process-mode",
+        "tcp-concurrent",
+    ] {
+        if let Some(chunk) = find(key) {
+            if let Some((_, value)) = chunk.lines.first().and_then(|l| l.split_once(':')) {
+                doc = crate::ops::set_top_scalar(&doc, key, &clean_scalar(value));
+            }
+        }
+    }
     if find("ipv6").is_some() {
         doc = crate::ops::set_nested_bool(&doc, &["ipv6"], flags.ipv6);
     }
@@ -1424,5 +1477,399 @@ mod tests {
         let rules = PrivateRules::default();
         let (yaml, _) = compose(&input(None, &nodes, &rules)).unwrap();
         fs::write(out, yaml).unwrap();
+    }
+}
+
+/// Preserve the source's routing policy. Node-only sources get one simple selector.
+/// This is the only composition path exposed while custom routing is paused.
+pub fn compose_profile(input: &ComposeInput) -> Result<(String, ComposeReport), String> {
+    let mut report = ComposeReport::default();
+    let mut chunks = match input.subscription.and_then(|s| s.clash_doc.as_deref()) {
+        Some(doc) => split_chunks(doc),
+        None => split_chunks(&template_base(input.controller_addr, input.secret)),
+    };
+    chunks.retain(|c| c.key.as_deref() != Some("sub-rules"));
+    let mut names = HashSet::new();
+    if let Some(c) = chunks.iter().find(|c| c.key.as_deref() == Some("proxies")) {
+        names.extend(clash_item_names(c));
+    }
+    let mut new_nodes = Vec::new();
+    if let Some(sub) = input.subscription {
+        report.format = sub.format;
+        report.sub_skipped = sub.skipped.clone();
+        if sub.clash_doc.is_none() {
+            for node in &sub.proxies {
+                if let Some(name) = node["name"].as_str() {
+                    names.insert(name.to_string());
+                }
+                new_nodes.push(node.clone());
+            }
+            if !sub.groups.is_empty() {
+                chunks.push(YamlChunk {
+                    key: Some("proxy-groups".into()),
+                    lines: std::iter::once("proxy-groups:".into())
+                        .chain(sub.groups.iter().map(|g| format!("  - {g}")))
+                        .collect(),
+                });
+            }
+            if !sub.rules.is_empty() {
+                chunks.push(YamlChunk {
+                    key: Some("rules".into()),
+                    lines: std::iter::once("rules:".into())
+                        .chain(sub.rules.iter().map(|r| format!("  - {}", yaml_str(r))))
+                        .collect(),
+                });
+            }
+            if !sub.rule_providers.is_empty() {
+                chunks.push(YamlChunk {
+                    key: Some("rule-providers".into()),
+                    lines: std::iter::once("rule-providers:".into())
+                        .chain(
+                            sub.rule_providers
+                                .iter()
+                                .map(|(k, v)| format!("  {}: {v}", yaml_str(k))),
+                        )
+                        .collect(),
+                });
+            }
+        }
+    }
+    report.sub_nodes = names.len();
+    let mut manual_names = Vec::new();
+    for node in input.manual {
+        match &node.parsed {
+            Ok(node) => {
+                let mut node = node.clone();
+                let base = node["name"].as_str().unwrap_or("node").to_string();
+                let mut name = base.clone();
+                let mut n = 2;
+                while names.contains(&name) {
+                    name = format!("{base} ({n})");
+                    n += 1;
+                }
+                names.insert(name.clone());
+                manual_names.push(name.clone());
+                node["name"] = json!(name);
+                new_nodes.push(node);
+            }
+            Err(reason) => report.manual_skipped.push(reason.clone()),
+        }
+    }
+    report.manual_nodes = manual_names.len();
+    let has_providers = chunks
+        .iter()
+        .any(|c| c.key.as_deref() == Some("proxy-providers"));
+    if names.is_empty() && !has_providers {
+        return Err("没有可用节点，请在设置 → 配置方案导入订阅或节点 / Import a subscription or nodes under Settings → Profiles".into());
+    }
+    let items: Vec<_> = new_nodes.iter().map(Value::to_string).collect();
+    if let Some(c) = chunks
+        .iter_mut()
+        .find(|c| c.key.as_deref() == Some("proxies"))
+    {
+        if !items.is_empty() {
+            append_items(c, &items)?;
+        }
+    } else {
+        chunks.push(YamlChunk {
+            key: Some("proxies".into()),
+            lines: std::iter::once("proxies:".into())
+                .chain(items.iter().map(|i| format!("  - {i}")))
+                .collect(),
+        });
+    }
+    let group_names = chunks
+        .iter()
+        .find(|c| c.key.as_deref() == Some("proxy-groups"))
+        .map(clash_item_names)
+        .unwrap_or_default();
+    let fallback = if let Some(name) = group_names.first() {
+        name.clone()
+    } else {
+        let name = pick_name("PROXY", &names);
+        chunks.retain(|c| c.key.as_deref() != Some("proxy-groups"));
+        let group =
+            json!({"name":name,"type":"select","include-all":true,"exclude-filter":INFO_EXCLUDE});
+        chunks.push(YamlChunk {
+            key: Some("proxy-groups".into()),
+            lines: vec!["proxy-groups:".into(), format!("  - {group}")],
+        });
+        name
+    };
+    if !manual_names.is_empty() {
+        if let Some(c) = chunks
+            .iter_mut()
+            .find(|c| c.key.as_deref() == Some("proxy-groups"))
+        {
+            append_manual_members(c, &manual_names);
+        }
+    }
+    let has_rules = chunks
+        .iter()
+        .find(|c| c.key.as_deref() == Some("rules"))
+        .is_some_and(|c| {
+            c.lines.iter().any(|l| l.trim_start().starts_with('-'))
+                || c.lines.first().is_some_and(|l| {
+                    !clean_scalar(l.split_once(':').map(|(_, v)| v).unwrap_or("")).is_empty()
+                        && !l.trim_end().ends_with("[]")
+                })
+        });
+    if !has_rules {
+        chunks.retain(|c| c.key.as_deref() != Some("rules"));
+        chunks.push(YamlChunk {
+            key: Some("rules".into()),
+            lines: vec![
+                "rules:".into(),
+                format!("  - {}", yaml_str(&format!("MATCH,{fallback}"))),
+            ],
+        });
+    }
+    let body = crate::mihomo::normalize_subscription(&join_chunks(&chunks), input.controller_addr);
+    let body = crate::ops::set_top_scalar(&body, "secret", &json!(input.secret).to_string());
+    Ok((format!("{GENERATED_MARK}\n{body}"), report))
+}
+
+fn append_manual_members(groups: &mut YamlChunk, names: &[String]) {
+    let Some(indent) = groups
+        .lines
+        .iter()
+        .skip(1)
+        .filter(|l| l.trim_start().starts_with('-'))
+        .map(|l| leading_spaces(l))
+        .min()
+    else {
+        return;
+    };
+    let starts: Vec<_> = groups
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| leading_spaces(l) == indent && l.trim_start().starts_with('-'))
+        .map(|(i, _)| i)
+        .collect();
+    for (n, start) in starts.iter().enumerate().rev() {
+        let end = starts.get(n + 1).copied().unwrap_or(groups.lines.len());
+        let block = &groups.lines[*start..end];
+        // JSON flow groups are emitted by terc's Surge converter.
+        if let Ok(mut value) =
+            serde_json::from_str::<Value>(block[0].trim_start().trim_start_matches('-').trim())
+        {
+            if value["type"] == "select" && value["include-all"] != true {
+                if let Some(members) = value["proxies"].as_array_mut() {
+                    members.extend(names.iter().map(|n| json!(n)));
+                    groups.lines[*start] = format!("{}- {value}", " ".repeat(indent));
+                }
+            }
+            continue;
+        }
+        let flow = block[0].trim_start().trim_start_matches('-').trim();
+        if flow.starts_with('{') {
+            if flow_value(flow.trim_start_matches('{'), "type").as_deref() == Some("select")
+                && flow_value(flow.trim_start_matches('{'), "include-all").as_deref()
+                    != Some("true")
+            {
+                if let Some(begin) = flow
+                    .find("proxies:")
+                    .map(|n| n + 8)
+                    .and_then(|n| flow[n..].find('[').map(|i| i + n))
+                {
+                    if let Some(close) = flow.rfind(']') {
+                        let sep = if flow[begin + 1..close].trim().is_empty() {
+                            ""
+                        } else {
+                            ", "
+                        };
+                        groups.lines[*start] = format!(
+                            "{}- {}{sep}{}{}",
+                            " ".repeat(indent),
+                            &flow[..close],
+                            names
+                                .iter()
+                                .map(|n| yaml_str(n))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            &flow[close..]
+                        );
+                    }
+                } else if let Some(close) = flow.rfind('}') {
+                    groups.lines[*start] = format!(
+                        "{}- {}, proxies: [{}]}}",
+                        " ".repeat(indent),
+                        flow[..close].trim_end(),
+                        names
+                            .iter()
+                            .map(|n| yaml_str(n))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
+            continue;
+        }
+        if !block.iter().any(|l| l.trim() == "type: select")
+            || block.iter().any(|l| l.trim() == "include-all: true")
+        {
+            continue;
+        }
+        let Some(pos) = block
+            .iter()
+            .position(|l| l.trim_start().starts_with("proxies:"))
+        else {
+            groups.lines.insert(
+                end,
+                format!(
+                    "{}proxies: [{}]",
+                    " ".repeat(indent + 2),
+                    names
+                        .iter()
+                        .map(|n| yaml_str(n))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            continue;
+        };
+        let at = *start + pos;
+        let line = &groups.lines[at];
+        if let Some(close) = line.rfind(']') {
+            let open = line.find('[').unwrap_or(close);
+            let sep = if line[open + 1..close].trim().is_empty() {
+                ""
+            } else {
+                ", "
+            };
+            groups.lines[at] = format!(
+                "{}{sep}{}{}",
+                &line[..close],
+                names
+                    .iter()
+                    .map(|n| yaml_str(n))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                &line[close..]
+            );
+        } else {
+            let field_indent = leading_spaces(line);
+            let insert = groups.lines[at + 1..end]
+                .iter()
+                .position(|l| {
+                    !l.trim().is_empty()
+                        && leading_spaces(l) <= field_indent
+                        && !l.trim_start().starts_with('-')
+                })
+                .map(|p| at + 1 + p)
+                .unwrap_or(end);
+            let item_indent = groups.lines[at + 1..end]
+                .iter()
+                .find(|l| l.trim_start().starts_with('-'))
+                .map(|l| leading_spaces(l))
+                .unwrap_or(field_indent + 2);
+            groups.lines.splice(
+                insert..insert,
+                names
+                    .iter()
+                    .map(|n| format!("{}- {}", " ".repeat(item_indent), yaml_str(n))),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    const CLASH: &str = "mixed-port: 7897\nproxies:\n  - {name: HK, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake}\nproxy-groups:\n  - name: Airport\n    type: select\n    proxies: [HK]\nrules:\n  - DOMAIN-SUFFIX,example.org,DIRECT\n  - MATCH,Airport\n";
+    fn build(sub: Option<&Converted>, nodes: &[ManualNode]) -> String {
+        let mut rules = PrivateRules::default();
+        rules.rules.push("DOMAIN-SUFFIX,custom.invalid,AI".into());
+        compose_profile(&ComposeInput {
+            subscription: sub,
+            manual: nodes,
+            rules: &rules,
+            controller_addr: "127.0.0.1:9090",
+            secret: "local-secret",
+            test_url: "https://example.org",
+        })
+        .unwrap()
+        .0
+    }
+    fn manual() -> Vec<ManualNode> {
+        let line = "Own = ss, 192.0.2.2, 8388, encrypt-method=aes-128-gcm, password=fake";
+        vec![ManualNode {
+            line: line.into(),
+            parsed: parse_node_line(line),
+        }]
+    }
+
+    #[test]
+    fn profile_preserves_source_rules_groups_and_includes_manual_nodes() {
+        let sub = convert_subscription(CLASH).unwrap();
+        let yaml = build(Some(&sub), &manual());
+        assert!(yaml.contains("DOMAIN-SUFFIX,example.org,DIRECT"));
+        assert!(yaml.contains("MATCH,Airport"));
+        assert!(yaml.contains("proxies: [HK, \"Own\"]"));
+        assert!(!yaml.contains("custom.invalid"));
+        let chunks = split_chunks(&yaml);
+        let groups = chunks
+            .iter()
+            .find(|c| c.key.as_deref() == Some("proxy-groups"))
+            .unwrap();
+        assert_eq!(clash_item_names(groups), vec!["Airport"]);
+        assert!(yaml.contains("secret: \"local-secret\""));
+        let flow = CLASH.replace(
+            "  - name: Airport\n    type: select\n    proxies: [HK]",
+            "  - {name: Airport, type: select, proxies: [HK]}",
+        );
+        let yaml = build(Some(&convert_subscription(&flow).unwrap()), &manual());
+        assert!(yaml.contains("proxies: [HK, \"Own\"]"));
+    }
+
+    #[test]
+    fn node_only_profiles_have_one_selector_and_no_custom_presets() {
+        let yaml = build(None, &manual());
+        let chunks = split_chunks(&yaml);
+        let groups = chunks
+            .iter()
+            .find(|c| c.key.as_deref() == Some("proxy-groups"))
+            .unwrap();
+        assert_eq!(clash_item_names(groups), vec!["PROXY"]);
+        assert!(yaml.contains("MATCH,PROXY"));
+        assert!(!yaml.contains("custom.invalid"));
+        assert!(!yaml.contains("GEOIP,CN"));
+        let copied = carry_runtime_state("port: 7890\nsocks-port: 7891\n", &yaml);
+        assert!(copied.contains("mixed-port: 0"));
+        crate::mihomo::validate_listener_ports(&copied).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an installed Mihomo; validates temporary configs only"]
+    fn real_core_accepts_profile_sources() {
+        let bin = crate::mihomo::discover_mihomo_binary().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("terc-profile-validation-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let surge="[Proxy]\nJP = trojan, 192.0.2.3, 443, password=fake\n[Proxy Group]\nAirport = select, JP\n[Rule]\nDOMAIN-SUFFIX,example.org,DIRECT\nFINAL,Airport\n";
+        for source in [None, Some(CLASH), Some(surge)] {
+            let converted = source.map(|s| convert_subscription(s).unwrap());
+            let yaml = build(converted.as_ref(), &manual());
+            crate::mihomo::validate_listener_ports(&yaml).unwrap();
+            let path = dir.join("config.yaml");
+            fs::write(&path, &yaml).unwrap();
+            let out = std::process::Command::new(&bin)
+                .arg("-t")
+                .arg("-d")
+                .arg(&dir)
+                .arg("-f")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

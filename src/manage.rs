@@ -1,4 +1,4 @@
-//! Own nodes (N) and private rules / AI routing (R) overlays.
+//! Unified profiles and manual-node management. Legacy private-rule tools are not exposed.
 //!
 //! Every change is written to `~/.config/terc/` first, then the config is
 //! regenerated, validated with `mihomo -t`, and hot-reloaded in the background.
@@ -16,7 +16,7 @@ use ratatui::{
 use crate::{
     compose::{
         add_manual_node, load_manual_nodes, parse_rule_input, remove_manual_node, rule_target,
-        set_rule_target, terc_dir, PrivateRules, AI_PRESET, POLICY_TARGETS,
+        set_rule_target, PrivateRules, AI_PRESET, POLICY_TARGETS,
     },
     mihomo::{is_info_pseudo_node, test_node_async},
     subconv::node_summary,
@@ -31,6 +31,8 @@ use crate::{
 pub enum ManageInput {
     AddNode,
     AddRule,
+    AddProfile,
+    RenameProfile,
 }
 
 /// Pick the Chinese, English or Japanese string for the current language.
@@ -53,7 +55,7 @@ const BUILTIN_POLICIES: &[&str] = &[
 
 impl App {
     pub fn open_own_nodes(&mut self) {
-        self.own_nodes = load_manual_nodes(&terc_dir());
+        self.own_nodes = load_manual_nodes(&crate::compose::profile_dir(&self.config.controller));
         self.own_node_index = self
             .own_node_index
             .min(self.own_nodes.len().saturating_sub(1));
@@ -62,7 +64,8 @@ impl App {
     }
 
     pub fn open_private_rules(&mut self) {
-        self.private_rules = PrivateRules::load(&terc_dir());
+        self.private_rules =
+            PrivateRules::load(&crate::compose::profile_dir(&self.config.controller));
         self.private_rule_index = self
             .private_rule_index
             .min(self.private_rules.rules.len().saturating_sub(1));
@@ -71,7 +74,7 @@ impl App {
         self.overlay = Overlay::PrivateRules;
     }
 
-    /// Regenerate config.yaml from the cached subscription + own nodes + rules.
+    /// Regenerate config.yaml from the cached subscription + manual nodes + rules.
     pub fn apply_composed(&mut self) {
         if self.action_busy {
             self.pending_regen = true;
@@ -109,6 +112,25 @@ impl App {
             return;
         }
         match kind {
+            ManageInput::AddProfile => self.import_profile(&text),
+            ManageInput::RenameProfile => {
+                if let Some(profile) = self.profiles.get(self.profile_index).cloned() {
+                    let dir = std::path::Path::new(&profile.path).with_extension("");
+                    let mut source = crate::compose::ProfileSource::load(&dir);
+                    source.name = text;
+                    match source.save(&dir) {
+                        Ok(()) => {
+                            if profile.active {
+                                self.config.active_profile_label = source.name;
+                                self.save_preferences();
+                            }
+                            self.manage_input = None;
+                            self.open_profiles();
+                        }
+                        Err(err) => self.set_status(&err, true),
+                    }
+                }
+            }
             ManageInput::AddNode => self.add_own_nodes(&text),
             ManageInput::AddRule => match parse_rule_input(&text) {
                 Ok(rule) => {
@@ -129,7 +151,11 @@ impl App {
 
     /// Add one or more pasted nodes (one per line). Never echoes the line.
     pub fn add_own_nodes(&mut self, text: &str) {
-        let dir = terc_dir();
+        if self.action_busy {
+            self.set_status("请等待当前操作完成 / Wait for the current operation", true);
+            return;
+        }
+        let dir = crate::compose::profile_dir(&self.config.controller);
         let mut added = Vec::new();
         let mut errors = Vec::new();
         // wg-quick .conf or Surge `[WireGuard x]` blocks become wireguard:// lines.
@@ -174,12 +200,20 @@ impl App {
     }
 
     pub fn remove_selected_own_node(&mut self) {
+        if self.action_busy {
+            self.set_status("请等待当前操作完成 / Wait for the current operation", true);
+            return;
+        }
         if self.own_nodes.is_empty() {
             return;
         }
-        match remove_manual_node(&terc_dir(), self.own_node_index) {
+        match remove_manual_node(
+            &crate::compose::profile_dir(&self.config.controller),
+            self.own_node_index,
+        ) {
             Ok(_) => {
-                self.own_nodes = load_manual_nodes(&terc_dir());
+                self.own_nodes =
+                    load_manual_nodes(&crate::compose::profile_dir(&self.config.controller));
                 self.own_node_index = self
                     .own_node_index
                     .min(self.own_nodes.len().saturating_sub(1));
@@ -217,7 +251,10 @@ impl App {
     }
 
     fn save_rules_and_apply(&mut self) {
-        if let Err(err) = self.private_rules.save(&terc_dir()) {
+        if let Err(err) = self
+            .private_rules
+            .save(&crate::compose::profile_dir(&self.config.controller))
+        {
             self.set_status(&err, true);
             return;
         }
@@ -329,7 +366,8 @@ impl App {
 
     pub fn open_ai_picker(&mut self) {
         if self.own_nodes.is_empty() {
-            self.own_nodes = load_manual_nodes(&terc_dir());
+            self.own_nodes =
+                load_manual_nodes(&crate::compose::profile_dir(&self.config.controller));
         }
         self.ai_picker_selected = self.private_rules.ai.members.clone();
         self.ai_picker_index = 0;
@@ -395,6 +433,9 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) {
 pub fn handle_manage_paste(app: &mut App, text: &str) {
     match app.manage_input {
         Some(ManageInput::AddNode) if text.trim().lines().count() > 1 => app.add_own_nodes(text),
+        Some(ManageInput::AddProfile) if text.trim().lines().count() > 1 => {
+            app.import_profile(text)
+        }
         Some(_) => {
             app.manage_editor.insert_text(text.trim());
         }
@@ -460,7 +501,8 @@ pub fn handle_private_rules_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('b') => app.toggle_subscription_rules(),
         KeyCode::Char('c') => app.toggle_cn_direct(),
         KeyCode::Enter => {
-            app.private_rules = PrivateRules::load(&terc_dir());
+            app.private_rules =
+                PrivateRules::load(&crate::compose::profile_dir(&app.config.controller));
             app.apply_composed();
         }
         _ => {}
@@ -519,15 +561,20 @@ fn hint(frame: &mut Frame, app: &App, area: Rect, text: &str) {
 }
 
 pub fn draw_own_nodes(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme();
     let popup = centered_rect(84, 72, area);
     frame.render_widget(Clear, popup);
-    let title = format!(
-        "{} · {}",
-        l3(app, "自有节点", "Own nodes", "自前ノード"),
-        app.own_nodes.len()
+    let inner = draw_panel(
+        frame,
+        popup,
+        app.theme(),
+        Some(panel_title("手动节点 / Manual nodes".into(), app.theme())),
+        true,
     );
-    let inner = draw_panel(frame, popup, theme, Some(panel_title(title, theme)), true);
+    draw_manual_nodes_content(frame, app, inner);
+}
+
+fn draw_manual_nodes_content(frame: &mut Frame, app: &App, inner: Rect) {
+    let theme = app.theme();
     let adding = app.manage_input == Some(ManageInput::AddNode);
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -542,8 +589,8 @@ pub fn draw_own_nodes(frame: &mut Frame, app: &App, area: Rect) {
             Line::styled(
                 l3(
                     app,
-                    "还没有自有节点。按 a 粘贴一条 Surge 节点行，或 ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// wireguard:// ssh:// 链接；WireGuard 也可直接粘贴整段 wg-quick .conf。",
-                    "No own nodes yet. Press a and paste a Surge proxy line or an ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// wireguard:// ssh:// link; for WireGuard you can also paste a whole wg-quick .conf.",
+                    "还没有手动节点。按 a 粘贴一条 Surge 节点行，或 ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// wireguard:// ssh:// 链接；WireGuard 也可直接粘贴整段 wg-quick .conf。",
+                    "No manual nodes yet. Press a and paste a Surge proxy line or an ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// wireguard:// ssh:// link; for WireGuard you can also paste a whole wg-quick .conf.",
                     "自前ノードなし。a で Surge 行または ss:// などのリンクを貼り付け。",
                 ),
                 Style::default().fg(theme.text),
@@ -552,8 +599,8 @@ pub fn draw_own_nodes(frame: &mut Frame, app: &App, area: Rect) {
             Line::styled(
                 l3(
                     app,
-                    "也可以直接编辑 ~/.config/terc/nodes.conf（一行一个，只存在本机），改完回到这里按 N 再开。",
-                    "Or edit ~/.config/terc/nodes.conf by hand (one per line, local only).",
+                    "节点单独保存在当前配置方案中；修改后校验并应用。",
+                    "Manual nodes belong to the active profile. Changes are validated before applying.",
                     "~/.config/terc/nodes.conf を直接編集しても構いません。",
                 ),
                 Style::default().fg(theme.muted),
@@ -637,8 +684,8 @@ pub fn draw_own_nodes(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             l3(
                 app,
-                "a 添加  d 删除  r/Enter 测速  A 全部测速  Esc 关闭 · 密码只存本机、不显示",
-                "a add  d delete  r/Enter test  A test all  Esc close · secrets stay local, never shown",
+                "a 添加  d 删除  r/Enter 测速  A 全部测速  Esc 关闭  密码只存本机、不显示",
+                "a add  d delete  r/Enter test  A test all  Esc close  secrets stay local, never shown",
                 "a 追加  d 削除  r 測定  A 全測定  Esc 閉じる",
             )
         },
@@ -759,7 +806,7 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
             theme,
             Some(panel_title(
                 format!(
-                    "{} · {}",
+                    "{}  {}",
                     l3(app, "选择 AI 成员", "Pick AI members", "AI メンバー選択"),
                     app.ai_picker_selected.len()
                 ),
@@ -774,8 +821,8 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
                 list_inner,
                 l3(
                     app,
-                    "没有候选：先启动内核（K）或添加自有节点（N）",
-                    "No candidates: start the core (K) or add own nodes (N)",
+                    "没有候选：先启动内核（K）或添加手动节点（N）",
+                    "No candidates: start the core (K) or add manual nodes (N)",
                     "候補なし",
                 ),
             );
@@ -821,7 +868,7 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
             theme,
             Some(panel_title(
                 format!(
-                    "{} · {}",
+                    "{}  {}",
                     l3(app, "私有规则", "Private rules", "プライベートルール"),
                     rules.rules.len()
                 ),
@@ -913,5 +960,212 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
                 "a 追加  d 削除  J/K 並べ替え  t 宛先  Enter 再適用  Esc 閉じる",
             )
         },
+    );
+}
+
+pub fn handle_profiles_key(app: &mut App, key: KeyEvent) {
+    if app.manage_input.is_some() {
+        handle_editor_key(app, key);
+        return;
+    }
+    match key.code {
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.profile_page =
+                (app.profile_page + if key.code == KeyCode::Tab { 1 } else { 2 }) % 3;
+        }
+        KeyCode::Char('1'..='3') => {
+            if let KeyCode::Char(c) = key.code {
+                app.profile_page = (c as u8 - b'1') as usize;
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q' | 'f') => app.close_overlay(),
+        _ => match app.profile_page {
+            0 => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.profile_index = app
+                        .profile_index
+                        .checked_sub(1)
+                        .unwrap_or(app.profiles.len().saturating_sub(1))
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !app.profiles.is_empty() {
+                        app.profile_index = (app.profile_index + 1) % app.profiles.len();
+                    }
+                }
+                KeyCode::Enter => app.switch_selected_profile(),
+                KeyCode::Char('a') => app.start_manage_input(ManageInput::AddProfile),
+                KeyCode::Char('n') => {
+                    if let Some(profile) = app.profiles.get(app.profile_index).cloned() {
+                        app.start_manage_input(ManageInput::RenameProfile);
+                        app.manage_editor.load(&profile.label);
+                    }
+                }
+                KeyCode::Char('c') => {
+                    if !app.action_busy {
+                        app.save_profile_copy();
+                        app.open_profiles();
+                    }
+                }
+                _ => {}
+            },
+            1 => match key.code {
+                KeyCode::Char('e') => app.open_setup(app.screen),
+                KeyCode::Char('u') => app.update_subscription(),
+                _ => {}
+            },
+            _ => handle_own_nodes_key(app, key),
+        },
+    }
+}
+
+pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let popup = if area.width < 75 || area.height < 22 {
+        area
+    } else {
+        centered_rect(90, 86, area)
+    };
+    frame.render_widget(Clear, popup);
+    let inner = draw_panel(
+        frame,
+        popup,
+        theme,
+        Some(panel_title(
+            l3(app, "配置方案", "Profiles", "プロファイル").into(),
+            theme,
+        )),
+        true,
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let tabs = if app.lang() == Lang::Zh {
+        ["方案列表", "当前订阅", "手动节点"]
+    } else {
+        ["Profiles", "Subscription", "Manual nodes"]
+    };
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 3); 3])
+        .split(rows[0]);
+    for (i, name) in tabs.iter().enumerate() {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} {} {}",
+                if app.profile_page == i { "▶" } else { " " },
+                i + 1,
+                name
+            ))
+            .style(selected_style(app, app.profile_page == i)),
+            cols[i],
+        );
+    }
+    match app.profile_page {
+        0 => {
+            let adding = matches!(
+                app.manage_input,
+                Some(ManageInput::AddProfile | ManageInput::RenameProfile)
+            );
+            let body = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Min(0),
+                    Constraint::Length(if adding { 4 } else { 2 }),
+                    Constraint::Length(1),
+                ])
+                .split(rows[1]);
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{} {}",
+                    l3(app, "当前方案", "Active profile", "使用中"),
+                    app.profile_display_name()
+                ))
+                .style(Style::default().fg(theme.peak)),
+                body[0],
+            );
+            if app.profiles.is_empty() {
+                frame.render_widget(Paragraph::new(l3(app,"还没有保存的方案。c 保存当前配置；a 导入订阅或节点。","No saved profiles. c saves the current configuration; a imports a subscription or nodes.","c で保存、a で追加")).wrap(Wrap{trim:true}),body[1]);
+            } else {
+                let visible = body[1].height as usize;
+                let start = visible_list_start(app.profile_index, app.profiles.len(), visible);
+                let items: Vec<_> = app
+                    .profiles
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(visible)
+                    .map(|(i, p)| {
+                        ListItem::new(Line::styled(
+                            format!(
+                                "{} {} {}",
+                                if i == app.profile_index { "▶" } else { " " },
+                                if p.active { "●" } else { "○" },
+                                p.label
+                            ),
+                            selected_style(app, i == app.profile_index),
+                        ))
+                    })
+                    .collect();
+                frame.render_widget(List::new(items), body[1]);
+            }
+            if adding {
+                draw_input(
+                    frame,
+                    app,
+                    body[2],
+                    if app.manage_input == Some(ManageInput::RenameProfile) {
+                        l3(app, "方案名称", "Profile name", "プロファイル名")
+                    } else {
+                        l3(
+                            app,
+                            "粘贴订阅地址或节点（支持多行 / WireGuard 配置）",
+                            "Paste subscription URL or nodes (multi-line / WireGuard supported)",
+                            "URL / ノードを貼り付け",
+                        )
+                    },
+                );
+            } else {
+                frame.render_widget(Paragraph::new(l3(app,"每个方案独立保存订阅来源和手动节点。自有规则编辑暂缓，优先使用来源分流。","Each profile keeps its subscription and manual nodes separately. Source routing is preserved; custom rule editing is paused.","プロファイルごとにソースを保存")).style(Style::default().fg(theme.muted)).wrap(Wrap{trim:true}),body[2]);
+            }
+            frame.render_widget(
+                Paragraph::new(if adding {
+                    "Enter 确认 / Confirm   Esc 取消 / Cancel"
+                } else {
+                    l3(
+                        app,
+                        "a 导入  c 副本  n 改名  Enter 应用",
+                        "a Import  c Copy  n Rename  Enter Apply",
+                        "a 追加  c コピー  Enter 適用",
+                    )
+                }),
+                body[3],
+            );
+        }
+        1 => {
+            let url = if app.config.controller.subscription_url.is_empty() {
+                "—".into()
+            } else {
+                crate::mask_url(&app.config.controller.subscription_url)
+            };
+            let lines=vec![Line::from(app.profile_display_name()),Line::default(),Line::styled(l3(app,"订阅地址","Subscription URL","URL"),Style::default().fg(theme.muted)),Line::from(url),Line::default(),Line::from(l3(app,"e 编辑当前来源   u 更新订阅","e Edit source   u Update subscription","e 編集  u 更新")),Line::default(),Line::styled(l3(app,"切换订阅请在方案列表按 a 导入新方案。来源自带的规则与策略组将保留。","Use a on the Profiles tab to import another source. Its rules and groups are preserved.","a で新しいソースを追加"),Style::default().fg(theme.muted))];
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[1]);
+        }
+        _ => draw_manual_nodes_content(frame, app, rows[1]),
+    }
+    frame.render_widget(
+        Paragraph::new(l3(
+            app,
+            "Tab 切换   1/2/3 分类   Esc 返回",
+            "Tab Switch   1/2/3 Tabs   Esc Back",
+            "Tab 切替  Esc 戻る",
+        ))
+        .style(Style::default().fg(theme.muted)),
+        rows[2],
     );
 }

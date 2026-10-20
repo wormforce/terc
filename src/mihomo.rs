@@ -81,6 +81,7 @@ pub struct CoreSnapshot {
     pub socks_port: u16,
     pub mixed_port: u16,
     pub allow_lan: bool,
+    pub config_values: HashMap<String, String>,
     pub sysproxy_enabled: bool,
     pub network_service: String,
     pub groups: Vec<ProxyGroup>,
@@ -155,6 +156,8 @@ pub struct ControllerConfig {
     pub subscription_url: String,
     pub test_url: String,
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub profile_id: String,
 }
 
 impl Default for ControllerConfig {
@@ -166,6 +169,7 @@ impl Default for ControllerConfig {
             subscription_url: String::new(),
             test_url: "http://www.gstatic.com/generate_204".to_string(),
             timeout_ms: 4000,
+            profile_id: String::new(),
         }
     }
 }
@@ -191,18 +195,7 @@ pub fn config_file_exists(cfg: &ControllerConfig) -> bool {
 }
 
 pub fn normalize_subscription(raw: &str, controller_addr: &str) -> String {
-    let normalized = raw.replace(
-        "external-controller: :9090",
-        "external-controller: 127.0.0.1:9090",
-    );
-    let has_controller = normalized
-        .lines()
-        .any(|line| line.starts_with("external-controller:"));
-    if has_controller {
-        normalized
-    } else {
-        format!("external-controller: {controller_addr}\n{normalized}")
-    }
+    crate::ops::set_top_scalar(raw, "external-controller", controller_addr)
 }
 pub fn percent_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 3);
@@ -430,6 +423,58 @@ fn local_flags(cfg: &ControllerConfig) -> RuntimeFlags {
 }
 
 pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
+    let mut snapshot = fetch_core_snapshot(cfg);
+    if let Ok(raw) = read_config_text(cfg) {
+        for chunk in crate::ops::split_chunks(&raw) {
+            if let Some(key) = chunk.key {
+                if ![
+                    "mode",
+                    "port",
+                    "socks-port",
+                    "mixed-port",
+                    "log-level",
+                    "find-process-mode",
+                    "allow-lan",
+                    "tcp-concurrent",
+                ]
+                .contains(&key.as_str())
+                {
+                    continue;
+                }
+                if let Some((_, value)) = chunk.lines.first().and_then(|l| l.split_once(':')) {
+                    let value = crate::ops::clean_scalar(value);
+                    if !value.is_empty() {
+                        snapshot.config_values.insert(key, value);
+                    }
+                }
+            }
+        }
+    }
+    if !snapshot.running {
+        let port = |key: &str| {
+            snapshot
+                .config_values
+                .get(key)
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(0)
+        };
+        snapshot.http_port = port("port");
+        snapshot.socks_port = port("socks-port");
+        snapshot.mixed_port = port("mixed-port");
+        snapshot.allow_lan = snapshot
+            .config_values
+            .get("allow-lan")
+            .is_some_and(|v| v == "true");
+        snapshot.mode = snapshot
+            .config_values
+            .get("mode")
+            .cloned()
+            .unwrap_or_else(|| "rule".into());
+    }
+    snapshot
+}
+
+fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
     let timeout = Duration::from_millis(700);
     let (net_service, sysproxy_enabled) = detect_sysproxy();
     let core_bin_path = discover_mihomo_binary()
@@ -456,8 +501,8 @@ pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut mode = "Rule".to_string();
-    let mut http_port = 7890;
-    let mut socks_port = 7891;
+    let mut http_port = 0;
+    let mut socks_port = 0;
     let mut mixed_port = 0;
     let mut allow_lan = false;
 
@@ -468,8 +513,8 @@ pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
             if let Some(m) = v.get("mode").and_then(Value::as_str) {
                 mode = m.to_string();
             }
-            http_port = v.get("port").and_then(Value::as_u64).unwrap_or(7890) as u16;
-            socks_port = v.get("socks-port").and_then(Value::as_u64).unwrap_or(7891) as u16;
+            http_port = v.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+            socks_port = v.get("socks-port").and_then(Value::as_u64).unwrap_or(0) as u16;
             mixed_port = v.get("mixed-port").and_then(Value::as_u64).unwrap_or(0) as u16;
             allow_lan = v.get("allow-lan").and_then(Value::as_bool).unwrap_or(false);
             apply_general_json(&mut flags, &v);
@@ -675,6 +720,7 @@ pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
         socks_port,
         mixed_port,
         allow_lan,
+        config_values: HashMap::new(),
         sysproxy_enabled,
         network_service: net_service,
         groups,
@@ -998,6 +1044,89 @@ pub fn discover_mihomo_binary() -> Option<PathBuf> {
     None
 }
 
+pub fn validate_listener_ports(text: &str) -> Result<(), String> {
+    let mut ports = HashMap::new();
+    for chunk in crate::ops::split_chunks(text) {
+        let Some(key) = chunk.key else {
+            continue;
+        };
+        if !["port", "socks-port", "mixed-port"].contains(&key.as_str()) {
+            continue;
+        }
+        let port = chunk
+            .lines
+            .first()
+            .and_then(|l| l.split_once(':'))
+            .and_then(|(_, v)| crate::ops::clean_scalar(v).parse::<u16>().ok())
+            .unwrap_or(0);
+        if port == 0 {
+            continue;
+        }
+        if let Some(other) = ports.insert(port, key.clone()) {
+            return Err(format!("代理端口冲突 / Proxy port conflict: {other} and {key} both use {port}. Set different ports or disable one listener with 0 under Settings → Proxy."));
+        }
+    }
+    Ok(())
+}
+
+fn check_startup_ports(text: &str) -> Result<(), String> {
+    for chunk in crate::ops::split_chunks(text) {
+        let Some(key) = chunk.key else {
+            continue;
+        };
+        if !["port", "socks-port", "mixed-port"].contains(&key.as_str()) {
+            continue;
+        }
+        let port = chunk
+            .lines
+            .first()
+            .and_then(|l| l.split_once(':'))
+            .and_then(|(_, v)| crate::ops::clean_scalar(v).parse::<u16>().ok())
+            .unwrap_or(0);
+        if port != 0 {
+            // The authorized core may bind privileged ports that the UI cannot.
+            if let Err(e) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                if e.kind() != io::ErrorKind::PermissionDenied {
+                    return Err(format!("{key} :{port} 无法使用 / Port is occupied or unavailable: {e}. Close the other proxy or change this port under Settings → Proxy."));
+                }
+            }
+        }
+    }
+    let dns = crate::ops::parse_dns_block(text);
+    if dns.enable {
+        if let Ok(address) = dns.listen.parse::<SocketAddr>() {
+            if let Err(e) = std::net::TcpListener::bind(address) {
+                if e.kind() != io::ErrorKind::PermissionDenied {
+                    return Err(format!("DNS {} 已被占用 / DNS port is occupied or unavailable: {e}. Check for another Mihomo service. No additional core was started.",dns.listen));
+                }
+            }
+            if let Err(e) = std::net::UdpSocket::bind(address) {
+                if e.kind() != io::ErrorKind::PermissionDenied {
+                    return Err(format!(
+                        "DNS {} 已被占用 / DNS port is occupied or unavailable: {e}",
+                        dns.listen
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn core_log_excerpt(cfg: &ControllerConfig) -> String {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(Path::new(&cfg.config_dir).join("terc-core.log")) else {
+        return String::new();
+    };
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(size.saturating_sub(8192)));
+    let mut tail = Vec::new();
+    let _ = file.read_to_end(&mut tail);
+    let text = String::from_utf8_lossy(&tail);
+    let lines: Vec<_> = text.lines().collect();
+    lines[lines.len().saturating_sub(24)..].join("\n")
+}
+
 pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     let bin = discover_mihomo_binary()
         .ok_or("mihomo binary not found  download the managed core first")?;
@@ -1018,10 +1147,25 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     ) {
         return Ok("Mihomo controller is already running".into());
     }
+    if let Ok((pid, _)) = crate::privilege::managed_core(cfg) {
+        return Err(format!("Mihomo (PID {pid}) is still running but its controller is not responding. Stop the existing core before restarting.\n{}", core_log_excerpt(cfg)));
+    }
+    if let Ok(address) = cfg.addr.parse::<SocketAddr>() {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(400)).is_ok() {
+            return Err(format!("Controller {} is occupied but did not accept this client. Check the controller secret or existing Mihomo service. No additional core was started.", cfg.addr));
+        }
+    }
+    let raw = read_config_text(cfg)?;
+    validate_listener_ports(&raw)?;
+    check_startup_ports(&raw)?;
     if cfg!(target_os = "macos") && local_flags(cfg).tun_enabled {
         return crate::privilege::start_core(cfg, None);
     }
     let log_path = Path::new(&cfg.config_dir).join("terc-core.log");
+    if log_path.is_file() {
+        fs::rename(&log_path, log_path.with_file_name("terc-core.previous.log"))
+            .map_err(|e| e.to_string())?;
+    }
     let log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let mut child = Command::new(&bin)
         .arg("-d")
@@ -1069,12 +1213,14 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
         }
         thread::sleep(Duration::from_millis(200));
     }
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
+    // A failed start must not leave an orphan that collides with the next attempt.
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(&pid_path);
     Err(format!(
-        "Mihomo process started but controller is not ready; inspect {}",
-        log_path.display()
+        "Mihomo controller was not ready; the failed startup was stopped. Log: {}\n{}",
+        log_path.display(),
+        core_log_excerpt(cfg)
     ))
 }
 
@@ -1148,7 +1294,7 @@ pub fn regenerate_config(
     zh: bool,
 ) -> Result<String, String> {
     use crate::compose;
-    let dir = compose::terc_dir();
+    let dir = compose::profile_dir(cfg);
     let old = read_config_text(cfg).ok();
     let has_url = !cfg.subscription_url.trim().is_empty();
     let need_download = refresh
@@ -1160,13 +1306,20 @@ pub fn regenerate_config(
     } else {
         None
     };
-    let sub = compose::load_subscription_source(&dir, fresh, old.as_deref())?;
+    let source_config = if cfg.profile_id.is_empty() {
+        old.as_deref()
+    } else {
+        None
+    };
+    let sub = if let Some(raw) = &fresh {
+        Some(crate::subconv::convert_subscription(raw)?)
+    } else {
+        compose::load_subscription_source(&dir, None, source_config)?
+    };
     let manual = compose::load_manual_nodes(&dir);
-    if !compose::rules_path(&dir).is_file() {
-        compose::PrivateRules::default().save(&dir)?;
-    }
-    let rules = compose::PrivateRules::load(&dir);
-    let (base, report) = compose::compose(&compose::ComposeInput {
+    // Custom rules and AI presets are paused. The source owns routing policy.
+    let rules = compose::PrivateRules::default();
+    let (base, report) = compose::compose_profile(&compose::ComposeInput {
         subscription: sub.as_ref(),
         manual: &manual,
         rules: &rules,
@@ -1183,6 +1336,17 @@ pub fn regenerate_config(
     };
     let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
     install_config(cfg, &generated, running)?;
+    if let Some(raw) = fresh {
+        compose::write_private(&compose::cache_path(&dir), &raw)?;
+    }
+    if !cfg.profile_id.is_empty() {
+        compose::write_private(
+            &compose::terc_dir()
+                .join("profiles")
+                .join(format!("{}.yaml", cfg.profile_id)),
+            &generated,
+        )?;
+    }
     let tail = match (running, zh) {
         (true, true) => " — 已校验并热重载",
         (true, false) => " — validated & hot-reloaded",
@@ -1195,6 +1359,7 @@ pub fn regenerate_config(
 /// Validate before replacing the active file. Keep disk and runtime on the old
 /// configuration if the controller rejects the candidate.
 pub fn install_config(cfg: &ControllerConfig, text: &str, running: bool) -> Result<(), String> {
+    validate_listener_ports(text)?;
     fs::create_dir_all(&cfg.config_dir).map_err(|e| e.to_string())?;
     let candidate = Path::new(&cfg.config_dir).join(".terc-candidate.yaml");
     fs::write(&candidate, text).map_err(|e| e.to_string())?;
@@ -1652,7 +1817,7 @@ pub fn reload_config(cfg: &ControllerConfig) -> Result<(), String> {
         "PUT",
         "/configs?force=true",
         Some(&body),
-        Duration::from_millis(2500),
+        Duration::from_millis(cfg.timeout_ms.max(10_000)),
     ) {
         Ok((status, _)) if (200..300).contains(&status) => Ok(()),
         Ok((status, text)) => Err(format!("reload HTTP {status} {}", brief(&text))),
@@ -2145,6 +2310,7 @@ mod tests {
                         }
                         Err(e) => panic!("{e}"),
                     };
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
@@ -2295,7 +2461,8 @@ mod tests {
     fn normalize_subscription_adds_missing_controller() {
         let raw = "mixed-port: 7890\nproxies:\n  - name: a\n";
         let out = normalize_subscription(raw, "127.0.0.1:9090");
-        assert!(out.starts_with("external-controller: 127.0.0.1:9090\nmixed-port: 7890"));
+        assert!(out.contains("external-controller: 127.0.0.1:9090"));
+        assert!(out.contains("mixed-port: 7890"));
     }
 
     #[test]
@@ -2420,7 +2587,7 @@ mod tests {
         let msg = regenerate_config(&cfg, &[], false, false, true).unwrap();
         assert!(msg.contains("URI 1 节点"), "{msg}");
         assert!(msg.contains("跳过 1"), "{msg}");
-        assert!(terc.join("rules.conf").is_file());
+        assert!(!terc.join("rules.conf").is_file());
         persist_nested_bool(&cfg, &["sniffer", "enable"], true).unwrap();
         let modules = crate::ops::builtin_modules();
         regenerate_config(&cfg, &modules[..1], false, false, false).unwrap();
@@ -2429,5 +2596,31 @@ mod tests {
         assert!(crate::ops::parse_yaml_flags(&text).sniffing);
         assert!(text.contains("US-Own"));
         fs::remove_dir_all(home).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+    #[test]
+    fn duplicate_proxy_ports_are_rejected_and_disabled_ports_are_allowed() {
+        let err =
+            validate_listener_ports("port: 7890\nmixed-port: 7890\nsocks-port: 0\n").unwrap_err();
+        assert!(err.contains("port and mixed-port"));
+        validate_listener_ports("port: 0\nsocks-port: 0\nmixed-port: 7890\n").unwrap();
+        validate_listener_ports("port: 7890\nsocks-port: 7891\nmixed-port: 7892\n").unwrap();
+    }
+    #[test]
+    fn occupied_proxy_and_dns_ports_fail_before_launching_a_core() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(check_startup_ports(&format!("mixed-port: {port}\n"))
+            .unwrap_err()
+            .contains("occupied"));
+        assert!(check_startup_ports(&format!(
+            "dns:\n  enable: true\n  listen: 127.0.0.1:{port}\n"
+        ))
+        .unwrap_err()
+        .contains("DNS"));
     }
 }
