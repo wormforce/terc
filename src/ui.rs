@@ -809,7 +809,12 @@ fn draw_groups_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let visible_h = inner.height as usize;
-    let start = visible_list_start(app.group_index, app.snapshot.groups.len(), visible_h);
+    let start = proxy_list_start(
+        &mut app.group_scroll,
+        app.group_index,
+        app.snapshot.groups.len(),
+        visible_h,
+    );
     app.proxy_hits
         .push((inner, FocusPane::Groups, start, app.snapshot.groups.len()));
     let max_w = inner.width.saturating_sub(2) as usize;
@@ -905,7 +910,12 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let visible_h = inner.height as usize;
-    let start = visible_list_start(app.node_index, group.all.len(), visible_h);
+    let start = proxy_list_start(
+        &mut app.node_scroll,
+        app.node_index,
+        group.all.len(),
+        visible_h,
+    );
     app.proxy_hits
         .push((inner, FocusPane::Nodes, start, group.all.len()));
     let max_w = inner.width.saturating_sub(2) as usize;
@@ -1634,6 +1644,25 @@ fn draw_setup(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(foot).wrap(Wrap { trim: true }), rows[3]);
 }
 
+fn proxy_list_start(
+    offset: &mut usize,
+    selected: usize,
+    len: usize,
+    visible_height: usize,
+) -> usize {
+    *offset = (*offset).min(len.saturating_sub(visible_height));
+    if visible_height == 0 {
+        return *offset;
+    }
+    let selected = selected.min(len.saturating_sub(1));
+    if selected < *offset {
+        *offset = selected;
+    } else if selected >= offset.saturating_add(visible_height) {
+        *offset = selected + 1 - visible_height;
+    }
+    *offset
+}
+
 pub fn visible_list_start(selected: usize, len: usize, visible_height: usize) -> usize {
     if visible_height == 0 || len <= visible_height {
         return 0;
@@ -1687,6 +1716,16 @@ pub fn truncate_str(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_viewport_only_scrolls_to_reveal_selection_and_clamps_on_resize() {
+        let mut offset = 20;
+        assert_eq!(proxy_list_start(&mut offset, 22, 40, 10), 20);
+        assert_eq!(proxy_list_start(&mut offset, 19, 40, 10), 19);
+        assert_eq!(proxy_list_start(&mut offset, 29, 40, 10), 20);
+        assert_eq!(proxy_list_start(&mut offset, 29, 40, 30), 10);
+        assert_eq!(proxy_list_start(&mut offset, 4, 5, 10), 0);
+    }
 
     #[test]
     fn input_viewport_keeps_cursor_visible_when_scrolled() {

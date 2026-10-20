@@ -294,6 +294,8 @@ pub struct App {
     pub focus: FocusPane,
     pub group_index: usize,
     pub node_index: usize,
+    pub group_scroll: usize,
+    pub node_scroll: usize,
     pub conn_index: usize,
     pub connection_detail: bool,
     pub detail_scroll: u16,
@@ -384,6 +386,8 @@ impl App {
             focus: FocusPane::Groups,
             group_index: 0,
             node_index: 0,
+            group_scroll: 0,
+            node_scroll: 0,
             conn_index: 0,
             connection_detail: false,
             detail_scroll: 0,
@@ -847,6 +851,7 @@ impl App {
     }
 
     pub fn sync_node_cursor_to_active(&mut self) {
+        self.node_scroll = 0;
         if let Some(group) = self.snapshot.groups.get(self.group_index) {
             if let Some(pos) = group.all.iter().position(|n| n == &group.now) {
                 self.node_index = pos;
@@ -2772,6 +2777,15 @@ mod tests {
             assert!(proxy_mouse_action(&mut app, event));
             assert_eq!(app.node_index, start);
             assert_eq!(app.focus, FocusPane::Nodes);
+            render_text(&mut app, width, height);
+            assert!(app
+                .proxy_hits
+                .contains(&(area, FocusPane::Nodes, start, 40)));
+            app.accept_snapshot(app.snapshot.clone());
+            render_text(&mut app, width, height);
+            assert!(app
+                .proxy_hits
+                .contains(&(area, FocusPane::Nodes, start, 40)));
             event.kind = MouseEventKind::ScrollDown;
             assert!(!proxy_mouse_action(&mut app, event));
             assert_eq!(app.node_index, start + 1);
