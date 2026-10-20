@@ -1215,6 +1215,11 @@ impl App {
         }
         self.run_action("Switching routing mode…", None, None, move |cfg| {
             switch_routing_mode(&cfg, mode).map_err(|e| e.to_string())?;
+            // A later reload applies the file's mode, so record the switch there.
+            if config_file_exists(&cfg) {
+                crate::mihomo::persist_mode(&cfg, &mode.to_ascii_lowercase())
+                    .map_err(|e| format!("Routing mode › {mode}; not saved to config.yaml: {e}"))?;
+            }
             Ok(format!("Routing mode › {mode}"))
         });
     }

@@ -1559,6 +1559,13 @@ fn install_config_with(
 ) -> Result<(), InstallFailure> {
     validate_listener_ports(text)?;
     fs::create_dir_all(&cfg.config_dir).map_err(|e| e.to_string())?;
+    // A force reload applies the file's `mode`, so keep a mode that was only
+    // switched at runtime.
+    let text = if running {
+        keep_runtime_mode(cfg, text)
+    } else {
+        text.to_string()
+    };
     let candidate = Path::new(&cfg.config_dir).join(".terc-candidate.yaml");
     write_private(&candidate, text.as_bytes()).map_err(|e| e.to_string())?;
     let result = (|| {
@@ -1684,6 +1691,42 @@ fn controller_answers(cfg: &ControllerConfig, settle: Duration) -> bool {
         }
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn keep_runtime_mode(cfg: &ControllerConfig, text: &str) -> String {
+    let runtime = read_runtime_config(cfg).ok();
+    match runtime
+        .as_ref()
+        .and_then(|v| v.get("mode"))
+        .and_then(Value::as_str)
+    {
+        Some(mode) => with_mode(text, &mode.to_ascii_lowercase()),
+        None => text.to_string(),
+    }
+}
+
+/// Set the top-level `mode`. With modules applied, the base kept in the header
+/// is updated too, so disabling a module does not bring the old mode back.
+fn with_mode(doc: &str, mode: &str) -> String {
+    use crate::ops::set_top_scalar;
+    let literal = serde_json::to_string(mode).unwrap();
+    // Header layout written by ops::apply_modules_with_switches.
+    let mut parts = doc.splitn(3, '\n');
+    if let (Some(head), Some(switches), Some(effective)) =
+        (parts.next(), parts.next(), parts.next())
+    {
+        let base = head
+            .strip_prefix("# terc-base: ")
+            .and_then(|v| serde_json::from_str::<String>(v).ok());
+        if let Some(base) = base.filter(|_| switches.starts_with("# terc-switches: ")) {
+            return format!(
+                "# terc-base: {}\n{switches}\n{}",
+                serde_json::to_string(&set_top_scalar(&base, "mode", &literal)).unwrap(),
+                set_top_scalar(effective, "mode", &literal)
+            );
+        }
+    }
+    set_top_scalar(doc, "mode", &literal)
 }
 
 /// Write a file only the user can read (configs hold node credentials and the
@@ -2156,6 +2199,14 @@ pub fn persist_nested_bool(
     let raw = read_config_text(cfg)?;
     let next = crate::ops::set_nested_bool(&raw, path, value);
     install_config(cfg, &next, false)
+}
+
+/// Record a mode switched at runtime so later reloads and restarts keep it.
+/// The core already runs it, so this only writes the file.
+pub fn persist_mode(cfg: &ControllerConfig, mode: &str) -> Result<(), String> {
+    let raw = read_config_text(cfg)?;
+    write_private(&config_yaml_path(cfg), with_mode(&raw, mode).as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 pub fn query_dns(cfg: &ControllerConfig, name: &str, qtype: &str) -> Result<DnsMessage, String> {
@@ -2727,7 +2778,7 @@ mod tests {
         for status in [400, 204] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             cfg.addr = listener.local_addr().unwrap().to_string();
-            let server = thread::spawn(move || {
+            let server = thread::spawn(move || loop {
                 let (stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
@@ -2748,12 +2799,22 @@ mod tests {
                 }
                 let mut payload = vec![0; length];
                 reader.read_exact(&mut payload).unwrap();
+                // The runtime mode is read first; this mock has none to carry.
+                if request.starts_with("GET /configs ") {
+                    write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
                 assert!(request.starts_with("PUT /configs?force=true "));
                 write!(
                     reader.get_mut(),
                     "HTTP/1.1 {status} Result\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 .unwrap();
+                break;
             });
             let next = "mode: direct\nipv6: true\nproxies: []\nrules: []\n";
             let result = install_config(&cfg, next, true);
@@ -3123,7 +3184,10 @@ mod listener_tests {
         };
         let previous = "mode: rule\nproxies: []\n";
         fs::write(config_yaml_path(&cfg), previous).unwrap();
-        let server = serve(listener, vec![http("400 Bad Request", "bad")]);
+        let server = serve(
+            listener,
+            vec![http("200 OK", "{}"), http("400 Bad Request", "bad")],
+        );
         let failure = install_config_with(
             &cfg,
             "mode: rule\nipv6: true\n",
@@ -3134,7 +3198,7 @@ mod listener_tests {
         .err()
         .unwrap();
         let requests = server.join().unwrap();
-        assert!(requests[0].starts_with("PUT /configs?force=true "));
+        assert!(requests[1].starts_with("PUT /configs?force=true "));
         assert!(!failure.kept);
         assert!(failure.message.contains("previous configuration restored"));
         assert_eq!(read_config_text(&cfg).unwrap(), previous);
@@ -3157,7 +3221,7 @@ mod listener_tests {
             };
             fs::write(config_yaml_path(&cfg), "mode: rule\n").unwrap();
             // The PUT connection closes without a reply, as on a client timeout.
-            let mut responses = vec![Vec::new()];
+            let mut responses = vec![http("200 OK", "{}"), Vec::new()];
             if answers {
                 responses.push(http("200 OK", "{\"version\":\"v1\"}"));
             }
@@ -3166,7 +3230,7 @@ mod listener_tests {
             let requests = server.join().unwrap();
             if answers {
                 assert!(result.is_ok());
-                assert!(requests[1].starts_with("GET /version "));
+                assert!(requests[2].starts_with("GET /version "));
             } else {
                 let failure = result.err().unwrap();
                 assert!(failure.kept);
@@ -3238,5 +3302,62 @@ mod listener_tests {
         assert!(failure.message.contains("rejected") && failure.message.contains("bad key"));
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(dir_fail).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reload_keeps_a_mode_switched_at_runtime() {
+        let (dir, bin) = install_fixture("mode", "exit 0");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let server = serve(
+            listener,
+            vec![
+                http("200 OK", r#"{"mode":"Direct","allow-lan":false}"#),
+                http("204 No Content", ""),
+            ],
+        );
+        let modules = vec![crate::ops::ModuleSnippet {
+            id: "lan".into(),
+            name: "LAN".into(),
+            description: String::new(),
+            body: "allow-lan: true\n".into(),
+            builtin: false,
+        }];
+        let text = crate::ops::apply_modules_with_switches(
+            "mode: rule\nallow-lan: false\nproxies: []\n",
+            &modules,
+            &[],
+        )
+        .unwrap();
+        install_config_with(&cfg, &text, true, || Some(bin), &TEST_LIMITS)
+            .ok()
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /configs "));
+        assert!(requests[1].starts_with("PUT /configs?force=true "));
+        let installed = read_config_text(&cfg).unwrap();
+        assert!(installed.contains("\nmode: \"direct\"\n"));
+        assert!(installed.contains("allow-lan: true"));
+        let base = crate::ops::strip_marked_modules(&installed);
+        assert!(base.starts_with("mode: \"direct\"\n"));
+        assert!(base.contains("allow-lan: false"));
+
+        // Persisting a runtime switch writes the file without a reload.
+        persist_mode(&cfg, "global").unwrap();
+        let persisted = read_config_text(&cfg).unwrap();
+        assert!(crate::ops::strip_marked_modules(&persisted).starts_with("mode: \"global\"\n"));
+        assert!(persisted.contains("\nmode: \"global\"\n"));
+        // Regenerating from it carries the mode into the new base.
+        let carried = crate::compose::carry_runtime_state(
+            &crate::ops::strip_marked_modules(&persisted),
+            "mode: rule\nproxies: []\n",
+        );
+        assert!(carried.starts_with("mode: global\n"));
+        fs::remove_dir_all(dir).unwrap();
     }
 }
