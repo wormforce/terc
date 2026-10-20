@@ -197,33 +197,80 @@ ws-opts:
 
 ## 4. C：terc 的控制器客户端改用 WebSocket
 
-### 4.1 Mihomo 端的现状
+- 状态：**已接入**（批次 `ws-stream`）。`/connections` 默认走 WebSocket 推送，失败时自动回退到 HTTP 轮询；
+  设置 → 排查工具 →“连接实时推送”可以关闭。
+- 本节的 Mihomo 行号都对应 `MetaCubeX/mihomo` `Meta` 分支的 commit `88dcbf7f1614a67c3b36b848ee3592dfa92ada36`
+  （2026-09-30），只读源码，没有实测。
 
-- `/traffic`、`/memory`、`/logs` 同时支持两种模式（`hub/route/server.go:371`、`:417`、`:482`）。
-  前两个在两种模式下都是每秒推送一次，**改用 WebSocket 不会更快。**
-- `/connections` 支持 WebSocket，并接受 `?interval=毫秒` 参数，默认 1000
-  （`hub/route/connections.go:24`–`70`；Meta-Docs `api/index.md`“连接”一节）。
-- 认证：WebSocket 可以用 `?token=`（`server.go:340`，专门为浏览器准备），
-  也可以照常使用 `Authorization: Bearer`（`server.go:354`）。terc 应该用请求头，避免 token 出现在 URL 和日志里。
-- 服务端握手后只写不读（`hub/route/common.go:33` 劫持连接，`:132` `wsWriteServerMessage`
-  写出不分片、不加掩码、FIN 置位的帧）。**它从不回复 ping，也不回复 close。**
-  客户端不能等 pong 或 close，只能靠读超时和重连判断连接是否还活着。
-- 握手响应头由 Go 的 `http.Header` 写出，会被规范化为 `Sec-Websocket-Accept`（`common.go:123`）。
-  所以客户端必须按不区分大小写的方式比对头名。
+### 4.1 Mihomo 端的现状（88dcbf7）
 
-### 4.2 terc 的现状
+- `/traffic`、`/memory`、`/logs` 同时支持 chunked HTTP 和 WebSocket（`hub/route/server.go` 中各自的处理函数）。
+  前两个在两种模式下都是每秒推送一次，**改用 WebSocket 不会更快**，所以继续用 chunked。
+- `/connections` 只有在请求头**恰好是小写的** `Upgrade: websocket` 时才走 WebSocket，比较区分大小写
+  （`hub/route/connections.go:25`）；否则返回一次完整的 JSON。`src/ws.rs` 发送的正是这个写法。
+- `interval`：用 `strconv.Atoi` 解析，默认 1000 毫秒（`connections.go:36`–`47`）。
+  **必须是正整数**：非整数会在写出 101 之后才报错，客户端只会收到 101 然后一片沉默（`:31`、`:39`–`43`）；
+  `<= 0` 会先发出第一份快照（`:60`），随后 `time.NewTicker` 因非正间隔而 panic（`:64`）。
+  terc 固定请求 `/connections?interval=1000`。
+- 认证（`server.go:336`–`365`）：`?token=` 只在 `Upgrade` 恰好是 `websocket` 时才被读取（`:340`），专为浏览器准备；
+  `Authorization: Bearer` 对 WebSocket 同样有效（`:351`–`361`）。**terc 只用请求头，从不把 secret 写进 URL**，
+  这样它不会出现在 URL 和日志里。
+- 握手要求（`hub/route/common.go:33`–`129`）：GET、HTTP/1.1 及以上、非空 `Host`、`Connection` 含 `upgrade`
+  （不区分大小写）、24 字符的 `Sec-WebSocket-Key`、`Sec-WebSocket-Version: 13`（否则 426）。不协商子协议和扩展。
+  响应头经 Go 的 `http.Header` 规范化为 `Sec-Websocket-Accept`（`common.go:119`–`125`），客户端按不区分大小写比对。
+- 消息：每个 tick 发送一份**完整快照**，不是增量；连接建立后立即发一份，之后每个 interval 一份（`connections.go:49`–`70`）。
+  形如 `{downloadTotal, uploadTotal, connections, memory}`（`tunnel/statistic/manager.go:124`–`129`），以 `\n` 结尾。
+  没有连接时 `connections` 是 JSON `null` 而不是 `[]`（`manager.go:85`）；端口字段是字符串（`constant/metadata.go:199`–`202`）。
+  已关闭的连接只是从下一份快照里消失。
+- 帧：每条消息一个不分片、不加掩码、FIN 置位的 text 帧，长度用 7/16/64 位（`common.go:132`–`169`），
+  **服务端没有大小上限**（`:151`–`154`）。
+- 服务端握手后**只写不读**（`connections.go:31` 丢弃了读端）：从不回复 ping，不回 close，也不发 close。
+  循环只在写失败时结束（`:66`–`69`），即客户端断开 TCP 之后。写超时已被清除（`common.go:117`）。
 
-- `stream_json_lines`（`src/mihomo.rs:361`）读取 chunked 的按行 JSON，读超时 3 秒，断开后 900 毫秒重连。工作正常。
-- `/connections` 用 `Connection: close` 每 2.2 秒轮询一次（`src/mihomo.rs:620`，`src/main.rs:873`）。
+### 4.2 terc 的实现
+
+- `/traffic`、`/memory`、`/logs` 仍由 `stream_json_lines`（`src/mihomo.rs:399`）读 chunked 的按行 JSON。
+- `spawn_stream_workers`（`src/mihomo.rs:329`）多启动一个线程 `stream_connections`（`:545`）：
+  - 用 `ws::connect` 连 `ws://{控制器}/connections?interval=1000`，secret 非空时带 `Authorization: Bearer …`。
+    连接超时 1.5 秒，读超时 2 秒。
+  - 每个 text 帧用 serde_json 解析，交给 `connections_from_snapshot_json`（`:702`，轮询也用它），
+    以 `BackendEvent::Connections` 发给界面。界面和轮询走同一个 `install_connections`，
+    所以连接时长、单连接速率、长连接与关闭记录都不变，只是采样变成每秒一次、间隔更稳。
+  - 会话在这些情况下结束，结束时直接丢掉 socket，**不发 close、不等 pong 或 close**：
+    连续 3 次读超时（推送间隔 1 秒，6 秒没有消息）；连续 3 条无法解析的消息；收到 close；任何其他错误；
+    开关被关闭；程序退出。ping 由 `ws.rs` 自动回复，binary / pong 忽略。
+  - 重连间隔：会话收到过快照后断开 → 1 秒；连接或握手失败 → 2、4、8、16、30 秒（封顶）；
+    帧或消息超过 `ws.rs` 的上限（`WsError::TooLarge`）→ 暂停 5 分钟，期间由 HTTP 轮询负责。
+    所有等待都以 100 毫秒为步长检查退出标志和开关，关掉再打开开关等于立即重试。
+  - 日志只在状态变化时写一行：变为不可用时一条 `warning`
+    “terc: /connections WebSocket 不可用，改用 HTTP 轮询 / unavailable, polling over HTTP: 原因”，
+    从不可用恢复时一条 `info`“… 已连接 / connected”。重复的相同失败不再刷屏。
+    TCP 连接被拒绝（内核没在运行）不算 WebSocket 故障，不写日志，只按退避重试。
+- 界面（`src/main.rs`）：
+  - `stream_live()`（`:1023`）= 开关打开且最近一次推送在 3 秒以内。
+  - `tick` 在推送正常时调用 `fetch_snapshot_with(cfg, false)`，跳过 `/connections` 的 GET；
+    这样得到的快照 `connections_ok == false`，`accept_snapshot` 会保留当前列表。
+    推送超过 3 秒没来，下一次 2.2 秒的轮询就自动带上 `/connections`。
+  - `accept_snapshot` 在推送正常时把任何轮询快照都当作 `connections_ok == false`：
+    在推送到达之前就已发出的轮询，不能覆盖更新的推送数据，也不能制造假的“连接已关闭”。
+  - 推送事件即使在其他操作进行中（`action_busy`）也会被接受。
+- 设置：`connections_stream`，默认开启；`#[serde(default = "default_true")]` 保证旧的 config.json 照常加载，
+  不会因缺字段回落到默认配置并覆盖用户文件。设置行显示 `OFF`、`ON · WebSocket`（推送正常）或
+  `ON · HTTP`（已开启但正在回退）。
+- 已知限制：和 `/traffic` 等线程一样，控制器地址和 secret 在启动时确定，修改后需要重启 terc。
+- 测试（`src/mihomo.rs` 的 `mod stream_tests`，只连 `127.0.0.1:0` 上的模拟控制器，时间按毫秒缩放）：
+  两份快照（含 `connections: null` 和字符串端口）、404 握手只警告一次并按退避重试、
+  超大帧触发长暂停、静默 3 次读超时后重连并记录恢复、退出标志和开关能及时结束线程、
+  退避序列，以及 `connections_from_snapshot_json` 与原轮询解析结果一致。
 
 ### 4.3 收益与成本
 
-- 只有 `/connections` 值得改：服务端按 `interval` 推送，省掉每次轮询的建连开销，
-  采样间隔也更稳定，§2.7 的单连接速率会更准确。
-- `/traffic`、`/memory`、`/logs` 改不改差别不大，继续用 chunked。
-- 代价：多一条代码路径，并且要处理 §4.1 里服务端不回 pong 的特点。
+- 收益：省掉每 2.2 秒一次的建连和完整 GET，只保留一条本地长连接；采样间隔稳定在 1 秒，
+  单连接速率（§2.7）更准，AI 长连接的断开也更早出现在连接视图和日志里。
+- 成本：多一条代码路径和一个线程。回退是自动且即时的，所以默认开启。
+- 风险控制：超大快照不报错而是暂停推送；任何错误都丢弃整条连接再重连，不复用可能已错位的流。
 
-### 4.4 `src/ws.rs`（已写好，未接入）
+### 4.4 `src/ws.rs`
 
 - 只依赖 std，基于 `std::net::TcpStream`。SHA-1 在文件内实现；base64 复用已有的
   `crate::subconv::encode_base64`，没有再写一份。
@@ -241,7 +288,8 @@ ws-opts:
 - 测试：RFC 示例 key `dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`、
   SHA-1 和 base64 的标准向量、RFC §5.7 的掩码示例，以及一个本地 `TcpListener` 模拟控制器。
   模拟控制器像 Mihomo 一样，101 响应与首帧一起写出，并且不回复 close。
-- 模块开头写了 `#![allow(dead_code)]`，原因是还没有任何代码调用它，接入时删掉。
+- 模块级的 `#![allow(dead_code)]` 已删除。应用从不向 Mihomo 发消息，所以 `send`、`send_fragmented`、
+  `is_closed` 只在测试里用，各自标了 `#[cfg_attr(not(test), allow(dead_code))]`；没有用处的 `get_mut` 已删除。
 
 ## 5. 推荐范围
 
