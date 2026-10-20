@@ -269,7 +269,8 @@ pub fn http_request(
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(500);
+        // A dropped connection is not an answer from the controller.
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no HTTP response"))?;
 
     let body = if headers.lines().any(|l| {
         l.to_ascii_lowercase()
@@ -1468,7 +1469,19 @@ pub fn regenerate_routing(
         None => (base, Vec::new()),
     };
     let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
-    install_config(cfg, &generated, running)?;
+    // A file kept after an unanswered reload may already be live, so record
+    // the matching cache and routing before reporting the unknown outcome.
+    let unknown = match install_config_with(
+        cfg,
+        &generated,
+        running,
+        discover_mihomo_binary,
+        &INSTALL_LIMITS,
+    ) {
+        Ok(()) => None,
+        Err(failure) if failure.kept => Some(failure.message),
+        Err(failure) => return Err(failure.message),
+    };
     if let Some(raw) = fresh {
         compose::write_private(&compose::cache_path(&dir), &raw)?;
     }
@@ -1485,6 +1498,9 @@ pub fn regenerate_routing(
             &generated,
         )?;
     }
+    if let Some(message) = unknown {
+        return Err(message);
+    }
     let tail = match (running, zh) {
         (true, true) => " — 已校验并热重载",
         (true, false) => " — validated & hot-reloaded",
@@ -1497,54 +1513,201 @@ pub fn regenerate_routing(
 /// Validate before replacing the active file. Keep disk and runtime on the old
 /// configuration if the controller rejects the candidate.
 pub fn install_config(cfg: &ControllerConfig, text: &str, running: bool) -> Result<(), String> {
+    install_config_with(cfg, text, running, discover_mihomo_binary, &INSTALL_LIMITS)
+        .map_err(|failure| failure.message)
+}
+
+/// How long `mihomo -t` may run, and how long the controller may stay silent
+/// after an unanswered reload before its outcome is reported as unknown.
+struct InstallLimits {
+    check: Duration,
+    settle: Duration,
+}
+
+const INSTALL_LIMITS: InstallLimits = InstallLimits {
+    check: Duration::from_secs(60),
+    settle: Duration::from_secs(30),
+};
+
+struct InstallFailure {
+    message: String,
+    /// The new file stayed on disk because the reload outcome is unknown.
+    kept: bool,
+}
+
+impl From<String> for InstallFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            kept: false,
+        }
+    }
+}
+
+impl From<&str> for InstallFailure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+fn install_config_with(
+    cfg: &ControllerConfig,
+    text: &str,
+    running: bool,
+    find_bin: impl FnOnce() -> Option<PathBuf>,
+    limits: &InstallLimits,
+) -> Result<(), InstallFailure> {
     validate_listener_ports(text)?;
     fs::create_dir_all(&cfg.config_dir).map_err(|e| e.to_string())?;
     let candidate = Path::new(&cfg.config_dir).join(".terc-candidate.yaml");
-    fs::write(&candidate, text).map_err(|e| e.to_string())?;
+    write_private(&candidate, text.as_bytes()).map_err(|e| e.to_string())?;
     let result = (|| {
-        let bin = discover_mihomo_binary()
-            .ok_or("Install the managed Mihomo core before saving a configuration")?;
-        let output = Command::new(bin)
-            .arg("-t")
-            .arg("-d")
-            .arg(&cfg.config_dir)
-            .arg("-f")
-            .arg(&candidate)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            return Err(format!(
-                "Configuration rejected: {} {}",
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
+        let bin =
+            find_bin().ok_or("Install the managed Mihomo core before saving a configuration")?;
+        check_candidate(&bin, cfg, &candidate, limits.check)?;
         let path = config_yaml_path(cfg);
         let previous = match fs::read(&path) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(e.to_string().into()),
         };
         fs::rename(&candidate, &path).map_err(|e| e.to_string())?;
-        if running {
-            if let Err(err) = reload_config(cfg) {
+        if !running {
+            return Ok(());
+        }
+        match reload_config(cfg) {
+            Ok(()) => Ok(()),
+            Err(ReloadError::Rejected(err)) => {
                 let restored = match previous {
-                    Some(bytes) => fs::write(&path, bytes),
+                    Some(bytes) => write_private(&path, &bytes),
                     None => fs::remove_file(&path),
                 };
-                return match restored {
-                    Ok(()) => Err(format!("{err}; previous configuration restored")),
-                    Err(restore) => Err(format!(
-                        "{err}; could not restore previous configuration: {restore}"
-                    )),
-                };
+                Err(match restored {
+                    Ok(()) => format!("{err}; previous configuration restored"),
+                    Err(restore) => {
+                        format!("{err}; could not restore previous configuration: {restore}")
+                    }
+                }
+                .into())
             }
+            // Mihomo finishes applying a PUT after the client gives up, so the
+            // new file may already be live. Never roll back on a lost reply.
+            Err(ReloadError::Unknown(_)) if controller_answers(cfg, limits.settle) => Ok(()),
+            Err(ReloadError::Unknown(err)) => Err(InstallFailure {
+                message: format!(
+                    "热重载结果未知，新配置已保留在磁盘上 / Reload outcome unknown ({err}); the new configuration was kept on disk"
+                ),
+                kept: true,
+            }),
         }
-        Ok(())
     })();
     let _ = fs::remove_file(candidate);
     result
+}
+
+/// Run `mihomo -t` on the candidate, stopping a check that hangs.
+fn check_candidate(
+    bin: &Path,
+    cfg: &ControllerConfig,
+    candidate: &Path,
+    limit: Duration,
+) -> Result<(), String> {
+    let mut child = Command::new(bin)
+        .arg("-t")
+        .arg("-d")
+        .arg(&cfg.config_dir)
+        .arg("-f")
+        .arg(candidate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    // Drain both pipes so a chatty check cannot block on a full buffer.
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<Vec<u8>> {
+        thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Configuration check did not finish within {}s and was stopped",
+                limit.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    Err(format!(
+        "Configuration rejected: {} {}",
+        String::from_utf8_lossy(&stdout).trim(),
+        String::from_utf8_lossy(&stderr).trim()
+    ))
+}
+
+/// Poll the controller after a reload that got no reply.
+fn controller_answers(cfg: &ControllerConfig, settle: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if matches!(
+            http_request(
+                &cfg.addr,
+                &cfg.secret,
+                "GET",
+                "/version",
+                None,
+                Duration::from_millis(1000),
+            ),
+            Ok((200, _))
+        ) {
+            return true;
+        }
+        if started.elapsed() >= settle {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Write a file only the user can read (configs hold node credentials and the
+/// controller secret), replacing any existing file atomically.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let _ = fs::remove_file(&tmp);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 pub fn mihomo_asset_id_for(os: &str, arch: &str) -> Option<&'static str> {
@@ -1942,24 +2105,46 @@ pub fn set_rule_disabled(cfg: &ControllerConfig, index: usize, disabled: bool) -
     }
 }
 
-pub fn reload_config(cfg: &ControllerConfig) -> Result<(), String> {
+/// Only an explicit rejection proves the core kept its previous configuration.
+#[derive(Debug)]
+pub enum ReloadError {
+    /// The controller answered with an HTTP error.
+    Rejected(String),
+    /// No answer (I/O error or timeout); the core may still apply the file.
+    Unknown(String),
+}
+
+impl std::fmt::Display for ReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(text) | Self::Unknown(text) => f.write_str(text),
+        }
+    }
+}
+
+pub fn reload_config(cfg: &ControllerConfig) -> Result<(), ReloadError> {
     let path = config_yaml_path(cfg);
     let body = serde_json::json!({
         "path": path.display().to_string(),
         "payload": ""
     })
     .to_string();
+    // The first fetch of new providers runs inside the request, so allow well
+    // beyond Mihomo's own provider download timeout.
     match http_request(
         &cfg.addr,
         &cfg.secret,
         "PUT",
         "/configs?force=true",
         Some(&body),
-        Duration::from_millis(cfg.timeout_ms.max(10_000)),
+        Duration::from_millis(cfg.timeout_ms.max(90_000)),
     ) {
         Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-        Ok((status, text)) => Err(format!("reload HTTP {status} {}", brief(&text))),
-        Err(err) => Err(err.to_string()),
+        Ok((status, text)) => Err(ReloadError::Rejected(format!(
+            "reload HTTP {status} {}",
+            brief(&text)
+        ))),
+        Err(err) => Err(ReloadError::Unknown(err.to_string())),
     }
 }
 
@@ -2886,5 +3071,172 @@ mod listener_tests {
         assert!(server.join().unwrap()[0].starts_with("GET /proxies "));
         assert_eq!(status, 200);
         assert_eq!(body, "{\"n\":\"节\"}");
+    }
+
+    fn http(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// A temporary config dir with a stand-in for `mihomo -t` (never a real core).
+    #[cfg(unix)]
+    fn install_fixture(tag: &str, check: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "terc-install-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("fake-mihomo");
+        fs::write(&bin, format!("#!/bin/sh\n{check}\n")).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, bin)
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode()
+    }
+
+    const TEST_LIMITS: InstallLimits = InstallLimits {
+        check: Duration::from_secs(10),
+        settle: Duration::from_millis(600),
+    };
+
+    #[test]
+    #[cfg(unix)]
+    fn rejected_reload_restores_previous_file_privately() {
+        let (dir, bin) = install_fixture("rejected", "exit 0");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let previous = "mode: rule\nproxies: []\n";
+        fs::write(config_yaml_path(&cfg), previous).unwrap();
+        let server = serve(listener, vec![http("400 Bad Request", "bad")]);
+        let failure = install_config_with(
+            &cfg,
+            "mode: rule\nipv6: true\n",
+            true,
+            || Some(bin),
+            &TEST_LIMITS,
+        )
+        .err()
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("PUT /configs?force=true "));
+        assert!(!failure.kept);
+        assert!(failure.message.contains("previous configuration restored"));
+        assert_eq!(read_config_text(&cfg).unwrap(), previous);
+        assert_eq!(mode_of(&config_yaml_path(&cfg)) & 0o077, 0);
+        assert!(!dir.join(".terc-candidate.yaml").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unanswered_reload_keeps_the_new_file() {
+        let next = "mode: rule\nipv6: true\n";
+        for answers in [true, false] {
+            let (dir, bin) = install_fixture("unknown", "exit 0");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let cfg = ControllerConfig {
+                addr: listener.local_addr().unwrap().to_string(),
+                config_dir: dir.display().to_string(),
+                ..ControllerConfig::default()
+            };
+            fs::write(config_yaml_path(&cfg), "mode: rule\n").unwrap();
+            // The PUT connection closes without a reply, as on a client timeout.
+            let mut responses = vec![Vec::new()];
+            if answers {
+                responses.push(http("200 OK", "{\"version\":\"v1\"}"));
+            }
+            let server = serve(listener, responses);
+            let result = install_config_with(&cfg, next, true, || Some(bin), &TEST_LIMITS);
+            let requests = server.join().unwrap();
+            if answers {
+                assert!(result.is_ok());
+                assert!(requests[1].starts_with("GET /version "));
+            } else {
+                let failure = result.err().unwrap();
+                assert!(failure.kept);
+                assert!(failure.message.contains("kept on disk"));
+            }
+            assert_eq!(read_config_text(&cfg).unwrap(), next);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hung_config_check_is_stopped_and_leaves_the_file() {
+        let (dir, bin) = install_fixture("hung", "exec sleep 30");
+        let cfg = ControllerConfig {
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        fs::write(config_yaml_path(&cfg), "mode: rule\n").unwrap();
+        let limits = InstallLimits {
+            check: Duration::from_millis(300),
+            ..TEST_LIMITS
+        };
+        let started = Instant::now();
+        let failure = install_config_with(&cfg, "mode: global\n", false, || Some(bin), &limits)
+            .err()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(failure.message.contains("did not finish"));
+        assert_eq!(read_config_text(&cfg).unwrap(), "mode: rule\n");
+        assert!(!dir.join(".terc-candidate.yaml").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installed_config_is_private_even_over_a_public_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, bin) = install_fixture("private", "echo checked; exit 0");
+        let cfg = ControllerConfig {
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let path = config_yaml_path(&cfg);
+        fs::write(&path, "mode: rule\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let stale = dir.join(".terc-candidate.yaml");
+        fs::write(&stale, "").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+        install_config_with(&cfg, "mode: global\n", false, || Some(bin), &TEST_LIMITS)
+            .ok()
+            .unwrap();
+        assert_eq!(read_config_text(&cfg).unwrap(), "mode: global\n");
+        assert_eq!(mode_of(&path) & 0o077, 0);
+        let (dir_fail, bin_fail) = install_fixture("private-fail", "echo bad key >&2; exit 1");
+        let cfg_fail = ControllerConfig {
+            config_dir: dir_fail.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let failure = install_config_with(
+            &cfg_fail,
+            "mode: global\n",
+            false,
+            || Some(bin_fail),
+            &TEST_LIMITS,
+        )
+        .err()
+        .unwrap();
+        assert!(failure.message.contains("rejected") && failure.message.contains("bad key"));
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(dir_fail).unwrap();
     }
 }

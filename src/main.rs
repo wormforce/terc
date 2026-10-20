@@ -194,14 +194,17 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::path();
+        self.save_to(&Self::path())
+    }
+
+    /// The file holds the controller secret and subscription URL, so only the
+    /// user may read it.
+    fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        let candidate = path.with_extension("json.tmp");
-        fs::write(&candidate, json).map_err(|e| e.to_string())?;
-        fs::rename(candidate, path).map_err(|e| e.to_string())
+        crate::mihomo::write_private(path, json.as_bytes()).map_err(|e| e.to_string())
     }
 }
 
@@ -234,8 +237,27 @@ impl Drop for SendOnDrop {
 }
 
 #[cfg(test)]
-mod send_on_drop_tests {
+mod io_tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn saved_preferences_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = env::temp_dir().join(format!("terc-prefs-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut cfg = Config::default();
+        cfg.controller.secret = "s3cret".into();
+        cfg.save_to(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0);
+        assert!(fs::read_to_string(&path).unwrap().contains("s3cret"));
+        assert!(!dir.join("config.json.tmp").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn panicking_worker_still_reports_completion() {
