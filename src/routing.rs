@@ -292,21 +292,6 @@ fn field_value(field: &YamlChunk) -> String {
     }
     clean_scalar(value)
 }
-fn regex_escape(text: &str) -> String {
-    let mut out = String::new();
-    for c in text.chars() {
-        match c {
-            // Mihomo splits filters at backticks.
-            '`' => out.push_str("\\x60"),
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
 // Rewrite each group of a proxy-groups chunk as fields, keeping template layout.
 fn map_groups(
     groups: &YamlChunk,
@@ -396,23 +381,8 @@ pub fn template(raw: &str) -> Result<String, String> {
         if all {
             return Ok(());
         }
-        // The group now draws on every node. Listed nodes become a name filter
-        // so region groups keep their region, and info pseudo-nodes stay out.
-        let listed: Vec<_> = removed
-            .iter()
-            .filter(|n| !crate::compose::is_info_name(n))
-            .map(|n| regex_escape(n))
-            .collect();
-        if !providers
-            && !listed.is_empty()
-            && !fields.iter().any(|f| f.key.as_deref() == Some("filter"))
-        {
-            let filter = format!("^(?:{})$", listed.join("|"));
-            fields.push(YamlChunk {
-                key: Some("filter".into()),
-                lines: vec![format!("filter: {}", json!(filter))],
-            });
-        }
+        // The group now draws on every node of whichever source the scheme is
+        // applied to, so no node names are kept; info pseudo-nodes stay out.
         let info = crate::compose::INFO_EXCLUDE;
         let old = fields
             .iter()
@@ -560,10 +530,7 @@ mod tests {
             let route = template(&doc).unwrap();
             assert!(!route.contains("SECRET"));
             assert!(!route.contains("AirportProvider"));
-            // A node name may survive only as a filter pattern, never as a member.
-            assert!(route
-                .lines()
-                .all(|l| !l.contains("HK, 01") || l.trim_start().starts_with("filter: \"^(?:")));
+            assert!(!route.contains("HK, 01"));
             assert!(route.contains("include-all: true"));
             assert!(route.contains("[\"Auto\",\"DIRECT\"]"));
             assert!(route.contains("filter:"));
@@ -578,14 +545,14 @@ mod tests {
     }
 
     #[test]
-    fn templates_keep_listed_nodes_as_a_filter_without_info_nodes() {
+    fn templates_widen_listed_nodes_without_info_nodes() {
         let doc = "proxies:\n  - {name: 剩余流量：100GB, type: ss}\n  - {name: HK1, type: ss}\n  - {name: 'HK.2', type: ss}\n  - {name: US1, type: ss}\nproxy-groups:\n  - {name: 香港, type: url-test, proxies: [剩余流量：100GB, HK1, 'HK.2'], exclude-filter: 'x#y'}\n  - {name: Netflix, type: select, proxies: [香港, HK1, US1]}\n  - {name: Mixed, type: select, proxies: [HK1], use: [P], exclude-filter: \"a`b\"}\n  - {name: Kept, type: select, include-all-proxies: true, proxies: [HK1]}\nrules:\n  - MATCH,Netflix\n";
         let route = template(doc).unwrap();
         let info = serde_json::to_string(crate::compose::INFO_EXCLUDE).unwrap();
         let hk = group(&route, "香港");
         assert!(hk.contains("proxies: []"), "{hk}");
         assert!(hk.contains("include-all: true"));
-        assert!(hk.contains(r#"filter: "^(?:HK1|HK\\.2)$""#), "{hk}");
+        assert!(!hk.contains("HK1") && !hk.contains("    filter:"), "{hk}");
         let merged = format!("(?:x#y)|(?:{})", crate::compose::INFO_EXCLUDE);
         assert!(
             hk.contains(&format!("exclude-filter: {}", json!(merged))),
@@ -593,9 +560,8 @@ mod tests {
         );
         let netflix = group(&route, "Netflix");
         assert!(netflix.contains("proxies: [\"香港\"]"));
-        assert!(netflix.contains(r#"filter: "^(?:HK1|US1)$""#), "{netflix}");
+        assert!(!netflix.contains("    filter:"), "{netflix}");
         assert!(netflix.contains(&format!("exclude-filter: {info}")));
-        // Provider nodes stay reachable, so no name filter there.
         let mixed = group(&route, "Mixed");
         assert!(!mixed.contains("\nfilter:") && !mixed.contains("    filter:"));
         let joined = format!("a`b`{}", crate::compose::INFO_EXCLUDE);
@@ -606,6 +572,23 @@ mod tests {
         let kept = group(&route, "Kept");
         assert!(kept.contains("include-all: true") && !kept.contains("filter"));
         assert!(!route.contains("剩余流量"));
+    }
+
+    #[test]
+    fn templates_draw_on_the_nodes_of_the_source_they_are_applied_to() {
+        let other = "proxies:\n  - {name: AirportNode, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: secret}\nproxy-groups:\n  - {name: Airport, type: select, proxies: [AirportNode]}\nrules:\n  - MATCH,Airport\n";
+        let route = template(other).unwrap();
+        assert!(!route.contains("AirportNode"), "{route}");
+        let base = "proxies:\n  - {name: OwnNode, type: ss, server: 192.0.2.3, port: 8388, cipher: aes-128-gcm, password: fake}\nproxy-groups:\n  - {name: PROXY, type: select, proxies: [OwnNode]}\nrules:\n  - MATCH,PROXY\n";
+        let mut chunks = split_chunks(base);
+        chunks.retain(|c| !policy_key(c.key.as_deref()));
+        chunks.extend(split_chunks(&route));
+        let out = join_chunks(&chunks);
+        let airport = group(&out, "Airport");
+        assert!(airport.contains("include-all: true"), "{airport}");
+        // A name filter from the template's own source would match nothing here.
+        assert!(!airport.contains("    filter:"), "{airport}");
+        assert!(out.contains("MATCH,Airport") && !out.contains("AirportNode"));
     }
 
     #[test]

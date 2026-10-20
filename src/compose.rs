@@ -27,16 +27,6 @@ pub const DEFAULT_AI_EXCLUDE: &str =
     "(?i)(🇭🇰|港|\\bHK\\b|Hong ?Kong|🇨🇳|中国|回国|剩余|到期|流量|过期|官网|套餐|expire|traffic)";
 pub(crate) const INFO_EXCLUDE: &str = "(?i)(剩余|到期|流量|过期|官网|套餐|expire|traffic)";
 
-/// Plain-text form of INFO_EXCLUDE, for code that has no regex engine.
-pub(crate) fn is_info_name(name: &str) -> bool {
-    let name = name.to_lowercase();
-    [
-        "剩余", "到期", "流量", "过期", "官网", "套餐", "expire", "traffic",
-    ]
-    .iter()
-    .any(|w| name.contains(w))
-}
-
 /// AI services routed to the AI group. Kept as data so the UI and docs agree.
 pub const AI_PRESET: &[(&str, &[&str])] = &[
     (
