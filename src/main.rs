@@ -194,14 +194,99 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::path();
+        self.save_to(&Self::path())
+    }
+
+    /// The file holds the controller secret and subscription URL, so only the
+    /// user may read it.
+    fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        let candidate = path.with_extension("json.tmp");
-        fs::write(&candidate, json).map_err(|e| e.to_string())?;
-        fs::rename(candidate, path).map_err(|e| e.to_string())
+        crate::mihomo::write_private(path, json.as_bytes()).map_err(|e| e.to_string())
+    }
+}
+
+/// Deliver a worker's completion event even when the worker panics, so
+/// `snapshot_pending` and `action_busy` are always cleared.
+struct SendOnDrop {
+    tx: Sender<BackendEvent>,
+    event: Option<BackendEvent>,
+}
+
+impl SendOnDrop {
+    fn new(tx: Sender<BackendEvent>, fallback: BackendEvent) -> Self {
+        Self {
+            tx,
+            event: Some(fallback),
+        }
+    }
+
+    fn set(&mut self, event: BackendEvent) {
+        self.event = Some(event);
+    }
+}
+
+impl Drop for SendOnDrop {
+    fn drop(&mut self) {
+        if let Some(event) = self.event.take() {
+            let _ = self.tx.send(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn saved_preferences_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = env::temp_dir().join(format!("terc-prefs-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut cfg = Config::default();
+        cfg.controller.secret = "s3cret".into();
+        cfg.save_to(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0);
+        assert!(fs::read_to_string(&path).unwrap().contains("s3cret"));
+        assert!(!dir.join("config.json.tmp").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn panicking_worker_still_reports_completion() {
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+            if done.event.is_some() {
+                panic!("fetch failed");
+            }
+            done.set(BackendEvent::StatusMessage {
+                text: String::new(),
+                is_error: false,
+            });
+        });
+        assert!(worker.join().is_err());
+        assert!(matches!(rx.try_recv(), Ok(BackendEvent::SnapshotDone(_))));
+
+        let (tx, rx) = mpsc::channel();
+        let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+        done.set(BackendEvent::StatusMessage {
+            text: "ok".into(),
+            is_error: false,
+        });
+        drop(done);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::StatusMessage { .. })
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }
 
@@ -876,8 +961,8 @@ impl App {
             let cfg = self.config.controller.clone();
             let tx = self.tx.clone();
             thread::spawn(move || {
-                let snap = fetch_snapshot(&cfg);
-                let _ = tx.send(BackendEvent::SnapshotDone(Box::new(snap)));
+                let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+                done.set(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
             });
         }
     }
@@ -915,7 +1000,8 @@ impl App {
         let cfg = self.config.controller.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let _ = tx.send(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
+            let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+            done.set(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
         });
     }
 
@@ -937,12 +1023,21 @@ impl App {
         let cfg = self.config.controller.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
+            let mut done = SendOnDrop::new(
+                tx.clone(),
+                BackendEvent::ActionDone {
+                    result: Err("Operation failed unexpectedly".into()),
+                    modules: None,
+                    profile: None,
+                },
+            );
             let result = action(cfg.clone());
-            let _ = tx.send(BackendEvent::ActionDone {
+            done.set(BackendEvent::ActionDone {
                 result,
                 modules,
                 profile,
             });
+            drop(done);
             let _ = tx.send(BackendEvent::Snapshot(Box::new(fetch_snapshot(&cfg))));
         });
     }
@@ -1120,6 +1215,11 @@ impl App {
         }
         self.run_action("Switching routing mode…", None, None, move |cfg| {
             switch_routing_mode(&cfg, mode).map_err(|e| e.to_string())?;
+            // A later reload applies the file's mode, so record the switch there.
+            if config_file_exists(&cfg) {
+                crate::mihomo::persist_mode(&cfg, &mode.to_ascii_lowercase())
+                    .map_err(|e| format!("Routing mode › {mode}; not saved to config.yaml: {e}"))?;
+            }
             Ok(format!("Routing mode › {mode}"))
         });
     }

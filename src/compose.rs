@@ -1135,7 +1135,8 @@ pub fn compose(input: &ComposeInput) -> Result<(String, ComposeReport), String> 
     Ok((format!("{GENERATED_MARK}\n{body}"), report))
 }
 
-/// Keep TUN / sniffer / DNS / IPv6 switch states from the previous config.
+/// Keep TUN / sniffer / DNS / IPv6 switch states and the routing mode from the
+/// previous config.
 pub fn carry_runtime_state(old_base: &str, new_base: &str) -> String {
     let old = split_chunks(old_base);
     let mut doc = new_base.to_string();
@@ -1179,6 +1180,7 @@ pub fn carry_runtime_state(old_base: &str, new_base: &str) -> String {
         "log-level",
         "find-process-mode",
         "tcp-concurrent",
+        "mode",
     ] {
         if let Some(chunk) = find(key) {
             if let Some((_, value)) = chunk.lines.first().and_then(|l| l.split_once(':')) {
