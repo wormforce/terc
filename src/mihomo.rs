@@ -506,8 +506,12 @@ enum SessionEnd {
     Exit,
     /// The switch went off.
     Disabled,
-    /// Snapshots arrived, then the stream ended.
+    /// Snapshots arrived, then the stream broke.
     Dropped(String),
+    /// Snapshots arrived, then the core closed the socket (EOF, reset or a
+    /// close frame), as it does when it stops or restarts. Not logged: the
+    /// next attempt is refused while it is down, and any other failure logs.
+    Ended(String),
     /// The core refused the TCP connection. It is not running, so polling
     /// has nothing to fetch either and this is not worth a log line.
     Unreachable(String),
@@ -520,7 +524,7 @@ enum SessionEnd {
 /// Pause before the next attempt; `failures` counts consecutive failed ones.
 fn retry_delay(end: &SessionEnd, failures: &mut usize, t: &StreamTiming) -> Duration {
     match end {
-        SessionEnd::Dropped(_) => {
+        SessionEnd::Dropped(_) | SessionEnd::Ended(_) => {
             *failures = 0;
             t.retry
         }
@@ -589,7 +593,7 @@ fn stream_connections_with(
         match &end {
             SessionEnd::Exit => return,
             SessionEnd::Disabled => continue,
-            SessionEnd::Unreachable(_) => {}
+            SessionEnd::Unreachable(_) | SessionEnd::Ended(_) => {}
             SessionEnd::Dropped(err) | SessionEnd::Failed(err) | SessionEnd::TooLarge(err) => {
                 if healthy != Some(false) {
                     healthy = Some(false);
@@ -682,7 +686,10 @@ fn stream_session(
                     *healthy = Some(true);
                 }
             }
-            Ok(Message::Close(_)) => return ended("closed by the controller".into(), delivered),
+            Ok(Message::Close(_)) if delivered > 0 => {
+                return SessionEnd::Ended("closed by the controller".into())
+            }
+            Ok(Message::Close(_)) => return SessionEnd::Failed("closed by the controller".into()),
             // ws.rs already answered pings; Mihomo sends none of these.
             Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_)) => idle = 0,
             Err(WsError::Io(e))
@@ -698,6 +705,17 @@ fn stream_session(
                 }
             }
             Err(e @ WsError::TooLarge(_)) => return SessionEnd::TooLarge(e.to_string()),
+            Err(WsError::Io(e))
+                if delivered > 0
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                    ) =>
+            {
+                return SessionEnd::Ended(e.to_string())
+            }
             Err(e) => return ended(e.to_string(), delivered),
         }
     }
@@ -1071,6 +1089,31 @@ mod stream_tests {
         );
         worker.finish(Duration::from_secs(1));
         drop(first);
+    }
+
+    #[test]
+    fn a_core_stop_and_restart_leave_no_log_lines() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = start(&listener, fast(), true);
+        let (mut stream, head) = accept_request(&listener);
+        let mut reply = upgrade(&head);
+        reply.extend(text_frame(&snapshot_json(&["a.test"])));
+        stream.write_all(&reply).unwrap();
+        assert!(matches!(worker.next(), BackendEvent::Connections { .. }));
+        // The core stops: EOF, then refused connections for a while.
+        drop(stream);
+        drop(listener);
+        thread::sleep(Duration::from_millis(150));
+        // It comes back on the same address.
+        let listener = TcpListener::bind(addr).unwrap();
+        let (mut stream, head) = accept_request(&listener);
+        let mut reply = upgrade(&head);
+        reply.extend(text_frame(&snapshot_json(&["b.test"])));
+        stream.write_all(&reply).unwrap();
+        assert!(matches!(worker.next(), BackendEvent::Connections { .. }));
+        let events = worker.finish(Duration::from_secs(1));
+        assert!(logs(&events).is_empty(), "{:?}", logs(&events));
     }
 
     #[test]
