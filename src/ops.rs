@@ -67,6 +67,7 @@ pub struct ModuleSnippet {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileEntry {
+    pub kind: String,
     pub name: String,
     pub label: String,
     pub path: String,
@@ -851,6 +852,7 @@ pub fn list_profiles(config_dir: &Path, extra_dir: &Path, active_name: &str) -> 
                 source.name
             };
             found.push(ProfileEntry {
+                kind: "导入".into(),
                 label,
                 active: !active_name.is_empty() && stem == active_name,
                 name: stem,

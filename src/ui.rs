@@ -1110,12 +1110,10 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
             "↵ 选节点",
             "r 测速",
             "m 模式",
-            "a 自动优选",
-            "u 更新订阅",
-            "f 配置方案",
-            "T TUN",
+            "a 优选",
+            "c 连接",
             "s 设置",
-            "? 更多",
+            "? 帮助",
             "q 退出",
         ]
     } else {
@@ -1125,18 +1123,16 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
             "r Test",
             "m Mode",
             "a Best",
-            "u Update",
-            "f Profiles",
-            "T TUN",
+            "c Connections",
             "s Settings",
-            "? More",
+            "? Help",
             "q Quit",
         ]
     };
     let mut text = String::new();
     // Reserve help and quit so narrow windows still offer a way to discover controls.
-    let tail = format!("  {}  {}", hints[9], hints[10]);
-    for hint in &hints[..9] {
+    let tail = format!("  {}  {}  {}", hints[6], hints[7], hints[8]);
+    for hint in &hints[..6] {
         let candidate = if text.is_empty() {
             hint.to_string()
         } else {
@@ -1165,7 +1161,14 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         Some(panel_title(app.t("settings").to_string(), theme)),
         true,
     );
-    if inner.width >= 56 && inner.height >= 10 {
+    if app.settings_management {
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .split(inner);
+        draw_settings_tabs(frame, app, parts[0]);
+        crate::manage::draw_profile_hub(frame, app, parts[1]);
+    } else if inner.width >= 56 && inner.height >= 10 {
         draw_settings_board(frame, app, inner);
     } else {
         draw_settings_compact(frame, app, inner);
@@ -1200,9 +1203,9 @@ fn draw_settings_tabs(frame: &mut Frame, app: &App, area: Rect) {
     {
         let name = if area.width < 60 {
             if app.lang() == Lang::Zh {
-                ["代理", "外观", "方案", "排查"][i]
+                ["代理", "外观", "配置", "排查"][i]
             } else {
-                ["Proxy", "UI", "Profiles", "Tools"][i]
+                ["Proxy", "UI", "Sources", "Tools"][i]
             }
         } else {
             app.t(key)
@@ -1376,18 +1379,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("m", app.t("help_m")),
         ("r", app.t("help_r")),
         ("a", app.t("help_a")),
-        ("u", app.t("help_u")),
         ("Enter", app.t("help_enter")),
         ("↑↓ jk", app.t("help_jk")),
         ("c / L / p", app.t("help_tabs")),
-        ("t / s", app.t("help_t")),
-        ("K", "启动/停止 terc 管理的内核  Start/stop managed core"),
-        ("", "进阶与排查 / Advanced & diagnostics"),
-        ("T / n / i", app.t("help_tun")),
-        ("D", app.t("help_dns_key")),
-        ("d g v o f b w", app.t("help_views")),
-        ("f", "配置方案：统一管理订阅、手动节点与配置快照 / Profiles: subscriptions and manual nodes"),
-        ("g", "规则浏览：按内核顺序查看；自有规则编辑已暂停 / Inspect effective rules; custom editing paused"),
+        ("s", "设置：代理开关、配置方案、路由方案、界面、排查工具 / Settings: proxy, profiles, routing, appearance, diagnostics"),
         ("e  /", app.t("help_explain")),
         ("x", app.t("help_rule_x")),
         ("F", app.t("help_flush")),

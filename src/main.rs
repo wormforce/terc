@@ -18,7 +18,10 @@ pub mod mihomo;
 pub mod ops;
 pub mod panels;
 mod privilege;
+pub mod proxy_form;
+pub mod routing;
 mod settings;
+pub mod storage;
 pub mod subconv;
 pub mod ui;
 
@@ -84,7 +87,6 @@ pub enum MainTab {
 pub enum Overlay {
     None,
     Modules,
-    Profiles,
     Probe,
     Runtime,
     Best,
@@ -163,9 +165,9 @@ pub struct Config {
     pub controller: ControllerConfig,
     #[serde(default)]
     pub enabled_modules: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub active_profile: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub active_profile_label: String,
 }
 
@@ -328,6 +330,11 @@ pub struct App {
     pub module_index: usize,
     pub profile_index: usize,
     pub profile_page: usize,
+    pub routing_index: usize,
+    pub routing_mode: String,
+    pub routing_plans: Vec<routing::Entry>,
+    pub settings_management: bool,
+    pub proxy_form: Option<proxy_form::Form>,
     pub tunnel_index: usize,
     pub overlay: Overlay,
     pub catalog: Vec<crate::ops::ModuleSnippet>,
@@ -435,6 +442,11 @@ impl App {
             module_index: 0,
             profile_index: 0,
             profile_page: 0,
+            routing_index: 0,
+            routing_mode: String::new(),
+            routing_plans: Vec::new(),
+            settings_management: false,
+            proxy_form: None,
             tunnel_index: 0,
             overlay: Overlay::None,
             catalog: Vec::new(),
@@ -488,6 +500,8 @@ impl App {
             ai_picker_selected: Vec::new(),
             pending_regen: false,
         };
+        app.routing_mode = routing::selected(&app.config.controller);
+        app.routing_plans = routing::entries(&app.config.controller, app.lang() == Lang::Zh);
         app.dns_editor.load("example.com");
         app.sync_node_cursor_to_active();
         if app.screen == Screen::Setup {
@@ -705,6 +719,13 @@ impl App {
                             self.load_core_log();
                         }
                     }
+                    if self.proxy_form.as_ref().is_some_and(|f| f.submitting) {
+                        if ok {
+                            self.proxy_form = None;
+                        } else if let Some(f) = self.proxy_form.as_mut() {
+                            f.submitting = false;
+                        }
+                    }
                     if ok {
                         if let Some(ids) = modules {
                             self.config.enabled_modules = ids;
@@ -726,7 +747,10 @@ impl App {
                             self.open_profiles();
                         }
                     }
-                    if self.overlay == Overlay::OwnNodes || self.overlay == Overlay::Profiles {
+                    self.routing_plans =
+                        routing::entries(&self.config.controller, self.lang() == Lang::Zh);
+                    self.routing_mode = routing::selected(&self.config.controller);
+                    if self.settings_management || self.overlay == Overlay::OwnNodes {
                         self.own_nodes = crate::compose::load_manual_nodes(
                             &crate::compose::profile_dir(&self.config.controller),
                         );
@@ -1188,8 +1212,8 @@ impl App {
             (Lang::Zh, "cat_appearance") => "视觉与主题",
             (Lang::En, "cat_appearance") => "Appearance",
             (Lang::Ja, "cat_appearance") => "外観・テーマ",
-            (Lang::Zh, "cat_sub") => "配置方案",
-            (Lang::En, "cat_sub") => "Profiles",
+            (Lang::Zh, "cat_sub") => "订阅与分流",
+            (Lang::En, "cat_sub") => "Sources & Routing",
             (Lang::Ja, "cat_sub") => "サブスクリプション",
             (Lang::Zh, "settings_parameters") => "配置项",
             (Lang::En, "settings_parameters") => "Parameters",
@@ -1622,7 +1646,8 @@ fn main() -> io::Result<()> {
         println!("terc {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let config = Config::load();
+    let mut config = Config::load();
+    storage::migrate(&mut config).map_err(io::Error::other)?;
     let mut app = App::new(config);
     run(&mut app)
 }
@@ -1680,7 +1705,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     }
                 }
                 CEvent::Paste(text) => {
-                    if app.screen == Screen::Settings && app.setting_input.is_some() {
+                    if let Some(form) = app.proxy_form.as_mut() {
+                        form.paste(&text);
+                    } else if app.screen == Screen::Settings && app.setting_input.is_some() {
                         let text = text.trim();
                         let id = app.settings_rows()[app.setting_index].id;
                         if id == crate::settings::SettingId::TestUrl
@@ -1696,10 +1723,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                             app.setup_editor.insert_text(text.trim());
                         }
                     } else if matches!(app.screen, Screen::Dashboard | Screen::Settings)
-                        && matches!(
-                            app.overlay,
-                            Overlay::OwnNodes | Overlay::PrivateRules | Overlay::Profiles
-                        )
+                        && (app.settings_management
+                            || matches!(app.overlay, Overlay::OwnNodes | Overlay::PrivateRules))
                     {
                         crate::manage::handle_manage_paste(app, &text);
                     } else if app.screen == Screen::Dashboard && app.overlay == Overlay::Probe {
@@ -1786,6 +1811,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
     if key.code == KeyCode::Char('!')
         && app.setting_input.is_none()
+        && app.manage_input.is_none()
+        && app.proxy_form.is_none()
         && !app.dns_editing
         && !app.rule_editing
         && !app.log_editing
@@ -1872,22 +1899,6 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             EscStep::Proxies => app.main_tab = MainTab::Proxies,
         },
         KeyCode::Char(' ') => app.toggle_sysproxy(),
-        KeyCode::Char('T') => app.toggle_tun(),
-        KeyCode::Char('n') => app.toggle_sniffing(),
-        KeyCode::Char('i') => app.toggle_ipv6(),
-        KeyCode::Char('D') => app.toggle_dns(),
-        KeyCode::Char('d') => app.main_tab = MainTab::Dns,
-        KeyCode::Char('g') => app.main_tab = MainTab::Rules,
-        KeyCode::Char('v') => app.main_tab = MainTab::Providers,
-        KeyCode::Char('o') => app.open_modules(),
-        KeyCode::Char('f') => app.open_profiles(),
-        KeyCode::Char('b') => app.open_probe(),
-        KeyCode::Char('w') => app.open_runtime(),
-        KeyCode::Char('N') => {
-            app.profile_page = 2;
-            app.open_profiles();
-        }
-        KeyCode::Char('R') => app.main_tab = MainTab::Rules,
         KeyCode::Char('e') if app.main_tab == MainTab::Dns => app.dns_editing = true,
         KeyCode::Char('e') | KeyCode::Char('/') if app.main_tab == MainTab::Rules => {
             app.rule_explaining = key.code == KeyCode::Char('e');
@@ -1907,7 +1918,6 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('H') if app.main_tab == MainTab::Providers => {
             app.healthcheck_selected_provider()
         }
-        KeyCode::Char('K') => app.toggle_core_service(),
         KeyCode::Char('m') => app.cycle_routing_mode(),
         KeyCode::Char('r') if app.main_tab == MainTab::Proxies => app.test_current_group(),
         KeyCode::Char('a') if app.main_tab == MainTab::Proxies => app.select_best_node_in_group(),
@@ -1923,17 +1933,6 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             } else {
                 app.pause_logs();
             }
-        }
-        KeyCode::Char('u') => {
-            if app.config.controller.subscription_url.trim().is_empty() {
-                app.open_setup(Screen::Dashboard);
-            } else {
-                app.update_subscription();
-            }
-        }
-        KeyCode::Char('t') => {
-            app.config.settings.show_traffic = !app.config.settings.show_traffic;
-            app.save_preferences();
         }
         KeyCode::Char('p') => app.main_tab = MainTab::Proxies,
         KeyCode::Char('c') => {
@@ -2137,7 +2136,6 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected_module(),
             _ => {}
         },
-        Overlay::Profiles => crate::manage::handle_profiles_key(app, key),
         Overlay::Probe => {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('w'))
@@ -2330,6 +2328,10 @@ fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
 fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
     if app.overlay != Overlay::None {
         return handle_overlay_key(app, key);
+    }
+    if app.settings_management {
+        crate::manage::handle_profiles_key(app, key);
+        return false;
     }
     crate::settings::handle_key(app, key)
 }
@@ -2543,20 +2545,98 @@ mod tests {
         assert!(app.setting_input.is_some());
         press(&mut app, KeyCode::Esc);
         app.clear_status();
-        app.overlay = Overlay::Profiles;
         for (w, h) in [(42, 12), (80, 24), (120, 30)] {
-            app.profile_page = 0;
-            assert!(render_text(&mut app, w, h).contains("配置方案"));
-            press(&mut app, KeyCode::Tab);
-            assert_eq!(app.profile_page, 1);
-            render_text(&mut app, w, h);
-            press(&mut app, KeyCode::Tab);
+            app.setting_index = app
+                .settings_rows()
+                .iter()
+                .position(|r| r.id == crate::settings::SettingId::Profiles)
+                .unwrap();
+            press(&mut app, KeyCode::Enter);
+            assert!(app.settings_management);
+            assert_eq!(app.overlay, Overlay::None);
+            assert!(render_text(&mut app, w, h).contains("代理列表"));
+            press(&mut app, KeyCode::Char('v'));
             assert_eq!(app.profile_page, 2);
             render_text(&mut app, w, h);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.profile_page, 0);
+            press(&mut app, KeyCode::Esc);
+            assert!(!app.settings_management);
+            app.setting_index = app
+                .settings_rows()
+                .iter()
+                .position(|r| r.id == crate::settings::SettingId::Routing)
+                .unwrap();
+            press(&mut app, KeyCode::Enter);
+            assert!(render_text(&mut app, w, h).contains("分流方案"));
+            assert_eq!(app.overlay, Overlay::None);
+            app.routing_index = 0;
+            press(&mut app, KeyCode::Down);
+            assert_eq!(app.routing_index, 1);
+            press(&mut app, KeyCode::Char('c'));
+            press(&mut app, KeyCode::Char('q'));
+            assert_eq!(app.manage_editor.text, "q");
+            press(&mut app, KeyCode::Esc);
+            assert!(app.settings_management);
+            press(&mut app, KeyCode::Esc);
         }
-        press(&mut app, KeyCode::Esc);
         assert_eq!(app.screen, Screen::Settings);
         assert_eq!(app.overlay, Overlay::None);
+        let rows = app.settings_rows();
+        let management: Vec<_> = rows
+            .iter()
+            .filter(|r| r.category == SettingCategory::Subscription)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(management, vec!["代理订阅", "分流方案"]);
+    }
+
+    #[test]
+    fn manager_has_named_rows_and_inline_masked_form() {
+        let mut app = offline_app();
+        app.screen = Screen::Settings;
+        app.settings_management = true;
+        app.setting_index = app
+            .settings_rows()
+            .iter()
+            .position(|r| r.id == crate::settings::SettingId::Profiles)
+            .unwrap();
+        app.profiles = vec![crate::ops::ProfileEntry {
+            name: "proxy-001".into(),
+            label: "机场 Alpha".into(),
+            kind: "订阅".into(),
+            path: String::new(),
+            active: true,
+        }];
+        app.config.controller.profile_id = "proxy-001".into();
+        app.config.active_profile_label = "机场 Alpha".into();
+        let view = render_text(&mut app, 100, 30);
+        assert!(view.contains("机场Alpha"));
+        assert!(view.contains("proxy-001"));
+        assert!(!view.contains("Current"));
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.proxy_form.is_some());
+        assert_eq!(app.overlay, Overlay::None);
+        let form = app.proxy_form.as_mut().unwrap();
+        form.kind = 1;
+        form.secret.load("hidden-secret");
+        form.index = form
+            .fields()
+            .iter()
+            .position(|f| *f == crate::proxy_form::Field::Secret)
+            .unwrap();
+        form.editing = true;
+        for (w, h) in [(42, 12), (80, 24), (120, 30)] {
+            let view = render_text(&mut app, w, h);
+            assert!(view.contains("添加代理"));
+            assert!(!view.contains("hidden-secret"));
+            assert!(view.contains("***"));
+        }
+        press(&mut app, KeyCode::Esc);
+        assert!(app.proxy_form.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.proxy_form.is_none());
+        assert!(app.settings_management);
     }
 
     #[test]

@@ -77,8 +77,12 @@ Transparency follows your terminal profile. `terc` leaves the background at its 
 | **Controls** | System proxy, routing mode, and TUN |
 | **Traffic graph** | btop-style dual up/down rate history on an auto-scaled, labeled axis (`max …/s`), drawn as Braille or Blocks |
 | **Overview** | Aligned core, mode, proxy, TUN, memory, and connection metrics; port and quota below |
-| **Profiles** | Manage subscriptions, manual nodes and snapshots together; switch sources in Settings |
+| **Proxy subscriptions** | Add, update and switch subscriptions and manual nodes inside Settings |
+| **Routing plans** | Independent rules and groups; each source remembers its assignment, and saved plans can be reused |
 | **Themes** | Spring, Vintage, and Mono; all preserve the terminal background |
+
+
+Press `s` → Sources & Routing for the named proxy list; Tab opens routing plans. Press `a` for the unified subscription/proxy form, `e` to edit the selected entry. Both pages stay inside Settings. Sources own nodes, while routing plans own rules and groups. Switching sources restores its assigned plan. Choose subscription routing, Proxy all, routing from another source, or use `c` to save current routing for reuse. Saved groups use current-source nodes, preserving group references and filters.
 
 <details>
 <summary>Advanced tools and diagnostics</summary>
@@ -88,7 +92,7 @@ Transparency follows your terminal profile. `terc` leaves the background at its 
 | **Connections** | Process, inbound, sniff host, rule payload, chain, and geo/ASN, with one-key close |
 | **DNS** | Resolver status from the config, live lookup, and DNS / Fake-IP flush |
 | **Rules** | Ordered list with live hit counts, local explain, and runtime disable |
-| **Providers (`v`)** | `proxy-providers` and `rule-providers`, not the airport subscription URL. Refresh one or all; proxy providers can run a health check |
+| **Providers (Settings → Tools)** | `proxy-providers` and `rule-providers`, not the airport subscription URL. Refresh one or all; proxy providers can run a health check |
 | **Snippets** | YAML overlays for TUN, sniffer, Fake-IP, process lookup, TCP racing, and IPv6 |
 | **Probe** | DNS answers plus a delay test of the selected node |
 | **Runtime** | TUN device and any WireGuard or Tailscale outbound the core already exposes |
@@ -112,15 +116,15 @@ Click a group to browse its nodes; click a node to activate it. Scrolling moves 
 | Proxies | <kbd>r</kbd> | Run concurrent URL latency tests for the current group |
 | Proxies | <kbd>a</kbd> | Choose all countries or the connected node’s country, then test and select the fastest node |
 | Dashboard | <kbd>m</kbd> | Cycle routing mode (`Rule` → `Global` → `Direct`) |
-| Dashboard | <kbd>u</kbd> | Fetch latest subscription YAML and hot-reload core (`PUT /configs?force=true`); opens the setup window when no URL is saved |
+| Settings → Proxy subscriptions | Update subscription | Refresh the source and apply the selected routing plan |
 | Setup window | <kbd>Enter</kbd> | Save the subscription URL, write the config and start the core |
 | Setup window | <kbd>Ctrl+U</kbd> / <kbd>Ctrl+D</kbd> | Clear the input line / download a managed `mihomo` core |
-| Setup window | <kbd>Esc</kbd> | Dismiss for now — <kbd>u</kbd> reopens it while nothing is configured |
+| Setup window | <kbd>Esc</kbd> | Dismiss for now — reopen through Settings → Proxy subscriptions |
 | Dashboard | <kbd>p</kbd> / <kbd>c</kbd> / <kbd>L</kbd> | Switch main pane: **Proxies** / **Connections** / **Logs** |
-| Dashboard | <kbd>t</kbd> | Show or hide the top Traffic & Overview panels |
+| Settings → Appearance | Top panels | Show or hide traffic and overview panels |
 | Dashboard | <kbd>s</kbd> | Open the dual-pane Settings board. Press again there to return |
 | Settings | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Enter</kbd> | Adjust setting or trigger action |
-| Settings | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> / <kbd>1</kbd>–<kbd>3</kbd> | Switch category pages (`Core & Proxy` / `Appearance` / `Subscription`) |
+| Settings | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> / <kbd>1</kbd>–<kbd>4</kbd> | Switch category pages (`Proxy` / `Appearance` / `Sources & Routing` / `Tools`) |
 | Any view | <kbd>?</kbd> | Open keyboard shortcut help. Press again to return to the dashboard |
 | Dashboard | <kbd>q</kbd> | Quit (`mihomo` stays running in the background) |
 | Dashboard | <kbd>Esc</kbd> | Return to the proxy list; press q to quit |
@@ -131,10 +135,6 @@ Click a group to browse its nodes; click a node to activate it. Scrolling moves 
 
 | Where | Key | Action |
 | --- | --- | --- |
-| Dashboard | <kbd>T</kbd> / <kbd>n</kbd> / <kbd>i</kbd> | Toggle TUN, sniffer, or IPv6. TUN requests macOS administrator authorization when needed; effective changes are saved |
-| Dashboard | <kbd>D</kbd> | Toggle `dns.enable` in the config and hot-reload |
-| Dashboard | <kbd>d</kbd> / <kbd>g</kbd> / <kbd>v</kbd> | DNS, rules, providers |
-| Dashboard | <kbd>o</kbd> / <kbd>f</kbd> / <kbd>b</kbd> / <kbd>w</kbd> | Snippet gallery, profiles, probe, WireGuard / runtime |
 | Rules | <kbd>/</kbd> or <kbd>e</kbd> | Filter the list and explain a host, IP, or `process:name` |
 | Rules | <kbd>x</kbd> | Disable or restore the selected rule (`PATCH /rules/disable`) |
 | DNS | <kbd>Enter</kbd> / <kbd>F</kbd> / <kbd>[</kbd> <kbd>]</kbd> | Look up, flush DNS and Fake-IP, cycle record type |
@@ -143,7 +143,7 @@ Click a group to browse its nodes; click a node to activate it. Scrolling moves 
 
 </details>
 
-Install the core before submitting the first subscription (`Ctrl+D` in Setup downloads it). Subscription, snippet and profile changes are validated with `mihomo -t` before replacing the configuration; rejected reloads restore the previous file. Enabled snippets are reapplied on subscription updates and profile switches. `K` stops only a core started by terc; use the service manager for external cores.
+Install the core before submitting the first subscription (`Ctrl+D` in Setup downloads it). Subscription, snippet and profile changes are validated with `mihomo -t` before replacing the configuration; rejected reloads restore the previous file. Enabled snippets are reapplied on subscription updates and profile switches. The Core service setting stops only a core started by terc; use the service manager for external cores.
 
 Logs: `P` pauses/resumes display while capture continues, `/` searches, and Enter opens full text. Connections: Enter opens full details on narrow terminals. Results remain accessible with graphs hidden; `!` opens the full result and Backspace dismisses it. Help supports arrows and Page Up/Down.
 
@@ -158,7 +158,7 @@ Open **Settings** with <kbd>s</kbd>. UI preferences save to `~/.config/terc/conf
 | **Core & Proxy** | Start/stop `mihomo`, toggle the system proxy, switch routing mode, download `mihomo-darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` into `~/.config/terc/core/mihomo` |
 | **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling recursively merges mappings; disabling restores the source. Mihomo validates candidates before applying |
 | **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), UI refresh rate (`15` / `30` / `60` / `120 Hz`), graph interval (`1000–86400000 ms`, arrows adjust by `100 ms`, Enter accepts a typed value; averaged rates, clears history on change), UI language |
-| **Profiles** | Subscriptions, manual nodes and snapshots in one manager. Preserves source groups and rules, validates and reloads. Custom rule and AI preset editing is paused |
+| **Sources & routing** | Independent node sources and routing plans, per-source assignments, reusable policies, validation before applying. Custom rule and AI preset editing is paused |
 | **Proxy settings** | Mixed / HTTP / SOCKS ports, LAN access, TUN, DNS, IPv6, test URL and timeout; advanced tools live under Diagnostics |
 
 The graph interval is set in milliseconds. Mihomo normally supplies one traffic sample per second, so the minimum is 1000 ms.

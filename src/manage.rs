@@ -33,6 +33,8 @@ pub enum ManageInput {
     AddRule,
     AddProfile,
     RenameProfile,
+    SaveRouting,
+    EditSubscription,
 }
 
 /// Pick the Chinese, English or Japanese string for the current language.
@@ -112,6 +114,59 @@ impl App {
             return;
         }
         match kind {
+            ManageInput::SaveRouting => {
+                let result = crate::mihomo::read_config_text(&self.config.controller)
+                    .and_then(|raw| crate::routing::save(&text, &raw));
+                match result {
+                    Ok(id) => {
+                        self.manage_input = None;
+                        self.open_profiles();
+                        self.routing_index = self
+                            .routing_plans
+                            .iter()
+                            .position(|p| p.id == id)
+                            .unwrap_or(0);
+                        self.set_status(
+                            "分流方案已保存，Enter 可应用 / Plan saved; Enter to apply",
+                            false,
+                        );
+                    }
+                    Err(err) => self.set_status(&err, true),
+                }
+            }
+            ManageInput::EditSubscription => {
+                if !text.starts_with("https://") && !text.starts_with("http://") {
+                    self.set_status("请输入订阅地址 / Enter a subscription URL", true);
+                    return;
+                }
+                if self.action_busy {
+                    return;
+                }
+                let running = self.snapshot.running;
+                let zh = self.lang() == Lang::Zh;
+                let modules = crate::ops::enabled_snippets(
+                    &crate::ops::module_catalog(&crate::ops::modules_dir(
+                        &std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
+                    )),
+                    &self.config.enabled_modules,
+                );
+                self.manage_input = None;
+                self.run_action(
+                    "正在更新订阅来源 / Updating source…",
+                    None,
+                    Some(self.config.controller.profile_id.clone()),
+                    move |mut cfg| {
+                        cfg.subscription_url = text;
+                        let result =
+                            crate::mihomo::regenerate_config(&cfg, &modules, running, true, zh)?;
+                        let dir = crate::compose::profile_dir(&cfg);
+                        let mut source = crate::compose::ProfileSource::load(&dir);
+                        source.subscription_url = cfg.subscription_url;
+                        source.save(&dir)?;
+                        Ok(result)
+                    },
+                );
+            }
             ManageInput::AddProfile => self.import_profile(&text),
             ManageInput::RenameProfile => {
                 if let Some(profile) = self.profiles.get(self.profile_index).cloned() {
@@ -599,9 +654,9 @@ fn draw_manual_nodes_content(frame: &mut Frame, app: &App, inner: Rect) {
             Line::styled(
                 l3(
                     app,
-                    "节点单独保存在当前配置方案中；修改后校验并应用。",
+                    "节点单独保存在当前代理订阅中；修改后校验并应用。",
                     "Manual nodes belong to the active profile. Changes are validated before applying.",
-                    "~/.config/terc/nodes.conf を直接編集しても構いません。",
+                    "ノードはソースに保存されます。",
                 ),
                 Style::default().fg(theme.muted),
             ),
@@ -964,208 +1019,274 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 pub fn handle_profiles_key(app: &mut App, key: KeyEvent) {
+    if app.proxy_form.is_some() {
+        crate::proxy_form::handle(app, key);
+        return;
+    }
     if app.manage_input.is_some() {
         handle_editor_key(app, key);
         return;
     }
-    match key.code {
-        KeyCode::Tab | KeyCode::BackTab => {
-            app.profile_page =
-                (app.profile_page + if key.code == KeyCode::Tab { 1 } else { 2 }) % 3;
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        app.profile_page = if app.profile_page == 3 { 0 } else { 3 };
+        return;
+    }
+    if matches!(key.code, KeyCode::Char('1' | '2' | '4')) {
+        app.settings_management = false;
+        crate::settings::handle_key(app, key);
+        return;
+    }
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        if app.profile_page == 2 {
+            app.profile_page = 0;
+        } else {
+            app.settings_management = false;
+            app.setting_index = 0;
+            app.overlay = Overlay::None;
         }
-        KeyCode::Char('1'..='3') => {
-            if let KeyCode::Char(c) = key.code {
-                app.profile_page = (c as u8 - b'1') as usize;
+        return;
+    }
+    match app.profile_page {
+        3 => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                move_cursor(&mut app.routing_index, app.routing_plans.len(), false)
             }
-        }
-        KeyCode::Esc | KeyCode::Char('q' | 'f') => app.close_overlay(),
-        _ => match app.profile_page {
-            0 => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.profile_index = app
-                        .profile_index
-                        .checked_sub(1)
-                        .unwrap_or(app.profiles.len().saturating_sub(1))
+            KeyCode::Down | KeyCode::Char('j') => {
+                move_cursor(&mut app.routing_index, app.routing_plans.len(), true)
+            }
+            KeyCode::Char('c') => app.start_manage_input(ManageInput::SaveRouting),
+            KeyCode::Enter => {
+                let Some(plan) = app.routing_plans.get(app.routing_index) else {
+                    return;
+                };
+                let id = plan.id.clone();
+                let running = app.snapshot.running;
+                let zh = app.lang() == Lang::Zh;
+                let catalog = crate::ops::module_catalog(&crate::ops::modules_dir(
+                    &std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
+                ));
+                let modules = crate::ops::enabled_snippets(&catalog, &app.config.enabled_modules);
+                app.run_action(
+                    "正在切换分流方案 / Applying routing plan…",
+                    None,
+                    None,
+                    move |cfg| {
+                        crate::mihomo::regenerate_routing(
+                            &cfg,
+                            &modules,
+                            running,
+                            false,
+                            zh,
+                            Some(&id),
+                        )
+                    },
+                );
+            }
+            _ => {}
+        },
+        2 => handle_own_nodes_key(app, key),
+        _ => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                move_cursor(&mut app.profile_index, app.profiles.len(), false)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                move_cursor(&mut app.profile_index, app.profiles.len(), true)
+            }
+            KeyCode::Enter => app.switch_selected_profile(),
+            KeyCode::Char('a') => app.proxy_form = Some(crate::proxy_form::Form::default()),
+            KeyCode::Char('c') if !app.action_busy => {
+                app.save_profile_copy();
+                app.open_profiles();
+            }
+            KeyCode::Char('n') => {
+                if let Some(profile) = app.profiles.get(app.profile_index).cloned() {
+                    app.start_manage_input(ManageInput::RenameProfile);
+                    app.manage_editor.load(&profile.label);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if !app.profiles.is_empty() {
-                        app.profile_index = (app.profile_index + 1) % app.profiles.len();
-                    }
+            }
+            KeyCode::Char('u') => app.update_subscription(),
+            KeyCode::Char('e') => {
+                if let Some(entry) = app.profiles.get(app.profile_index) {
+                    app.proxy_form = Some(crate::proxy_form::Form::from_record(
+                        entry.name.clone(),
+                        crate::compose::ProfileSource::load(std::path::Path::new(&entry.path)),
+                    ));
                 }
-                KeyCode::Enter => app.switch_selected_profile(),
-                KeyCode::Char('a') => app.start_manage_input(ManageInput::AddProfile),
-                KeyCode::Char('n') => {
-                    if let Some(profile) = app.profiles.get(app.profile_index).cloned() {
-                        app.start_manage_input(ManageInput::RenameProfile);
-                        app.manage_editor.load(&profile.label);
-                    }
-                }
-                KeyCode::Char('c') => {
-                    if !app.action_busy {
-                        app.save_profile_copy();
-                        app.open_profiles();
-                    }
-                }
-                _ => {}
-            },
-            1 => match key.code {
-                KeyCode::Char('e') => app.open_setup(app.screen),
-                KeyCode::Char('u') => app.update_subscription(),
-                _ => {}
-            },
-            _ => handle_own_nodes_key(app, key),
+            }
+            KeyCode::Char('v') => app.profile_page = 2,
+            _ => {}
         },
     }
 }
 
+/// Render inside the settings panel. No second window or overlay is created.
 pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
+    if app.proxy_form.is_some() {
+        crate::proxy_form::draw(frame, app, area);
+        return;
+    }
     let theme = app.theme();
-    let popup = if area.width < 75 || area.height < 22 {
-        area
+    let routing = app.profile_page == 3;
+    let title = if routing {
+        l3(
+            app,
+            "代理列表    [ 分流方案 ]",
+            "Proxies    [ Routing ]",
+            "設定 / ルーティング",
+        )
+    } else if app.profile_page == 2 {
+        l3(
+            app,
+            "手动节点",
+            "Settings / Subscriptions / Nodes",
+            "設定 / ノード",
+        )
     } else {
-        centered_rect(90, 86, area)
+        l3(
+            app,
+            "[ 代理列表 ]    分流方案",
+            "[ Proxies ]    Routing",
+            "設定 / サブスクリプション",
+        )
     };
-    frame.render_widget(Clear, popup);
-    let inner = draw_panel(
-        frame,
-        popup,
-        theme,
-        Some(panel_title(
-            l3(app, "配置方案", "Profiles", "プロファイル").into(),
-            theme,
-        )),
-        true,
-    );
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Min(1),
+            Constraint::Length(if app.manage_input.is_some() { 4 } else { 3 }),
             Constraint::Length(1),
         ])
-        .split(inner);
-    let tabs = if app.lang() == Lang::Zh {
-        ["方案列表", "当前订阅", "手动节点"]
-    } else {
-        ["Profiles", "Subscription", "Manual nodes"]
-    };
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 3); 3])
-        .split(rows[0]);
-    for (i, name) in tabs.iter().enumerate() {
-        frame.render_widget(
-            Paragraph::new(format!(
-                "{} {} {}",
-                if app.profile_page == i { "▶" } else { " " },
-                i + 1,
-                name
-            ))
-            .style(selected_style(app, app.profile_page == i)),
-            cols[i],
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(title).style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        rows[0],
+    );
+    let route_name = app
+        .routing_plans
+        .iter()
+        .find(|p| p.id == app.routing_mode)
+        .map(|p| p.label.as_str())
+        .unwrap_or("跟随订阅 / Follow source");
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}   →   {}",
+            app.profile_display_name(),
+            route_name
+        ))
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(theme.peak)),
+        rows[1],
+    );
+    if app.profile_page == 2 {
+        let content = Rect::new(
+            area.x,
+            rows[2].y,
+            area.width,
+            area.bottom().saturating_sub(rows[2].y + 1),
         );
-    }
-    match app.profile_page {
-        0 => {
-            let adding = matches!(
-                app.manage_input,
-                Some(ManageInput::AddProfile | ManageInput::RenameProfile)
-            );
-            let body = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(2),
-                    Constraint::Min(0),
-                    Constraint::Length(if adding { 4 } else { 2 }),
-                    Constraint::Length(1),
-                ])
-                .split(rows[1]);
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "{} {}",
-                    l3(app, "当前方案", "Active profile", "使用中"),
-                    app.profile_display_name()
-                ))
-                .style(Style::default().fg(theme.peak)),
-                body[0],
-            );
-            if app.profiles.is_empty() {
-                frame.render_widget(Paragraph::new(l3(app,"还没有保存的方案。c 保存当前配置；a 导入订阅或节点。","No saved profiles. c saves the current configuration; a imports a subscription or nodes.","c で保存、a で追加")).wrap(Wrap{trim:true}),body[1]);
-            } else {
-                let visible = body[1].height as usize;
-                let start = visible_list_start(app.profile_index, app.profiles.len(), visible);
-                let items: Vec<_> = app
-                    .profiles
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(visible)
-                    .map(|(i, p)| {
-                        ListItem::new(Line::styled(
-                            format!(
-                                "{} {} {}",
-                                if i == app.profile_index { "▶" } else { " " },
-                                if p.active { "●" } else { "○" },
-                                p.label
-                            ),
-                            selected_style(app, i == app.profile_index),
-                        ))
-                    })
-                    .collect();
-                frame.render_widget(List::new(items), body[1]);
-            }
-            if adding {
-                draw_input(
-                    frame,
-                    app,
-                    body[2],
-                    if app.manage_input == Some(ManageInput::RenameProfile) {
-                        l3(app, "方案名称", "Profile name", "プロファイル名")
-                    } else {
-                        l3(
-                            app,
-                            "粘贴订阅地址或节点（支持多行 / WireGuard 配置）",
-                            "Paste subscription URL or nodes (multi-line / WireGuard supported)",
-                            "URL / ノードを貼り付け",
-                        )
-                    },
-                );
-            } else {
-                frame.render_widget(Paragraph::new(l3(app,"每个方案独立保存订阅来源和手动节点。自有规则编辑暂缓，优先使用来源分流。","Each profile keeps its subscription and manual nodes separately. Source routing is preserved; custom rule editing is paused.","プロファイルごとにソースを保存")).style(Style::default().fg(theme.muted)).wrap(Wrap{trim:true}),body[2]);
-            }
-            frame.render_widget(
-                Paragraph::new(if adding {
-                    "Enter 确认 / Confirm   Esc 取消 / Cancel"
+        draw_manual_nodes_content(frame, app, content);
+    } else {
+        let entries: Vec<(String, bool)> = if routing {
+            app.routing_plans
+                .iter()
+                .map(|p| (p.label.clone(), p.id == app.routing_mode))
+                .collect()
+        } else {
+            app.profiles
+                .iter()
+                .map(|p| (format!("{}   {}   [{}]", p.label, p.kind, p.name), p.active))
+                .collect()
+        };
+        let selected = if routing {
+            app.routing_index
+        } else {
+            app.profile_index
+        };
+        let visible = rows[2].height as usize;
+        let start = visible_list_start(selected, entries.len(), visible);
+        let items: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(i, (label, active))| {
+                let style = if i == selected {
+                    Style::default()
+                        .fg(theme.peak)
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
                 } else {
-                    l3(
-                        app,
-                        "a 导入  c 副本  n 改名  Enter 应用",
-                        "a Import  c Copy  n Rename  Enter Apply",
-                        "a 追加  c コピー  Enter 適用",
-                    )
-                }),
-                body[3],
+                    Style::default().fg(theme.text)
+                };
+                ListItem::new(format!(
+                    "{} {} {}",
+                    if i == selected { "▶" } else { " " },
+                    if *active { "●" } else { "○" },
+                    label
+                ))
+                .style(style)
+            })
+            .collect();
+        if items.is_empty() {
+            frame.render_widget(
+                Paragraph::new(l3(
+                    app,
+                    "a 添加订阅或节点；c 保存当前来源。",
+                    "a Add a subscription or nodes; c saves the current source.",
+                    "a 追加 c 保存",
+                ))
+                .wrap(Wrap { trim: true }),
+                rows[2],
+            );
+        } else {
+            frame.render_widget(List::new(items), rows[2]);
+        }
+        if let Some(kind) = app.manage_input {
+            let label = match kind {
+                ManageInput::SaveRouting => l3(
+                    app,
+                    "方案名称（复用规则与组，节点成员跟随当前订阅）",
+                    "Name (reuse policies; members follow the current source)",
+                    "名前",
+                ),
+                ManageInput::RenameProfile => l3(app, "订阅名称", "Subscription name", "名前"),
+                ManageInput::EditSubscription => {
+                    l3(app, "当前订阅地址", "Active subscription URL", "URL")
+                }
+                _ => l3(
+                    app,
+                    "订阅地址或节点（支持多行）",
+                    "Subscription URL or nodes (multi-line supported)",
+                    "URL / ノード",
+                ),
+            };
+            draw_input(frame, app, rows[3], label);
+        } else {
+            let desc = if routing {
+                l3(app,"Enter 为当前订阅应用所选方案。c 将当前规则与策略组保存为可复用方案。保存后节点成员统一跟随订阅，保留组间引用与过滤条件。","Enter assigns the plan to the active subscription. c saves current routing for reuse. Saved groups use current-source nodes, preserving group links and filters.","Enter 適用 c 保存")
+            } else {
+                l3(app,"Enter 切换订阅并加载它记住的分流。a 添加代理  e 编辑选中项  n 改名。u 更新当前订阅  v 管理当前节点。Tab 切换分流。","Enter switches source with its assigned routing. a Add  c Copy  n Rename. u Update active  e Edit active URL  v Active nodes.","Enter 切替 a 追加 c 保存 n 名前 u 更新 v ノード")
+            };
+            frame.render_widget(
+                Paragraph::new(desc)
+                    .style(Style::default().fg(theme.muted))
+                    .wrap(Wrap { trim: true }),
+                rows[3],
             );
         }
-        1 => {
-            let url = if app.config.controller.subscription_url.is_empty() {
-                "—".into()
-            } else {
-                crate::mask_url(&app.config.controller.subscription_url)
-            };
-            let lines=vec![Line::from(app.profile_display_name()),Line::default(),Line::styled(l3(app,"订阅地址","Subscription URL","URL"),Style::default().fg(theme.muted)),Line::from(url),Line::default(),Line::from(l3(app,"e 编辑当前来源   u 更新订阅","e Edit source   u Update subscription","e 編集  u 更新")),Line::default(),Line::styled(l3(app,"切换订阅请在方案列表按 a 导入新方案。来源自带的规则与策略组将保留。","Use a on the Profiles tab to import another source. Its rules and groups are preserved.","a で新しいソースを追加"),Style::default().fg(theme.muted))];
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[1]);
-        }
-        _ => draw_manual_nodes_content(frame, app, rows[1]),
     }
     frame.render_widget(
-        Paragraph::new(l3(
-            app,
-            "Tab 切换   1/2/3 分类   Esc 返回",
-            "Tab Switch   1/2/3 Tabs   Esc Back",
-            "Tab 切替  Esc 戻る",
-        ))
+        Paragraph::new(if app.manage_input.is_some() {
+            "Enter 确认 / Save   Esc 取消 / Cancel"
+        } else {
+            "↑↓ 选择 / Select   Enter 应用 / Apply   Esc 返回设置 / Back"
+        })
         .style(Style::default().fg(theme.muted)),
-        rows[2],
+        rows[4],
     );
 }

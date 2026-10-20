@@ -3,8 +3,8 @@
 //!
 //! Files under `~/.config/terc/` (all hand-editable):
 //! - `rules.conf`  private rules and AI routing settings
-//! - `nodes.conf`  user-owned nodes, one Surge line or URI per line
-//! - `subscription.cache`  last downloaded subscription body
+//! - `source.json`  named source, structured nodes and routing assignment
+//! - `subscription.yaml`  original subscription body (cached separately)
 
 use std::{
     collections::HashSet,
@@ -20,7 +20,7 @@ use crate::{
 };
 
 pub const GENERATED_MARK: &str =
-    "# terc-generated: managed by Settings > Profiles; subscription routing is preserved";
+    "# terc-generated: managed by Settings; nodes and routing are composed separately";
 
 pub const DEFAULT_AI_FILTER: &str = "(?i)(🇺🇸|🇯🇵|🇸🇬|🇹🇼|美国|美國|日本|新加坡|狮城|獅城|台湾|台灣|\\b(US|USA|JP|SG|TW|SEA|LAX|SJC|NRT|HND|SIN|TPE)\\b|United States|Japan|Tokyo|Osaka|Singapore|Taiwan|Taipei|Seattle|Los Angeles|San Jose|Silicon Valley|New York|Chicago|Dallas|Ashburn)";
 pub const DEFAULT_AI_EXCLUDE: &str =
@@ -199,7 +199,7 @@ pub fn profile_dir(cfg: &crate::mihomo::ControllerConfig) -> PathBuf {
     if cfg.profile_id.is_empty() {
         terc_dir()
     } else {
-        terc_dir().join("profiles").join(&cfg.profile_id)
+        terc_dir().join("sources").join(&cfg.profile_id)
     }
 }
 
@@ -207,6 +207,15 @@ pub fn profile_dir(cfg: &crate::mihomo::ControllerConfig) -> PathBuf {
 pub struct ProfileSource {
     pub name: String,
     pub subscription_url: String,
+    #[serde(default)]
+    pub nodes: Vec<Value>,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default = "default_routing")]
+    pub routing: String,
+}
+fn default_routing() -> String {
+    "subscription".into()
 }
 impl ProfileSource {
     pub fn load(dir: &Path) -> Self {
@@ -223,16 +232,20 @@ impl ProfileSource {
     }
 }
 
+pub fn local_routing(dir: &Path) -> bool {
+    ProfileSource::load(dir).routing == "local"
+}
+
 pub fn rules_path(dir: &Path) -> PathBuf {
     dir.join("rules.conf")
 }
 
 pub fn nodes_path(dir: &Path) -> PathBuf {
-    dir.join("nodes.conf")
+    dir.join("source.json")
 }
 
 pub fn cache_path(dir: &Path) -> PathBuf {
-    dir.join("subscription.cache")
+    dir.join("subscription.yaml")
 }
 
 /// Write a file readable only by the user (nodes and subscriptions hold secrets).
@@ -520,69 +533,39 @@ impl ManualNode {
     }
 }
 
-const NODES_HEADER: &str = "# terc 自有节点 / own nodes — 一行一个：Surge 节点行或 ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// wireguard:// ssh:// 链接（WireGuard 也可直接粘贴 wg-quick .conf）\n# 只保存在本机，不会上传。Local only.\n";
-
 pub fn load_manual_nodes(dir: &Path) -> Vec<ManualNode> {
-    let text = fs::read_to_string(nodes_path(dir)).unwrap_or_default();
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
-        .map(|line| ManualNode {
-            line: line.to_string(),
-            parsed: parse_node_line(line),
+    ProfileSource::load(dir)
+        .nodes
+        .into_iter()
+        .map(|node| ManualNode {
+            line: node.to_string(),
+            parsed: Ok(node),
         })
         .collect()
 }
-
 pub fn add_manual_node(dir: &Path, line: &str) -> Result<String, String> {
-    let line = line.trim();
-    let node = parse_node_line(line)?;
-    let name = node["name"].as_str().unwrap_or("?").to_string();
-    if load_manual_nodes(dir).iter().any(|n| n.name() == name) {
-        return Err(format!("已有同名节点 / duplicate node name: {name}"));
+    let node = parse_node_line(line.trim())?;
+    let name = node["name"].as_str().unwrap_or("Proxy").to_string();
+    let mut source = ProfileSource::load(dir);
+    if source
+        .nodes
+        .iter()
+        .any(|n| n["name"].as_str() == Some(&name))
+    {
+        return Err(format!("已有同名节点 / Duplicate node: {name}"));
     }
-    let path = nodes_path(dir);
-    let mut text = fs::read_to_string(&path).unwrap_or_else(|_| NODES_HEADER.to_string());
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(line);
-    text.push('\n');
-    write_private(&path, &text)?;
+    source.nodes.push(node);
+    source.save(dir)?;
     Ok(name)
 }
-
-/// Remove the n-th node line, keeping comments and other lines verbatim.
 pub fn remove_manual_node(dir: &Path, index: usize) -> Result<String, String> {
-    let path = nodes_path(dir);
-    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut seen = 0usize;
-    let mut removed = None;
-    let mut kept = Vec::new();
-    for raw in text.lines() {
-        let t = raw.trim();
-        let is_node = !t.is_empty() && !t.starts_with('#') && !t.starts_with("//");
-        if is_node {
-            if seen == index {
-                removed = Some(
-                    ManualNode {
-                        line: t.to_string(),
-                        parsed: parse_node_line(t),
-                    }
-                    .name(),
-                );
-                seen += 1;
-                continue;
-            }
-            seen += 1;
-        }
-        kept.push(raw.to_string());
+    let mut source = ProfileSource::load(dir);
+    if index >= source.nodes.len() {
+        return Err("没有这个节点 / No such node".into());
     }
-    let name = removed.ok_or("没有这个节点 / no such node")?;
-    let mut out = kept.join("\n");
-    out.push('\n');
-    write_private(&path, &out)?;
-    Ok(name)
+    let node = source.nodes.remove(index);
+    source.save(dir)?;
+    Ok(node["name"].as_str().unwrap_or("Proxy").into())
 }
 
 // ------------------------------------------------------------ compose
@@ -912,7 +895,7 @@ pub fn compose(input: &ComposeInput) -> Result<(String, ComposeReport), String> 
                 manual_names.push(name);
                 new_proxies.push(v);
             }
-            Err(reason) => report.manual_skipped.push(format!("nodes.conf: {reason}")),
+            Err(reason) => report.manual_skipped.push(format!("source.json: {reason}")),
         }
     }
     report.manual_nodes = manual_names.len();
@@ -1305,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_nodes_file_add_remove_keeps_comments() {
+    fn manual_nodes_json_add_remove_preserves_source() {
         let dir = std::env::temp_dir().join(format!("terc-nodes-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let line = "Test-SS = ss, 192.0.2.10, 8388, encrypt-method=aes-128-gcm, password=fake-pass";
@@ -1317,7 +1300,7 @@ mod tests {
         assert_eq!(nodes[1].name(), "T2");
         assert_eq!(remove_manual_node(&dir, 0).unwrap(), "Test-SS");
         let text = fs::read_to_string(nodes_path(&dir)).unwrap();
-        assert!(text.starts_with("# terc"));
+        assert!(serde_json::from_str::<ProfileSource>(&text).is_ok());
         assert_eq!(load_manual_nodes(&dir).len(), 1);
         #[cfg(unix)]
         {
@@ -1560,7 +1543,7 @@ pub fn compose_profile(input: &ComposeInput) -> Result<(String, ComposeReport), 
         .iter()
         .any(|c| c.key.as_deref() == Some("proxy-providers"));
     if names.is_empty() && !has_providers {
-        return Err("没有可用节点，请在设置 → 配置方案导入订阅或节点 / Import a subscription or nodes under Settings → Profiles".into());
+        return Err("没有可用节点，请在设置 → 代理订阅导入订阅或节点 / Import nodes under Settings → Proxy subscriptions".into());
     }
     let items: Vec<_> = new_nodes.iter().map(Value::to_string).collect();
     if let Some(c) = chunks

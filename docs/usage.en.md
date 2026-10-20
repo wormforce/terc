@@ -17,9 +17,9 @@ There is no Windows build. The system proxy is never turned on by Setup.
 
 ## Subscription URL and Providers
 
-The airport subscription is the single URL you paste. `u` downloads it, combines it with the active profile’s manual nodes in `config.yaml`, preserving source routing, validates, and hot-reloads the core. If no URL is saved, `u` opens Setup again.
+The airport subscription is the single URL you paste. Settings → Proxy subscriptions → Update subscription downloads it, combines it with the active profile’s manual nodes in `config.yaml`, preserving source routing, validates, and hot-reloads the core. Set the source URL in Settings first.
 
-`v` opens **订阅源 / Providers**. That page is `proxy-providers` and `rule-providers` inside the Mihomo config: extra URLs the core uses to refresh a node list or a rule list. It is not the airport URL. Refreshing a provider does not replace the subscription link in `~/.config/terc/config.json`.
+Settings → Tools opens **订阅源 / Providers**. That page is `proxy-providers` and `rule-providers` inside the Mihomo config: extra URLs the core uses to refresh a node list or a rule list. It is not the airport URL. Refreshing a provider does not replace the subscription link in `~/.config/terc/config.json`.
 
 On that page, Enter refreshes the selected provider, `F` refreshes all of them, and `H` health-checks a proxy provider. Rule providers have no latency check.
 
@@ -37,23 +37,19 @@ Snell v4/v5 needs Mihomo v1.19.26 or newer (`Ctrl+D` fetches the latest). Mihomo
 
 Skipped, never fatal: `external`, snell v6, listen-only WireGuard sections (`listen-port` with peers lacking `endpoint`), `ssid`/`subnet` groups, `policy-path`, `USER-AGENT`, `URL-REGEX`, `RULE-SET,SYSTEM`/`LAN`, rules pointing at unknown policies, unsupported ciphers. The result toast says "N skipped"; press `!` for the list (names and types only, never secrets). Only a recognizable download replaces `~/.config/terc/subscription.cache`.
 
-## Profiles: subscriptions and manual nodes
+## Proxy subscriptions and routing plans
 
-Open Settings → Profiles, or press `f` on the dashboard. Subscriptions, VPS nodes and imported proxies share one manager.
+Press `s` → Sources & Routing to see the named proxy list directly. Tab switches between proxies and routing plans. Rows show name, type, stable ID and active state; the selected row is highlighted.
 
-- **Profiles**: `a` imports a subscription URL or nodes into a new profile (multi-line and WireGuard configs supported); `c` saves a copy; `n` renames; Enter applies the selection.
-- **Subscription**: `e` edits the active source; `u` updates it. Import another provider with `a` on the Profiles tab to keep both available.
-- **Manual nodes**: `a` adds, `d` removes, `r` / Enter tests, `A` tests all. Surge lines and ss / trojan / vmess / vless / hysteria2 / tuic / wireguard / ssh links are supported.
+Press `a` for the unified Add proxy form. Choose Subscription, Single proxy, or Import links/configuration. Enter a name and the relevant URL or server, port, credentials, cipher and TLS/SNI fields. Supported form protocols: SS, Trojan, VMess, VLESS, SOCKS5, HTTP, Hysteria2 and TUIC. Other supported protocols can be imported. Arrows/Tab select fields, left/right cycle options, Enter edits, Ctrl+S saves and uses the entry. Passwords are masked. `e` edits the selected entry, `n` renames, `u` updates the active subscription, and `v` manages attached nodes. Failed saves restore the old source record and configuration.
 
-Tab / Shift+Tab or 1–3 switches pages. Esc returns to Settings. Every profile owns its source, node list and cache, so a refresh after switching profiles cannot mix the previous source into the active one. Snapshots live at `~/.config/terc/profiles/<id>.yaml`; source metadata, cache and manual nodes live in the matching directory. Node lists do not display passwords.
+Routing lists subscription routing, Proxy all, routing cached by each source and named saved plans. Enter assigns a plan to the active proxy; `c` saves current routing for reuse. Nodes always come from the active source.
 
-Clash and convertible Surge subscriptions preserve their own groups, rules and rule providers. Manual nodes join selectable groups. Node-only sources receive one `PROXY` selector and a `MATCH` fallback.
-
-**Custom rule and AI preset development and editing are paused.** Existing `rules.conf` files remain local. Newly generated profiles do not apply those custom rules, China-direct rules or AI presets, and do not add AUTO / AI groups. Existing live configurations change only when updated or regenerated.
+For example, source A can use its own routing and manual source B can use a shared plan. Switching restores each assignment. Updating B's nodes keeps its routing and never imports A's nodes. Original source caches remain separate. Validation failures keep the current configuration and routing assignment. Previous local snapshots remain selectable as policy only. Custom rule editing is still paused.
 
 ## Common settings
 
-Settings has four tabs: Proxy, Appearance, Profiles and Diagnostics (Tab / Shift+Tab or 1–4).
+Settings has four tabs: Proxy, Appearance, Sources & Routing and Diagnostics (Tab / Shift+Tab or 1–4).
 
 Proxy settings include mixed / HTTP / SOCKS ports, LAN access, TUN, DNS, IPv6, sniffing, concurrent TCP, process matching, the test URL and controller timeout. Port values range from 0 to 65535; 0 disables a listener. A mixed port supports both HTTP and SOCKS and must not duplicate another listener. Turn off system proxy before changing ports, then enable it again after saving.
 
@@ -63,22 +59,17 @@ Diagnostics contains the log level, core download, snippets, probe, runtime deta
 
 ## Sniffer
 
-`n` toggles the Mihomo sniffer. Many flows arrive with only an IP. The sniffer reads the HTTP Host, TLS SNI, or QUIC name from the start of the flow and fills the domain back in, so domain rules can match. The connections view shows that sniffed host. It does not store page contents, and it is not a packet capture.
+Settings → Proxy toggles the Mihomo sniffer. Many flows arrive with only an IP. The sniffer reads the HTTP Host, TLS SNI, or QUIC name from the start of the flow and fills the domain back in, so domain rules can match. The connections view shows that sniffed host. It does not store page contents, and it is not a packet capture.
 
 ## Other views
 
 | Key | View |
 | --- | --- |
-| `T` / Space / `D` / `i` / `m` | TUN, system proxy, `dns.enable`, IPv6, routing mode |
-| `d` | DNS lookup. `F` flushes DNS and Fake-IP. `[` `]` change the record type |
-| `g` | Effective rules: `/` searches, `e` tests a target, Enter opens details, `x` temporarily disables the selection |
-| `o` | Snippets appended to the config (`~/.config/terc/modules`) |
-| `f` | Profiles (`~/.config/terc/profiles`). Enter switches, `c` saves a copy |
-| `b` | Probe: DNS plus a delay test of the selected node |
-| `w` | Runtime: TUN device and WireGuard / Tailscale outbounds |
-| `f` | Profiles: subscriptions, manual nodes and configuration switching |
+| Settings → Proxy | TUN, DNS, IPv6, sniffer, core service |
+| Settings → Proxy subscriptions | Sources and manual nodes; separate Routing plans entry |
+| Settings → Tools | DNS lookup, effective rules, providers, snippets, probe and runtime |
 | `s` / `?` | Settings and help. Esc returns to the dashboard |
-| `q` | Quit the UI. The core keeps running. `K` starts or stops it |
+| `q` | Quit the UI. The core keeps running. Settings → Proxy → Core service starts or stops it |
 | Esc | From a subview, return to proxies. From proxies, stay on the dashboard; q quits |
 
 ## Linux and macOS
@@ -86,3 +77,7 @@ Diagnostics contains the log level, core download, snippets, probe, runtime deta
 System proxy on macOS uses `networksetup` on the active network service. On Linux it uses GNOME `gsettings` (`org.gnome.system.proxy`) when that schema is present, and otherwise does nothing and says so. Linux never calls `networksetup`. Neither platform enables the proxy on its own.
 
 Local control is `TcpStream` to `127.0.0.1:9090`. Remote downloads use the system `curl`.
+
+## Storage
+
+Under `~/.config/terc/`, `sources/<id>/source.json` stores the source name, kind, URL, structured nodes and routing assignment. `subscription.yaml` beside it holds the original subscription. `routing/` holds reusable plans; `generated/` holds derived core configurations. Startup imports legacy records while retaining their original files. It does not start a core or enable the system proxy.

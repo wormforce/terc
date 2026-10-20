@@ -174,6 +174,21 @@ pub fn convert_subscription(raw: &str) -> Result<Converted, String> {
 /// Parse one user-pasted node: a Surge `Name = type, ...` line or a URI.
 pub fn parse_node_line(line: &str) -> Result<Value, String> {
     let line = line.trim().trim_start_matches('\u{feff}');
+    if line.starts_with('{') {
+        let value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+        if value["name"].as_str().is_none()
+            || value["type"].as_str().is_none()
+            || value["server"].as_str().is_none()
+            || value["port"]
+                .as_u64()
+                .filter(|p| (1..=65535).contains(p))
+                .is_none()
+        {
+            return Err("节点缺少名称、类型、服务器或有效端口 / Incomplete proxy".into());
+        }
+        return Ok(value);
+    }
+
     if line.is_empty() {
         return Err("空行 / empty line".into());
     }

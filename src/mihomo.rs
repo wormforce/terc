@@ -1293,11 +1293,38 @@ pub fn regenerate_config(
     refresh: bool,
     zh: bool,
 ) -> Result<String, String> {
+    regenerate_routing(cfg, modules, running, refresh, zh, None)
+}
+
+pub fn regenerate_routing(
+    cfg: &ControllerConfig,
+    modules: &[crate::ops::ModuleSnippet],
+    running: bool,
+    refresh: bool,
+    zh: bool,
+    selection: Option<&str>,
+) -> Result<String, String> {
     use crate::compose;
     let dir = compose::profile_dir(cfg);
     let old = read_config_text(cfg).ok();
+    let route = selection
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::routing::selected(cfg));
+    // Preserve the outgoing configuration before the first explicit switch.
+    // This snapshot never becomes the subscription cache.
+    if selection.is_some() && !dir.join("routing-local.yaml").exists() {
+        if let Some(doc) = &old {
+            compose::write_private(&dir.join("routing-local.yaml"), doc)?;
+        }
+    }
     let has_url = !cfg.subscription_url.trim().is_empty();
     let need_download = refresh
+        || (selection == Some("subscription")
+            && has_url
+            && fs::read_to_string(compose::cache_path(&dir))
+                .ok()
+                .as_deref()
+                .is_none_or(compose::is_generated))
         || (has_url
             && !compose::cache_path(&dir).is_file()
             && old.as_deref().is_none_or(compose::is_generated));
@@ -1311,11 +1338,31 @@ pub fn regenerate_config(
     } else {
         None
     };
-    let sub = if let Some(raw) = &fresh {
+    // Keep imported source documents before any generated output replaces them.
+    if !compose::cache_path(&dir).exists() {
+        if let Some(doc) = source_config.filter(|doc| !compose::is_generated(doc)) {
+            if crate::ops::has_subscription_source(doc) {
+                crate::subconv::convert_subscription(doc)?;
+                compose::write_private(&compose::cache_path(&dir), doc)?;
+            }
+        }
+    }
+    let sub = if compose::ProfileSource::load(&dir).kind == "proxy" {
+        None
+    } else if let Some(raw) = &fresh {
         Some(crate::subconv::convert_subscription(raw)?)
     } else {
         compose::load_subscription_source(&dir, None, source_config)?
     };
+    if selection == Some("subscription")
+        && sub.is_none()
+        && compose::load_manual_nodes(&dir).is_empty()
+    {
+        return Err(
+            "没有机场原始配置。请在当前订阅中填写订阅地址后重试 / Add a subscription URL first"
+                .into(),
+        );
+    }
     let manual = compose::load_manual_nodes(&dir);
     // Custom rules and AI presets are paused. The source owns routing policy.
     let rules = compose::PrivateRules::default();
@@ -1327,6 +1374,7 @@ pub fn regenerate_config(
         secret: &cfg.secret,
         test_url: &cfg.test_url,
     })?;
+    let base = crate::routing::apply(&base, &route, cfg)?;
     let (base, switches) = match old.as_deref() {
         Some(doc) => (
             compose::carry_runtime_state(&crate::ops::strip_marked_modules(doc), &base),
@@ -1339,10 +1387,15 @@ pub fn regenerate_config(
     if let Some(raw) = fresh {
         compose::write_private(&compose::cache_path(&dir), &raw)?;
     }
+    if let Some(route) = selection {
+        let mut source = compose::ProfileSource::load(&dir);
+        source.routing = route.into();
+        source.save(&dir)?;
+    }
     if !cfg.profile_id.is_empty() {
         compose::write_private(
             &compose::terc_dir()
-                .join("profiles")
+                .join("generated")
                 .join(format!("{}.yaml", cfg.profile_id)),
             &generated,
         )?;

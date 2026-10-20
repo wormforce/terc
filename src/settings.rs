@@ -13,9 +13,9 @@ pub enum SettingId {
     Refresh,
     GraphInterval,
     Language,
-    Subscription,
-    Update,
     Profiles,
+    Routing,
+    DnsTools,
     MixedPort,
     HttpPort,
     SocksPort,
@@ -141,29 +141,17 @@ impl App {
             self.t("desc_lang"),
             self.t("desc_lang"),
         );
+        add(Profiles, C::Subscription, "代理订阅", "Proxy subscriptions", self.profile_display_name(), "管理机场订阅、自建和手动节点。选择来源后，可在分流方案中指定它使用的分流。", "Manage subscriptions and manual nodes. Assign an independent routing plan to each source.");
+        add(Routing, C::Subscription, "分流方案", "Routing plans", self.routing_plans.iter().find(|p| p.id == self.routing_mode).map(|p| p.label.clone()).unwrap_or_else(|| "跟随订阅 / Follow source".into()), "选择当前代理订阅使用的分流方案。保存的方案可以被多个订阅复用，节点始终来自当前订阅。", "Choose routing for the active subscription. Saved plans can be shared; nodes always come from the active source.");
         add(
-            Subscription,
-            C::Subscription,
-            "订阅地址",
-            "Subscription URL",
-            if self.config.controller.subscription_url.is_empty() {
-                "—".into()
-            } else {
-                crate::mask_url(&self.config.controller.subscription_url)
-            },
-            "编辑当前配置方案的订阅地址，或导入节点。",
-            "Edit the active profile's subscription URL or import nodes.",
-        );
-        add(
-            Update,
-            C::Subscription,
-            "更新当前订阅",
-            "Update subscription",
+            DnsTools,
+            C::Diagnostics,
+            "DNS 查询",
+            "DNS lookup",
             action.clone(),
-            "下载并校验后应用；保留订阅自带的规则与策略组。",
-            "Download, validate and apply, preserving the subscription's rules and groups.",
+            "查询解析结果与清理缓存。",
+            "Inspect DNS results and clear the cache.",
         );
-        add(Profiles,C::Subscription,"配置方案","Profiles",self.profile_display_name(),"统一管理订阅与手动节点。Enter 打开，a 导入新方案，c 保存副本，Tab 查看方案来源。不同方案分别保存节点与订阅。","Manage subscriptions and manual nodes together. Enter opens profiles; a imports; c saves a copy; Tab shows sources. Each profile has its own nodes and subscription.");
         let port_desc="Enter 输入端口（0–65535），0 表示关闭此监听。混合端口同时支持 HTTP 和 SOCKS。保存后校验并重载。系统代理开启时请先关闭，再调整端口。";
         let port_en="Enter a port (0–65535); 0 disables this listener. Mixed supports HTTP and SOCKS. Validate and reload on save. Turn off system proxy before changing ports.";
         add(
@@ -311,8 +299,6 @@ impl App {
         ] {
             add(id,C::Diagnostics,zh,en,action.clone(),"Enter 打开。自有规则编辑已暂停；规则浏览以当前内核实际生效的顺序为准。","Enter to open. Custom rule editing is paused; rule browsing follows the core's effective order.");
         }
-        // Lead the sources category with the unified manager.
-        rows.swap(9, 11);
         if let Some(input) = &self.setting_input {
             if let Some(row) = rows.get_mut(self.setting_index) {
                 row.value = format!("{input}▏");
@@ -376,9 +362,18 @@ impl App {
                 self.config.settings.lang = langs[(i as i32 + dir).rem_euclid(3) as usize];
                 self.save_preferences();
             }
-            Subscription => self.open_setup(Screen::Settings),
-            Update => self.update_subscription(),
-            Profiles => self.open_profiles(),
+            Profiles => {
+                self.profile_page = 0;
+                self.open_profiles();
+            }
+            Routing => {
+                self.profile_page = 3;
+                self.open_profiles();
+            }
+            DnsTools => {
+                self.screen = Screen::Dashboard;
+                self.main_tab = crate::MainTab::Dns;
+            }
             MixedPort | HttpPort | SocksPort | TestUrl | Timeout => {
                 self.setting_input = Some(String::new());
             }
@@ -599,6 +594,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 .iter()
                 .position(|r| r.category == categories[next])
                 .unwrap();
+            if categories[next] == C::Subscription {
+                app.profile_page = 0;
+                app.open_profiles();
+            }
         }
         _ => {}
     }

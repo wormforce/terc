@@ -57,7 +57,7 @@ pub fn draw_toggle_strip(frame: &mut Frame, app: &App, area: Rect) {
         ),
         (mode, app.snapshot.mode.as_str(), true),
         (
-            "T TUN",
+            "TUN",
             if app.snapshot.tun_enabled {
                 "ON"
             } else {
@@ -488,7 +488,6 @@ pub fn draw_overlay(frame: &mut Frame, app: &App, area: Rect) {
     match app.overlay {
         Overlay::None => {}
         Overlay::Modules => draw_modules(frame, app, area),
-        Overlay::Profiles => draw_profiles(frame, app, area),
         Overlay::Probe => draw_probe(frame, app, area),
         Overlay::Runtime => draw_runtime(frame, app, area),
         Overlay::Best => draw_best(frame, app, area),
@@ -930,10 +929,6 @@ fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
         )),
         rows[1],
     );
-}
-
-fn draw_profiles(frame: &mut Frame, app: &App, area: Rect) {
-    crate::manage::draw_profile_hub(frame, app, area);
 }
 
 fn draw_probe(frame: &mut Frame, app: &App, area: Rect) {
