@@ -245,8 +245,9 @@ impl Form {
                 return Err("请输入有效的订阅 URL".into());
             }
             result.subscription_url = url;
-            // Keep manually attached nodes while editing an existing subscription.
-            if self.original.subscription_url.is_empty() {
+            // Keep manually attached nodes while editing an existing subscription,
+            // or giving an imported one a URL; there they are extras, not the form's.
+            if self.original.subscription_url.is_empty() && self.original.kind != "imported" {
                 result.nodes.clear();
             }
         } else if self.kind == 2 {
@@ -683,6 +684,13 @@ mod tests {
             assert_eq!(saved.kind, "imported");
             assert_eq!(saved.name, "改名");
             assert_eq!(saved.nodes.len(), nodes.len());
+            // Adding the airport URL makes it refreshable without losing extras.
+            f.kind = 0;
+            f.url.load("https://airport.test/sub");
+            let saved = f.record().unwrap();
+            assert_eq!(saved.kind, "subscription");
+            assert_eq!(saved.subscription_url, "https://airport.test/sub");
+            assert_eq!(saved.nodes, nodes);
         }
     }
     #[test]
