@@ -491,7 +491,7 @@ impl ManualNode {
     }
 }
 
-const NODES_HEADER: &str = "# terc 自有节点 / own nodes — 一行一个：Surge 节点行或 ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// 链接\n# 只保存在本机，不会上传。Local only.\n";
+const NODES_HEADER: &str = "# terc 自有节点 / own nodes — 一行一个：Surge 节点行或 ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// wireguard:// ssh:// 链接（WireGuard 也可直接粘贴 wg-quick .conf）\n# 只保存在本机，不会上传。Local only.\n";
 
 pub fn load_manual_nodes(dir: &Path) -> Vec<ManualNode> {
     let text = fs::read_to_string(nodes_path(dir)).unwrap_or_default();
@@ -1370,14 +1370,24 @@ mod tests {
         let nodes = manual(&[
             "🇺🇸 Own-SS = ss, 192.0.2.1, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=AAAAAAAAAAAAAAAAAAAAAA==, udp-relay=true, tfo=true",
             "vless://00000000-0000-0000-0000-000000000000@192.0.2.4:443?security=reality&sni=www.example.com&pbk=Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw&sid=ab&type=tcp#Own-VL",
+            "wireguard://AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE%3D@192.0.2.40:51820?publickey=AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI%3D&address=172.16.0.2%2F32&reserved=1%2C2%2C3&mtu=1280#Own-WG",
+            "Own-SSH = ssh, 192.0.2.50, 22, username=root, password=fake",
         ]);
         let clash = "mixed-port: 7897\nproxies:\n  - {name: \"HK 01\", type: ss, server: 192.0.2.5, port: 1, cipher: aes-128-gcm, password: x}\nproxy-groups:\n  - name: Airport\n    type: select\n    proxies: [HK 01]\nrules:\n  - DOMAIN-SUFFIX,google.com,Airport\n  - MATCH,Airport\n";
         let surge = convert_subscription(crate::subconv::tests::SURGE).unwrap();
         let clash = convert_subscription(clash).unwrap();
+        // The fake PEM in the fixture would (rightly) fail Mihomo's key parser.
+        let wg_profile = crate::subconv::tests::surge_wg_profile()
+            .lines()
+            .filter(|l| !l.starts_with("KeyJump"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wg = convert_subscription(&wg_profile).unwrap();
+        assert!(wg.proxies.iter().any(|p| p["name"] == "Mesh"));
         let mut rules = PrivateRules::default();
         rules.rules.push("DOMAIN-SUFFIX,example.org,AI".into());
         rules.rules.push("PROCESS-NAME,curl,DIRECT".into());
-        for sub in [None, Some(&surge), Some(&clash)] {
+        for sub in [None, Some(&surge), Some(&clash), Some(&wg)] {
             for keep in [false, true] {
                 rules.subscription_rules = keep;
                 let (yaml, _) = compose(&input(sub, &nodes, &rules)).unwrap();

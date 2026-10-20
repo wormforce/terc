@@ -91,6 +91,7 @@ const URI_SCHEMES: &[&str] = &[
     "socks://",
     "wireguard://",
     "wg://",
+    "ssh://",
 ];
 
 const SURGE_PROXY_TYPES: &[&str] = &[
@@ -189,7 +190,7 @@ pub fn parse_node_line(line: &str) -> Result<Value, String> {
         return Err("需要 Surge 节点行或节点链接 / expected a Surge line or URI".into());
     };
     let mut alias = HashMap::new();
-    match parse_surge_proxy(name.trim(), rest, &mut alias)? {
+    match parse_surge_proxy(name.trim(), rest, &mut alias, &SurgeCtx::default())? {
         Some(node) => Ok(node),
         None => Err("DIRECT / REJECT 不是节点 / not a node".into()),
     }
@@ -218,6 +219,8 @@ fn convert_surge(text: &str) -> Converted {
     let mut proxy_lines = Vec::new();
     let mut group_lines = Vec::new();
     let mut rule_lines = Vec::new();
+    let mut ctx = SurgeCtx::default();
+    let mut wg_section: Option<String> = None;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty()
@@ -228,13 +231,37 @@ fn convert_surge(text: &str) -> Converted {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
-            section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            let header = line[1..line.len() - 1].trim();
+            section = header.to_ascii_lowercase();
+            wg_section = section
+                .strip_prefix("wireguard ")
+                .map(|_| header["wireguard ".len()..].trim().to_string());
+            if let Some(name) = &wg_section {
+                ctx.wireguard.entry(name.clone()).or_default();
+            }
+            continue;
+        }
+        if let Some(wg) = &wg_section {
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim().to_ascii_lowercase();
+                let entry = ctx.wireguard.entry(wg.clone()).or_default();
+                if key == "peer" {
+                    entry.peers.extend(split_params(v.trim()));
+                } else {
+                    entry.kv.insert(key, unquote(v.trim()));
+                }
+            }
             continue;
         }
         match section.as_str() {
             "proxy" => proxy_lines.push(line.to_string()),
             "proxy group" => group_lines.push(line.to_string()),
             "rule" => rule_lines.push(line.to_string()),
+            "keystore" => {
+                if let Some((k, v)) = line.split_once('=') {
+                    ctx.keystore.insert(unquote(k.trim()), v.trim().to_string());
+                }
+            }
             // Section-less Surge proxy lists (policy-path style).
             "" if surge_proxy_like(line) => proxy_lines.push(line.to_string()),
             _ => {}
@@ -250,7 +277,7 @@ fn convert_surge(text: &str) -> Converted {
             continue;
         };
         let name = unquote(name.trim());
-        match parse_surge_proxy(&name, rest, &mut alias) {
+        match parse_surge_proxy(&name, rest, &mut alias, &ctx) {
             Ok(Some(mut node)) => {
                 unique_name(&mut node, &mut names);
                 out.proxies.push(node);
@@ -524,11 +551,223 @@ fn parse_port(name: &str, v: &str) -> Result<u16, String> {
         .ok_or_else(|| format!("{name}: invalid port"))
 }
 
+/// Sections a Surge proxy line may reference: `[WireGuard <name>]` and
+/// `[Keystore]` (SSH private keys).
+#[derive(Debug, Default)]
+struct SurgeCtx {
+    wireguard: HashMap<String, WgSection>,
+    keystore: HashMap<String, String>,
+}
+
+#[derive(Debug, Default)]
+struct WgSection {
+    kv: HashMap<String, String>,
+    /// Raw `(public-key = ..., endpoint = ...)` groups, in order.
+    peers: Vec<String>,
+}
+
+/// A WireGuard key as Mihomo wants it (standard base64 of 32 bytes). Surge also
+/// accepts 64-character hex.
+fn wg_key(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).unwrap_or(0))
+            .collect();
+        return Some(encode_base64(&bytes));
+    }
+    decode_base64(t)
+        .filter(|b| b.len() == 32)
+        .map(|b| encode_base64(&b))
+}
+
+/// Surge `client-id` / URI `reserved`: `83/12/235`, `83,12,235`, 6 hex chars
+/// or 4-char base64 — all three bytes.
+fn wg_reserved(raw: &str) -> Option<Vec<u8>> {
+    let t = raw.trim().trim_matches(|c| c == '[' || c == ']');
+    if t.is_empty() {
+        return None;
+    }
+    let sep = if t.contains('/') { '/' } else { ',' };
+    if t.contains(sep) {
+        let v: Option<Vec<u8>> = t.split(sep).map(|p| p.trim().parse::<u8>().ok()).collect();
+        return v.filter(|v| v.len() == 3);
+    }
+    if t.len() == 6 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (0..3)
+            .map(|i| u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).ok())
+            .collect();
+    }
+    decode_base64(t).filter(|b| b.len() == 3)
+}
+
+/// `host:port`, `[v6]:port`.
+fn split_endpoint(raw: &str) -> Option<(String, u16)> {
+    let t = raw.trim();
+    let (host, port) = if let Some(rest) = t.strip_prefix('[') {
+        let (h, after) = rest.split_once(']')?;
+        (h, after.strip_prefix(':')?)
+    } else {
+        t.rsplit_once(':')?
+    };
+    let port = port.trim().parse::<u16>().ok().filter(|p| *p > 0)?;
+    (!host.trim().is_empty()).then(|| (host.trim().to_string(), port))
+}
+
+fn list_values(raw: &str) -> Vec<String> {
+    unquote(raw)
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Fill a Mihomo `wireguard` proxy from a Surge `[WireGuard <section>]`.
+fn surge_wireguard(
+    name: &str,
+    kv: &HashMap<String, String>,
+    ctx: &SurgeCtx,
+    node: &mut Map<String, Value>,
+) -> Result<(), String> {
+    let section_name = kv
+        .get("section-name")
+        .ok_or_else(|| format!("{name}: wireguard missing section-name"))?;
+    let sec = ctx
+        .wireguard
+        .get(section_name.as_str())
+        .ok_or_else(|| format!("{name}: wireguard section [WireGuard {section_name}] not found"))?;
+    let private_key = sec
+        .kv
+        .get("private-key")
+        .and_then(|k| wg_key(k))
+        .ok_or_else(|| format!("{name}: wireguard private-key missing or invalid"))?;
+    let mut peers = Vec::new();
+    for raw in &sec.peers {
+        let inner = raw.trim().trim_start_matches('(').trim_end_matches(')');
+        let mut p: HashMap<String, String> = HashMap::new();
+        for part in split_params(inner) {
+            if let Some((k, v)) = part.split_once('=') {
+                p.insert(k.trim().to_ascii_lowercase(), unquote(v.trim()));
+            }
+        }
+        peers.push(p);
+    }
+    if peers.is_empty() {
+        return Err(format!("{name}: wireguard section has no peer"));
+    }
+    let mut out_peers = Vec::new();
+    let mut keepalive = None;
+    for (i, p) in peers.iter().enumerate() {
+        let public_key = p
+            .get("public-key")
+            .and_then(|k| wg_key(k))
+            .ok_or_else(|| format!("{name}: wireguard peer {} public-key invalid", i + 1))?;
+        let (server, port) = p
+            .get("endpoint")
+            .and_then(|e| split_endpoint(e))
+            .ok_or_else(|| {
+                format!(
+                    "{name}: wireguard peer {} needs endpoint (listen-port unsupported)",
+                    i + 1
+                )
+            })?;
+        let mut peer = Map::new();
+        peer.insert("server".into(), json!(server));
+        peer.insert("port".into(), json!(port));
+        peer.insert("public-key".into(), json!(public_key));
+        if let Some(psk) = p.get("preshared-key").and_then(|k| wg_key(k)) {
+            peer.insert("pre-shared-key".into(), json!(psk));
+        }
+        let allowed = p
+            .get("allowed-ips")
+            .map(|v| list_values(v))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["0.0.0.0/0".into(), "::/0".into()]);
+        peer.insert("allowed-ips".into(), json!(allowed));
+        if let Some(id) = p.get("client-id") {
+            let r = wg_reserved(id)
+                .ok_or_else(|| format!("{name}: wireguard client-id must be 3 bytes"))?;
+            peer.insert("reserved".into(), json!(r));
+        }
+        if keepalive.is_none() {
+            keepalive = p.get("keepalive").and_then(|v| v.parse::<u64>().ok());
+        }
+        out_peers.push(peer);
+    }
+    node.insert("type".into(), json!("wireguard"));
+    node.insert("private-key".into(), json!(private_key));
+    let ip = sec.kv.get("self-ip").filter(|v| !v.is_empty());
+    let ipv6 = sec.kv.get("self-ip-v6").filter(|v| !v.is_empty());
+    if ip.is_none() && ipv6.is_none() {
+        return Err(format!("{name}: wireguard needs self-ip or self-ip-v6"));
+    }
+    if let Some(v) = ip {
+        node.insert("ip".into(), json!(v));
+    }
+    if let Some(v) = ipv6 {
+        node.insert("ipv6".into(), json!(v));
+    }
+    if let Some(m) = sec.kv.get("mtu").and_then(|v| v.parse::<u64>().ok()) {
+        node.insert("mtu".into(), json!(m));
+    }
+    if let Some(k) = keepalive {
+        node.insert("persistent-keepalive".into(), json!(k));
+    }
+    let dns: Vec<String> = sec
+        .kv
+        .get("dns-server")
+        .map(|v| list_values(v))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| !d.eq_ignore_ascii_case("system"))
+        .collect();
+    if !dns.is_empty() {
+        node.insert("remote-dns-resolve".into(), json!(true));
+        node.insert("dns".into(), json!(dns));
+    }
+    node.insert("udp".into(), json!(true));
+    let first = out_peers[0].clone();
+    // Top-level server/port always mirror the first peer (summaries, tests).
+    node.insert("server".into(), first["server"].clone());
+    node.insert("port".into(), first["port"].clone());
+    if out_peers.len() == 1 {
+        for (k, v) in first {
+            node.insert(k, v);
+        }
+    } else {
+        node.insert("peers".into(), json!(out_peers));
+    }
+    Ok(())
+}
+
+/// Resolve a Surge `[Keystore]` item (`type=openssh-private-key, base64=...`)
+/// to the PEM text Mihomo accepts inline.
+fn keystore_private_key(name: &str, item: &str, ctx: &SurgeCtx) -> Result<String, String> {
+    let raw = ctx
+        .keystore
+        .get(item)
+        .ok_or_else(|| format!("{name}: ssh private-key needs [Keystore] item {item}"))?;
+    let b64 = split_params(raw)
+        .into_iter()
+        .find_map(|p| {
+            p.split_once('=')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("base64"))
+                .map(|(_, v)| unquote(v.trim()))
+        })
+        .ok_or_else(|| format!("{name}: ssh keystore item has no base64"))?;
+    let pem = decode_base64(&b64)
+        .and_then(|b| String::from_utf8(b).ok())
+        .filter(|t| t.contains("PRIVATE KEY"))
+        .ok_or_else(|| format!("{name}: ssh keystore item is not a private key"))?;
+    Ok(pem)
+}
+
 /// Ok(None) means the line defines a built-in policy alias (direct/reject).
 fn parse_surge_proxy(
     name: &str,
     rest: &str,
     alias: &mut HashMap<String, String>,
+    ctx: &SurgeCtx,
 ) -> Result<Option<Value>, String> {
     let name = unquote(name);
     if name.is_empty() {
@@ -568,6 +807,8 @@ fn parse_surge_proxy(
         "tuic",
         "tuic-v5",
         "anytls",
+        "wireguard",
+        "ssh",
     ];
     if !SUPPORTED.contains(&kind.as_str()) {
         return Err(format!("{name} = {kind}"));
@@ -582,16 +823,20 @@ fn parse_surge_proxy(
             _ => positional.push(unquote(part)),
         }
     }
-    let server = positional
-        .first()
-        .cloned()
-        .ok_or_else(|| format!("{name}: missing server"))?;
-    let port = parse_port(&name, positional.get(1).map(String::as_str).unwrap_or(""))?;
     let flag = |k: &str| kv.get(k).map(|v| truthy(v));
     let mut node = Map::new();
     node.insert("name".into(), json!(name));
-    node.insert("server".into(), json!(server));
-    node.insert("port".into(), json!(port));
+    if kind == "wireguard" {
+        surge_wireguard(&name, &kv, ctx, &mut node)?;
+    } else {
+        let server = positional
+            .first()
+            .cloned()
+            .ok_or_else(|| format!("{name}: missing server"))?;
+        let port = parse_port(&name, positional.get(1).map(String::as_str).unwrap_or(""))?;
+        node.insert("server".into(), json!(server));
+        node.insert("port".into(), json!(port));
+    }
     let sni = kv.get("sni").cloned();
     let skip_verify = flag("skip-cert-verify");
     let ws = |node: &mut Map<String, Value>| {
@@ -717,7 +962,9 @@ fn parse_surge_proxy(
                 .get("version")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(1);
-            if version > 3 {
+            // Mihomo ≥ 1.19.26 speaks v1–v5 (v5 = v4 wire, no QUIC proxy
+            // mode); v6 is not implemented by Mihomo.
+            if !(1..=5).contains(&version) {
                 return Err(format!("{name}: snell v{version} unsupported by Mihomo"));
             }
             node.insert("type".into(), json!("snell"));
@@ -726,7 +973,24 @@ fn parse_surge_proxy(
                 json!(kv.get("psk").cloned().unwrap_or_default()),
             );
             node.insert("version".into(), json!(version));
-            if let Some(mode) = kv.get("obfs") {
+            if version >= 4 && flag("reuse") == Some(true) {
+                node.insert("reuse".into(), json!(true));
+            }
+            if let Some(pw) = kv.get("shadow-tls-password") {
+                let v = kv
+                    .get("shadow-tls-version")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(3);
+                node.insert(
+                    "obfs-opts".into(),
+                    json!({
+                        "mode": "shadow-tls",
+                        "host": kv.get("shadow-tls-sni").cloned().unwrap_or_default(),
+                        "password": pw,
+                        "version": v,
+                    }),
+                );
+            } else if let Some(mode) = kv.get("obfs") {
                 let mut opts = Map::new();
                 opts.insert("mode".into(), json!(mode));
                 if let Some(host) = kv.get("obfs-host") {
@@ -789,6 +1053,41 @@ fn parse_surge_proxy(
                 node.insert("sni".into(), json!(s));
             }
         }
+        "wireguard" => {}
+        "ssh" => {
+            node.insert("type".into(), json!("ssh"));
+            let user = kv
+                .get("username")
+                .cloned()
+                .or_else(|| positional.get(2).cloned())
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| format!("{name}: ssh missing username"))?;
+            node.insert("username".into(), json!(user));
+            let password = kv
+                .get("password")
+                .cloned()
+                .or_else(|| positional.get(3).cloned())
+                .filter(|p| !p.is_empty());
+            let key = kv.get("private-key").filter(|k| !k.is_empty());
+            if password.is_none() && key.is_none() {
+                return Err(format!("{name}: ssh needs password or private-key"));
+            }
+            if let Some(p) = password {
+                node.insert("password".into(), json!(p));
+            }
+            if let Some(item) = key {
+                node.insert(
+                    "private-key".into(),
+                    json!(keystore_private_key(&name, item, ctx)?),
+                );
+            }
+            if let Some(fp) = kv.get("server-fingerprint") {
+                let keys = list_values(fp);
+                if !keys.is_empty() {
+                    node.insert("host-key".into(), json!(keys));
+                }
+            }
+        }
         other => return Err(format!("{name} = {other}")),
     }
     if let Some(v) = flag("udp-relay") {
@@ -798,7 +1097,10 @@ fn parse_surge_proxy(
         node.insert("tfo".into(), json!(v));
     }
     if let Some(v) = skip_verify {
-        if kind != "ss" && kind != "snell" {
+        if !matches!(
+            kind.as_str(),
+            "ss" | "shadowsocks" | "snell" | "wireguard" | "ssh"
+        ) {
             node.insert("skip-cert-verify".into(), json!(v));
         }
     }
@@ -1083,6 +1385,7 @@ pub fn parse_uri(raw: &str) -> Result<Value, String> {
     let kind_label = match scheme.as_str() {
         "hy2" => "hysteria2",
         "socks" => "socks5",
+        "wg" => "wireguard",
         s => s,
     };
     let name = uri_name(&url, kind_label);
@@ -1199,6 +1502,80 @@ pub fn parse_uri(raw: &str) -> Result<Value, String> {
             }
             if scheme == "https" {
                 node.insert("tls".into(), json!(true));
+            }
+        }
+        "wireguard" | "wg" => {
+            node.insert("type".into(), json!("wireguard"));
+            let key =
+                wg_key(&user).ok_or_else(|| format!("{name}: wireguard private key invalid"))?;
+            node.insert("private-key".into(), json!(key));
+            let public = url
+                .q("publickey")
+                .or_else(|| url.q("public-key"))
+                .or_else(|| url.q("peer_public_key"))
+                .and_then(|k| wg_key(&k))
+                .ok_or_else(|| format!("{name}: wireguard publickey missing or invalid"))?;
+            node.insert("public-key".into(), json!(public));
+            if let Some(psk) = url
+                .q("presharedkey")
+                .or_else(|| url.q("pre-shared-key"))
+                .or_else(|| url.q("psk"))
+                .and_then(|k| wg_key(&k))
+            {
+                node.insert("pre-shared-key".into(), json!(psk));
+            }
+            let addrs = url
+                .q("address")
+                .or_else(|| url.q("ip"))
+                .or_else(|| url.q("local_address"))
+                .map(|v| list_values(&v))
+                .unwrap_or_default();
+            for a in &addrs {
+                let key = if a.contains(':') { "ipv6" } else { "ip" };
+                node.entry(key).or_insert_with(|| json!(a));
+            }
+            if !node.contains_key("ip") && !node.contains_key("ipv6") {
+                return Err(format!("{name}: wireguard address missing"));
+            }
+            if let Some(r) = url.q("reserved") {
+                let r = wg_reserved(&r)
+                    .ok_or_else(|| format!("{name}: wireguard reserved must be 3 bytes"))?;
+                node.insert("reserved".into(), json!(r));
+            }
+            if let Some(m) = url.q("mtu").and_then(|v| v.parse::<u64>().ok()) {
+                node.insert("mtu".into(), json!(m));
+            }
+            if let Some(k) = url
+                .q("keepalive")
+                .or_else(|| url.q("persistent-keepalive"))
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                node.insert("persistent-keepalive".into(), json!(k));
+            }
+            let allowed = url
+                .q("allowedips")
+                .or_else(|| url.q("allowed-ips"))
+                .map(|v| list_values(&v))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| vec!["0.0.0.0/0".into(), "::/0".into()]);
+            node.insert("allowed-ips".into(), json!(allowed));
+            let dns = url.q("dns").map(|v| list_values(&v)).unwrap_or_default();
+            if !dns.is_empty() {
+                node.insert("remote-dns-resolve".into(), json!(true));
+                node.insert("dns".into(), json!(dns));
+            }
+            node.insert("udp".into(), json!(true));
+        }
+        "ssh" => {
+            node.insert("type".into(), json!("ssh"));
+            let (u, p) = user.split_once(':').unwrap_or((&user, ""));
+            if u.is_empty() || p.is_empty() {
+                return Err(format!("{name}: ssh:// needs user:password@"));
+            }
+            node.insert("username".into(), json!(u));
+            node.insert("password".into(), json!(p));
+            if let Some(hk) = url.q("host-key").or_else(|| url.q("hostkey")) {
+                node.insert("host-key".into(), json!(list_values(&hk)));
             }
         }
         other => return Err(format!("{other}://")),
@@ -1457,6 +1834,212 @@ pub fn node_summary(node: &Value) -> String {
     )
 }
 
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Serialize a single-peer Mihomo `wireguard` node as a `wireguard://` line,
+/// the one-line form nodes.conf stores. Multi-peer setups are refused.
+pub fn wireguard_uri(node: &Value) -> Result<String, String> {
+    let name = node["name"].as_str().unwrap_or("WireGuard");
+    if node.get("peers").is_some() {
+        return Err(format!(
+            "{name}: 多 peer WireGuard 请放在订阅里 / multi-peer WireGuard: use a subscription"
+        ));
+    }
+    let s = |k: &str| node[k].as_str().map(str::to_string);
+    let server = s("server").ok_or_else(|| format!("{name}: no endpoint"))?;
+    let host = if server.contains(':') {
+        format!("[{server}]")
+    } else {
+        server
+    };
+    let mut q = vec![format!(
+        "publickey={}",
+        percent_encode(&s("public-key").unwrap_or_default())
+    )];
+    let addrs: Vec<String> = [s("ip"), s("ipv6")].into_iter().flatten().collect();
+    q.push(format!("address={}", percent_encode(&addrs.join(","))));
+    if let Some(psk) = s("pre-shared-key") {
+        q.push(format!("presharedkey={}", percent_encode(&psk)));
+    }
+    if let Some(r) = node["reserved"].as_array() {
+        let r: Vec<String> = r.iter().map(|b| b.to_string()).collect();
+        q.push(format!("reserved={}", percent_encode(&r.join(","))));
+    }
+    if let Some(m) = node["mtu"].as_u64() {
+        q.push(format!("mtu={m}"));
+    }
+    if let Some(k) = node["persistent-keepalive"].as_u64() {
+        q.push(format!("keepalive={k}"));
+    }
+    if let Some(a) = node["allowed-ips"].as_array() {
+        let a: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+        q.push(format!("allowedips={}", percent_encode(&a.join(","))));
+    }
+    if let Some(d) = node["dns"].as_array() {
+        let d: Vec<&str> = d.iter().filter_map(Value::as_str).collect();
+        q.push(format!("dns={}", percent_encode(&d.join(","))));
+    }
+    Ok(format!(
+        "wireguard://{}@{}:{}?{}#{}",
+        percent_encode(&s("private-key").unwrap_or_default()),
+        host,
+        node["port"].as_u64().unwrap_or(0),
+        q.join("&"),
+        percent_encode(name)
+    ))
+}
+
+/// Parse a standard wg-quick `.conf` (`[Interface]` + `[Peer]`).
+fn wg_quick_node(text: &str) -> Result<Value, String> {
+    let mut section = String::new();
+    let mut iface: HashMap<String, String> = HashMap::new();
+    let mut peers: Vec<HashMap<String, String>> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            if section == "peer" {
+                peers.push(HashMap::new());
+            }
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_string());
+        match section.as_str() {
+            "interface" => {
+                iface.insert(k, v);
+            }
+            "peer" => {
+                if let Some(p) = peers.last_mut() {
+                    p.insert(k, v);
+                }
+            }
+            _ => {}
+        }
+    }
+    if peers.len() != 1 {
+        return Err(format!(
+            "wg-quick: 需要正好一个 [Peer]，实际 {} / exactly one [Peer] expected",
+            peers.len()
+        ));
+    }
+    let peer = &peers[0];
+    let (server, port) = peer
+        .get("endpoint")
+        .and_then(|e| split_endpoint(e))
+        .ok_or("wg-quick: [Peer] Endpoint missing")?;
+    let mut node = Map::new();
+    node.insert("name".into(), json!(format!("WG {server}")));
+    node.insert("type".into(), json!("wireguard"));
+    node.insert("server".into(), json!(server));
+    node.insert("port".into(), json!(port));
+    node.insert(
+        "private-key".into(),
+        json!(iface
+            .get("privatekey")
+            .and_then(|k| wg_key(k))
+            .ok_or("wg-quick: PrivateKey missing or invalid")?),
+    );
+    node.insert(
+        "public-key".into(),
+        json!(peer
+            .get("publickey")
+            .and_then(|k| wg_key(k))
+            .ok_or("wg-quick: PublicKey missing or invalid")?),
+    );
+    if let Some(psk) = peer.get("presharedkey").and_then(|k| wg_key(k)) {
+        node.insert("pre-shared-key".into(), json!(psk));
+    }
+    for a in iface
+        .get("address")
+        .map(|v| list_values(v))
+        .unwrap_or_default()
+    {
+        let key = if a.contains(':') { "ipv6" } else { "ip" };
+        node.entry(key).or_insert_with(|| json!(a));
+    }
+    if !node.contains_key("ip") && !node.contains_key("ipv6") {
+        return Err("wg-quick: Address missing".into());
+    }
+    if let Some(m) = iface.get("mtu").and_then(|v| v.parse::<u64>().ok()) {
+        node.insert("mtu".into(), json!(m));
+    }
+    if let Some(k) = peer
+        .get("persistentkeepalive")
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        node.insert("persistent-keepalive".into(), json!(k));
+    }
+    let allowed = peer
+        .get("allowedips")
+        .map(|v| list_values(v))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec!["0.0.0.0/0".into(), "::/0".into()]);
+    node.insert("allowed-ips".into(), json!(allowed));
+    // DNS entries may also be search domains; keep IP literals only.
+    let dns: Vec<String> = iface
+        .get("dns")
+        .map(|v| list_values(v))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d.parse::<std::net::IpAddr>().is_ok())
+        .collect();
+    if !dns.is_empty() {
+        node.insert("remote-dns-resolve".into(), json!(true));
+        node.insert("dns".into(), json!(dns));
+    }
+    node.insert("udp".into(), json!(true));
+    Ok(Value::Object(node))
+}
+
+/// Multi-line pastes that describe nodes no single line can: a wg-quick
+/// `.conf`, or a Surge WireGuard policy line plus its `[WireGuard x]` section.
+/// Returns `None` when the text is not such a block (handle it line by line).
+/// On success yields one-line node strings for nodes.conf.
+pub fn block_to_node_lines(text: &str) -> Option<Result<Vec<String>, String>> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("[interface]") && lower.contains("[peer]") {
+        return Some(
+            wg_quick_node(text)
+                .and_then(|n| wireguard_uri(&n))
+                .map(|l| vec![l]),
+        );
+    }
+    if !lower.contains("[wireguard ") {
+        return None;
+    }
+    let out = convert_surge(text);
+    let lines: Result<Vec<String>, String> = out
+        .proxies
+        .iter()
+        .filter(|p| p["type"] == "wireguard")
+        .map(wireguard_uri)
+        .collect();
+    Some(match lines {
+        Ok(v) if v.is_empty() => Err(out
+            .skipped
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "没有找到 WireGuard 节点 / no WireGuard policy found".into())),
+        other => other,
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1476,7 +2059,8 @@ HTTP = https, 192.0.2.6, 443, user, pass
 SOCKS = socks5, 192.0.2.7, 1080
 Obfs-SS = ss, 192.0.2.8, 8388, encrypt-method=aes-256-gcm, password=fake, obfs=http, obfs-host=example.com
 WG = wireguard, section-name=Home
-Snell5 = snell, 192.0.2.9, 443, psk=fake, version=5
+Snell5 = snell, 192.0.2.9, 443, psk=fake, version=5, reuse=true
+Snell6 = snell, 192.0.2.9, 444, psk=fake, version=6
 
 [Proxy Group]
 Proxy = select, 🇺🇸 US-SS, 🇯🇵 JP-Trojan, Auto, WG, On
@@ -1564,9 +2148,13 @@ FINAL,Proxy,dns-failed
             by_name(&out.proxies, "Obfs-SS")["plugin-opts"]["mode"],
             "http"
         );
-        assert_eq!(out.proxies.len(), 8);
-        assert!(out.skipped.iter().any(|s| s.contains("wireguard")));
-        assert!(out.skipped.iter().any(|s| s.contains("snell v5")));
+        let snell = by_name(&out.proxies, "Snell5");
+        assert_eq!(snell["version"], 5);
+        assert_eq!(snell["reuse"], true);
+        assert_eq!(out.proxies.len(), 9);
+        // WG references a section that does not exist; Snell v6 has no Mihomo support.
+        assert!(out.skipped.iter().any(|s| s.contains("wireguard section")));
+        assert!(out.skipped.iter().any(|s| s.contains("snell v6")));
         // Skip notes never echo secrets.
         assert!(out.skipped.iter().all(|s| !s.contains("fake")));
     }
@@ -1705,6 +2293,159 @@ FINAL,Proxy,dns-failed
             parse_node_line("socks5://u:p@192.0.2.1:1080#S").unwrap()["username"],
             "u"
         );
+    }
+
+    // Placeholder keys: 32 bytes of 0x01 / 0x02, and 0x03 as hex.
+    const K1: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    const K2: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+    const K3_HEX: &str = "0303030303030303030303030303030303030303030303030303030303030303";
+
+    pub(crate) fn surge_wg_profile() -> String {
+        format!(
+            r#"[Proxy]
+Home WG = wireguard, section-name=home, underlying-proxy=Jump
+Mesh = wireguard, section-name=mesh
+Jump = ssh, 192.0.2.20, 22, username=root, password=fake, server-fingerprint="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBk2No6KBq2m9VTCcHXXJBX4/A3RNr+L+yDBl5+TF9qz"
+KeyJump = ssh, 192.0.2.21, 2222, username=ops, private-key=key1
+NoKey = ssh, 192.0.2.22, 22, username=ops, private-key=missing
+
+[Keystore]
+key1 = type=openssh-private-key, base64={pem}
+
+[WireGuard home]
+private-key = {K1}
+self-ip = 10.8.0.2
+self-ip-v6 = fd00::2
+dns-server = 10.8.0.1, system
+mtu = 1280
+peer = (public-key = {K3_HEX}, allowed-ips = "0.0.0.0/0, ::/0", endpoint = vpn.example.com:51820, keepalive = 25, preshared-key = {K2}, client-id = 83/12/235)
+
+[WireGuard mesh]
+private-key = {K1}
+self-ip = 10.9.0.2
+peer = (public-key = {K2}, allowed-ips = 10.9.0.0/24, endpoint = [2001:db8::1]:51820, client-id = U4An)
+peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:51821)
+"#,
+            pem = encode_base64(
+                b"-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n"
+            )
+        )
+    }
+
+    #[test]
+    fn surge_wireguard_and_ssh_map_to_mihomo() {
+        let out = convert_subscription(&surge_wg_profile()).unwrap();
+        let wg = by_name(&out.proxies, "Home WG");
+        assert_eq!(wg["type"], "wireguard");
+        assert_eq!(wg["server"], "vpn.example.com");
+        assert_eq!(wg["port"], 51820);
+        assert_eq!(wg["private-key"], K1);
+        assert_eq!(wg["public-key"], encode_base64(&[3u8; 32]));
+        assert_eq!(wg["pre-shared-key"], K2);
+        assert_eq!(wg["ip"], "10.8.0.2");
+        assert_eq!(wg["ipv6"], "fd00::2");
+        assert_eq!(wg["mtu"], 1280);
+        assert_eq!(wg["reserved"], json!([83, 12, 235]));
+        assert_eq!(wg["allowed-ips"], json!(["0.0.0.0/0", "::/0"]));
+        assert_eq!(wg["persistent-keepalive"], 25);
+        assert_eq!(wg["remote-dns-resolve"], true);
+        assert_eq!(wg["dns"], json!(["10.8.0.1"]));
+        assert_eq!(wg["udp"], true);
+        assert_eq!(wg["dialer-proxy"], "Jump");
+        assert!(wg.get("peers").is_none());
+        assert!(wg.get("skip-cert-verify").is_none());
+
+        let mesh = by_name(&out.proxies, "Mesh");
+        let peers = mesh["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0]["server"], "2001:db8::1");
+        assert_eq!(peers[0]["reserved"], json!([83, 128, 39]));
+        assert_eq!(peers[1]["allowed-ips"], json!(["10.10.0.0/24"]));
+        assert_eq!(mesh["server"], "2001:db8::1");
+
+        let jump = by_name(&out.proxies, "Jump");
+        assert_eq!(jump["type"], "ssh");
+        assert_eq!(jump["username"], "root");
+        assert_eq!(jump["password"], "fake");
+        assert!(jump["host-key"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("ssh-ed25519 "));
+        let kj = by_name(&out.proxies, "KeyJump");
+        assert!(kj["private-key"]
+            .as_str()
+            .unwrap()
+            .contains("OPENSSH PRIVATE KEY"));
+        assert!(out
+            .skipped
+            .iter()
+            .any(|s| s.contains("NoKey") && s.contains("Keystore")));
+        assert!(out.skipped.iter().all(|s| !s.contains("fake")));
+    }
+
+    #[test]
+    fn wireguard_one_line_forms_round_trip() {
+        let line = format!(
+            "wireguard://{}@192.0.2.40:51820?publickey={}&address=172.16.0.2/32,fd01::2/128&reserved=1,2,3&mtu=1280&dns=1.1.1.1#WARP",
+            percent_encode(K1),
+            percent_encode(K2)
+        );
+        let n = parse_node_line(&line).unwrap();
+        assert_eq!(n["type"], "wireguard");
+        assert_eq!(n["name"], "WARP");
+        assert_eq!(n["private-key"], K1);
+        assert_eq!(n["public-key"], K2);
+        assert_eq!(n["ip"], "172.16.0.2/32");
+        assert_eq!(n["ipv6"], "fd01::2/128");
+        assert_eq!(n["reserved"], json!([1, 2, 3]));
+        assert_eq!(node_summary(&n), "wireguard  192.0.2.40:51820");
+        // Serializing and re-parsing yields the same node.
+        let again = parse_node_line(&wireguard_uri(&n).unwrap()).unwrap();
+        assert_eq!(again, n);
+        assert!(parse_node_line("wg://bad@192.0.2.1:1?publickey=x#X").is_err());
+
+        let conf = format!(
+            "[Interface]\nPrivateKey = {K1}\nAddress = 10.7.0.2/32, fd07::2/128\nDNS = 10.7.0.1, lan\nMTU = 1420\n\n[Peer]\nPublicKey = {K2}\nAllowedIPs = 0.0.0.0/0\nEndpoint = [2001:db8::7]:51820\nPersistentKeepalive = 15\n"
+        );
+        let lines = block_to_node_lines(&conf).unwrap().unwrap();
+        assert_eq!(lines.len(), 1);
+        let q = parse_node_line(&lines[0]).unwrap();
+        assert_eq!(q["server"], "2001:db8::7");
+        assert_eq!(q["dns"], json!(["10.7.0.1"]));
+        assert_eq!(q["persistent-keepalive"], 15);
+        assert_eq!(q["allowed-ips"], json!(["0.0.0.0/0"]));
+
+        let surge_block = format!(
+            "Lab = wireguard, section-name=lab\n[WireGuard lab]\nprivate-key = {K1}\nself-ip = 10.6.0.2\npeer = (public-key = {K2}, allowed-ips = 10.6.0.0/24, endpoint = lab.example.com:51820)\n"
+        );
+        let lines = block_to_node_lines(&surge_block).unwrap().unwrap();
+        assert_eq!(parse_node_line(&lines[0]).unwrap()["name"], "Lab");
+        assert!(block_to_node_lines(&surge_wg_profile()).unwrap().is_err());
+        assert!(block_to_node_lines("trojan://p@192.0.2.1:443#a").is_none());
+
+        let ssh = parse_node_line("ssh://root:fake@192.0.2.50:22#Box").unwrap();
+        assert_eq!(ssh["type"], "ssh");
+        assert_eq!(ssh["password"], "fake");
+        assert!(parse_node_line("ssh://root@192.0.2.50:22#Box").is_err());
+        assert_eq!(
+            parse_node_line("S = ssh, 192.0.2.51, 22, username=u, password=fake").unwrap()["type"],
+            "ssh"
+        );
+    }
+
+    #[test]
+    fn wg_helpers() {
+        assert_eq!(wg_key(K3_HEX).unwrap(), encode_base64(&[3u8; 32]));
+        assert!(wg_key("short").is_none());
+        assert_eq!(wg_reserved("U4An").unwrap(), vec![83, 128, 39]);
+        assert_eq!(wg_reserved("010203").unwrap(), vec![1, 2, 3]);
+        assert_eq!(wg_reserved("[1, 2, 3]").unwrap(), vec![1, 2, 3]);
+        assert!(wg_reserved("1/2").is_none());
+        assert_eq!(
+            split_endpoint("[::1]:51820").unwrap(),
+            ("::1".into(), 51820)
+        );
+        assert!(split_endpoint("host").is_none());
     }
 
     #[test]

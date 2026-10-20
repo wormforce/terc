@@ -132,7 +132,20 @@ impl App {
         let dir = terc_dir();
         let mut added = Vec::new();
         let mut errors = Vec::new();
-        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // wg-quick .conf or Surge `[WireGuard x]` blocks become wireguard:// lines.
+        let block_lines;
+        let lines: Vec<&str> = match crate::subconv::block_to_node_lines(text) {
+            Some(Ok(v)) => {
+                block_lines = v;
+                block_lines.iter().map(String::as_str).collect()
+            }
+            Some(Err(err)) => {
+                errors.push(err);
+                Vec::new()
+            }
+            None => text.lines().collect(),
+        };
+        for line in lines.into_iter().map(str::trim).filter(|l| !l.is_empty()) {
             match add_manual_node(&dir, line) {
                 Ok(name) => added.push(name),
                 Err(err) => errors.push(err),
@@ -529,8 +542,8 @@ pub fn draw_own_nodes(frame: &mut Frame, app: &App, area: Rect) {
             Line::styled(
                 l3(
                     app,
-                    "还没有自有节点。按 a 粘贴一条 Surge 节点行，或 ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// 链接。",
-                    "No own nodes yet. Press a and paste a Surge proxy line or an ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// link.",
+                    "还没有自有节点。按 a 粘贴一条 Surge 节点行，或 ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// wireguard:// ssh:// 链接；WireGuard 也可直接粘贴整段 wg-quick .conf。",
+                    "No own nodes yet. Press a and paste a Surge proxy line or an ss:// trojan:// vless:// vmess:// hysteria2:// tuic:// wireguard:// ssh:// link; for WireGuard you can also paste a whole wg-quick .conf.",
                     "自前ノードなし。a で Surge 行または ss:// などのリンクを貼り付け。",
                 ),
                 Style::default().fg(theme.text),
