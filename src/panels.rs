@@ -369,6 +369,8 @@ pub fn draw_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Overlay::Probe => draw_probe(frame, app, area),
         Overlay::Runtime => draw_runtime(frame, app, area),
         Overlay::Best => draw_best(frame, app, area),
+        Overlay::OwnNodes => crate::manage::draw_own_nodes(frame, app, area),
+        Overlay::PrivateRules => crate::manage::draw_private_rules(frame, app, area),
     }
 }
 

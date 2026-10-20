@@ -1115,6 +1115,8 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
             "m 模式",
             "a 自动优选",
             "u 更新订阅",
+            "N 自有节点",
+            "R 规则",
             "s 设置",
             "? 更多",
             "q 退出",
@@ -1127,6 +1129,8 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
             "m Mode",
             "a Best",
             "u Update",
+            "N Nodes",
+            "R Rules",
             "s Settings",
             "? More",
             "q Quit",
@@ -1134,8 +1138,8 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
     };
     let mut text = String::new();
     // Reserve help and quit so narrow windows still offer a way to discover controls.
-    let tail = format!("  {}  {}", hints[7], hints[8]);
-    for hint in &hints[..7] {
+    let tail = format!("  {}  {}", hints[9], hints[10]);
+    for hint in &hints[..9] {
         let candidate = if text.is_empty() {
             hint.to_string()
         } else {
@@ -1384,6 +1388,14 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("T / n / i", app.t("help_tun")),
         ("D", app.t("help_dns_key")),
         ("d g v o f b w", app.t("help_views")),
+        (
+            "N",
+            "自有节点：粘贴 Surge 行或 ss:// 等链接添加 VPS，可测速  Own nodes: paste a Surge line or URI",
+        ),
+        (
+            "R",
+            "私有规则与 AI 分流：增删排序规则、AI 预设与成员  Private rules & AI routing",
+        ),
         ("e  /", app.t("help_explain")),
         ("x", app.t("help_rule_x")),
         ("F", app.t("help_flush")),

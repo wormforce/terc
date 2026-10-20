@@ -1154,7 +1154,7 @@ pub fn regenerate_config(
     let need_download = refresh
         || (has_url
             && !compose::cache_path(&dir).is_file()
-            && old.as_deref().map_or(true, compose::is_generated));
+            && old.as_deref().is_none_or(compose::is_generated));
     let fresh = if need_download && has_url {
         Some(download_subscription(cfg)?)
     } else {
@@ -2387,5 +2387,47 @@ mod tests {
         let off = gnome_proxy_commands(false, 7890, 7891);
         assert_eq!(off.len(), 1);
         assert_eq!(off[0][4], "'none'");
+    }
+
+    #[test]
+    #[ignore = "requires an installed Mihomo binary; run alone, it points HOME at a temp dir"]
+    fn regenerate_pipeline_composes_validates_and_keeps_switches() {
+        let bin = discover_mihomo_binary().expect("mihomo binary");
+        let home = std::env::temp_dir().join(format!("terc-home-{}", std::process::id()));
+        let terc = home.join(".config/terc");
+        fs::create_dir_all(terc.join("mihomo")).unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::set_var(
+            "PATH",
+            format!("{}:/usr/bin:/bin", bin.parent().unwrap().display()),
+        );
+        let cfg = ControllerConfig {
+            config_dir: terc.join("mihomo").display().to_string(),
+            ..ControllerConfig::default()
+        };
+        // No subscription, no nodes: a clear error, nothing written.
+        assert!(regenerate_config(&cfg, &[], false, false, true).is_err());
+        fs::write(
+            terc.join("subscription.cache"),
+            crate::subconv::encode_base64(b"trojan://fake@192.0.2.1:443#JP-1\nssr://x\n"),
+        )
+        .unwrap();
+        crate::compose::add_manual_node(
+            &terc,
+            "US-Own = ss, 192.0.2.2, 8388, encrypt-method=aes-128-gcm, password=fake",
+        )
+        .unwrap();
+        let msg = regenerate_config(&cfg, &[], false, false, true).unwrap();
+        assert!(msg.contains("URI 1 节点"), "{msg}");
+        assert!(msg.contains("跳过 1"), "{msg}");
+        assert!(terc.join("rules.conf").is_file());
+        persist_nested_bool(&cfg, &["sniffer", "enable"], true).unwrap();
+        let modules = crate::ops::builtin_modules();
+        regenerate_config(&cfg, &modules[..1], false, false, false).unwrap();
+        let text = read_config_text(&cfg).unwrap();
+        assert!(crate::compose::is_generated(&text));
+        assert!(crate::ops::parse_yaml_flags(&text).sniffing);
+        assert!(text.contains("US-Own"));
+        fs::remove_dir_all(home).unwrap();
     }
 }

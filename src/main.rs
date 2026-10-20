@@ -13,6 +13,7 @@ use std::{
 pub mod best;
 pub mod compose;
 pub mod control;
+pub mod manage;
 pub mod mihomo;
 pub mod ops;
 pub mod panels;
@@ -86,6 +87,8 @@ pub enum Overlay {
     Probe,
     Runtime,
     Best,
+    OwnNodes,
+    PrivateRules,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,6 +361,16 @@ pub struct App {
     pub setup_phase: SetupPhase,
     pub setup_start_at: Instant,
     pub core_downloading: bool,
+    pub own_nodes: Vec<crate::compose::ManualNode>,
+    pub own_node_index: usize,
+    pub private_rules: crate::compose::PrivateRules,
+    pub private_rule_index: usize,
+    pub manage_input: Option<crate::manage::ManageInput>,
+    pub manage_editor: LineEditor,
+    pub ai_picker: bool,
+    pub ai_picker_index: usize,
+    pub ai_picker_selected: Vec<String>,
+    pub pending_regen: bool,
 }
 
 impl App {
@@ -450,6 +463,16 @@ impl App {
             setup_phase: SetupPhase::Editing,
             setup_start_at: Instant::now(),
             core_downloading: false,
+            own_nodes: Vec::new(),
+            own_node_index: 0,
+            private_rules: crate::compose::PrivateRules::default(),
+            private_rule_index: 0,
+            manage_input: None,
+            manage_editor: LineEditor::default(),
+            ai_picker: false,
+            ai_picker_index: 0,
+            ai_picker_selected: Vec::new(),
+            pending_regen: false,
         };
         app.dns_editor.load("example.com");
         app.sync_node_cursor_to_active();
@@ -500,9 +523,30 @@ impl App {
         }
         let lower = url.to_ascii_lowercase();
         if !lower.starts_with("https://") && !lower.starts_with("http://") {
-            self.set_status(self.t("setup_err_scheme"), true);
+            // Not a subscription link: accept a pasted node (Surge line or URI).
+            if crate::subconv::parse_node_line(url.lines().next().unwrap_or("")).is_err() {
+                self.set_status(self.t("setup_err_scheme"), true);
+                return;
+            }
+            let dir = crate::compose::terc_dir();
+            let mut added = 0;
+            let mut last_err = String::new();
+            for line in url.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                match crate::compose::add_manual_node(&dir, line) {
+                    Ok(_) => added += 1,
+                    Err(err) => last_err = err,
+                }
+            }
+            if added == 0 {
+                self.set_status(&last_err, true);
+                return;
+            }
+            self.setup_phase = SetupPhase::Fetching;
+            self.setup_editor.clear();
+            self.apply_composed();
             return;
         }
+        let url = url.split_whitespace().next().unwrap_or("").to_string();
         self.config.controller.subscription_url = url;
         self.save_preferences();
         self.setup_phase = SetupPhase::Fetching;
@@ -652,6 +696,14 @@ impl App {
                             self.save_preferences();
                             self.open_profiles();
                         }
+                    }
+                    if self.overlay == Overlay::OwnNodes {
+                        self.own_nodes =
+                            crate::compose::load_manual_nodes(&crate::compose::terc_dir());
+                    }
+                    if self.pending_regen {
+                        self.pending_regen = false;
+                        self.apply_composed();
                     }
                     if self.setup_phase == SetupPhase::Fetching {
                         self.finish_setup_fetch(ok);
@@ -1365,9 +1417,9 @@ impl App {
             (Lang::Zh, "setup_intro") => "terc 是 Mihomo (Clash.Meta) 的终端控制器与流量监视器。首次使用请完成以下三步。",
             (Lang::En, "setup_intro") => "terc is a terminal Mihomo (Clash.Meta) controller and traffic monitor. Three steps to get running.",
             (Lang::Ja, "setup_intro") => "terc はターミナルの Mihomo コントローラーです。3ステップで起動できます。",
-            (Lang::Zh, "setup_step_sub") => "订阅链接",
-            (Lang::En, "setup_step_sub") => "Subscription link",
-            (Lang::Ja, "setup_step_sub") => "サブスクリンク",
+            (Lang::Zh, "setup_step_sub") => "订阅或自有节点",
+            (Lang::En, "setup_step_sub") => "Subscription or own node",
+            (Lang::Ja, "setup_step_sub") => "サブスクまたは自前ノード",
             (Lang::Zh, "setup_step_core") => "内核二进制",
             (Lang::En, "setup_step_core") => "Core binary",
             (Lang::Ja, "setup_step_core") => "コアバイナリ",
@@ -1398,11 +1450,11 @@ impl App {
             (Lang::Zh, "setup_dl_busy") => "正在下载 mihomo 内核…",
             (Lang::En, "setup_dl_busy") => "Downloading mihomo core…",
             (Lang::Ja, "setup_dl_busy") => "mihomo をダウンロード中…",
-            (Lang::Zh, "setup_input") => "订阅链接",
-            (Lang::En, "setup_input") => "Subscription URL",
+            (Lang::Zh, "setup_input") => "订阅链接 / 节点",
+            (Lang::En, "setup_input") => "Subscription URL / node",
             (Lang::Ja, "setup_input") => "サブスクリンク",
-            (Lang::Zh, "setup_paste_hint") => "可直接粘贴机场订阅链接（Ctrl+U 清空，Ctrl+D 下载内核）",
-            (Lang::En, "setup_paste_hint") => "Paste your subscription link (Ctrl+U clears, Ctrl+D downloads the core)",
+            (Lang::Zh, "setup_paste_hint") => "粘贴机场订阅链接（Clash / Surge / 节点列表都能识别），或直接粘贴一条自有节点：Surge 节点行或 ss:// 等链接（Ctrl+U 清空，Ctrl+D 下载内核）",
+            (Lang::En, "setup_paste_hint") => "Paste a subscription link (Clash / Surge / URI lists all work) or one own node: a Surge proxy line or ss:// etc. (Ctrl+U clears, Ctrl+D downloads the core)",
             (Lang::Ja, "setup_paste_hint") => "リンクを貼り付け可能（Ctrl+U クリア、Ctrl+D でコア導入）",
             (Lang::Zh, "setup_keys") => "Enter 保存并启动内核  Esc 稍后再说",
             (Lang::En, "setup_keys") => "Enter saves & starts the core  Esc for later",
@@ -1419,8 +1471,8 @@ impl App {
             (Lang::Zh, "setup_err_empty") => "请输入订阅链接后再按 Enter",
             (Lang::En, "setup_err_empty") => "Paste your subscription link first",
             (Lang::Ja, "setup_err_empty") => "まずリンクを入力してください",
-            (Lang::Zh, "setup_err_scheme") => "订阅链接必须以 http:// 或 https:// 开头",
-            (Lang::En, "setup_err_scheme") => "The link must start with http:// or https://",
+            (Lang::Zh, "setup_err_scheme") => "需要 http(s) 订阅链接，或一条 Surge 节点行 / ss:// 等节点链接",
+            (Lang::En, "setup_err_scheme") => "Enter an http(s) subscription link, or a Surge proxy line / ss:// style node link",
             (Lang::Ja, "setup_err_scheme") => "リンクは http:// または https:// で始めてください",
             (Lang::Zh, "setup_msg_saved") => "订阅已保存  内核未安装：按 Ctrl+D 下载，启动后按 K",
             (Lang::En, "setup_msg_saved") => "Subscription saved  no core binary: press Ctrl+D, then K to start",
@@ -1444,7 +1496,8 @@ impl App {
             (Lang::Zh, "help_a") => "选择全球或当前国家范围，测速后优选",
             (_, "help_a") => "Choose all countries or current country, test and select fastest",
             (_, "help_m") => "Cycle routing mode (Rule / Global / Direct)",
-            (_, "help_u") => "Fetch subscription & hot-reload (u opens the setup window when unset)",
+            (Lang::Zh, "help_u") => "拉取订阅（Clash / Surge / 节点列表），与自有节点和私有规则合成配置后热重载；未设置时打开初始设置",
+            (_, "help_u") => "Fetch subscription (Clash / Surge / URI list), compose with own nodes + private rules, hot-reload (opens setup when unset)",
             (_, "help_tabs") => "Switch view: [p] Proxies  [c] Connections  [L] Logs",
             (_, "help_t") => "Toggle top Traffic & Overview panels",
             (_, "help_s") => "Open Settings board (Core / Theme / Subscription)",
@@ -1767,7 +1820,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         }
                     } else if app.screen == Screen::Setup && app.setup_phase == SetupPhase::Editing
                     {
-                        app.setup_editor.insert(&text);
+                        if text.trim().lines().count() > 1 {
+                            app.setup_editor.load(text.trim());
+                        } else {
+                            app.setup_editor.insert_text(text.trim());
+                        }
+                    } else if app.screen == Screen::Dashboard
+                        && matches!(app.overlay, Overlay::OwnNodes | Overlay::PrivateRules)
+                    {
+                        crate::manage::handle_manage_paste(app, &text);
                     } else if app.screen == Screen::Dashboard && app.overlay == Overlay::Probe {
                         app.probe_editor.insert(&text);
                     } else if app.screen == Screen::Dashboard
@@ -1943,6 +2004,8 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('f') => app.open_profiles(),
         KeyCode::Char('b') => app.open_probe(),
         KeyCode::Char('w') => app.open_runtime(),
+        KeyCode::Char('N') => app.open_own_nodes(),
+        KeyCode::Char('R') => app.open_private_rules(),
         KeyCode::Char('e') if app.main_tab == MainTab::Dns => app.dns_editing = true,
         KeyCode::Char('e') | KeyCode::Char('/') if app.main_tab == MainTab::Rules => {
             app.rule_editing = true;
@@ -2159,6 +2222,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
     }
     match app.overlay {
         Overlay::None => {}
+        Overlay::OwnNodes => crate::manage::handle_own_nodes_key(app, key),
+        Overlay::PrivateRules => crate::manage::handle_private_rules_key(app, key),
         Overlay::Best => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
             KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Char('j' | 'k') => {
@@ -2488,7 +2553,7 @@ fn handle_setup_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Home => app.setup_editor.move_home(),
         KeyCode::End => app.setup_editor.move_end(),
         KeyCode::Char(c) if editable => {
-            app.setup_editor.insert(&c.to_string());
+            app.setup_editor.insert_text(&c.to_string());
         }
         _ => {}
     }
@@ -3000,5 +3065,65 @@ mod tests {
         assert_eq!(dashboard_esc(MainTab::Rules, true), EscStep::Proxies);
         assert_eq!(dashboard_esc(MainTab::Providers, true), EscStep::Proxies);
         assert_eq!(dashboard_esc(MainTab::Dns, true), EscStep::Proxies);
+    }
+
+    #[test]
+    fn own_nodes_and_private_rules_overlays_render_without_secrets() {
+        let mut app = offline_app();
+        let line =
+            "Fake-Own = ss, 192.0.2.10, 8388, encrypt-method=aes-128-gcm, password=SuperSecretPw";
+        app.own_nodes = vec![
+            crate::compose::ManualNode {
+                line: line.into(),
+                parsed: crate::subconv::parse_node_line(line),
+            },
+            crate::compose::ManualNode {
+                line: "broken".into(),
+                parsed: crate::subconv::parse_node_line("broken"),
+            },
+        ];
+        app.overlay = Overlay::OwnNodes;
+        for (w, h) in [(120, 36), (60, 18)] {
+            let text = render_text(&mut app, w, h);
+            assert!(!text.contains("SuperSecret"), "{text}");
+        }
+        let text = render_text(&mut app, 140, 40);
+        assert!(text.contains("Fake-Own"));
+        assert!(text.contains("192.0.2.10:8388"));
+        assert!(text.contains("自有节点"));
+        // Typing in the add box keeps spaces (Surge lines need them).
+        press(&mut app, KeyCode::Char('a'));
+        for ch in "A = ss".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        assert_eq!(app.manage_editor.text, "A = ss");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.manage_input.is_none());
+        assert_eq!(app.overlay, Overlay::OwnNodes);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+
+        app.private_rules.rules = vec!["DOMAIN-SUFFIX,example.com,AI".into()];
+        app.overlay = Overlay::PrivateRules;
+        let text = render_text(&mut app, 140, 40);
+        assert!(text.contains("example.com"));
+        assert!(text.contains("→AI"));
+        assert!(text.contains("AI预设"));
+        app.ai_picker = true;
+        app.snapshot.groups.push(crate::mihomo::ProxyGroup {
+            name: "AUTO".into(),
+            kind: "URLTest".into(),
+            now: String::new(),
+            all: vec![],
+        });
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.ai_picker_selected, vec!["AUTO".to_string()]);
+        let text = render_text(&mut app, 140, 40);
+        assert!(text.contains("●AUTO"));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.ai_picker_selected.is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.ai_picker);
+        assert_eq!(app.overlay, Overlay::PrivateRules);
     }
 }
