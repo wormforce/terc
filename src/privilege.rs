@@ -195,7 +195,7 @@ pub(crate) fn controller_core(cfg: &ControllerConfig) -> Result<(u32, u32), Stri
                 .and_then(|s| s.parse::<u32>().ok())
                 == Some(pid)
         }) {
-            return Err("Mihomo 由 launchd/Homebrew 服务管理，请先在服务管理器停止，再按 K 启动 / Stop the managed service first, then press K to start Mihomo through terc".into());
+            return Err("Mihomo 由 launchd/Homebrew 服务管理，请先在服务管理器停止，再在 设置 → 内核与代理 → 内核服务 启动 / Stop the managed service first, then start Mihomo through terc in Settings → Core & Proxy → Core service".into());
         }
     }
     Ok((pid, uid))
@@ -425,7 +425,7 @@ pub(crate) fn set_tun(
         }
         mihomo::set_tun_enabled(cfg, enable).map_err(|e| {
             if cfg!(target_os = "macos") && managed_core(cfg).is_err() {
-                format!("TUN change failed: {e}. 该内核由外部程序管理，请通过原服务授权；或先在原程序停止内核，再按 K 由 terc 启动 / Authorize the external core through its service manager, or stop it there and press K to start a terc-managed core.")
+                format!("TUN change failed: {e}. 该内核由外部程序管理，请通过原服务授权；或先在原程序停止内核，再在 设置 → 内核与代理 → 内核服务 由 terc 启动 / Authorize the external core through its service manager, or stop it there and start a terc-managed core in Settings → Core & Proxy → Core service.")
             } else { format!("TUN change failed: {e}") }
         })?;
     }

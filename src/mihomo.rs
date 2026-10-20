@@ -124,6 +124,8 @@ pub struct ProxyNode {
     pub kind: String,
     pub udp: bool,
     pub delay: Option<u16>,
+    /// Owning proxy provider, used for the provider healthcheck delay route.
+    pub provider: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -590,6 +592,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
                             kind,
                             udp,
                             delay,
+                            provider: None,
                         },
                     );
                 }
@@ -705,6 +708,16 @@ fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
         timeout,
     ) {
         providers.extend(parse_providers_json(&body, "proxy"));
+        for found in crate::ops::parse_provider_nodes(&body) {
+            let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
+                name: found.name,
+                kind: found.kind,
+                udp: found.udp,
+                delay: found.delay,
+                provider: None,
+            });
+            node.provider.get_or_insert(found.provider);
+        }
     }
     if let Ok((200, body)) = http_request(
         &cfg.addr,
@@ -947,6 +960,10 @@ pub fn test_best_delays_async(
     test_delays_async(cfg, group_name, nodes, tx, true);
 }
 
+/// Concurrent delay probes per test run. Workers pull the next node as soon
+/// as one finishes, so a slow node never holds back the rest of a batch.
+const DELAY_WORKERS: usize = 8;
+
 fn test_delays_async(
     cfg: ControllerConfig,
     group_name: String,
@@ -955,57 +972,51 @@ fn test_delays_async(
     best: bool,
 ) {
     thread::spawn(move || {
-        let mut results = Vec::new();
-        let mut handles = Vec::new();
-        let chunk_size = 8;
-        for chunk in nodes.chunks(chunk_size) {
-            for node in chunk.iter().cloned() {
-                if is_info_pseudo_node(&node) {
-                    continue;
-                }
-                let cfg_clone = cfg.clone();
-                let group_clone = group_name.clone();
-                let tx_clone = tx.clone();
-                handles.push(thread::spawn(move || {
-                    let path = format!(
-                        "/proxies/{}/delay?url={}&timeout={}",
-                        percent_encode(&node),
-                        percent_encode(&cfg_clone.test_url),
-                        cfg_clone.timeout_ms
-                    );
-                    let delay = http_request(
-                        &cfg_clone.addr,
-                        &cfg_clone.secret,
-                        "GET",
-                        &path,
-                        None,
-                        Duration::from_millis(cfg_clone.timeout_ms + 500),
-                    )
-                    .ok()
-                    .and_then(|(status, body)| {
-                        if status == 200 {
-                            serde_json::from_str::<Value>(&body)
+        let queue: Vec<String> = nodes
+            .into_iter()
+            .filter(|node| !is_info_pseudo_node(node))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let providers = std::sync::OnceLock::new();
+        let mut indexed: Vec<(usize, Option<u16>)> = thread::scope(|scope| {
+            let workers: Vec<_> = (0..DELAY_WORKERS.min(queue.len()))
+                .map(|_| {
+                    let tx = tx.clone();
+                    let (cfg, group_name, queue, next, providers) =
+                        (&cfg, &group_name, &queue, &next, &providers);
+                    scope.spawn(move || {
+                        let mut done = Vec::new();
+                        loop {
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(node) = queue.get(index) else {
+                                break;
+                            };
+                            let delay = node_delay_with(cfg, node, &cfg.test_url, providers)
                                 .ok()
-                                .and_then(|v| v.get("delay").and_then(Value::as_u64))
-                                .and_then(|d| if d > 0 { Some(d as u16) } else { None })
-                        } else {
-                            None
+                                .flatten();
+                            let _ = tx.send(BackendEvent::DelayResult {
+                                group: group_name.clone(),
+                                node: node.clone(),
+                                delay,
+                            });
+                            done.push((index, delay));
                         }
-                    });
-                    let _ = tx_clone.send(BackendEvent::DelayResult {
-                        group: group_clone,
-                        node: node.clone(),
-                        delay,
-                    });
-                    (node, delay)
-                }));
-            }
-            for h in handles.drain(..) {
-                if let Ok(result) = h.join() {
-                    results.push(result);
-                }
-            }
-        }
+                        done
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().ok())
+                .flatten()
+                .collect()
+        });
+        // BestTestDone keeps the group order, as the batched version did.
+        indexed.sort_by_key(|(index, _)| *index);
+        let results = indexed
+            .into_iter()
+            .map(|(index, delay)| (queue[index].clone(), delay))
+            .collect();
         let _ = tx.send(if best {
             BackendEvent::BestTestDone {
                 group: group_name,
@@ -2306,7 +2317,8 @@ pub fn refresh_provider(cfg: &ControllerConfig, kind: &str, name: &str) -> Resul
         "PUT",
         &path,
         None,
-        Duration::from_millis(4000),
+        // Mihomo downloads and parses the provider before it answers.
+        Duration::from_secs(30),
     ) {
         Ok((status, _)) if (200..300).contains(&status) => Ok(()),
         Ok((status, body)) => Err(format!("HTTP {status} {}", brief(&body))),
@@ -2380,20 +2392,49 @@ pub fn test_node_delay(
     node: &str,
     url: &str,
 ) -> Result<Option<u16>, String> {
-    let path = format!(
-        "/proxies/{}/delay?url={}&timeout={}",
-        percent_encode(node),
-        percent_encode(url),
-        cfg.timeout_ms
-    );
-    match http_request(
-        &cfg.addr,
-        &cfg.secret,
-        "GET",
-        &path,
-        None,
-        Duration::from_millis(cfg.timeout_ms + 500),
-    ) {
+    node_delay_with(cfg, node, url, &std::sync::OnceLock::new())
+}
+
+/// GET /proxies/{name}/delay, falling back to the provider healthcheck route
+/// on 404: since Mihomo v1.19.28 the former only resolves inline proxies.
+/// `providers` maps node to provider and is fetched at most once per run.
+fn node_delay_with(
+    cfg: &ControllerConfig,
+    node: &str,
+    url: &str,
+    providers: &std::sync::OnceLock<HashMap<String, String>>,
+) -> Result<Option<u16>, String> {
+    let query = format!("url={}&timeout={}", percent_encode(url), cfg.timeout_ms);
+    let get = |path: &str| {
+        http_request(
+            &cfg.addr,
+            &cfg.secret,
+            "GET",
+            path,
+            None,
+            Duration::from_millis(cfg.timeout_ms + 500),
+        )
+    };
+    let mut response = get(&format!("/proxies/{}/delay?{query}", percent_encode(node)));
+    if matches!(response, Ok((404, _))) {
+        let providers = providers.get_or_init(|| {
+            match get("/providers/proxies") {
+                Ok((200, body)) => crate::ops::parse_provider_nodes(&body),
+                _ => Vec::new(),
+            }
+            .into_iter()
+            .map(|found| (found.name, found.provider))
+            .collect()
+        });
+        if let Some(provider) = providers.get(node) {
+            response = get(&format!(
+                "/providers/proxies/{}/{}/healthcheck?{query}",
+                percent_encode(provider),
+                percent_encode(node)
+            ));
+        }
+    }
+    match response {
         Ok((200, body)) => Ok(serde_json::from_str::<Value>(&body)
             .ok()
             .and_then(|v| v.get("delay").and_then(Value::as_u64))
@@ -2589,6 +2630,130 @@ fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<S
         "System Proxy {} ({service})",
         if enable { "ON" } else { "OFF" }
     ))
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicUsize, mpsc};
+
+    /// Mock controller in the shape of Mihomo >= v1.19.28: /proxies/{name}/delay
+    /// 404s for provider nodes, which answer on the provider healthcheck route.
+    fn mock_controller(lookups: Arc<AtomicUsize>) -> ControllerConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let lookups = lookups.clone();
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let (status, body) = if path == "/providers/proxies" {
+                        lookups.fetch_add(1, Ordering::SeqCst);
+                        (
+                            200,
+                            r#"{"providers":{"air":{"name":"air","proxies":[{"name":"JP 01","type":"Vmess"},{"name":"US 01","type":"Trojan"}]}}}"#,
+                        )
+                    } else if path.starts_with("/proxies/Inline/delay?") {
+                        (200, r#"{"delay":15}"#)
+                    } else if path.starts_with("/providers/proxies/air/JP%2001/healthcheck?url=")
+                        && path.contains("&timeout=")
+                    {
+                        (200, r#"{"delay":42}"#)
+                    } else if path.starts_with("/providers/proxies/air/US%2001/healthcheck?") {
+                        (504, r#"{"message":"Timeout"}"#)
+                    } else {
+                        (404, r#"{"message":"resource not found"}"#)
+                    };
+                    let _ = write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        ControllerConfig {
+            addr,
+            timeout_ms: 500,
+            ..ControllerConfig::default()
+        }
+    }
+
+    #[test]
+    fn delay_falls_back_to_provider_healthcheck_on_404() {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let cfg = mock_controller(lookups.clone());
+        let url = "https://www.gstatic.com/generate_204";
+        assert_eq!(test_node_delay(&cfg, "Inline", url), Ok(Some(15)));
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(test_node_delay(&cfg, "JP 01", url), Ok(Some(42)));
+        assert!(test_node_delay(&cfg, "US 01", url)
+            .unwrap_err()
+            .starts_with("HTTP 504"));
+        assert!(test_node_delay(&cfg, "Gone", url)
+            .unwrap_err()
+            .starts_with("HTTP 404"));
+    }
+
+    #[test]
+    fn group_test_streams_results_and_looks_up_providers_once() {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let cfg = mock_controller(lookups.clone());
+        let (tx, rx) = mpsc::channel();
+        let nodes = [
+            "JP 01",
+            "剩余流量：1 GB",
+            "Inline",
+            "US 01",
+            "Gone",
+            "JP 01",
+        ];
+        test_best_delays_async(
+            cfg,
+            "Main".into(),
+            nodes.iter().map(|s| s.to_string()).collect(),
+            tx,
+        );
+        let mut streamed = Vec::new();
+        let results = loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                BackendEvent::DelayResult { group, node, delay } => {
+                    assert_eq!(group, "Main");
+                    streamed.push((node, delay));
+                }
+                BackendEvent::BestTestDone { group, results } => {
+                    assert_eq!(group, "Main");
+                    break results;
+                }
+                _ => panic!("unexpected event"),
+            }
+        };
+        let expected: Vec<(String, Option<u16>)> = [
+            ("JP 01", Some(42)),
+            ("Inline", Some(15)),
+            ("US 01", None),
+            ("Gone", None),
+            ("JP 01", Some(42)),
+        ]
+        .iter()
+        .map(|(n, d)| (n.to_string(), *d))
+        .collect();
+        assert_eq!(results, expected);
+        streamed.sort();
+        let mut sorted = expected.clone();
+        sorted.sort();
+        assert_eq!(streamed, sorted);
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[cfg(test)]

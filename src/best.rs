@@ -165,6 +165,7 @@ mod tests {
                     .into(),
                     udp: true,
                     delay: Some(1),
+                    provider: None,
                 },
             );
         }
