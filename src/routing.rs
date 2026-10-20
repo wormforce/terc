@@ -1,7 +1,12 @@
 //! Routing templates contain policy only. Proxy credentials and providers belong
 //! to the selected subscription, and are never imported from a routing plan.
 use crate::ops::{clean_scalar, join_chunks, split_chunks, YamlChunk};
-use std::{fs, path::PathBuf};
+use serde_json::json;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::PathBuf,
+};
 
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -120,8 +125,21 @@ pub fn apply(
     if id == "subscription" {
         return Ok(base.into());
     }
+    let mut chunks = split_chunks(base);
+    let proxies: HashSet<String> = chunks
+        .iter()
+        .find(|c| c.key.as_deref() == Some("proxies"))
+        .map(crate::compose::clash_item_names)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     let yaml = if id == "all" {
-        "proxy-groups:\n  - {name: PROXY, type: select, include-all: true}\nrules:\n  - MATCH,PROXY\n".into()
+        let name = crate::compose::pick_name("PROXY", &proxies);
+        let group = json!({"name":name,"type":"select","include-all":true,"exclude-filter":crate::compose::INFO_EXCLUDE});
+        format!(
+            "proxy-groups:\n  - {group}\nrules:\n  - {}\n",
+            json!(format!("MATCH,{name}"))
+        )
     } else if id == "local" {
         template(
             &fs::read_to_string(crate::compose::profile_dir(cfg).join("routing-local.yaml"))
@@ -156,7 +174,7 @@ pub fn apply(
         .map_err(|e| e.to_string())?;
         plan.yaml
     };
-    let mut chunks = split_chunks(base);
+    let yaml = avoid_names(&yaml, &proxies)?;
     chunks.retain(|c| !policy_key(c.key.as_deref()));
     chunks.extend(
         split_chunks(&yaml)
@@ -257,23 +275,28 @@ fn members(field: &YamlChunk) -> Result<Vec<String>, String> {
         )
     }
 }
-pub fn template(raw: &str) -> Result<String, String> {
-    let mut chunks = split_chunks(&crate::ops::strip_marked_modules(raw));
-    let groups = chunks
-        .iter()
-        .find(|c| c.key.as_deref() == Some("proxy-groups"))
-        .ok_or("当前配置没有策略组 / No policy groups")?;
-    let names = crate::compose::clash_item_names(groups);
-    if names.is_empty() {
-        return Err("当前策略组无法保存为分流方案 / Cannot read policy groups".into());
+fn field_value(field: &YamlChunk) -> String {
+    let value = field.lines[0]
+        .split_once(':')
+        .map(|(_, v)| v.trim())
+        .unwrap_or("");
+    // Regex values may hold `#`, which clean_scalar would cut as a comment.
+    if value.starts_with('"') {
+        if let Ok(text) = serde_json::from_str::<String>(value) {
+            return text;
+        }
+    } else if let Some(text) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+        return text.replace("''", "'");
+    } else if !value.starts_with('\'') {
+        return value.split(" #").next().unwrap_or(value).trim().to_string();
     }
-    let is_policy = |name: &str| {
-        names.iter().any(|n| n == name)
-            || matches!(
-                name,
-                "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS" | "COMPATIBLE" | "GLOBAL"
-            )
-    };
+    clean_scalar(value)
+}
+// Rewrite each group of a proxy-groups chunk as fields, keeping template layout.
+fn map_groups(
+    groups: &YamlChunk,
+    mut edit: impl FnMut(&mut Vec<YamlChunk>) -> Result<(), String>,
+) -> Result<Vec<String>, String> {
     let indent = groups
         .lines
         .iter()
@@ -295,19 +318,48 @@ pub fn template(raw: &str) -> Result<String, String> {
     for (i, start) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(groups.lines.len());
         let mut fields = group_fields(&groups.lines[*start..end])?;
-        let mut pool = fields.iter().any(|f| {
-            matches!(
-                f.key.as_deref(),
-                Some("use" | "include-all" | "include-all-proxies" | "include-all-providers")
-            ) && !f.lines[0].ends_with("false")
-        });
+        edit(&mut fields)?;
+        let lines = join_chunks(&fields);
+        for (j, line) in lines.lines().enumerate() {
+            output.push(format!("{}{}", if j == 0 { "  - " } else { "    " }, line));
+        }
+    }
+    Ok(output)
+}
+pub fn template(raw: &str) -> Result<String, String> {
+    let mut chunks = split_chunks(&crate::ops::strip_marked_modules(raw));
+    let groups = chunks
+        .iter()
+        .find(|c| c.key.as_deref() == Some("proxy-groups"))
+        .ok_or("当前配置没有策略组 / No policy groups")?;
+    let names = crate::compose::clash_item_names(groups);
+    if names.is_empty() {
+        return Err("当前策略组无法保存为分流方案 / Cannot read policy groups".into());
+    }
+    let is_policy = |name: &str| {
+        names.iter().any(|n| n == name)
+            || matches!(
+                name,
+                "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS" | "COMPATIBLE" | "GLOBAL"
+            )
+    };
+    let output = map_groups(groups, |fields| {
+        let set = |fields: &Vec<YamlChunk>, keys: &[&str]| {
+            fields.iter().any(|f| {
+                f.key.as_deref().is_some_and(|k| keys.contains(&k))
+                    && !f.lines[0].ends_with("false")
+            })
+        };
+        let all = set(fields, &["include-all", "include-all-proxies"]);
+        let providers = set(fields, &["use", "include-all-providers"]);
+        let mut removed = Vec::new();
         if let Some(field) = fields
             .iter_mut()
             .find(|f| f.key.as_deref() == Some("proxies"))
         {
-            let old = members(field)?;
-            let kept: Vec<_> = old.iter().filter(|n| is_policy(n)).collect();
-            pool |= kept.len() != old.len();
+            let (kept, nodes): (Vec<_>, Vec<_>) =
+                members(field)?.into_iter().partition(|n| is_policy(n));
+            removed = nodes;
             field.lines = vec![format!(
                 "proxies: {}",
                 serde_json::to_string(&kept).unwrap()
@@ -319,21 +371,146 @@ pub fn template(raw: &str) -> Result<String, String> {
                 Some("use" | "include-all" | "include-all-proxies" | "include-all-providers")
             )
         });
-        if pool {
-            fields.push(YamlChunk {
-                key: Some("include-all".into()),
-                lines: vec!["include-all: true".into()],
-            });
+        if !(all || providers || !removed.is_empty()) {
+            return Ok(());
         }
-        let lines = join_chunks(&fields);
-        for (j, line) in lines.lines().enumerate() {
-            output.push(format!("{}{}", if j == 0 { "  - " } else { "    " }, line));
+        fields.push(YamlChunk {
+            key: Some("include-all".into()),
+            lines: vec!["include-all: true".into()],
+        });
+        if all {
+            return Ok(());
         }
-    }
+        // The group now draws on every node of whichever source the scheme is
+        // applied to, so no node names are kept; info pseudo-nodes stay out.
+        let info = crate::compose::INFO_EXCLUDE;
+        let old = fields
+            .iter()
+            .position(|f| f.key.as_deref() == Some("exclude-filter"));
+        let merged = match old.map(|i| field_value(&fields[i])) {
+            Some(old) if old.contains(info) => old,
+            Some(old) if old.contains('`') => format!("{old}`{info}"),
+            Some(old) if !old.is_empty() => format!("(?:{old})|(?:{info})"),
+            _ => info.to_string(),
+        };
+        let field = YamlChunk {
+            key: Some("exclude-filter".into()),
+            lines: vec![format!("exclude-filter: {}", json!(merged))],
+        };
+        match old {
+            Some(i) => fields[i] = field,
+            None => fields.push(field),
+        }
+        Ok(())
+    })?;
     chunks.retain(|c| policy_key(c.key.as_deref()));
     for chunk in &mut chunks {
         if chunk.key.as_deref() == Some("proxy-groups") {
             chunk.lines = output.clone();
+        }
+    }
+    Ok(join_chunks(&chunks))
+}
+
+// Point a rule at renamed groups. Only the target and later fields can name a
+// group; a SUB-RULE target names a sub-rule set instead.
+fn rename_rule(rule: &str, renames: &HashMap<String, String>) -> Option<String> {
+    let mut parts = Vec::new();
+    let (mut start, mut depth) = (0, 0i32);
+    for (i, c) in rule.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&rule[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&rule[start..]);
+    let kind = parts[0].trim();
+    if kind == "SUB-RULE" {
+        return None;
+    }
+    let first = if kind == "MATCH" { 1 } else { 2 };
+    let mut changed = false;
+    let parts: Vec<String> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| match renames.get(part.trim()) {
+            Some(new) if i >= first => {
+                changed = true;
+                new.clone()
+            }
+            _ => part.to_string(),
+        })
+        .collect();
+    changed.then(|| parts.join(","))
+}
+
+/// A template group may share its name with a node of the selected source.
+/// Such groups are renamed, with rules and other groups following them.
+fn avoid_names(yaml: &str, proxies: &HashSet<String>) -> Result<String, String> {
+    let mut chunks = split_chunks(yaml);
+    let Some(groups) = chunks
+        .iter()
+        .find(|c| c.key.as_deref() == Some("proxy-groups"))
+    else {
+        return Ok(yaml.into());
+    };
+    let names = crate::compose::clash_item_names(groups);
+    let mut taken: HashSet<String> = proxies.iter().chain(&names).cloned().collect();
+    let mut renames = HashMap::new();
+    for name in names.iter().filter(|n| proxies.contains(*n)) {
+        let new = crate::compose::pick_name(name, &taken);
+        taken.insert(new.clone());
+        renames.insert(name.clone(), new);
+    }
+    if renames.is_empty() {
+        return Ok(yaml.into());
+    }
+    let output = map_groups(groups, |fields| {
+        for field in fields.iter_mut() {
+            match field.key.as_deref() {
+                Some("name") => {
+                    if let Some(new) = renames.get(&field_value(field)) {
+                        field.lines = vec![format!("name: {}", json!(new))];
+                    }
+                }
+                Some("proxies") => {
+                    let list: Vec<_> = members(field)?
+                        .into_iter()
+                        .map(|n| renames.get(&n).cloned().unwrap_or(n))
+                        .collect();
+                    field.lines = vec![format!("proxies: {}", json!(list))];
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })?;
+    for chunk in &mut chunks {
+        match chunk.key.as_deref() {
+            Some("proxy-groups") => chunk.lines = output.clone(),
+            Some("rules" | "sub-rules") => {
+                for line in chunk.lines.iter_mut().skip(1) {
+                    let Some(item) = line.trim_start().strip_prefix('-') else {
+                        continue;
+                    };
+                    let item = item.trim();
+                    let rule = if item.starts_with('"') {
+                        serde_json::from_str::<String>(item).unwrap_or_else(|_| clean_scalar(item))
+                    } else {
+                        clean_scalar(item)
+                    };
+                    if let Some(rule) = rename_rule(&rule, &renames) {
+                        let indent = crate::ops::leading_spaces(line);
+                        *line = format!("{}- {}", " ".repeat(indent), json!(rule));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(join_chunks(&chunks))
@@ -359,5 +536,114 @@ mod tests {
             assert!(route.contains("filter:"));
             assert!(route.contains("MATCH,Choice"));
         }
+    }
+
+    fn group<'a>(yaml: &'a str, name: &str) -> &'a str {
+        let at = yaml.find(&format!("- name: {name}\n")).unwrap();
+        let rest = &yaml[at + 2..];
+        &rest[..rest.find("\n  - ").or(rest.find("\nrules:")).unwrap()]
+    }
+
+    #[test]
+    fn templates_widen_listed_nodes_without_info_nodes() {
+        let doc = "proxies:\n  - {name: 剩余流量：100GB, type: ss}\n  - {name: HK1, type: ss}\n  - {name: 'HK.2', type: ss}\n  - {name: US1, type: ss}\nproxy-groups:\n  - {name: 香港, type: url-test, proxies: [剩余流量：100GB, HK1, 'HK.2'], exclude-filter: 'x#y'}\n  - {name: Netflix, type: select, proxies: [香港, HK1, US1]}\n  - {name: Mixed, type: select, proxies: [HK1], use: [P], exclude-filter: \"a`b\"}\n  - {name: Kept, type: select, include-all-proxies: true, proxies: [HK1]}\nrules:\n  - MATCH,Netflix\n";
+        let route = template(doc).unwrap();
+        let info = serde_json::to_string(crate::compose::INFO_EXCLUDE).unwrap();
+        let hk = group(&route, "香港");
+        assert!(hk.contains("proxies: []"), "{hk}");
+        assert!(hk.contains("include-all: true"));
+        assert!(!hk.contains("HK1") && !hk.contains("    filter:"), "{hk}");
+        let merged = format!("(?:x#y)|(?:{})", crate::compose::INFO_EXCLUDE);
+        assert!(
+            hk.contains(&format!("exclude-filter: {}", json!(merged))),
+            "{hk}"
+        );
+        let netflix = group(&route, "Netflix");
+        assert!(netflix.contains("proxies: [\"香港\"]"));
+        assert!(!netflix.contains("    filter:"), "{netflix}");
+        assert!(netflix.contains(&format!("exclude-filter: {info}")));
+        let mixed = group(&route, "Mixed");
+        assert!(!mixed.contains("\nfilter:") && !mixed.contains("    filter:"));
+        let joined = format!("a`b`{}", crate::compose::INFO_EXCLUDE);
+        assert!(
+            mixed.contains(&format!("exclude-filter: {}", json!(joined))),
+            "{mixed}"
+        );
+        let kept = group(&route, "Kept");
+        assert!(kept.contains("include-all: true") && !kept.contains("filter"));
+        assert!(!route.contains("剩余流量"));
+    }
+
+    #[test]
+    fn templates_draw_on_the_nodes_of_the_source_they_are_applied_to() {
+        let other = "proxies:\n  - {name: AirportNode, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: secret}\nproxy-groups:\n  - {name: Airport, type: select, proxies: [AirportNode]}\nrules:\n  - MATCH,Airport\n";
+        let route = template(other).unwrap();
+        assert!(!route.contains("AirportNode"), "{route}");
+        let base = "proxies:\n  - {name: OwnNode, type: ss, server: 192.0.2.3, port: 8388, cipher: aes-128-gcm, password: fake}\nproxy-groups:\n  - {name: PROXY, type: select, proxies: [OwnNode]}\nrules:\n  - MATCH,PROXY\n";
+        let mut chunks = split_chunks(base);
+        chunks.retain(|c| !policy_key(c.key.as_deref()));
+        chunks.extend(split_chunks(&route));
+        let out = join_chunks(&chunks);
+        let airport = group(&out, "Airport");
+        assert!(airport.contains("include-all: true"), "{airport}");
+        // A name filter from the template's own source would match nothing here.
+        assert!(!airport.contains("    filter:"), "{airport}");
+        assert!(out.contains("MATCH,Airport") && !out.contains("AirportNode"));
+    }
+
+    #[test]
+    fn proxy_all_avoids_node_names_and_info_defaults() {
+        let base = "proxies:\n  - {name: 剩余流量：100GB, type: ss}\n  - {\"name\":\"PROXY\",\"type\":\"ss\"}\nproxy-groups:\n  - {name: Airport, type: select, proxies: [PROXY]}\nrules:\n  - SUB-RULE,(NETWORK,tcp),s1\n  - MATCH,Airport\nsub-rules:\n  s1:\n    - MATCH,Airport\n";
+        let cfg = crate::mihomo::ControllerConfig::default();
+        let out = apply(base, "all", &cfg).unwrap();
+        let group = json!({"name":"terc-PROXY","type":"select","include-all":true,"exclude-filter":crate::compose::INFO_EXCLUDE});
+        assert!(
+            out.contains(&format!("proxy-groups:\n  - {group}\n")),
+            "{out}"
+        );
+        assert!(out.contains("rules:\n  - \"MATCH,terc-PROXY\"\n"));
+        assert!(!out.contains("sub-rules") && !out.contains("SUB-RULE"));
+        let plain = base.replace("\"PROXY\"", "\"Own\"");
+        let out = apply(&plain, "all", &cfg).unwrap();
+        assert!(out.contains("\"name\":\"PROXY\"") && out.contains("MATCH,PROXY"));
+        assert_eq!(apply(base, "subscription", &cfg).unwrap(), base);
+    }
+
+    #[test]
+    fn template_groups_named_like_nodes_are_renamed_with_their_rules() {
+        let yaml = "proxy-groups:\n  - name: HK\n    type: select\n    proxies: [\"DIRECT\"]\n    include-all: true\n  - name: Choice\n    type: select\n    proxies: [\"HK\",\"DIRECT\"]\nrules:\n  - DOMAIN-SUFFIX,hk.example,HK\n  - AND,((DOMAIN,HK),(NETWORK,tcp)),HK,no-resolve\n  - SUB-RULE,(NETWORK,udp),HK\n  - \"MATCH,Choice\"\nsub-rules:\n  HK:\n    - IP-CIDR,192.0.2.0/24,HK,no-resolve\n";
+        let proxies = HashSet::from(["HK".to_string(), "US".to_string()]);
+        let out = avoid_names(yaml, &proxies).unwrap();
+        assert!(out.contains("  - name: \"terc-HK\"\n"), "{out}");
+        assert!(out.contains("proxies: [\"terc-HK\",\"DIRECT\"]"));
+        assert!(out.contains("  - \"DOMAIN-SUFFIX,hk.example,terc-HK\"\n"));
+        assert!(out.contains("  - \"AND,((DOMAIN,HK),(NETWORK,tcp)),terc-HK,no-resolve\"\n"));
+        assert!(out.contains("  - SUB-RULE,(NETWORK,udp),HK\n"));
+        assert!(out.contains("  HK:\n    - \"IP-CIDR,192.0.2.0/24,terc-HK,no-resolve\"\n"));
+        assert!(out.contains("  - \"MATCH,Choice\"\n"));
+        let untouched = HashSet::from(["US".to_string()]);
+        assert_eq!(avoid_names(yaml, &untouched).unwrap(), yaml);
+    }
+
+    #[test]
+    fn subscription_sub_rules_survive_compose_and_follow_routing() {
+        let doc = "proxies:\n  - {name: HK, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake}\nproxy-groups:\n  - name: Airport\n    type: select\n    proxies: [HK]\nrules:\n  - SUB-RULE,(NETWORK,tcp),s1\n  - MATCH,Airport\nsub-rules:\n  s1:\n    - DOMAIN-SUFFIX,example.net,Airport\n    - MATCH,DIRECT\n";
+        let converted = crate::subconv::convert_subscription(doc).unwrap();
+        let (base, _) = crate::compose::compose_profile(&crate::compose::ComposeInput {
+            subscription: Some(&converted),
+            manual: &[],
+            rules: &crate::compose::PrivateRules::default(),
+            controller_addr: "127.0.0.1:9090",
+            secret: "",
+            test_url: "https://example.org",
+        })
+        .unwrap();
+        let cfg = crate::mihomo::ControllerConfig::default();
+        let out = apply(&base, "subscription", &cfg).unwrap();
+        assert!(out.contains("  - SUB-RULE,(NETWORK,tcp),s1\n"));
+        assert!(out.contains("sub-rules:\n  s1:\n    - DOMAIN-SUFFIX,example.net,Airport\n"));
+        // A routing template carries sub-rules as policy.
+        let route = template(&base).unwrap();
+        assert!(route.contains("SUB-RULE,(NETWORK,tcp),s1") && route.contains("sub-rules:\n  s1:"));
     }
 }

@@ -796,10 +796,12 @@ fn draw_groups_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             app.t("core_stopped_hint")
         };
+        // The panel is about a third of the terminal, so the hint must wrap.
         frame.render_widget(
             Paragraph::new(hint)
                 .style(Style::default().fg(theme.muted))
-                .alignment(Alignment::Center),
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
             inner,
         );
         return;

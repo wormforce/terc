@@ -74,23 +74,35 @@ pub fn list(active: &str) -> Vec<ProfileEntry> {
     result.sort_by(|a, b| a.name.cmp(&b.name));
     result
 }
-fn import_old(old: &Path, id: &str, snapshot: Option<&str>, url: &str) -> Result<(), String> {
+/// Returns the legacy node lines that could not be parsed; they stay on disk.
+fn import_old(
+    old: &Path,
+    id: &str,
+    snapshot: Option<&str>,
+    url: &str,
+) -> Result<Vec<String>, String> {
     let target = root().join(id);
+    let mut skipped = Vec::new();
     if target.join("source.json").is_file() {
-        return Ok(());
+        return Ok(skipped);
     }
     let mut source = ProfileSource::load(old);
     if source.subscription_url.is_empty() {
         source.subscription_url = url.into();
     }
     source.name = label(&source.name, &source.subscription_url, id);
-    if let Ok(nodes) = fs::read_to_string(old.join("nodes.conf")) {
+    let nodes_conf = old.join("nodes.conf");
+    if let Ok(nodes) = fs::read_to_string(&nodes_conf) {
         for line in nodes
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
         {
-            source.nodes.push(crate::subconv::parse_node_line(line)?);
+            // Old versions skipped bad lines too; one typo must not block startup.
+            match crate::subconv::parse_node_line(line) {
+                Ok(node) => source.nodes.push(node),
+                Err(reason) => skipped.push(format!("{}: {reason}", nodes_conf.display())),
+            }
         }
     }
     if let Ok(mode) = fs::read_to_string(old.join("routing-mode")) {
@@ -101,18 +113,30 @@ fn import_old(old: &Path, id: &str, snapshot: Option<&str>, url: &str) -> Result
     }
     for (from, to) in [
         ("subscription.cache", "subscription.yaml"),
+        ("subscription.yaml", "subscription.yaml"),
         ("routing-local.yaml", "routing-local.yaml"),
     ] {
         if let Ok(text) = fs::read_to_string(old.join(from)) {
             compose::write_private(&target.join(to), &text)?;
         }
     }
+    // A terc-generated snapshot already holds the manual nodes; keeping them
+    // in the subscription would duplicate them with stale credentials. Its
+    // other nodes may exist nowhere else, as in old saved profile copies.
     if !target.join("subscription.yaml").exists() {
-        if let Some(raw) = snapshot {
-            compose::write_private(
-                &target.join("subscription.yaml"),
-                &crate::ops::strip_marked_modules(raw),
-            )?;
+        let doc = snapshot.and_then(|raw| {
+            if !compose::is_generated(raw) {
+                return Some(crate::ops::strip_marked_modules(raw));
+            }
+            let manual: Vec<String> = source
+                .nodes
+                .iter()
+                .filter_map(|n| n["name"].as_str().map(str::to_string))
+                .collect();
+            compose::generated_subscription(raw, &manual)
+        });
+        if let Some(doc) = doc.filter(|d| crate::ops::has_subscription_source(d)) {
+            compose::write_private(&target.join("subscription.yaml"), &doc)?;
         }
     }
     source.kind = if !source.subscription_url.is_empty() {
@@ -124,9 +148,17 @@ fn import_old(old: &Path, id: &str, snapshot: Option<&str>, url: &str) -> Result
     }
     .into();
     // Record is written last: partial imports are retried without losing originals.
-    source.save(&target)
+    source.save(&target)?;
+    Ok(skipped)
 }
-pub fn migrate(cfg: &mut Config) -> Result<(), String> {
+/// Returns notes about skipped lines and profiles; a broken legacy profile is
+/// reported and left in place rather than blocking the others or startup.
+pub fn migrate(cfg: &mut Config) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    let mut note = |id: &str, result: Result<Vec<String>, String>| match result {
+        Ok(skipped) => notes.extend(skipped),
+        Err(err) => notes.push(format!("{id}: {err}")),
+    };
     let legacy = compose::terc_dir().join("profiles");
     if let Ok(files) = fs::read_dir(&legacy) {
         for file in files.flatten() {
@@ -136,16 +168,19 @@ pub fn migrate(cfg: &mut Config) -> Result<(), String> {
                     continue;
                 };
                 let raw = fs::read_to_string(legacy.join(format!("{id}.yaml"))).ok();
-                import_old(
-                    &path,
+                note(
                     id,
-                    raw.as_deref(),
-                    if cfg.controller.profile_id == id {
-                        &cfg.controller.subscription_url
-                    } else {
-                        ""
-                    },
-                )?;
+                    import_old(
+                        &path,
+                        id,
+                        raw.as_deref(),
+                        if cfg.controller.profile_id == id {
+                            &cfg.controller.subscription_url
+                        } else {
+                            ""
+                        },
+                    ),
+                );
                 continue;
             }
             if path.extension().and_then(|s| s.to_str()) != Some("yaml") {
@@ -154,17 +189,21 @@ pub fn migrate(cfg: &mut Config) -> Result<(), String> {
             let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            import_old(
-                &legacy.join(id),
-                id,
-                Some(&raw),
-                if cfg.controller.profile_id == id {
-                    &cfg.controller.subscription_url
-                } else {
-                    ""
-                },
-            )?;
+            let result = fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|raw| {
+                    import_old(
+                        &legacy.join(id),
+                        id,
+                        Some(&raw),
+                        if cfg.controller.profile_id == id {
+                            &cfg.controller.subscription_url
+                        } else {
+                            ""
+                        },
+                    )
+                });
+            note(id, result);
         }
     }
     if cfg.controller.profile_id.is_empty() {
@@ -175,13 +214,16 @@ pub fn migrate(cfg: &mut Config) -> Result<(), String> {
         {
             // Stable ID makes retrying a migration safe after an interrupted save.
             let id = "imported-001";
-            import_old(
+            let result = import_old(
                 &compose::terc_dir(),
                 id,
                 raw.as_deref(),
                 &cfg.controller.subscription_url,
-            )?;
-            cfg.controller.profile_id = id.into();
+            );
+            if result.is_ok() {
+                cfg.controller.profile_id = id.into();
+            }
+            note(id, result);
         }
     }
     if !cfg.controller.profile_id.is_empty() {
@@ -192,7 +234,7 @@ pub fn migrate(cfg: &mut Config) -> Result<(), String> {
         cfg.controller.subscription_url = source.subscription_url;
         cfg.save()?;
     }
-    Ok(())
+    Ok(notes)
 }
 
 #[cfg(test)]
@@ -263,6 +305,117 @@ mod tests {
         assert_eq!(cfg.active_profile_label, "example.test");
         assert!(!cfg.active_profile_label.contains("secret"));
         assert!(!cfg.controller.profile_id.is_empty());
+        fs::remove_dir_all(temp).unwrap();
+    }
+    fn temp_home(name: &str) -> PathBuf {
+        let temp = std::env::temp_dir().join(format!("terc-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        std::env::set_var("HOME", &temp);
+        temp
+    }
+    const OWN_NODE: &str =
+        "OwnNode = ss, 192.0.2.3, 8388, encrypt-method=aes-128-gcm, password=fake";
+    fn generated_config(cfg: &mut Config, temp: &Path) {
+        cfg.controller.config_dir = temp.join("core").display().to_string();
+        let doc = format!("{}\nproxies:\n  - {{name: OwnNode, type: ss, server: 192.0.2.3, port: 8388, cipher: aes-128-gcm, password: fake}}\nrules:\n  - MATCH,DIRECT\n", compose::GENERATED_MARK);
+        compose::write_private(
+            &Path::new(&cfg.controller.config_dir).join("config.yaml"),
+            &doc,
+        )
+        .unwrap();
+    }
+    #[test]
+    #[ignore = "changes HOME; run alone with temporary data; never starts a core"]
+    fn migration_skips_unparseable_legacy_node_lines() {
+        let temp = temp_home("store-bad-line");
+        let old = compose::terc_dir().join("profiles/profile-3");
+        compose::write_private(
+            &old.join("source.json"),
+            r#"{"name":"Mine","subscription_url":""}"#,
+        )
+        .unwrap();
+        let nodes = format!("{OWN_NODE}\nTypo = ss 192.0.2.9\n");
+        compose::write_private(&old.join("nodes.conf"), &nodes).unwrap();
+        let mut cfg = Config::default();
+        let notes = migrate(&mut cfg).unwrap();
+        let source = ProfileSource::load(&root().join("profile-3"));
+        assert_eq!(source.nodes.len(), 1);
+        assert_eq!(source.nodes[0]["name"], "OwnNode");
+        assert!(notes.iter().any(|n| n.contains("Typo = ss 192.0.2.9")));
+        assert_eq!(fs::read_to_string(old.join("nodes.conf")).unwrap(), nodes);
+        fs::remove_dir_all(temp).unwrap();
+    }
+    #[test]
+    #[ignore = "changes HOME; run alone with temporary data; never starts a core"]
+    fn migration_ignores_generated_snapshot_for_node_only_source() {
+        let temp = temp_home("store-generated");
+        compose::add_manual_node(&compose::terc_dir(), OWN_NODE).unwrap();
+        let mut cfg = Config::default();
+        generated_config(&mut cfg, &temp);
+        migrate(&mut cfg).unwrap();
+        assert_eq!(cfg.controller.profile_id, "imported-001");
+        let source = ProfileSource::load(&root().join("imported-001"));
+        assert_eq!(source.kind, "proxy");
+        assert!(!root().join("imported-001/subscription.yaml").exists());
+        assert_eq!(source.nodes.len(), 1);
+        fs::remove_dir_all(temp).unwrap();
+    }
+    #[test]
+    #[ignore = "changes HOME; run alone with temporary data; never starts a core"]
+    fn migration_keeps_subscription_nodes_of_generated_snapshots() {
+        let temp = temp_home("store-generated-sub");
+        let remote = "  - {name: Remote, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: secret}\n";
+        let own = "  - {\"name\":\"OwnNode\",\"type\":\"ss\",\"server\":\"192.0.2.3\",\"port\":8388,\"cipher\":\"aes-128-gcm\",\"password\":\"fake\"}\n";
+        // An old saved copy of the generated config is its profile's only data.
+        compose::write_private(
+            &compose::terc_dir().join("profiles/profile-1.yaml"),
+            &format!(
+                "{}\nproxies:\n{remote}rules:\n  - MATCH,DIRECT\n",
+                compose::GENERATED_MARK
+            ),
+        )
+        .unwrap();
+        // A config composed from a hand-written one without caching it.
+        compose::write_private(&compose::terc_dir().join("nodes.conf"), OWN_NODE).unwrap();
+        let mut cfg = Config::default();
+        cfg.controller.config_dir = temp.join("core").display().to_string();
+        compose::write_private(
+            &Path::new(&cfg.controller.config_dir).join("config.yaml"),
+            &format!(
+                "{}\nproxies:\n{remote}{own}rules:\n  - MATCH,DIRECT\n",
+                compose::GENERATED_MARK
+            ),
+        )
+        .unwrap();
+        migrate(&mut cfg).unwrap();
+        for (id, nodes) in [("profile-1", 0), ("imported-001", 1)] {
+            let source = ProfileSource::load(&root().join(id));
+            assert_eq!(source.kind, "imported", "{id}");
+            assert_eq!(source.nodes.len(), nodes, "{id}");
+            let sub = fs::read_to_string(root().join(id).join("subscription.yaml")).unwrap();
+            assert!(sub.contains("name: Remote"), "{id}");
+            assert!(!sub.contains("OwnNode"), "{id}");
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
+    #[test]
+    #[ignore = "changes HOME; run alone with temporary data; never starts a core"]
+    fn migration_keeps_cached_subscription_download() {
+        let temp = temp_home("store-cache");
+        let raw = "proxies:\n  - {name: Remote, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: secret}\nrules:\n  - MATCH,DIRECT\n";
+        compose::write_private(&compose::terc_dir().join("subscription.yaml"), raw).unwrap();
+        let mut cfg = Config::default();
+        generated_config(&mut cfg, &temp);
+        migrate(&mut cfg).unwrap();
+        assert_eq!(
+            fs::read_to_string(root().join("imported-001/subscription.yaml")).unwrap(),
+            raw
+        );
+        assert_eq!(
+            ProfileSource::load(&root().join("imported-001")).kind,
+            "imported"
+        );
         fs::remove_dir_all(temp).unwrap();
     }
 }

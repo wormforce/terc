@@ -660,6 +660,71 @@ pub fn parse_providers_json(body: &str, kind: &str) -> Vec<ProviderInfo> {
     out
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderNode {
+    pub name: String,
+    pub kind: String,
+    pub udp: bool,
+    pub delay: Option<u16>,
+    pub provider: String,
+}
+
+/// Since Mihomo v1.19.28, GET /proxies omits proxy-provider nodes, so they are
+/// read from GET /providers/proxies. The reserved `default` provider only
+/// mirrors inline proxies and groups, which /proxies already lists.
+pub fn parse_provider_nodes(body: &str) -> Vec<ProviderNode> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(obj) = value.get("providers").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (key, item) in obj {
+        let provider = {
+            let named = json_string(item, "name");
+            if named.is_empty() {
+                key.clone()
+            } else {
+                named
+            }
+        };
+        if provider == "default" {
+            continue;
+        }
+        for proxy in item
+            .get("proxies")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let name = json_string(proxy, "name");
+            let kind = json_string(proxy, "type");
+            if name.is_empty()
+                || ["selector", "urltest", "fallback", "loadbalance", "relay"]
+                    .contains(&kind.to_ascii_lowercase().as_str())
+            {
+                continue;
+            }
+            let delay = proxy
+                .get("history")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.last())
+                .and_then(|h| h.get("delay"))
+                .and_then(Value::as_u64)
+                .and_then(|d| if d > 0 { Some(d as u16) } else { None });
+            out.push(ProviderNode {
+                name,
+                kind,
+                udp: proxy.get("udp").and_then(Value::as_bool).unwrap_or(false),
+                delay,
+                provider: provider.clone(),
+            });
+        }
+    }
+    out
+}
+
 pub fn parse_dns_message(body: &str) -> Result<DnsMessage, String> {
     let value: Value = serde_json::from_str(body).map_err(|err| err.to_string())?;
     let status = value
@@ -1635,6 +1700,31 @@ ipv6: false
         assert_eq!(proxies[0].name, "alpha");
         assert_eq!(proxies[1].name, "b");
         assert_eq!(proxies[1].count, 2);
+    }
+
+    #[test]
+    fn provider_nodes_skip_default_provider_and_groups() {
+        let nodes = parse_provider_nodes(
+            r#"{"providers":{
+                "default":{"name":"default","vehicleType":"Compatible","proxies":[{"name":"inline","type":"Shadowsocks"},{"name":"Auto","type":"URLTest"}]},
+                "air":{"name":"air","vehicleType":"HTTP","proxies":[
+                    {"name":"JP 01","type":"Vmess","udp":true,"history":[{"delay":0},{"delay":88}]},
+                    {"name":"US 01","type":"Trojan","history":[{"delay":120},{"delay":0}]},
+                    {"name":"Inner","type":"Selector","all":["JP 01"]},
+                    {"name":"Chain","type":"Relay"}
+                ]}
+            }}"#,
+        );
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "JP 01");
+        assert_eq!(nodes[0].kind, "Vmess");
+        assert!(nodes[0].udp);
+        assert_eq!(nodes[0].delay, Some(88));
+        assert_eq!(nodes[0].provider, "air");
+        assert_eq!(nodes[1].name, "US 01");
+        assert!(!nodes[1].udp);
+        assert_eq!(nodes[1].delay, None);
+        assert!(parse_provider_nodes("not json").is_empty());
     }
 
     #[test]
