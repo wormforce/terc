@@ -2758,6 +2758,11 @@ fn gnome_proxy_ready() -> bool {
 }
 
 pub fn detect_sysproxy() -> (String, bool) {
+    // Unit tests drive real key paths whose workers fetch a snapshot; they must
+    // never run networksetup or gsettings (AGENTS.md), not even to read.
+    if cfg!(test) {
+        return ("n/a".to_string(), false);
+    }
     match std::env::consts::OS {
         "macos" => detect_macos_sysproxy(),
         "linux" => detect_gnome_sysproxy().unwrap_or_else(|| ("n/a".to_string(), false)),
