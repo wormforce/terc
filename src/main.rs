@@ -480,6 +480,8 @@ pub struct App {
     pub conn_stream: Arc<mihomo::ConnStream>,
     /// When the last pushed `/connections` snapshot arrived.
     pub conn_stream_at: Option<Instant>,
+    /// Polls in a row that found the core not running.
+    pub down_polls: u8,
     pub last_snapshot_poll: Instant,
     pub setup_origin: Screen,
     pub setup_editor: LineEditor,
@@ -607,6 +609,7 @@ impl App {
             stop_flag,
             conn_stream,
             conn_stream_at: None,
+            down_polls: 0,
             last_snapshot_poll: Instant::now(),
             setup_origin: Screen::Dashboard,
             setup_editor: LineEditor::default(),
@@ -1043,8 +1046,16 @@ impl App {
         let fresh = std::mem::take(&mut snapshot.connections);
         snapshot.connections = std::mem::take(&mut self.snapshot.connections);
         // A transient /connections failure while the core runs keeps the last
-        // list, so its sessions are not reported as closed.
-        let keep = snapshot.running && !snapshot.connections_ok;
+        // list, so its sessions are not reported as closed. One slow or failed
+        // /version (load, a GC pause, waking from sleep) also reads as a stopped
+        // core, so only a second such poll in a row, with no live push, ends it.
+        self.down_polls = if snapshot.running {
+            0
+        } else {
+            self.down_polls.saturating_add(1)
+        };
+        let doubtful_stop = !snapshot.running && (self.down_polls < 2 || self.stream_live());
+        let keep = (snapshot.running && !snapshot.connections_ok) || doubtful_stop;
         if keep {
             snapshot.upload_total = self.snapshot.upload_total;
             snapshot.download_total = self.snapshot.download_total;
@@ -3287,10 +3298,7 @@ mod tests {
         )
         .unwrap();
         conn.host = "visible.test".into();
-        app.accept_snapshot(CoreSnapshot {
-            connections: vec![conn],
-            ..Default::default()
-        });
+        app.accept_snapshot(live_snapshot(vec![conn]));
         app.main_tab = MainTab::Connections;
         app.conn_index = 0;
         press(&mut app, KeyCode::Enter);
@@ -3747,8 +3755,57 @@ mod tests {
         assert_eq!(app.conns.closed()[0].cause, None);
         app.accept_snapshot(live_snapshot(sample_connections()));
         app.accept_snapshot(CoreSnapshot::default());
+        app.accept_snapshot(CoreSnapshot::default());
         assert!(app.status_message.is_empty());
         assert_eq!(app.conns.closed()[0].cause, Some(conns::Cause::CoreStopped));
+    }
+
+    #[test]
+    fn one_failed_poll_is_not_a_core_stop() {
+        let mut app = offline_app();
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        let logs = app.logs.len();
+        // A slow /version and `SendOnDrop`'s fallback both read as not running.
+        app.accept_snapshot(CoreSnapshot::default());
+        assert!(!app.snapshot.running);
+        assert_eq!(app.snapshot.connections.len(), 3);
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        assert!(app.conns.closed().is_empty());
+        assert_eq!(app.logs.len(), logs);
+        // The session closes once, for no known reason, and is recorded once.
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        let ws = |app: &App| {
+            app.conns
+                .closed()
+                .iter()
+                .filter(|c| c.host == "ws.example.com:443")
+                .map(|c| c.cause)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ws(&app), [None]);
+
+        // Two in a row are a stop.
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        app.accept_snapshot(CoreSnapshot::default());
+        assert_eq!(app.snapshot.connections.len(), 3);
+        app.accept_snapshot(CoreSnapshot::default());
+        assert!(app.snapshot.connections.is_empty());
+        assert_eq!(ws(&app), [Some(conns::Cause::CoreStopped), None]);
+
+        // While pushes arrive the core is plainly up, whatever polls say.
+        app.tx
+            .send(BackendEvent::Connections {
+                items: sample_connections(),
+                upload_total: 1,
+                download_total: 1,
+            })
+            .unwrap();
+        app.drain_events();
+        for _ in 0..3 {
+            app.accept_snapshot(CoreSnapshot::default());
+        }
+        assert_eq!(app.snapshot.connections.len(), 3);
+        assert_eq!(ws(&app).len(), 2);
     }
 
     #[test]
