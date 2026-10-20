@@ -14,6 +14,7 @@ pub mod best;
 pub mod compose;
 mod conns;
 pub mod control;
+mod guard;
 pub mod manage;
 pub mod mihomo;
 pub mod ops;
@@ -482,6 +483,8 @@ pub struct App {
     pub ai_picker_index: usize,
     pub ai_picker_selected: Vec<String>,
     pub pending_regen: bool,
+    /// An action that would cut sessions and was pressed once (`guard`).
+    pub pending_confirm: Option<(guard::Disrupt, Instant)>,
 }
 
 impl App {
@@ -601,6 +604,7 @@ impl App {
             ai_picker_index: 0,
             ai_picker_selected: Vec::new(),
             pending_regen: false,
+            pending_confirm: None,
         };
         app.routing_mode = routing::selected(&app.config.controller);
         app.routing_plans = routing::entries(&app.config.controller, app.lang() == Lang::Zh);
@@ -1158,6 +1162,9 @@ impl App {
     }
 
     pub fn update_subscription(&mut self) {
+        if self.screen != Screen::Setup && !self.confirm_disruption(guard::Disrupt::Reload) {
+            return;
+        }
         let catalog = crate::ops::module_catalog(&crate::ops::modules_dir(&PathBuf::from(
             env::var_os("HOME").unwrap_or_default(),
         )));
@@ -1340,6 +1347,9 @@ impl App {
     }
 
     pub fn toggle_core_service(&mut self) {
+        if self.snapshot.running && !self.confirm_disruption(guard::Disrupt::CoreStop) {
+            return;
+        }
         let running = self.snapshot.running
             || crate::privilege::managed_core(&self.config.controller).is_ok();
         self.run_action("Updating core service…", None, None, move |cfg| {
@@ -2392,7 +2402,10 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                 });
             }
         }
-        KeyCode::Char('X') if app.main_tab == MainTab::Connections => {
+        KeyCode::Char('X') if app.main_tab == MainTab::Connections && !app.conn_closed_view => {
+            if !app.confirm_disruption(guard::Disrupt::CloseAll) {
+                return false;
+            }
             if !app.action_busy {
                 app.conns.note(conns::Cause::CloseAll, None);
             }

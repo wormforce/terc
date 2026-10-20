@@ -88,6 +88,18 @@ impl App {
     pub fn toggle_tun(&mut self) {
         let next = !self.snapshot.tun_enabled;
         let running = self.snapshot.running;
+        // Enabling only patches TUN in, except that a non-root core on macOS is
+        // restarted; the uid check needs the core's pid, so assume a restart.
+        let disrupt = if !next {
+            Some(crate::guard::Disrupt::TunOff)
+        } else if cfg!(target_os = "macos") && running {
+            Some(crate::guard::Disrupt::TunOnRestart)
+        } else {
+            None
+        };
+        if disrupt.is_some_and(|what| !self.confirm_disruption(what)) {
+            return;
+        }
         self.run_action(
             "正在设置 TUN，macOS 可能请求管理员授权 / Applying TUN…",
             None,
@@ -131,6 +143,9 @@ impl App {
     }
 
     pub fn toggle_dns(&mut self) {
+        if !self.confirm_disruption(crate::guard::Disrupt::Reload) {
+            return;
+        }
         let running = self.snapshot.running;
         self.run_action("Updating DNS configuration…", None, None, move |cfg| {
             let raw = read_config_text(&cfg)?;
@@ -293,6 +308,9 @@ impl App {
             ids.retain(|id| id != &module.id);
         }
         let snippets = enabled_snippets(&self.catalog, &ids);
+        if !self.confirm_disruption(crate::guard::Disrupt::Reload) {
+            return;
+        }
         let running = self.snapshot.running;
         self.run_action(
             "Applying module configuration…",
@@ -334,7 +352,7 @@ impl App {
         let Some(profile) = self.profiles.get(self.profile_index).cloned() else {
             return;
         };
-        if self.action_busy {
+        if self.action_busy || !self.confirm_disruption(crate::guard::Disrupt::Reload) {
             return;
         }
         let modules = enabled_snippets(
@@ -407,6 +425,9 @@ impl App {
     pub fn reload_profile(&mut self) {
         if !self.snapshot.running {
             self.set_status(self.t("st_core_down"), true);
+            return;
+        }
+        if !self.confirm_disruption(crate::guard::Disrupt::Reload) {
             return;
         }
         self.set_status(self.t("st_reloading"), false);
