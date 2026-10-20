@@ -8,10 +8,10 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::Sender,
-        Arc,
+        Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -124,6 +124,8 @@ pub struct ProxyNode {
     pub kind: String,
     pub udp: bool,
     pub delay: Option<u16>,
+    /// Owning proxy provider, used for the provider healthcheck delay route.
+    pub provider: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -256,47 +258,52 @@ pub fn http_request(
 
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
-    let text = String::from_utf8_lossy(&raw);
 
-    let (headers, rest) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    // Keep the body as bytes until the chunk framing is gone: a chunk boundary
+    // may split a multibyte character, and lossy-decoding first shifts offsets.
+    let (head, rest) = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(pos) => (&raw[..pos], &raw[pos + 4..]),
+        None => (&raw[..], &[][..]),
+    };
+    let headers = String::from_utf8_lossy(head);
     let status = headers
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(500);
+        // A dropped connection is not an answer from the controller.
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no HTTP response"))?;
 
-    let decoded_body = if headers.lines().any(|l| {
+    let body = if headers.lines().any(|l| {
         l.to_ascii_lowercase()
             .contains("transfer-encoding: chunked")
     }) {
         decode_chunked(rest)
     } else {
-        rest.to_string()
+        rest.to_vec()
     };
 
-    Ok((status, decoded_body))
+    Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
-fn decode_chunked(mut input: &str) -> String {
-    let mut out = String::new();
-    loop {
-        let Some((len_line, after_len)) = input.split_once("\r\n") else {
-            break;
-        };
+fn decode_chunked(mut input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(line_end) = input.windows(2).position(|w| w == b"\r\n") {
+        let len_line = String::from_utf8_lossy(&input[..line_end]);
         let Ok(chunk_len) = usize::from_str_radix(len_line.trim(), 16) else {
             break;
         };
         if chunk_len == 0 {
             break;
         }
-        if after_len.len() < chunk_len {
-            out.push_str(after_len);
+        let after_len = &input[line_end + 2..];
+        let take = chunk_len.min(after_len.len());
+        out.extend_from_slice(&after_len[..take]);
+        if take < chunk_len {
             break;
         }
-        out.push_str(&after_len[..chunk_len]);
-        input = &after_len[chunk_len..];
-        if let Some(stripped) = input.strip_prefix("\r\n") {
+        input = &after_len[take..];
+        if let Some(stripped) = input.strip_prefix(b"\r\n") {
             input = stripped;
         }
     }
@@ -585,6 +592,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
                             kind,
                             udp,
                             delay,
+                            provider: None,
                         },
                     );
                 }
@@ -700,6 +708,16 @@ fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
         timeout,
     ) {
         providers.extend(parse_providers_json(&body, "proxy"));
+        for found in crate::ops::parse_provider_nodes(&body) {
+            let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
+                name: found.name,
+                kind: found.kind,
+                udp: found.udp,
+                delay: found.delay,
+                provider: None,
+            });
+            node.provider.get_or_insert(found.provider);
+        }
     }
     if let Ok((200, body)) = http_request(
         &cfg.addr,
@@ -942,6 +960,10 @@ pub fn test_best_delays_async(
     test_delays_async(cfg, group_name, nodes, tx, true);
 }
 
+/// Concurrent delay probes per test run. Workers pull the next node as soon
+/// as one finishes, so a slow node never holds back the rest of a batch.
+const DELAY_WORKERS: usize = 8;
+
 fn test_delays_async(
     cfg: ControllerConfig,
     group_name: String,
@@ -950,57 +972,51 @@ fn test_delays_async(
     best: bool,
 ) {
     thread::spawn(move || {
-        let mut results = Vec::new();
-        let mut handles = Vec::new();
-        let chunk_size = 8;
-        for chunk in nodes.chunks(chunk_size) {
-            for node in chunk.iter().cloned() {
-                if is_info_pseudo_node(&node) {
-                    continue;
-                }
-                let cfg_clone = cfg.clone();
-                let group_clone = group_name.clone();
-                let tx_clone = tx.clone();
-                handles.push(thread::spawn(move || {
-                    let path = format!(
-                        "/proxies/{}/delay?url={}&timeout={}",
-                        percent_encode(&node),
-                        percent_encode(&cfg_clone.test_url),
-                        cfg_clone.timeout_ms
-                    );
-                    let delay = http_request(
-                        &cfg_clone.addr,
-                        &cfg_clone.secret,
-                        "GET",
-                        &path,
-                        None,
-                        Duration::from_millis(cfg_clone.timeout_ms + 500),
-                    )
-                    .ok()
-                    .and_then(|(status, body)| {
-                        if status == 200 {
-                            serde_json::from_str::<Value>(&body)
+        let queue: Vec<String> = nodes
+            .into_iter()
+            .filter(|node| !is_info_pseudo_node(node))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let providers = std::sync::OnceLock::new();
+        let mut indexed: Vec<(usize, Option<u16>)> = thread::scope(|scope| {
+            let workers: Vec<_> = (0..DELAY_WORKERS.min(queue.len()))
+                .map(|_| {
+                    let tx = tx.clone();
+                    let (cfg, group_name, queue, next, providers) =
+                        (&cfg, &group_name, &queue, &next, &providers);
+                    scope.spawn(move || {
+                        let mut done = Vec::new();
+                        loop {
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(node) = queue.get(index) else {
+                                break;
+                            };
+                            let delay = node_delay_with(cfg, node, &cfg.test_url, providers)
                                 .ok()
-                                .and_then(|v| v.get("delay").and_then(Value::as_u64))
-                                .and_then(|d| if d > 0 { Some(d as u16) } else { None })
-                        } else {
-                            None
+                                .flatten();
+                            let _ = tx.send(BackendEvent::DelayResult {
+                                group: group_name.clone(),
+                                node: node.clone(),
+                                delay,
+                            });
+                            done.push((index, delay));
                         }
-                    });
-                    let _ = tx_clone.send(BackendEvent::DelayResult {
-                        group: group_clone,
-                        node: node.clone(),
-                        delay,
-                    });
-                    (node, delay)
-                }));
-            }
-            for h in handles.drain(..) {
-                if let Ok(result) = h.join() {
-                    results.push(result);
-                }
-            }
-        }
+                        done
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().ok())
+                .flatten()
+                .collect()
+        });
+        // BestTestDone keeps the group order, as the batched version did.
+        indexed.sort_by_key(|(index, _)| *index);
+        let results = indexed
+            .into_iter()
+            .map(|(index, delay)| (queue[index].clone(), delay))
+            .collect();
         let _ = tx.send(if best {
             BackendEvent::BestTestDone {
                 group: group_name,
@@ -1187,41 +1203,122 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
         let _ = child.wait();
         return Err(err.to_string());
     }
-    for _ in 0..20 {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            let _ = fs::remove_file(&pid_path);
-            return Err(format!(
-                "Mihomo exited ({status}): {}",
-                fs::read_to_string(&log_path).unwrap_or_default()
-            ));
-        }
-        if matches!(
-            http_request(
-                &cfg.addr,
-                &cfg.secret,
-                "GET",
-                "/version",
-                None,
-                Duration::from_millis(200)
+    // A first start may download GeoIP/GeoSite data before the controller
+    // listens, so wait on a deadline while the process stays alive.
+    let started = Instant::now();
+    loop {
+        let exited = child.try_wait().map_err(|e| e.to_string())?;
+        let step = core_startup_step(
+            exited.is_some(),
+            || {
+                classify_probe(&http_request(
+                    &cfg.addr,
+                    &cfg.secret,
+                    "GET",
+                    "/version",
+                    None,
+                    Duration::from_millis(200),
+                ))
+            },
+            started.elapsed(),
+            || log_suggests_download(&core_log_excerpt(cfg)),
+        );
+        let reason = match step {
+            StartupStep::Wait => {
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            StartupStep::Exited => {
+                let _ = fs::remove_file(&pid_path);
+                return Err(format!(
+                    "Mihomo exited ({}): {}",
+                    exited.map(|s| s.to_string()).unwrap_or_default(),
+                    fs::read_to_string(&log_path).unwrap_or_default()
+                ));
+            }
+            StartupStep::Ready | StartupStep::StillStarting => {
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                if step == StartupStep::Ready {
+                    return Ok(format!("Started mihomo ({})", bin.display()));
+                }
+                // The PID record stays, so the managed-core guard blocks a second launch.
+                return Ok(format!(
+                    "Mihomo is still starting (downloading geodata?); the controller will come up when it finishes. Log: {}",
+                    log_path.display()
+                ));
+            }
+            StartupStep::Rejected(code) => {
+                format!("Mihomo controller rejected the request (HTTP {code})")
+            }
+            StartupStep::TimedOut => format!(
+                "Mihomo controller was not ready after {}s",
+                CORE_START_DEADLINE.as_secs()
             ),
-            Ok((200, _))
-        ) {
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return Ok(format!("Started mihomo ({})", bin.display()));
-        }
-        thread::sleep(Duration::from_millis(200));
+        };
+        // A failed start must not leave an orphan that collides with the next attempt.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(&pid_path);
+        return Err(format!(
+            "{reason}; the failed startup was stopped. Log: {}\n{}",
+            log_path.display(),
+            core_log_excerpt(cfg)
+        ));
     }
-    // A failed start must not leave an orphan that collides with the next attempt.
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_file(&pid_path);
-    Err(format!(
-        "Mihomo controller was not ready; the failed startup was stopped. Log: {}\n{}",
-        log_path.display(),
-        core_log_excerpt(cfg)
-    ))
+}
+
+/// Overall window for a fresh core to bring up its controller.
+const CORE_START_DEADLINE: Duration = Duration::from_secs(60);
+
+#[derive(Debug, PartialEq, Eq)]
+enum CoreProbe {
+    Ready,
+    Rejected(u16),
+    Pending,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupStep {
+    Ready,
+    Exited,
+    Rejected(u16),
+    Wait,
+    StillStarting,
+    TimedOut,
+}
+
+fn classify_probe(result: &io::Result<(u16, String)>) -> CoreProbe {
+    match result {
+        Ok((200, _)) => CoreProbe::Ready,
+        Ok((code @ (401 | 403), _)) => CoreProbe::Rejected(*code),
+        _ => CoreProbe::Pending,
+    }
+}
+
+// The probe and the log are evaluated lazily: an exited core is not probed,
+// and the log is only read once the deadline has passed.
+fn core_startup_step(
+    exited: bool,
+    probe: impl FnOnce() -> CoreProbe,
+    elapsed: Duration,
+    downloading: impl FnOnce() -> bool,
+) -> StartupStep {
+    if exited {
+        return StartupStep::Exited;
+    }
+    match probe() {
+        CoreProbe::Ready => StartupStep::Ready,
+        CoreProbe::Rejected(code) => StartupStep::Rejected(code),
+        CoreProbe::Pending if elapsed < CORE_START_DEADLINE => StartupStep::Wait,
+        CoreProbe::Pending if downloading() => StartupStep::StillStarting,
+        CoreProbe::Pending => StartupStep::TimedOut,
+    }
+}
+
+fn log_suggests_download(log: &str) -> bool {
+    log.to_ascii_lowercase().contains("download")
 }
 
 pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
@@ -1383,7 +1480,19 @@ pub fn regenerate_routing(
         None => (base, Vec::new()),
     };
     let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
-    install_config(cfg, &generated, running)?;
+    // A file kept after an unanswered reload may already be live, so record
+    // the matching cache and routing before reporting the unknown outcome.
+    let unknown = match install_config_with(
+        cfg,
+        &generated,
+        running,
+        discover_mihomo_binary,
+        &INSTALL_LIMITS,
+    ) {
+        Ok(()) => None,
+        Err(failure) if failure.kept => Some(failure.message),
+        Err(failure) => return Err(failure.message),
+    };
     if let Some(raw) = fresh {
         compose::write_private(&compose::cache_path(&dir), &raw)?;
     }
@@ -1400,6 +1509,9 @@ pub fn regenerate_routing(
             &generated,
         )?;
     }
+    if let Some(message) = unknown {
+        return Err(message);
+    }
     let tail = match (running, zh) {
         (true, true) => " — 已校验并热重载",
         (true, false) => " — validated & hot-reloaded",
@@ -1412,54 +1524,271 @@ pub fn regenerate_routing(
 /// Validate before replacing the active file. Keep disk and runtime on the old
 /// configuration if the controller rejects the candidate.
 pub fn install_config(cfg: &ControllerConfig, text: &str, running: bool) -> Result<(), String> {
+    install_config_with(cfg, text, running, discover_mihomo_binary, &INSTALL_LIMITS)
+        .map_err(|failure| failure.message)
+}
+
+/// How long `mihomo -t` may run, how long once its output shows a geodata
+/// download, and how long the controller may stay silent after an unanswered
+/// reload before its outcome is reported as unknown.
+struct InstallLimits {
+    check: Duration,
+    download: Duration,
+    settle: Duration,
+}
+
+const INSTALL_LIMITS: InstallLimits = InstallLimits {
+    check: Duration::from_secs(60),
+    // A first check fetches missing GeoIP/GeoSite files before it can finish;
+    // stopping it discards the partial file, so a slow link never gets past.
+    download: Duration::from_secs(600),
+    settle: Duration::from_secs(30),
+};
+
+struct InstallFailure {
+    message: String,
+    /// The new file stayed on disk because the reload outcome is unknown.
+    kept: bool,
+}
+
+impl From<String> for InstallFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            kept: false,
+        }
+    }
+}
+
+impl From<&str> for InstallFailure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+fn install_config_with(
+    cfg: &ControllerConfig,
+    text: &str,
+    running: bool,
+    find_bin: impl FnOnce() -> Option<PathBuf>,
+    limits: &InstallLimits,
+) -> Result<(), InstallFailure> {
     validate_listener_ports(text)?;
     fs::create_dir_all(&cfg.config_dir).map_err(|e| e.to_string())?;
+    // A force reload applies the file's `mode`, so keep a mode that was only
+    // switched at runtime.
+    let text = if running {
+        keep_runtime_mode(cfg, text)
+    } else {
+        text.to_string()
+    };
     let candidate = Path::new(&cfg.config_dir).join(".terc-candidate.yaml");
-    fs::write(&candidate, text).map_err(|e| e.to_string())?;
+    write_private(&candidate, text.as_bytes()).map_err(|e| e.to_string())?;
     let result = (|| {
-        let bin = discover_mihomo_binary()
-            .ok_or("Install the managed Mihomo core before saving a configuration")?;
-        let output = Command::new(bin)
-            .arg("-t")
-            .arg("-d")
-            .arg(&cfg.config_dir)
-            .arg("-f")
-            .arg(&candidate)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            return Err(format!(
-                "Configuration rejected: {} {}",
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
+        let bin =
+            find_bin().ok_or("Install the managed Mihomo core before saving a configuration")?;
+        check_candidate(&bin, cfg, &candidate, limits)?;
         let path = config_yaml_path(cfg);
         let previous = match fs::read(&path) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(e.to_string().into()),
         };
         fs::rename(&candidate, &path).map_err(|e| e.to_string())?;
-        if running {
-            if let Err(err) = reload_config(cfg) {
+        if !running {
+            return Ok(());
+        }
+        match reload_config(cfg) {
+            Ok(()) => Ok(()),
+            Err(ReloadError::Rejected(err)) => {
                 let restored = match previous {
-                    Some(bytes) => fs::write(&path, bytes),
+                    Some(bytes) => write_private(&path, &bytes),
                     None => fs::remove_file(&path),
                 };
-                return match restored {
-                    Ok(()) => Err(format!("{err}; previous configuration restored")),
-                    Err(restore) => Err(format!(
-                        "{err}; could not restore previous configuration: {restore}"
-                    )),
-                };
+                Err(match restored {
+                    Ok(()) => format!("{err}; previous configuration restored"),
+                    Err(restore) => {
+                        format!("{err}; could not restore previous configuration: {restore}")
+                    }
+                }
+                .into())
             }
+            // Mihomo finishes applying a PUT after the client gives up, so the
+            // new file may already be live. Never roll back on a lost reply.
+            Err(ReloadError::Unknown(_)) if controller_answers(cfg, limits.settle) => Ok(()),
+            Err(ReloadError::Unknown(err)) => Err(InstallFailure {
+                message: format!(
+                    "热重载结果未知，新配置已保留在磁盘上 / Reload outcome unknown ({err}); the new configuration was kept on disk"
+                ),
+                kept: true,
+            }),
         }
-        Ok(())
     })();
     let _ = fs::remove_file(candidate);
     result
+}
+
+/// Run `mihomo -t` on the candidate, stopping a check that hangs.
+fn check_candidate(
+    bin: &Path,
+    cfg: &ControllerConfig,
+    candidate: &Path,
+    limits: &InstallLimits,
+) -> Result<(), String> {
+    let mut child = Command::new(bin)
+        .arg("-t")
+        .arg("-d")
+        .arg(&cfg.config_dir)
+        .arg("-f")
+        .arg(candidate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    // Drain both pipes so a chatty check cannot block on a full buffer; the
+    // output read so far shows whether the check is downloading geodata.
+    fn drain(
+        pipe: Option<impl Read + Send + 'static>,
+        out: &Arc<Mutex<Vec<u8>>>,
+    ) -> thread::JoinHandle<()> {
+        let out = Arc::clone(out);
+        thread::spawn(move || {
+            let Some(mut pipe) = pipe else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut out) = out.lock() {
+                    out.extend_from_slice(&buf[..n]);
+                }
+            }
+        })
+    }
+    let (out, err) = (Arc::default(), Arc::default());
+    let stdout = drain(child.stdout.take(), &out);
+    let stderr = drain(child.stderr.take(), &err);
+    let text = |buf: &Arc<Mutex<Vec<u8>>>| {
+        buf.lock()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= limits.check
+            && (elapsed >= limits.download
+                || !log_suggests_download(&format!("{}{}", text(&out), text(&err))))
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Configuration check did not finish within {}s and was stopped",
+                elapsed.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let _ = (stdout.join(), stderr.join());
+    let (stdout, stderr) = (text(&out), text(&err));
+    Err(format!(
+        "Configuration rejected: {} {}",
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+/// Poll the controller after a reload that got no reply.
+fn controller_answers(cfg: &ControllerConfig, settle: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if matches!(
+            http_request(
+                &cfg.addr,
+                &cfg.secret,
+                "GET",
+                "/version",
+                None,
+                Duration::from_millis(1000),
+            ),
+            Ok((200, _))
+        ) {
+            return true;
+        }
+        if started.elapsed() >= settle {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn keep_runtime_mode(cfg: &ControllerConfig, text: &str) -> String {
+    let runtime = read_runtime_config(cfg).ok();
+    match runtime
+        .as_ref()
+        .and_then(|v| v.get("mode"))
+        .and_then(Value::as_str)
+    {
+        Some(mode) => with_mode(text, &mode.to_ascii_lowercase()),
+        None => text.to_string(),
+    }
+}
+
+/// Set the top-level `mode`. With modules applied, the base kept in the header
+/// is updated too, so disabling a module does not bring the old mode back.
+fn with_mode(doc: &str, mode: &str) -> String {
+    use crate::ops::set_top_scalar;
+    let literal = serde_json::to_string(mode).unwrap();
+    // Header layout written by ops::apply_modules_with_switches.
+    let mut parts = doc.splitn(3, '\n');
+    if let (Some(head), Some(switches), Some(effective)) =
+        (parts.next(), parts.next(), parts.next())
+    {
+        let base = head
+            .strip_prefix("# terc-base: ")
+            .and_then(|v| serde_json::from_str::<String>(v).ok());
+        if let Some(base) = base.filter(|_| switches.starts_with("# terc-switches: ")) {
+            return format!(
+                "# terc-base: {}\n{switches}\n{}",
+                serde_json::to_string(&set_top_scalar(&base, "mode", &literal)).unwrap(),
+                set_top_scalar(effective, "mode", &literal)
+            );
+        }
+    }
+    set_top_scalar(doc, "mode", &literal)
+}
+
+/// Write a file only the user can read (configs hold node credentials and the
+/// controller secret), replacing any existing file atomically.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let _ = fs::remove_file(&tmp);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 pub fn mihomo_asset_id_for(os: &str, arch: &str) -> Option<&'static str> {
@@ -1857,24 +2186,46 @@ pub fn set_rule_disabled(cfg: &ControllerConfig, index: usize, disabled: bool) -
     }
 }
 
-pub fn reload_config(cfg: &ControllerConfig) -> Result<(), String> {
+/// Only an explicit rejection proves the core kept its previous configuration.
+#[derive(Debug)]
+pub enum ReloadError {
+    /// The controller answered with an HTTP error.
+    Rejected(String),
+    /// No answer (I/O error or timeout); the core may still apply the file.
+    Unknown(String),
+}
+
+impl std::fmt::Display for ReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(text) | Self::Unknown(text) => f.write_str(text),
+        }
+    }
+}
+
+pub fn reload_config(cfg: &ControllerConfig) -> Result<(), ReloadError> {
     let path = config_yaml_path(cfg);
     let body = serde_json::json!({
         "path": path.display().to_string(),
         "payload": ""
     })
     .to_string();
+    // The first fetch of new providers runs inside the request, so allow well
+    // beyond Mihomo's own provider download timeout.
     match http_request(
         &cfg.addr,
         &cfg.secret,
         "PUT",
         "/configs?force=true",
         Some(&body),
-        Duration::from_millis(cfg.timeout_ms.max(10_000)),
+        Duration::from_millis(cfg.timeout_ms.max(90_000)),
     ) {
         Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-        Ok((status, text)) => Err(format!("reload HTTP {status} {}", brief(&text))),
-        Err(err) => Err(err.to_string()),
+        Ok((status, text)) => Err(ReloadError::Rejected(format!(
+            "reload HTTP {status} {}",
+            brief(&text)
+        ))),
+        Err(err) => Err(ReloadError::Unknown(err.to_string())),
     }
 }
 
@@ -1886,6 +2237,14 @@ pub fn persist_nested_bool(
     let raw = read_config_text(cfg)?;
     let next = crate::ops::set_nested_bool(&raw, path, value);
     install_config(cfg, &next, false)
+}
+
+/// Record a mode switched at runtime so later reloads and restarts keep it.
+/// The core already runs it, so this only writes the file.
+pub fn persist_mode(cfg: &ControllerConfig, mode: &str) -> Result<(), String> {
+    let raw = read_config_text(cfg)?;
+    write_private(&config_yaml_path(cfg), with_mode(&raw, mode).as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 pub fn query_dns(cfg: &ControllerConfig, name: &str, qtype: &str) -> Result<DnsMessage, String> {
@@ -1985,7 +2344,8 @@ pub fn refresh_provider(cfg: &ControllerConfig, kind: &str, name: &str) -> Resul
         "PUT",
         &path,
         None,
-        Duration::from_millis(4000),
+        // Mihomo downloads and parses the provider before it answers.
+        Duration::from_secs(30),
     ) {
         Ok((status, _)) if (200..300).contains(&status) => Ok(()),
         Ok((status, body)) => Err(format!("HTTP {status} {}", brief(&body))),
@@ -2059,20 +2419,49 @@ pub fn test_node_delay(
     node: &str,
     url: &str,
 ) -> Result<Option<u16>, String> {
-    let path = format!(
-        "/proxies/{}/delay?url={}&timeout={}",
-        percent_encode(node),
-        percent_encode(url),
-        cfg.timeout_ms
-    );
-    match http_request(
-        &cfg.addr,
-        &cfg.secret,
-        "GET",
-        &path,
-        None,
-        Duration::from_millis(cfg.timeout_ms + 500),
-    ) {
+    node_delay_with(cfg, node, url, &std::sync::OnceLock::new())
+}
+
+/// GET /proxies/{name}/delay, falling back to the provider healthcheck route
+/// on 404: since Mihomo v1.19.28 the former only resolves inline proxies.
+/// `providers` maps node to provider and is fetched at most once per run.
+fn node_delay_with(
+    cfg: &ControllerConfig,
+    node: &str,
+    url: &str,
+    providers: &std::sync::OnceLock<HashMap<String, String>>,
+) -> Result<Option<u16>, String> {
+    let query = format!("url={}&timeout={}", percent_encode(url), cfg.timeout_ms);
+    let get = |path: &str| {
+        http_request(
+            &cfg.addr,
+            &cfg.secret,
+            "GET",
+            path,
+            None,
+            Duration::from_millis(cfg.timeout_ms + 500),
+        )
+    };
+    let mut response = get(&format!("/proxies/{}/delay?{query}", percent_encode(node)));
+    if matches!(response, Ok((404, _))) {
+        let providers = providers.get_or_init(|| {
+            match get("/providers/proxies") {
+                Ok((200, body)) => crate::ops::parse_provider_nodes(&body),
+                _ => Vec::new(),
+            }
+            .into_iter()
+            .map(|found| (found.name, found.provider))
+            .collect()
+        });
+        if let Some(provider) = providers.get(node) {
+            response = get(&format!(
+                "/providers/proxies/{}/{}/healthcheck?{query}",
+                percent_encode(provider),
+                percent_encode(node)
+            ));
+        }
+    }
+    match response {
         Ok((200, body)) => Ok(serde_json::from_str::<Value>(&body)
             .ok()
             .and_then(|v| v.get("delay").and_then(Value::as_u64))
@@ -2271,6 +2660,130 @@ fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<S
 }
 
 #[cfg(test)]
+mod provider_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicUsize, mpsc};
+
+    /// Mock controller in the shape of Mihomo >= v1.19.28: /proxies/{name}/delay
+    /// 404s for provider nodes, which answer on the provider healthcheck route.
+    fn mock_controller(lookups: Arc<AtomicUsize>) -> ControllerConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let lookups = lookups.clone();
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let (status, body) = if path == "/providers/proxies" {
+                        lookups.fetch_add(1, Ordering::SeqCst);
+                        (
+                            200,
+                            r#"{"providers":{"air":{"name":"air","proxies":[{"name":"JP 01","type":"Vmess"},{"name":"US 01","type":"Trojan"}]}}}"#,
+                        )
+                    } else if path.starts_with("/proxies/Inline/delay?") {
+                        (200, r#"{"delay":15}"#)
+                    } else if path.starts_with("/providers/proxies/air/JP%2001/healthcheck?url=")
+                        && path.contains("&timeout=")
+                    {
+                        (200, r#"{"delay":42}"#)
+                    } else if path.starts_with("/providers/proxies/air/US%2001/healthcheck?") {
+                        (504, r#"{"message":"Timeout"}"#)
+                    } else {
+                        (404, r#"{"message":"resource not found"}"#)
+                    };
+                    let _ = write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        ControllerConfig {
+            addr,
+            timeout_ms: 500,
+            ..ControllerConfig::default()
+        }
+    }
+
+    #[test]
+    fn delay_falls_back_to_provider_healthcheck_on_404() {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let cfg = mock_controller(lookups.clone());
+        let url = "https://www.gstatic.com/generate_204";
+        assert_eq!(test_node_delay(&cfg, "Inline", url), Ok(Some(15)));
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(test_node_delay(&cfg, "JP 01", url), Ok(Some(42)));
+        assert!(test_node_delay(&cfg, "US 01", url)
+            .unwrap_err()
+            .starts_with("HTTP 504"));
+        assert!(test_node_delay(&cfg, "Gone", url)
+            .unwrap_err()
+            .starts_with("HTTP 404"));
+    }
+
+    #[test]
+    fn group_test_streams_results_and_looks_up_providers_once() {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let cfg = mock_controller(lookups.clone());
+        let (tx, rx) = mpsc::channel();
+        let nodes = [
+            "JP 01",
+            "剩余流量：1 GB",
+            "Inline",
+            "US 01",
+            "Gone",
+            "JP 01",
+        ];
+        test_best_delays_async(
+            cfg,
+            "Main".into(),
+            nodes.iter().map(|s| s.to_string()).collect(),
+            tx,
+        );
+        let mut streamed = Vec::new();
+        let results = loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                BackendEvent::DelayResult { group, node, delay } => {
+                    assert_eq!(group, "Main");
+                    streamed.push((node, delay));
+                }
+                BackendEvent::BestTestDone { group, results } => {
+                    assert_eq!(group, "Main");
+                    break results;
+                }
+                _ => panic!("unexpected event"),
+            }
+        };
+        let expected: Vec<(String, Option<u16>)> = [
+            ("JP 01", Some(42)),
+            ("Inline", Some(15)),
+            ("US 01", None),
+            ("Gone", None),
+            ("JP 01", Some(42)),
+        ]
+        .iter()
+        .map(|(n, d)| (n.to_string(), *d))
+        .collect();
+        assert_eq!(results, expected);
+        streamed.sort();
+        let mut sorted = expected.clone();
+        sorted.sort();
+        assert_eq!(streamed, sorted);
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2341,7 +2854,7 @@ mod tests {
 
     #[test]
     fn tun_patch_preserves_settings_and_checks_the_result() {
-        use std::{net::TcpListener, time::Instant};
+        use std::net::TcpListener;
         for actual in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -2457,7 +2970,7 @@ mod tests {
         for status in [400, 204] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             cfg.addr = listener.local_addr().unwrap().to_string();
-            let server = thread::spawn(move || {
+            let server = thread::spawn(move || loop {
                 let (stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
@@ -2478,12 +2991,22 @@ mod tests {
                 }
                 let mut payload = vec![0; length];
                 reader.read_exact(&mut payload).unwrap();
+                // The runtime mode is read first; this mock has none to carry.
+                if request.starts_with("GET /configs ") {
+                    write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
                 assert!(request.starts_with("PUT /configs?force=true "));
                 write!(
                     reader.get_mut(),
                     "HTTP/1.1 {status} Result\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 .unwrap();
+                break;
             });
             let next = "mode: direct\nipv6: true\nproxies: []\nrules: []\n";
             let result = install_config(&cfg, next, true);
@@ -2675,5 +3198,395 @@ mod listener_tests {
         ))
         .unwrap_err()
         .contains("DNS"));
+    }
+
+    #[test]
+    fn slow_core_start_waits_while_alive_and_returns_once_ready() {
+        let early = Duration::from_secs(5);
+        let never = || -> bool { panic!("log is only checked at the deadline") };
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Pending, early, never),
+            StartupStep::Wait
+        );
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Pending, Duration::from_secs(45), never),
+            StartupStep::Wait
+        );
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Ready, Duration::from_secs(30), never),
+            StartupStep::Ready
+        );
+        assert_eq!(
+            core_startup_step(true, || panic!("exited core is not probed"), early, never),
+            StartupStep::Exited
+        );
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Rejected(401), early, never),
+            StartupStep::Rejected(401)
+        );
+    }
+
+    #[test]
+    fn core_past_the_deadline_is_kept_only_while_downloading_geodata() {
+        let late = CORE_START_DEADLINE;
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Ready, late, || false),
+            StartupStep::Ready
+        );
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Pending, late, || true),
+            StartupStep::StillStarting
+        );
+        assert_eq!(
+            core_startup_step(false, || CoreProbe::Pending, late, || false),
+            StartupStep::TimedOut
+        );
+        assert!(log_suggests_download(
+            "INFO Can't find GeoSite.dat, start download\n"
+        ));
+        assert!(!log_suggests_download("INFO Start initial configuration\n"));
+    }
+
+    #[test]
+    fn controller_probe_separates_ready_rejected_and_pending() {
+        assert_eq!(classify_probe(&Ok((200, String::new()))), CoreProbe::Ready);
+        assert_eq!(
+            classify_probe(&Ok((401, String::new()))),
+            CoreProbe::Rejected(401)
+        );
+        assert_eq!(
+            classify_probe(&Ok((503, String::new()))),
+            CoreProbe::Pending
+        );
+        let refused = Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert_eq!(classify_probe(&refused), CoreProbe::Pending);
+    }
+
+    /// Answer one connection per canned response (empty closes without a
+    /// reply) and return each request line followed by its body.
+    fn serve(
+        listener: std::net::TcpListener,
+        responses: Vec<Vec<u8>>,
+    ) -> thread::JoinHandle<Vec<String>> {
+        thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.strip_prefix("Content-Length: ") {
+                        length = v.trim().parse::<usize>().unwrap();
+                    }
+                    if request.is_empty() {
+                        request = line;
+                    }
+                }
+                let mut payload = vec![0; length];
+                reader.read_exact(&mut payload).unwrap();
+                reader.get_mut().write_all(&response).unwrap();
+                requests.push(request + &String::from_utf8_lossy(&payload));
+            }
+            requests
+        })
+    }
+
+    #[test]
+    fn chunk_boundary_inside_a_character_decodes_to_the_character() {
+        assert_eq!(
+            decode_chunked(b"2\r\n\xE8\x8A\r\n1\r\n\x82\r\n0\r\n\r\n"),
+            "节".as_bytes()
+        );
+        // A truncated final chunk keeps what arrived instead of slicing past it.
+        assert_eq!(decode_chunked(b"5\r\nab"), b"ab");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = serve(
+            listener,
+            vec![
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                   8\r\n{\"n\":\"\xE8\x8A\r\n3\r\n\x82\"}\r\n0\r\n\r\n"
+                    .to_vec(),
+            ],
+        );
+        let (status, body) =
+            http_request(&addr, "", "GET", "/proxies", None, Duration::from_secs(3)).unwrap();
+        assert!(server.join().unwrap()[0].starts_with("GET /proxies "));
+        assert_eq!(status, 200);
+        assert_eq!(body, "{\"n\":\"节\"}");
+    }
+
+    fn http(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// A temporary config dir with a stand-in for `mihomo -t` (never a real core).
+    #[cfg(unix)]
+    fn install_fixture(tag: &str, check: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "terc-install-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("fake-mihomo");
+        fs::write(&bin, format!("#!/bin/sh\n{check}\n")).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, bin)
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode()
+    }
+
+    const TEST_LIMITS: InstallLimits = InstallLimits {
+        check: Duration::from_secs(10),
+        download: Duration::from_secs(10),
+        settle: Duration::from_millis(600),
+    };
+
+    #[test]
+    #[cfg(unix)]
+    fn rejected_reload_restores_previous_file_privately() {
+        let (dir, bin) = install_fixture("rejected", "exit 0");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let previous = "mode: rule\nproxies: []\n";
+        fs::write(config_yaml_path(&cfg), previous).unwrap();
+        let server = serve(
+            listener,
+            vec![http("200 OK", "{}"), http("400 Bad Request", "bad")],
+        );
+        let failure = install_config_with(
+            &cfg,
+            "mode: rule\nipv6: true\n",
+            true,
+            || Some(bin),
+            &TEST_LIMITS,
+        )
+        .err()
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[1].starts_with("PUT /configs?force=true "));
+        assert!(!failure.kept);
+        assert!(failure.message.contains("previous configuration restored"));
+        assert_eq!(read_config_text(&cfg).unwrap(), previous);
+        assert_eq!(mode_of(&config_yaml_path(&cfg)) & 0o077, 0);
+        assert!(!dir.join(".terc-candidate.yaml").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unanswered_reload_keeps_the_new_file() {
+        let next = "mode: rule\nipv6: true\n";
+        for answers in [true, false] {
+            let (dir, bin) = install_fixture("unknown", "exit 0");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let cfg = ControllerConfig {
+                addr: listener.local_addr().unwrap().to_string(),
+                config_dir: dir.display().to_string(),
+                ..ControllerConfig::default()
+            };
+            fs::write(config_yaml_path(&cfg), "mode: rule\n").unwrap();
+            // The PUT connection closes without a reply, as on a client timeout.
+            let mut responses = vec![http("200 OK", "{}"), Vec::new()];
+            if answers {
+                responses.push(http("200 OK", "{\"version\":\"v1\"}"));
+            }
+            let server = serve(listener, responses);
+            let result = install_config_with(&cfg, next, true, || Some(bin), &TEST_LIMITS);
+            let requests = server.join().unwrap();
+            if answers {
+                assert!(result.is_ok());
+                assert!(requests[2].starts_with("GET /version "));
+            } else {
+                let failure = result.err().unwrap();
+                assert!(failure.kept);
+                assert!(failure.message.contains("kept on disk"));
+            }
+            assert_eq!(read_config_text(&cfg).unwrap(), next);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hung_config_check_is_stopped_and_leaves_the_file() {
+        let (dir, bin) = install_fixture("hung", "exec sleep 30");
+        let cfg = ControllerConfig {
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        fs::write(config_yaml_path(&cfg), "mode: rule\n").unwrap();
+        let limits = InstallLimits {
+            check: Duration::from_millis(300),
+            ..TEST_LIMITS
+        };
+        let started = Instant::now();
+        let failure = install_config_with(&cfg, "mode: global\n", false, || Some(bin), &limits)
+            .err()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(failure.message.contains("did not finish"));
+        assert_eq!(read_config_text(&cfg).unwrap(), "mode: rule\n");
+        assert!(!dir.join(".terc-candidate.yaml").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn config_check_downloading_geodata_gets_more_time() {
+        let limits = InstallLimits {
+            check: Duration::from_millis(200),
+            download: Duration::from_secs(10),
+            ..TEST_LIMITS
+        };
+        let script = "echo 'Can not find GeoSite.dat, start download'; sleep 1; exit 0";
+        let (dir, bin) = install_fixture("download", script);
+        let cfg = ControllerConfig {
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        assert!(install_config_with(&cfg, "mode: global\n", false, || Some(bin), &limits).is_ok());
+        assert_eq!(read_config_text(&cfg).unwrap(), "mode: global\n");
+        fs::remove_dir_all(dir).unwrap();
+        // The longer deadline still stops a download that never ends.
+        let limits = InstallLimits {
+            download: Duration::from_millis(600),
+            ..limits
+        };
+        let (dir, bin) = install_fixture("download-hung", "echo downloading; exec sleep 30");
+        let cfg = ControllerConfig {
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let started = Instant::now();
+        let failure = install_config_with(&cfg, "mode: global\n", false, || Some(bin), &limits)
+            .err()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(failure.message.contains("did not finish"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installed_config_is_private_even_over_a_public_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, bin) = install_fixture("private", "echo checked; exit 0");
+        let cfg = ControllerConfig {
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let path = config_yaml_path(&cfg);
+        fs::write(&path, "mode: rule\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let stale = dir.join(".terc-candidate.yaml");
+        fs::write(&stale, "").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+        install_config_with(&cfg, "mode: global\n", false, || Some(bin), &TEST_LIMITS)
+            .ok()
+            .unwrap();
+        assert_eq!(read_config_text(&cfg).unwrap(), "mode: global\n");
+        assert_eq!(mode_of(&path) & 0o077, 0);
+        let (dir_fail, bin_fail) = install_fixture("private-fail", "echo bad key >&2; exit 1");
+        let cfg_fail = ControllerConfig {
+            config_dir: dir_fail.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let failure = install_config_with(
+            &cfg_fail,
+            "mode: global\n",
+            false,
+            || Some(bin_fail),
+            &TEST_LIMITS,
+        )
+        .err()
+        .unwrap();
+        assert!(failure.message.contains("rejected") && failure.message.contains("bad key"));
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(dir_fail).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reload_keeps_a_mode_switched_at_runtime() {
+        let (dir, bin) = install_fixture("mode", "exit 0");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let server = serve(
+            listener,
+            vec![
+                http("200 OK", r#"{"mode":"Direct","allow-lan":false}"#),
+                http("204 No Content", ""),
+            ],
+        );
+        let modules = vec![crate::ops::ModuleSnippet {
+            id: "lan".into(),
+            name: "LAN".into(),
+            description: String::new(),
+            body: "allow-lan: true\n".into(),
+            builtin: false,
+        }];
+        let text = crate::ops::apply_modules_with_switches(
+            "mode: rule\nallow-lan: false\nproxies: []\n",
+            &modules,
+            &[],
+        )
+        .unwrap();
+        install_config_with(&cfg, &text, true, || Some(bin), &TEST_LIMITS)
+            .ok()
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /configs "));
+        assert!(requests[1].starts_with("PUT /configs?force=true "));
+        let installed = read_config_text(&cfg).unwrap();
+        assert!(installed.contains("\nmode: \"direct\"\n"));
+        assert!(installed.contains("allow-lan: true"));
+        let base = crate::ops::strip_marked_modules(&installed);
+        assert!(base.starts_with("mode: \"direct\"\n"));
+        assert!(base.contains("allow-lan: false"));
+
+        // Persisting a runtime switch writes the file without a reload.
+        persist_mode(&cfg, "global").unwrap();
+        let persisted = read_config_text(&cfg).unwrap();
+        assert!(crate::ops::strip_marked_modules(&persisted).starts_with("mode: \"global\"\n"));
+        assert!(persisted.contains("\nmode: \"global\"\n"));
+        // Regenerating from it carries the mode into the new base.
+        let carried = crate::compose::carry_runtime_state(
+            &crate::ops::strip_marked_modules(&persisted),
+            "mode: rule\nproxies: []\n",
+        );
+        assert!(carried.starts_with("mode: global\n"));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

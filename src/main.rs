@@ -194,14 +194,99 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::path();
+        self.save_to(&Self::path())
+    }
+
+    /// The file holds the controller secret and subscription URL, so only the
+    /// user may read it.
+    fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        let candidate = path.with_extension("json.tmp");
-        fs::write(&candidate, json).map_err(|e| e.to_string())?;
-        fs::rename(candidate, path).map_err(|e| e.to_string())
+        crate::mihomo::write_private(path, json.as_bytes()).map_err(|e| e.to_string())
+    }
+}
+
+/// Deliver a worker's completion event even when the worker panics, so
+/// `snapshot_pending` and `action_busy` are always cleared.
+struct SendOnDrop {
+    tx: Sender<BackendEvent>,
+    event: Option<BackendEvent>,
+}
+
+impl SendOnDrop {
+    fn new(tx: Sender<BackendEvent>, fallback: BackendEvent) -> Self {
+        Self {
+            tx,
+            event: Some(fallback),
+        }
+    }
+
+    fn set(&mut self, event: BackendEvent) {
+        self.event = Some(event);
+    }
+}
+
+impl Drop for SendOnDrop {
+    fn drop(&mut self) {
+        if let Some(event) = self.event.take() {
+            let _ = self.tx.send(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn saved_preferences_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = env::temp_dir().join(format!("terc-prefs-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut cfg = Config::default();
+        cfg.controller.secret = "s3cret".into();
+        cfg.save_to(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0);
+        assert!(fs::read_to_string(&path).unwrap().contains("s3cret"));
+        assert!(!dir.join("config.json.tmp").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn panicking_worker_still_reports_completion() {
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+            if done.event.is_some() {
+                panic!("fetch failed");
+            }
+            done.set(BackendEvent::StatusMessage {
+                text: String::new(),
+                is_error: false,
+            });
+        });
+        assert!(worker.join().is_err());
+        assert!(matches!(rx.try_recv(), Ok(BackendEvent::SnapshotDone(_))));
+
+        let (tx, rx) = mpsc::channel();
+        let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+        done.set(BackendEvent::StatusMessage {
+            text: "ok".into(),
+            is_error: false,
+        });
+        drop(done);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::StatusMessage { .. })
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }
 
@@ -876,8 +961,8 @@ impl App {
             let cfg = self.config.controller.clone();
             let tx = self.tx.clone();
             thread::spawn(move || {
-                let snap = fetch_snapshot(&cfg);
-                let _ = tx.send(BackendEvent::SnapshotDone(Box::new(snap)));
+                let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+                done.set(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
             });
         }
     }
@@ -915,7 +1000,8 @@ impl App {
         let cfg = self.config.controller.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let _ = tx.send(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
+            let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+            done.set(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
         });
     }
 
@@ -937,12 +1023,21 @@ impl App {
         let cfg = self.config.controller.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
+            let mut done = SendOnDrop::new(
+                tx.clone(),
+                BackendEvent::ActionDone {
+                    result: Err("Operation failed unexpectedly".into()),
+                    modules: None,
+                    profile: None,
+                },
+            );
             let result = action(cfg.clone());
-            let _ = tx.send(BackendEvent::ActionDone {
+            done.set(BackendEvent::ActionDone {
                 result,
                 modules,
                 profile,
             });
+            drop(done);
             let _ = tx.send(BackendEvent::Snapshot(Box::new(fetch_snapshot(&cfg))));
         });
     }
@@ -1120,6 +1215,11 @@ impl App {
         }
         self.run_action("Switching routing mode…", None, None, move |cfg| {
             switch_routing_mode(&cfg, mode).map_err(|e| e.to_string())?;
+            // A later reload applies the file's mode, so record the switch there.
+            if config_file_exists(&cfg) {
+                crate::mihomo::persist_mode(&cfg, &mode.to_ascii_lowercase())
+                    .map_err(|e| format!("Routing mode › {mode}; not saved to config.yaml: {e}"))?;
+            }
             Ok(format!("Routing mode › {mode}"))
         });
     }
@@ -1173,15 +1273,15 @@ impl App {
             (Lang::Zh, "help") => "帮助",
             (Lang::En, "help") => "Help",
             (Lang::Ja, "help") => "ヘルプ",
-            (Lang::Zh, "stopped") => "未运行 (按 K 启动)",
-            (Lang::En, "stopped") => "Stopped (Press K)",
-            (Lang::Ja, "stopped") => "停止中 (Kで起動)",
+            (Lang::Zh, "stopped") => "未运行 (s → 内核服务)",
+            (Lang::En, "stopped") => "Stopped (s → Core service)",
+            (Lang::Ja, "stopped") => "停止中 (s → Core service)",
             (Lang::Zh, "no_groups") => "暂无策略组",
             (Lang::En, "no_groups") => "No proxy groups",
             (Lang::Ja, "no_groups") => "グループなし",
-            (Lang::Zh, "core_stopped_hint") => "Mihomo 内核未运行  按 K 启动内核，按 u 更新订阅（首次使用请按提示添加订阅）",
-            (Lang::En, "core_stopped_hint") => "Mihomo core is stopped  K starts it, u updates the subscription (first run: add one below)",
-            (Lang::Ja, "core_stopped_hint") => "Mihomo停止中  Kで起動、uでサブスク更新（初回は登録を追加）",
+            (Lang::Zh, "core_stopped_hint") => "Mihomo 内核未运行\n\n启动：设置 → 内核与代理 → 内核服务\n更新订阅 (u)：设置 → 订阅与分流 → 代理订阅\n（首次使用请按提示添加订阅）",
+            (Lang::En, "core_stopped_hint") => "Mihomo core is stopped\n\nStart: Settings → Core & Proxy → Core service\nUpdate (u): Settings → Sources & Routing → Proxy subscriptions\n(first run: add a subscription there)",
+            (Lang::Ja, "core_stopped_hint") => "Mihomo停止中\n\n起動：設定 → コア・プロキシ → Core service\n更新 (u)：設定 → サブスクリプション → Proxy subscriptions\n（初回は登録を追加）",
             (Lang::Zh, "no_connections") => "当前没有活跃连接",
             (Lang::En, "no_connections") => "No active connections",
             (Lang::Ja, "no_connections") => "アクティブな接続はありません",
@@ -1365,9 +1465,9 @@ impl App {
             (Lang::Zh, "setup_err_scheme") => "需要 http(s) 订阅链接，或一条 Surge 节点行 / ss:// 等节点链接",
             (Lang::En, "setup_err_scheme") => "Enter an http(s) subscription link, or a Surge proxy line / ss:// style node link",
             (Lang::Ja, "setup_err_scheme") => "リンクは http:// または https:// で始めてください",
-            (Lang::Zh, "setup_msg_saved") => "订阅已保存  内核未安装：按 Ctrl+D 下载，启动后按 K",
-            (Lang::En, "setup_msg_saved") => "Subscription saved  no core binary: press Ctrl+D, then K to start",
-            (Lang::Ja, "setup_msg_saved") => "サブスク保存済み  コア未導入：Ctrl+D で導入、K で起動",
+            (Lang::Zh, "setup_msg_saved") => "订阅已保存  内核未安装：按 Ctrl+D 下载，再按 Esc 返回，在 设置 → 内核与代理 → 内核服务 启动",
+            (Lang::En, "setup_msg_saved") => "Subscription saved  no core binary: press Ctrl+D to download, then Esc and start it in Settings → Core & Proxy → Core service",
+            (Lang::Ja, "setup_msg_saved") => "サブスク保存済み  コア未導入：Ctrl+D で導入後、Esc で戻り 設定 → コア・プロキシ → Core service で起動",
             (Lang::Zh, "setup_msg_starting") => "内核启动中，就绪后自动关闭本窗口…",
             (Lang::En, "setup_msg_starting") => "Starting core; this window closes once it answers…",
             (Lang::Ja, "setup_msg_starting") => "コア起動中。応答するとこの窓は閉じます…",
@@ -1467,9 +1567,9 @@ impl App {
             (Lang::Zh, "st_dns_flushing") => "正在清空 DNS / Fake-IP 缓存…",
             (Lang::En, "st_dns_flushing") => "Flushing DNS / Fake-IP cache…",
             (Lang::Ja, "st_dns_flushing") => "DNS / Fake-IP キャッシュを消去中…",
-            (Lang::Zh, "st_core_down") => "内核未运行  按 K 启动",
-            (Lang::En, "st_core_down") => "Core is stopped  press K",
-            (Lang::Ja, "st_core_down") => "コア停止中  K で起動",
+            (Lang::Zh, "st_core_down") => "内核未运行  在 设置 → 内核与代理 → 内核服务 启动",
+            (Lang::En, "st_core_down") => "Core is stopped  start it in Settings → Core & Proxy → Core service",
+            (Lang::Ja, "st_core_down") => "コア停止中  設定 → コア・プロキシ → Core service で起動",
             (Lang::Zh, "st_saved_core_down") => "已写入配置  内核未运行，启动后生效",
             (Lang::En, "st_saved_core_down") => "Saved  applies when the core is running",
             (Lang::Ja, "st_saved_core_down") => "保存済み  コア起動後に反映",
@@ -1647,8 +1747,23 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     let mut config = Config::load();
-    storage::migrate(&mut config).map_err(io::Error::other)?;
+    // Migration problems are shown in the UI; legacy files stay untouched.
+    let migration = storage::migrate(&mut config);
     let mut app = App::new(config);
+    match migration {
+        Ok(notes) if !notes.is_empty() => app.set_status(
+            &format!(
+                "迁移跳过 / Migration skipped / 移行スキップ: {}",
+                notes.join("; ")
+            ),
+            true,
+        ),
+        Ok(_) => {}
+        Err(err) => app.set_status(
+            &format!("迁移失败 / Migration failed / 移行失敗: {err}"),
+            true,
+        ),
+    }
     run(&mut app)
 }
 
@@ -2494,6 +2609,24 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.log_detail);
         assert!(render_text(&mut app, 60, 18).contains("second"));
+    }
+
+    #[test]
+    fn stopped_core_hint_names_both_settings_paths_at_common_widths() {
+        let mut app = offline_app();
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            for (width, height) in [(120, 36), (160, 40)] {
+                let view = render_text(&mut app, width, height);
+                let (core, update) = match lang {
+                    Lang::Zh => ("内核服务", "更新订阅(u)"),
+                    Lang::En => ("service", "Update(u)"),
+                    Lang::Ja => ("service", "更新(u)"),
+                };
+                assert!(view.contains(core), "{lang:?} {width}\n{view}");
+                assert!(view.contains(update), "{lang:?} {width}\n{view}");
+            }
+        }
     }
 
     #[test]
