@@ -175,7 +175,7 @@ pub fn convert_subscription(raw: &str) -> Result<Converted, String> {
 pub fn parse_node_line(line: &str) -> Result<Value, String> {
     let line = line.trim().trim_start_matches('\u{feff}');
     if line.starts_with('{') {
-        let value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+        let mut value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
         if value["name"].as_str().is_none()
             || value["type"].as_str().is_none()
             || value["server"].as_str().is_none()
@@ -186,6 +186,7 @@ pub fn parse_node_line(line: &str) -> Result<Value, String> {
         {
             return Err("节点缺少名称、类型、服务器或有效端口 / Incomplete proxy".into());
         }
+        normalize_ws_network(&mut value);
         return Ok(value);
     }
 
@@ -1436,6 +1437,41 @@ fn split_path_ed(path: &str) -> (String, Option<String>) {
     }
 }
 
+/// Rewrite a Clash `network: httpupgrade` node to Mihomo's form, `network: ws`
+/// plus `ws-opts.v2ray-http-upgrade: true`. Mihomo's vmess / vless / trojan
+/// adapters have no httpupgrade case and silently dial plain TCP for an unknown
+/// `network`. A non-standard `httpupgrade-opts {path, host}` is folded into
+/// `ws-opts`. Returns whether anything changed; a second run changes nothing.
+pub fn normalize_ws_network(node: &mut Value) -> bool {
+    let upgrade = node["network"]
+        .as_str()
+        .is_some_and(|n| n.eq_ignore_ascii_case("httpupgrade"));
+    let Some(node) = node.as_object_mut().filter(|_| upgrade) else {
+        return false;
+    };
+    node.insert("network".into(), json!("ws"));
+    let legacy = node.remove("httpupgrade-opts");
+    let opts = node.entry("ws-opts").or_insert_with(|| json!({}));
+    if !opts.is_object() {
+        *opts = json!({});
+    }
+    let opts = opts.as_object_mut().unwrap();
+    opts.entry("v2ray-http-upgrade").or_insert(json!(true));
+    let legacy = legacy.as_ref().and_then(Value::as_object);
+    if let Some(path) = legacy.and_then(|l| l.get("path")).filter(|p| p.is_string()) {
+        opts.entry("path").or_insert_with(|| path.clone());
+    }
+    if let Some(host) = legacy.and_then(|l| l.get("host")).filter(|h| h.is_string()) {
+        let headers = opts.entry("headers").or_insert_with(|| json!({}));
+        if let Some(headers) = headers.as_object_mut() {
+            if !headers.keys().any(|k| k.eq_ignore_ascii_case("host")) {
+                headers.insert("Host".into(), host.clone());
+            }
+        }
+    }
+    true
+}
+
 pub fn parse_uri(raw: &str) -> Result<Value, String> {
     let raw = raw.trim();
     let scheme = raw
@@ -2585,5 +2621,48 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
         }
         assert!(decode_base64("not base64!").is_none());
         assert_eq!(percent_decode("a%2Fb%zz%"), "a/b%zz%");
+    }
+
+    #[test]
+    fn httpupgrade_nodes_become_ws_with_v2ray_http_upgrade() {
+        let pasted = parse_node_line(
+            r#"{"name":"U","type":"vless","server":"192.0.2.4","port":443,"uuid":"u","network":"HTTPUpgrade","httpupgrade-opts":{"path":"/up","host":"u.example"}}"#,
+        )
+        .unwrap();
+        assert_eq!(pasted["network"], "ws");
+        assert!(pasted.get("httpupgrade-opts").is_none());
+        assert_eq!(
+            pasted["ws-opts"],
+            json!({"path": "/up", "headers": {"Host": "u.example"}, "v2ray-http-upgrade": true})
+        );
+        // Existing ws-opts win over the legacy keys; a lowercase host counts.
+        let mut node = json!({"network": "httpupgrade",
+            "ws-opts": {"path": "/keep", "headers": {"host": "k.example"},
+                "v2ray-http-upgrade-fast-open": true},
+            "httpupgrade-opts": {"path": "/old", "host": "old.example"}});
+        assert!(normalize_ws_network(&mut node));
+        assert_eq!(
+            node["ws-opts"],
+            json!({"path": "/keep", "headers": {"host": "k.example"},
+                "v2ray-http-upgrade": true, "v2ray-http-upgrade-fast-open": true})
+        );
+        let once = node.clone();
+        assert!(!normalize_ws_network(&mut node));
+        assert_eq!(node, once);
+        // ws-opts that is not an object is replaced.
+        let mut odd = json!({"network": "httpupgrade", "ws-opts": null});
+        assert!(normalize_ws_network(&mut odd));
+        assert_eq!(odd["ws-opts"], json!({"v2ray-http-upgrade": true}));
+        for other in [
+            json!({"network": "ws", "ws-opts": {"path": "/?ed=2048"}}),
+            json!({"network": "grpc", "grpc-opts": {"grpc-service-name": "s"}}),
+            json!({"network": "tcp"}),
+            json!({"type": "ss"}),
+            json!("httpupgrade"),
+        ] {
+            let mut node = other.clone();
+            assert!(!normalize_ws_network(&mut node));
+            assert_eq!(node, other);
+        }
     }
 }
