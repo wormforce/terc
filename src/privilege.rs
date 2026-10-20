@@ -402,6 +402,8 @@ pub(crate) fn set_tun(
                 );
             }
             mihomo::install_config(cfg, &updated, false)?;
+            // The restart closes every connection.
+            mihomo::announce_disruption(crate::conns::Cause::Tun, crate::conns::Scope::All);
             return match start_core(cfg, Some(pid)) {
                 Ok(text) => Ok(text),
                 Err(error) => {

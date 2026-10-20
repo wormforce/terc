@@ -293,6 +293,17 @@ pub fn bulk_label(n: usize, lang: Lang) -> String {
     }
 }
 
+/// Which closing connections a cause is given to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    Id(String),
+    /// Through a `proxy-providers:` node: a reload re-initialises those.
+    Providers,
+    /// Entered through TUN: a TUN rebuild closes those.
+    TunInbound,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClosedConn {
     pub host: String,
@@ -332,13 +343,24 @@ struct Seen {
     process: String,
     chains: String,
     provider: String,
+    inbound: String,
     start_ms: Option<i64>,
+}
+
+impl Scope {
+    fn covers(&self, id: &str, seen: &Seen) -> bool {
+        match self {
+            Self::All => true,
+            Self::Id(want) => want == id,
+            Self::Providers => !seen.provider.is_empty(),
+            Self::TunInbound => seen.inbound.eq_ignore_ascii_case("tun"),
+        }
+    }
 }
 
 struct PendingCause {
     cause: Cause,
-    /// `None` applies to every connection.
-    id: Option<String>,
+    scope: Scope,
     noted: Instant,
     until: Option<Instant>,
 }
@@ -409,6 +431,7 @@ impl Tracker {
                         process: item.process.clone(),
                         chains: item.chains.clone(),
                         provider: item.provider.clone(),
+                        inbound: item.inbound.clone(),
                         start_ms: item.start_ms,
                     },
                 );
@@ -424,7 +447,7 @@ impl Tracker {
             }
             let lifetime = age_secs(seen.start_ms, now_ms);
             let cause = pending
-                .filter(|p| p.id.as_deref().is_none_or(|want| want == id))
+                .filter(|p| p.scope.covers(id, seen))
                 .map(|p| p.cause)
                 .or(stopped.then_some(Cause::CoreStopped));
             // A short AI request is recorded only when terc cut it.
@@ -465,11 +488,12 @@ impl Tracker {
         closed
     }
 
-    /// Attributes closures from now on to `cause` until the action finishes.
-    pub fn note(&mut self, cause: Cause, id: Option<String>) {
+    /// Attributes closures in `scope` from now on to `cause` until the action
+    /// finishes.
+    pub fn note(&mut self, cause: Cause, scope: Scope) {
         self.cause = Some(PendingCause {
             cause,
-            id,
+            scope,
             noted: Instant::now(),
             until: None,
         });
@@ -693,7 +717,7 @@ mod tests {
 
         let mut conns = vec![item("page", "chatgpt.com:443", Some(NOW_MS - 1_000))];
         tracker.observe(&mut conns, true, t0, NOW_MS);
-        tracker.note(Cause::CloseAll, None);
+        tracker.note(Cause::CloseAll, Scope::All);
         let closed = tracker.observe(&mut [], true, t0 + Duration::from_secs(1), NOW_MS);
         assert_eq!(closed[0].cause, Some(Cause::CloseAll));
         assert_eq!(tracker.closed().len(), 2);
@@ -706,12 +730,38 @@ mod tests {
         let old = Some(NOW_MS - 120_000);
         let mut conns = vec![item("a", "a.test:443", old), item("b", "b.test:443", old)];
         tracker.observe(&mut conns, true, t0, NOW_MS);
-        tracker.note(Cause::UserClose, Some("a".into()));
+        tracker.note(Cause::UserClose, Scope::Id("a".into()));
         tracker.action_finished(t0);
         let closed = tracker.observe(&mut [], true, t0 + Duration::from_secs(1), NOW_MS);
         let cause = |host: &str| closed.iter().find(|c| c.host == host).unwrap().cause;
         assert_eq!(cause("a.test:443"), Some(Cause::UserClose));
         assert_eq!(cause("b.test:443"), None);
+    }
+
+    #[test]
+    fn reload_and_tun_causes_reach_only_the_connections_they_cut() {
+        let t0 = Instant::now();
+        let old = Some(NOW_MS - 120_000);
+        let mut sub = item("sub", "sub.test:443", old);
+        sub.provider = "airport".into();
+        let mut tun = item("tun", "tun.test:443", old);
+        tun.inbound = "Tun".into();
+        let mut top = item("top", "top.test:443", old);
+        top.inbound = "Mixed".into();
+        for (cause, scope, hit) in [
+            (Cause::Reload, Scope::Providers, "sub.test:443"),
+            (Cause::Tun, Scope::TunInbound, "tun.test:443"),
+        ] {
+            let mut tracker = Tracker::default();
+            let mut conns = vec![sub.clone(), tun.clone(), top.clone()];
+            tracker.observe(&mut conns, true, t0, NOW_MS);
+            tracker.note(cause, scope);
+            let closed = tracker.observe(&mut [], true, t0 + Duration::from_secs(1), NOW_MS);
+            for c in &closed {
+                let want = (c.host == hit).then_some(cause);
+                assert_eq!(c.cause, want, "{cause:?} {}", c.host);
+            }
+        }
     }
 
     #[test]
@@ -721,7 +771,7 @@ mod tests {
         let old = Some(NOW_MS - 120_000);
         let mut conns = vec![item("a", "a.test:443", old), item("b", "b.test:443", old)];
         tracker.observe(&mut conns, true, t0, NOW_MS);
-        tracker.note(Cause::CloseAll, None);
+        tracker.note(Cause::CloseAll, Scope::All);
         tracker.action_finished(t0);
         let mut left = vec![conns[1].clone()];
         let closed = tracker.observe(&mut left, true, t0 + Duration::from_secs(5), NOW_MS);
@@ -781,7 +831,7 @@ mod tests {
     fn pending_cause_without_finish_expires_at_the_cap() {
         let mut tracker = Tracker::default();
         let t0 = Instant::now();
-        tracker.note(Cause::CloseAll, None);
+        tracker.note(Cause::CloseAll, Scope::All);
         let mut conns = vec![item("a", "api.openai.com:443", None)];
         tracker.observe(&mut conns, true, t0, NOW_MS);
         let closed = tracker.observe(&mut [], true, t0 + CAUSE_MAX * 2, NOW_MS);

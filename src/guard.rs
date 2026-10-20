@@ -41,31 +41,45 @@ impl Disrupt {
             (Self::CoreStop, Lang::Ja) => "コア停止",
             (Self::Reload, Lang::Zh) => "重载配置（订阅提供者节点会重连）",
             (Self::Reload, Lang::En) => "Reloading the config (proxy-provider nodes reconnect)",
-            (Self::Reload, Lang::Ja) => "設定のリロード（プロバイダーノードは再接続）",
+            (Self::Reload, Lang::Ja) => "設定リロード（プロバイダーノード再接続）",
         }
     }
 
-    /// The closed-history cause; `CloseAll` is noted by the `X` key itself.
+    /// The closed-history cause noted on confirmation. `CloseAll` is noted by
+    /// the `X` key itself; reloads and TUN changes are announced by the worker
+    /// just before it sends them (`mihomo::announce_disruption`), since an
+    /// unchanged config is not reloaded and a failed check reloads nothing.
     fn cause(self) -> Option<Cause> {
         match self {
-            Self::CloseAll => None,
-            Self::TunOff | Self::TunOnRestart => Some(Cause::Tun),
             Self::CoreStop => Some(Cause::CoreStopped),
-            Self::Reload => Some(Cause::Reload),
+            Self::CloseAll | Self::TunOff | Self::TunOnRestart | Self::Reload => None,
         }
     }
 }
 
 fn prompt(what: Disrupt, hit: conns::Affected, lang: Lang) -> String {
     let (label, n, a) = (what.label(lang), hit.sessions, hit.ai);
+    // A regenerated config identical to the running one is not reloaded.
+    let may = what == Disrupt::Reload;
     match lang {
-        Lang::Zh => format!("{label}将断开 {n} 条长连接/AI 连接（其中 AI {a} 条）。再按一次确认"),
-        Lang::En => format!(
-            "{label} will drop {n} long-lived/AI connection(s) ({a} AI). Press again to confirm"
-        ),
-        Lang::Ja => format!(
-            "{label}で長時間/AI 接続 {n} 件（うち AI {a} 件）が切断されます。もう一度押して確定"
-        ),
+        Lang::Zh => {
+            let verb = if may { "可能断开" } else { "将断开" };
+            format!("{label}{verb} {n} 条长连接/AI 连接（其中 AI {a} 条）。再按一次确认")
+        }
+        Lang::En => {
+            let verb = if may { "may" } else { "will" };
+            format!(
+                "{label} {verb} drop {n} long-lived/AI connection(s) ({a} AI). Press again to confirm"
+            )
+        }
+        Lang::Ja => {
+            let verb = if may {
+                "切断される場合があります"
+            } else {
+                "切断されます"
+            };
+            format!("{label}で長時間/AI 接続 {n} 件（AI {a} 件）が{verb}。再度押して確定")
+        }
     }
 }
 
@@ -104,7 +118,7 @@ impl App {
         }
         self.pending_confirm = None;
         if let Some(cause) = what.cause() {
-            self.conns.note(cause, None);
+            self.conns.note(cause, conns::Scope::All);
         }
         true
     }
@@ -145,9 +159,14 @@ mod tests {
         ])
     }
 
-    /// The cause the tracker gives a long-lived session closing now.
+    /// The cause the tracker gives a long-lived top-level, Mixed-inbound
+    /// session closing now.
     fn cause(app: &mut App) -> Option<Cause> {
-        let mut conns = vec![conn("probe", 120, false, "", "Mixed")];
+        cause_for(app, conn("probe", 120, false, "", "Mixed"))
+    }
+
+    fn cause_for(app: &mut App, probe: ConnectionItem) -> Option<Cause> {
+        let mut conns = vec![probe];
         app.conns
             .observe(&mut conns, true, Instant::now(), conns::now_ms());
         let closed = app
@@ -224,18 +243,63 @@ mod tests {
         assert!(!app.confirm_disruption(Disrupt::Reload));
         assert_eq!(
             app.status_message,
-            "Reloading the config (proxy-provider nodes reconnect) will drop 1 \
+            "Reloading the config (proxy-provider nodes reconnect) may drop 1 \
              long-lived/AI connection(s) (0 AI). Press again to confirm"
         );
         assert!(app.confirm_disruption(Disrupt::Reload));
-        assert_eq!(cause(&mut app), Some(Cause::Reload));
+        // Confirming blames nothing: an unchanged config is never reloaded.
+        assert_eq!(cause(&mut app), None);
 
         // Without TUN or provider sessions neither prompts.
         let mut app = app_with(vec![conn("ai", 3, true, "", "Mixed")]);
         assert!(app.confirm_disruption(Disrupt::TunOff));
-        assert_eq!(cause(&mut app), Some(Cause::Tun));
+        assert_eq!(cause(&mut app), None);
         assert!(app.confirm_disruption(Disrupt::Reload));
         assert!(app.status_message.is_empty());
+    }
+
+    #[test]
+    fn announced_reloads_and_tun_rebuilds_blame_only_what_they_cut() {
+        use crate::{conns::Scope, mihomo::BackendEvent};
+        let mut app = mixed();
+        let announce = |app: &mut App, cause, scope| {
+            app.tx
+                .send(BackendEvent::Disrupting { cause, scope })
+                .unwrap();
+            app.drain_events();
+        };
+        announce(&mut app, Cause::Reload, Scope::Providers);
+        assert_eq!(cause(&mut app), None);
+        let provider = conn("p", 120, false, "airport", "Mixed");
+        assert_eq!(cause_for(&mut app, provider), Some(Cause::Reload));
+
+        announce(&mut app, Cause::Tun, Scope::TunInbound);
+        assert_eq!(cause(&mut app), None);
+        let tun = conn("t", 120, false, "", "Tun");
+        assert_eq!(cause_for(&mut app, tun), Some(Cause::Tun));
+
+        // A worker announces only through the channel it was given.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cfg = crate::mihomo::ControllerConfig {
+            addr: "127.0.0.1:1".into(),
+            ..Default::default()
+        };
+        std::thread::spawn(move || {
+            let _ = crate::mihomo::reload_config(&cfg);
+            crate::mihomo::report_disruptions(tx);
+            let _ = crate::mihomo::reload_config(&cfg);
+        })
+        .join()
+        .unwrap();
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            BackendEvent::Disrupting {
+                cause: Cause::Reload,
+                scope: Scope::Providers
+            }
+        ));
     }
 
     #[test]
@@ -292,8 +356,13 @@ mod tests {
     fn prompt_renders_in_the_toast_at_every_width_and_language() {
         for lang in [Lang::Zh, Lang::En, Lang::Ja] {
             for what in [Disrupt::Reload, Disrupt::TunOnRestart] {
-                for (width, height) in [(80, 24), (160, 40)] {
-                    let mut app = mixed();
+                for (width, height) in [(42, 12), (80, 24), (160, 40)] {
+                    // Two-digit counts, as in a busy agent session.
+                    let mut app = app_with(
+                        (0..12)
+                            .map(|i| conn(&i.to_string(), 120, i < 10, "airport", "Tun"))
+                            .collect(),
+                    );
                     app.config.settings.lang = lang;
                     assert!(!app.confirm_disruption(what));
                     let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();

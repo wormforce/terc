@@ -900,6 +900,7 @@ impl App {
                         }
                     }
                 }
+                BackendEvent::Disrupting { cause, scope } => self.conns.note(cause, scope),
                 // Live data: accepted even while an action runs.
                 BackendEvent::Connections {
                     items,
@@ -1206,6 +1207,7 @@ impl App {
         let cfg = self.config.controller.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
+            mihomo::report_disruptions(tx.clone());
             let mut done = SendOnDrop::new(
                 tx.clone(),
                 BackendEvent::ActionDone {
@@ -2463,7 +2465,8 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             if let Some(c) = app.selected_connection() {
                 let id = c.id.clone();
                 if !app.action_busy {
-                    app.conns.note(conns::Cause::UserClose, Some(id.clone()));
+                    app.conns
+                        .note(conns::Cause::UserClose, conns::Scope::Id(id.clone()));
                 }
                 app.run_action("Closing connection…", None, None, move |cfg| {
                     close_connection(&cfg, Some(&id)).map_err(|e| e.to_string())?;
@@ -2476,7 +2479,7 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                 return false;
             }
             if !app.action_busy {
-                app.conns.note(conns::Cause::CloseAll, None);
+                app.conns.note(conns::Cause::CloseAll, conns::Scope::All);
             }
             app.run_action("Closing all connections…", None, None, |cfg| {
                 close_connection(&cfg, None).map_err(|e| e.to_string())?;

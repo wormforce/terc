@@ -43,6 +43,12 @@ pub enum BackendEvent {
         payload: String,
     },
     Snapshot(Box<CoreSnapshot>),
+    /// A reload or TUN rebuild is about to be sent; closures in `scope` are
+    /// blamed on it from now until the action finishes.
+    Disrupting {
+        cause: crate::conns::Cause,
+        scope: crate::conns::Scope,
+    },
     /// A `/connections` snapshot pushed over WebSocket.
     Connections {
         items: Vec<ConnectionItem>,
@@ -2916,6 +2922,7 @@ pub fn set_tun_enabled(cfg: &ControllerConfig, enable: bool) -> io::Result<()> {
     let offset = fs::metadata(Path::new(&cfg.config_dir).join("terc-core.log"))
         .map(|m| m.len() as usize)
         .unwrap_or(0);
+    announce_disruption(crate::conns::Cause::Tun, crate::conns::Scope::TunInbound);
     patch_configs(cfg, &body)?;
     let actual = read_runtime_config(cfg)?;
     if let Some(error) = crate::privilege::tun_log_error(cfg, offset) {
@@ -2972,6 +2979,9 @@ pub fn reload_config(cfg: &ControllerConfig) -> Result<(), ReloadError> {
         "payload": ""
     })
     .to_string();
+    // Mihomo re-initialises every proxy provider on reload (§2.2 of
+    // docs/websocket-plan.md); top-level `proxies:` connections stay.
+    announce_disruption(crate::conns::Cause::Reload, crate::conns::Scope::Providers);
     // The first fetch of new providers runs inside the request, so allow well
     // beyond Mihomo's own provider download timeout.
     match http_request(
@@ -2993,6 +3003,28 @@ pub fn reload_config(cfg: &ControllerConfig) -> Result<(), ReloadError> {
 
 /// Set when a reload got no clear answer, so the core may not run the file.
 pub(crate) static RELOAD_UNCERTAIN: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// The UI channel of a `run_action` worker. Each worker runs one action,
+    /// so a thread-local reaches the reload and TUN paths deep inside it.
+    static DISRUPTION_TX: std::cell::RefCell<Option<Sender<BackendEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Lets this thread's reloads and TUN rebuilds report themselves to the UI.
+pub fn report_disruptions(tx: Sender<BackendEvent>) {
+    DISRUPTION_TX.with(|cell| *cell.borrow_mut() = Some(tx));
+}
+
+/// Sent just before the request that cuts connections, so a skipped reload
+/// (unchanged output) or an action that fails earlier blames nothing.
+pub(crate) fn announce_disruption(cause: crate::conns::Cause, scope: crate::conns::Scope) {
+    DISRUPTION_TX.with(|cell| {
+        if let Some(tx) = cell.borrow().as_ref() {
+            let _ = tx.send(BackendEvent::Disrupting { cause, scope });
+        }
+    });
+}
 
 /// Whether installing `candidate` needs `mihomo -t` and a reload.
 fn reload_needed(old: Option<&str>, candidate: &str, running: bool, uncertain: bool) -> bool {
