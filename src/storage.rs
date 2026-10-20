@@ -120,14 +120,23 @@ fn import_old(
             compose::write_private(&target.join(to), &text)?;
         }
     }
-    // A terc-generated snapshot already holds the manual nodes; keeping it
-    // as the subscription would duplicate them with stale credentials.
+    // A terc-generated snapshot already holds the manual nodes; keeping them
+    // in the subscription would duplicate them with stale credentials. Its
+    // other nodes may exist nowhere else, as in old saved profile copies.
     if !target.join("subscription.yaml").exists() {
-        if let Some(raw) = snapshot.filter(|d| !compose::is_generated(d)) {
-            let doc = crate::ops::strip_marked_modules(raw);
-            if crate::ops::has_subscription_source(&doc) {
-                compose::write_private(&target.join("subscription.yaml"), &doc)?;
+        let doc = snapshot.and_then(|raw| {
+            if !compose::is_generated(raw) {
+                return Some(crate::ops::strip_marked_modules(raw));
             }
+            let manual: Vec<String> = source
+                .nodes
+                .iter()
+                .filter_map(|n| n["name"].as_str().map(str::to_string))
+                .collect();
+            compose::generated_subscription(raw, &manual)
+        });
+        if let Some(doc) = doc.filter(|d| crate::ops::has_subscription_source(d)) {
+            compose::write_private(&target.join("subscription.yaml"), &doc)?;
         }
     }
     source.kind = if !source.subscription_url.is_empty() {
@@ -350,6 +359,44 @@ mod tests {
         assert_eq!(source.kind, "proxy");
         assert!(!root().join("imported-001/subscription.yaml").exists());
         assert_eq!(source.nodes.len(), 1);
+        fs::remove_dir_all(temp).unwrap();
+    }
+    #[test]
+    #[ignore = "changes HOME; run alone with temporary data; never starts a core"]
+    fn migration_keeps_subscription_nodes_of_generated_snapshots() {
+        let temp = temp_home("store-generated-sub");
+        let remote = "  - {name: Remote, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: secret}\n";
+        let own = "  - {\"name\":\"OwnNode\",\"type\":\"ss\",\"server\":\"192.0.2.3\",\"port\":8388,\"cipher\":\"aes-128-gcm\",\"password\":\"fake\"}\n";
+        // An old saved copy of the generated config is its profile's only data.
+        compose::write_private(
+            &compose::terc_dir().join("profiles/profile-1.yaml"),
+            &format!(
+                "{}\nproxies:\n{remote}rules:\n  - MATCH,DIRECT\n",
+                compose::GENERATED_MARK
+            ),
+        )
+        .unwrap();
+        // A config composed from a hand-written one without caching it.
+        compose::write_private(&compose::terc_dir().join("nodes.conf"), OWN_NODE).unwrap();
+        let mut cfg = Config::default();
+        cfg.controller.config_dir = temp.join("core").display().to_string();
+        compose::write_private(
+            &Path::new(&cfg.controller.config_dir).join("config.yaml"),
+            &format!(
+                "{}\nproxies:\n{remote}{own}rules:\n  - MATCH,DIRECT\n",
+                compose::GENERATED_MARK
+            ),
+        )
+        .unwrap();
+        migrate(&mut cfg).unwrap();
+        for (id, nodes) in [("profile-1", 0), ("imported-001", 1)] {
+            let source = ProfileSource::load(&root().join(id));
+            assert_eq!(source.kind, "imported", "{id}");
+            assert_eq!(source.nodes.len(), nodes, "{id}");
+            let sub = fs::read_to_string(root().join(id).join("subscription.yaml")).unwrap();
+            assert!(sub.contains("name: Remote"), "{id}");
+            assert!(!sub.contains("OwnNode"), "{id}");
+        }
         fs::remove_dir_all(temp).unwrap();
     }
     #[test]

@@ -1198,6 +1198,76 @@ pub fn is_generated(doc: &str) -> bool {
     crate::ops::strip_marked_modules(doc).starts_with("# terc-generated")
 }
 
+/// The subscription part of a terc-generated config: the copies it inlined
+/// from `manual` are dropped, and None means no other node or provider is left.
+/// Manual nodes were appended after the subscription's, so the last proxy named
+/// like each one (or its ` (n)` rename) is the manual copy.
+pub(crate) fn generated_subscription(doc: &str, manual: &[String]) -> Option<String> {
+    let doc = crate::ops::strip_marked_modules(doc);
+    let body: Vec<&str> = doc
+        .lines()
+        .skip_while(|l| l.starts_with("# terc-generated"))
+        .collect();
+    let mut chunks = split_chunks(&body.join("\n"));
+    let has_providers = chunks
+        .iter()
+        .any(|c| c.key.as_deref() == Some("proxy-providers"));
+    let proxies = chunks
+        .iter_mut()
+        .find(|c| c.key.as_deref() == Some("proxies"))?;
+    let indent = proxies
+        .lines
+        .iter()
+        .skip(1)
+        .find(|l| l.trim_start().starts_with('-'))
+        .map(|l| leading_spaces(l));
+    let starts: Vec<_> = (1..proxies.lines.len())
+        .filter(|&i| {
+            let line = &proxies.lines[i];
+            Some(leading_spaces(line)) == indent && line.trim_start().starts_with('-')
+        })
+        .collect();
+    let items: Vec<_> = starts
+        .iter()
+        .enumerate()
+        .map(|(n, &start)| {
+            let end = starts.get(n + 1).copied().unwrap_or(proxies.lines.len());
+            let chunk = YamlChunk {
+                key: Some("proxies".into()),
+                lines: std::iter::once("proxies:".to_string())
+                    .chain(proxies.lines[start..end].iter().cloned())
+                    .collect(),
+            };
+            (
+                start..end,
+                clash_item_names(&chunk).pop().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut dropped = HashSet::new();
+    for base in manual {
+        let renamed = |name: &str| {
+            name == base
+                || name
+                    .strip_prefix(base.as_str())
+                    .and_then(|r| r.strip_prefix(" ("))
+                    .and_then(|r| r.strip_suffix(')'))
+                    .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        };
+        if let Some(i) = (0..items.len())
+            .rev()
+            .find(|i| !dropped.contains(i) && renamed(&items[*i].1))
+        {
+            dropped.insert(i);
+        }
+    }
+    let kept = items.len() - dropped.len();
+    for i in (0..items.len()).rev().filter(|i| dropped.contains(i)) {
+        proxies.lines.drain(items[i].0.clone());
+    }
+    (kept > 0 || has_providers).then(|| join_chunks(&chunks))
+}
+
 /// Where the subscription nodes come from on this regeneration.
 pub fn load_subscription_source(
     dir: &Path,
@@ -1664,6 +1734,12 @@ fn append_manual_members(groups: &mut YamlChunk, names: &[String]) {
     for (n, start) in starts.iter().enumerate().rev() {
         let end = starts.get(n + 1).copied().unwrap_or(groups.lines.len());
         let block = &groups.lines[*start..end];
+        // A group that already lists a node (a migrated snapshot) keeps one entry.
+        let listed = group_members(block);
+        let names: Vec<_> = names.iter().filter(|n| !listed.contains(*n)).collect();
+        if names.is_empty() {
+            continue;
+        }
         // JSON flow groups are emitted by terc's Surge converter.
         if let Ok(mut value) =
             serde_json::from_str::<Value>(block[0].trim_start().trim_start_matches('-').trim())
@@ -1779,6 +1855,64 @@ fn append_manual_members(groups: &mut YamlChunk, names: &[String]) {
             );
         }
     }
+}
+
+/// Names in the `proxies` list of one proxy-groups item (best effort).
+fn group_members(block: &[String]) -> Vec<String> {
+    let split = |text: &str, open: usize| {
+        let Some(close) = matching_close(text, open) else {
+            return Vec::new();
+        };
+        let inner = &text[open + 1..close];
+        let mut parts = Vec::new();
+        let (mut from, mut depth) = (0, 0usize);
+        for (i, c) in flow_unquoted(inner) {
+            match c {
+                '[' | '{' => depth += 1,
+                ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    parts.push(clean_scalar(&inner[from..i]));
+                    from = i + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(clean_scalar(&inner[from..]));
+        parts.retain(|p| !p.is_empty());
+        parts
+    };
+    let first = block[0].trim_start().trim_start_matches('-').trim();
+    if first.starts_with('{') {
+        return flow_key_list(first, "proxies")
+            .map(|(open, _)| split(first, open))
+            .unwrap_or_default();
+    }
+    let Some(pos) = block.iter().enumerate().position(|(i, l)| {
+        let t = l.trim_start();
+        let t = if i == 0 {
+            t.trim_start_matches('-').trim_start()
+        } else {
+            t
+        };
+        t.starts_with("proxies:")
+    }) else {
+        return Vec::new();
+    };
+    let line = &block[pos];
+    let value = line[line.find("proxies:").unwrap_or(0) + "proxies:".len()..].trim_start();
+    if value.starts_with('[') {
+        return split(value, 0);
+    }
+    let field_indent = leading_spaces(line);
+    block[pos + 1..]
+        .iter()
+        .take_while(|l| {
+            l.trim().is_empty()
+                || leading_spaces(l) > field_indent
+                || l.trim_start().starts_with('-')
+        })
+        .filter_map(|l| l.trim().strip_prefix('-').map(clean_scalar))
+        .collect()
 }
 
 /// Characters of YAML flow text outside quoted scalars, with their byte index.
@@ -1910,6 +2044,37 @@ mod profile_tests {
         );
         let yaml = build(Some(&convert_subscription(&flow).unwrap()), &manual());
         assert!(yaml.contains("proxies: [HK, \"Own\"]"));
+    }
+
+    #[test]
+    fn generated_snapshot_keeps_subscription_nodes_without_manual_copies() {
+        let proxy_names = |yaml: &str| {
+            split_chunks(yaml)
+                .iter()
+                .find(|c| c.key.as_deref() == Some("proxies"))
+                .map(clash_item_names)
+                .unwrap_or_default()
+        };
+        let own = vec!["Own".to_string()];
+        let generated = build(Some(&convert_subscription(CLASH).unwrap()), &manual());
+        let snapshot = generated_subscription(&generated, &own).unwrap();
+        assert!(!snapshot.contains(GENERATED_MARK));
+        assert_eq!(proxy_names(&snapshot), vec!["HK"]);
+        // Recomposing lists the manual node once, in the proxies and the group.
+        let yaml = build(Some(&convert_subscription(&snapshot).unwrap()), &manual());
+        assert_eq!(proxy_names(&yaml), vec!["HK", "Own"]);
+        assert!(yaml.contains("proxies: [HK, \"Own\"]"), "{yaml}");
+        // A renamed manual copy goes; the subscription node it collided with stays.
+        let clash = CLASH
+            .replace("name: HK,", "name: Own,")
+            .replace("[HK]", "[Own]");
+        let generated = build(Some(&convert_subscription(&clash).unwrap()), &manual());
+        assert_eq!(proxy_names(&generated), vec!["Own", "Own (2)"]);
+        let snapshot = generated_subscription(&generated, &own).unwrap();
+        assert_eq!(proxy_names(&snapshot), vec!["Own"]);
+        assert!(snapshot.contains("192.0.2.1"));
+        // Nothing but manual nodes: no subscription is left.
+        assert!(generated_subscription(&build(None, &manual()), &own).is_none());
     }
 
     fn proxy_group_line(yaml: &str, name: &str) -> String {
