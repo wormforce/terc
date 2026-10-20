@@ -18,7 +18,7 @@
 | --- | --- | --- | --- | --- |
 | A | AI 工具的流量（`wss://`）经 Mihomo 转发 | 最高：断线就等于对话中断 | 连接视图（时长、速率、AI 标记、断开记录）；不必要的重载不再发生；会断线的操作先确认 | 阶段 2 完成，§2.8 完成 |
 | B | 代理节点使用 WebSocket 传输（`network: ws`） | 中：订阅里的节点能不能用 | 链接转换、`httpupgrade` 规范化、表单支持 Host / HTTPUpgrade / 早期数据 | 阶段 4 完成，剩余缺口见 §3.4 |
-| C | terc 自己用 WebSocket 读控制器流 | 低：现有的 chunked HTTP 已经能用 | std-only 的 `src/ws.rs` 用于 `/connections` 推送 | 阶段 3，见 §4 |
+| C | terc 自己用 WebSocket 读控制器流 | 低：现有的 chunked HTTP 已经能用 | std-only 的 `src/ws.rs` 读取 `/connections` 推送，失败时自动回退到轮询，设置里可关闭 | 阶段 3 完成，见 §4 |
 
 一句话：**对 Mihomo 来说，`wss://` 只是一条存活很久的 TLS/TCP 连接，它不解析 WebSocket 帧。**
 所以 A 的核心问题是“长连接会不会被重载、切节点、TUN 重建打断”，以及“terc 能不能把长连接显示出来”，
@@ -161,7 +161,7 @@ Mihomo 不提供任何断开原因：`Manager.Leave` 只删除 id（`tunnel/stat
    AI 连接无故断开时会弹出一次安静的提示（30 秒内不重复）。
 5. `providerChains` 已解析，详情里显示 provider，§2.8 用它判断哪些连接会被重载断开。
 
-### 2.8 保护长连接（本批次）
+### 2.8 保护长连接（已完成）
 
 1. **不做不必要的重载。** `regenerate_routing`（`src/mihomo.rs:1423`）生成配置后，先按运行时模式得到最终文本；
    如果和当前 `config.yaml` 完全相同，就跳过 `mihomo -t` 和 `PUT /configs`，但照常写订阅缓存、分流选择和
