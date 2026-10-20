@@ -1279,9 +1279,9 @@ impl App {
             (Lang::Zh, "no_groups") => "暂无策略组",
             (Lang::En, "no_groups") => "No proxy groups",
             (Lang::Ja, "no_groups") => "グループなし",
-            (Lang::Zh, "core_stopped_hint") => "Mihomo 内核未运行  在 设置 → 内核与代理 → 内核服务 启动，在 设置 → 订阅与分流 → 代理订阅 按 u 更新订阅（首次使用请按提示添加订阅）",
-            (Lang::En, "core_stopped_hint") => "Mihomo core is stopped  start it in Settings → Core & Proxy → Core service; update the subscription with u in Settings → Sources & Routing → Proxy subscriptions (first run: add one below)",
-            (Lang::Ja, "core_stopped_hint") => "Mihomo停止中  設定 → コア・プロキシ → Core service で起動、設定 → サブスクリプション → Proxy subscriptions の u でサブスク更新（初回は登録を追加）",
+            (Lang::Zh, "core_stopped_hint") => "Mihomo 内核未运行\n\n启动：设置 → 内核与代理 → 内核服务\n更新订阅 (u)：设置 → 订阅与分流 → 代理订阅\n（首次使用请按提示添加订阅）",
+            (Lang::En, "core_stopped_hint") => "Mihomo core is stopped\n\nStart: Settings → Core & Proxy → Core service\nUpdate (u): Settings → Sources & Routing → Proxy subscriptions\n(first run: add a subscription there)",
+            (Lang::Ja, "core_stopped_hint") => "Mihomo停止中\n\n起動：設定 → コア・プロキシ → Core service\n更新 (u)：設定 → サブスクリプション → Proxy subscriptions\n（初回は登録を追加）",
             (Lang::Zh, "no_connections") => "当前没有活跃连接",
             (Lang::En, "no_connections") => "No active connections",
             (Lang::Ja, "no_connections") => "アクティブな接続はありません",
@@ -2609,6 +2609,24 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.log_detail);
         assert!(render_text(&mut app, 60, 18).contains("second"));
+    }
+
+    #[test]
+    fn stopped_core_hint_names_both_settings_paths_at_common_widths() {
+        let mut app = offline_app();
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            for (width, height) in [(120, 36), (160, 40)] {
+                let view = render_text(&mut app, width, height);
+                let (core, update) = match lang {
+                    Lang::Zh => ("内核服务", "更新订阅(u)"),
+                    Lang::En => ("service", "Update(u)"),
+                    Lang::Ja => ("service", "更新(u)"),
+                };
+                assert!(view.contains(core), "{lang:?} {width}\n{view}");
+                assert!(view.contains(update), "{lang:?} {width}\n{view}");
+            }
+        }
     }
 
     #[test]
