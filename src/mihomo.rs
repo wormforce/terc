@@ -1996,7 +1996,8 @@ pub fn refresh_provider(cfg: &ControllerConfig, kind: &str, name: &str) -> Resul
         "PUT",
         &path,
         None,
-        Duration::from_millis(4000),
+        // Mihomo downloads and parses the provider before it answers.
+        Duration::from_secs(30),
     ) {
         Ok((status, _)) if (200..300).contains(&status) => Ok(()),
         Ok((status, body)) => Err(format!("HTTP {status} {}", brief(&body))),
