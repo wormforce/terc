@@ -1507,18 +1507,35 @@ pub fn regenerate_routing(
         None => (base, Vec::new()),
     };
     let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
+    // A reload re-initialises proxy providers and drops their connections, so
+    // an output identical to the active file is not reloaded at all.
+    let candidate = if running {
+        keep_runtime_mode(cfg, &generated)
+    } else {
+        generated.clone()
+    };
+    let reload = reload_needed(
+        old.as_deref(),
+        &candidate,
+        running,
+        RELOAD_UNCERTAIN.load(Ordering::SeqCst),
+    );
     // A file kept after an unanswered reload may already be live, so record
     // the matching cache and routing before reporting the unknown outcome.
-    let unknown = match install_config_with(
-        cfg,
-        &generated,
-        running,
-        discover_mihomo_binary,
-        &INSTALL_LIMITS,
-    ) {
-        Ok(()) => None,
-        Err(failure) if failure.kept => Some(failure.message),
-        Err(failure) => return Err(failure.message),
+    let unknown = if !reload {
+        None
+    } else {
+        match install_config_with(
+            cfg,
+            &generated,
+            running,
+            discover_mihomo_binary,
+            &INSTALL_LIMITS,
+        ) {
+            Ok(()) => None,
+            Err(failure) if failure.kept => Some(failure.message),
+            Err(failure) => return Err(failure.message),
+        }
     };
     if let Some(raw) = fresh {
         compose::write_private(&compose::cache_path(&dir), &raw)?;
@@ -1539,11 +1556,15 @@ pub fn regenerate_routing(
     if let Some(message) = unknown {
         return Err(message);
     }
-    let tail = match (running, zh) {
-        (true, true) => " — 已校验并热重载",
-        (true, false) => " — validated & hot-reloaded",
-        (false, true) => " — 已校验保存，内核未运行",
-        (false, false) => " — validated & saved; core stopped",
+    let tail = match (reload, running, zh) {
+        (false, true, true) => " — 配置未变化，未重载，现有连接不受影响",
+        (false, true, false) => " — unchanged; not reloaded, existing connections kept",
+        (false, false, true) => " — 配置未变化，内核未运行",
+        (false, false, false) => " — unchanged; core stopped",
+        (true, true, true) => " — 已校验并热重载",
+        (true, true, false) => " — validated & hot-reloaded",
+        (true, false, true) => " — 已校验保存，内核未运行",
+        (true, false, false) => " — validated & saved; core stopped",
     };
     Ok(format!("{}{tail}{}", report.summary(zh), report.details()))
 }
@@ -1626,7 +1647,10 @@ fn install_config_with(
             return Ok(());
         }
         match reload_config(cfg) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                RELOAD_UNCERTAIN.store(false, Ordering::SeqCst);
+                Ok(())
+            }
             Err(ReloadError::Rejected(err)) => {
                 let restored = match previous {
                     Some(bytes) => write_private(&path, &bytes),
@@ -1642,13 +1666,21 @@ fn install_config_with(
             }
             // Mihomo finishes applying a PUT after the client gives up, so the
             // new file may already be live. Never roll back on a lost reply.
-            Err(ReloadError::Unknown(_)) if controller_answers(cfg, limits.settle) => Ok(()),
-            Err(ReloadError::Unknown(err)) => Err(InstallFailure {
-                message: format!(
-                    "热重载结果未知，新配置已保留在磁盘上 / Reload outcome unknown ({err}); the new configuration was kept on disk"
-                ),
-                kept: true,
-            }),
+            // Either way the running config may differ from the file, so the
+            // next regeneration reloads even when its output is unchanged.
+            Err(ReloadError::Unknown(_)) if controller_answers(cfg, limits.settle) => {
+                RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(ReloadError::Unknown(err)) => {
+                RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+                Err(InstallFailure {
+                    message: format!(
+                        "热重载结果未知，新配置已保留在磁盘上 / Reload outcome unknown ({err}); the new configuration was kept on disk"
+                    ),
+                    kept: true,
+                })
+            }
         }
     })();
     let _ = fs::remove_file(candidate);
@@ -2254,6 +2286,14 @@ pub fn reload_config(cfg: &ControllerConfig) -> Result<(), ReloadError> {
         ))),
         Err(err) => Err(ReloadError::Unknown(err.to_string())),
     }
+}
+
+/// Set when a reload got no clear answer, so the core may not run the file.
+static RELOAD_UNCERTAIN: AtomicBool = AtomicBool::new(false);
+
+/// Whether installing `candidate` needs `mihomo -t` and a reload.
+fn reload_needed(old: Option<&str>, candidate: &str, running: bool, uncertain: bool) -> bool {
+    old != Some(candidate) || (running && uncertain)
 }
 
 pub fn persist_nested_bool(
@@ -3615,5 +3655,102 @@ mod listener_tests {
         );
         assert!(carried.starts_with("mode: global\n"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reload_runs_only_for_a_changed_or_uncertain_config() {
+        let doc = "mode: rule\n";
+        assert!(!reload_needed(Some(doc), doc, true, false));
+        assert!(!reload_needed(Some(doc), doc, false, false));
+        // A stopped core loads the file at startup, so uncertainty is moot.
+        assert!(!reload_needed(Some(doc), doc, false, true));
+        assert!(reload_needed(Some(doc), doc, true, true));
+        assert!(reload_needed(Some(doc), "mode: global\n", true, false));
+        assert!(reload_needed(Some(doc), "mode: global\n", false, false));
+        assert!(reload_needed(None, doc, false, false));
+        assert!(reload_needed(None, doc, true, false));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "points HOME at a temp dir; run alone. Uses a stand-in for mihomo -t and a mock controller, never a real core"]
+    fn unchanged_regeneration_skips_the_check_and_the_reload() {
+        let (home, bin) =
+            install_fixture("skip", "echo run >> \"$(dirname \"$0\")/checks\"; exit 0");
+        std::env::set_var("HOME", &home);
+        let core = home.join(".config/terc/core");
+        fs::create_dir_all(&core).unwrap();
+        fs::rename(&bin, core.join("mihomo")).unwrap();
+        let checks = core.join("checks");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            config_dir: home.join("mihomo").display().to_string(),
+            profile_id: "p1".into(),
+            ..ControllerConfig::default()
+        };
+        let dir = crate::compose::profile_dir(&cfg);
+        crate::compose::add_manual_node(
+            &dir,
+            "Own = ss, 192.0.2.2, 8388, encrypt-method=aes-128-gcm, password=fake",
+        )
+        .unwrap();
+        // The second pass carries listener keys over from the first file, so
+        // the output settles after two installs. Each runs the check and
+        // reloads; `regenerate_routing` and `install_config_with` read the mode.
+        let mode = || http("200 OK", r#"{"mode":"rule"}"#);
+        for pass in 1..=2 {
+            let server = serve(
+                listener.try_clone().unwrap(),
+                vec![mode(), mode(), http("204 No Content", "")],
+            );
+            let msg = regenerate_config(&cfg, &[], true, false, false).unwrap();
+            assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
+            assert!(msg.contains("validated & hot-reloaded"), "{msg}");
+            assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), pass);
+        }
+        let installed = read_config_text(&cfg).unwrap();
+        let generated = compose_generated(&cfg);
+        fs::remove_file(&generated).unwrap();
+
+        // Running: only `GET /configs` for the runtime mode, no PUT.
+        let server = serve(listener.try_clone().unwrap(), vec![mode()]);
+        assert!(crate::compose::ProfileSource::load(&dir).routing.is_empty());
+        let second =
+            regenerate_routing(&cfg, &[], true, false, false, Some("subscription")).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /configs "));
+        assert!(
+            second.contains(" — unchanged; not reloaded, existing connections kept"),
+            "{second}"
+        );
+        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 2);
+        assert_eq!(read_config_text(&cfg).unwrap(), installed);
+        // The routing choice and the generated copy are still written.
+        assert_eq!(
+            crate::compose::ProfileSource::load(&dir).routing,
+            "subscription"
+        );
+        assert!(generated.is_file());
+
+        // An earlier reload with no answer forces the next one, which clears it.
+        RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+        let server = serve(
+            listener.try_clone().unwrap(),
+            vec![mode(), mode(), http("204 No Content", "")],
+        );
+        let third = regenerate_config(&cfg, &[], true, false, true).unwrap();
+        assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
+        assert!(third.contains("已校验并热重载"), "{third}");
+        assert!(!RELOAD_UNCERTAIN.load(Ordering::SeqCst));
+        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 3);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    fn compose_generated(cfg: &ControllerConfig) -> PathBuf {
+        crate::compose::terc_dir()
+            .join("generated")
+            .join(format!("{}.yaml", cfg.profile_id))
     }
 }
