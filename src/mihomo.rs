@@ -2289,11 +2289,58 @@ pub fn reload_config(cfg: &ControllerConfig) -> Result<(), ReloadError> {
 }
 
 /// Set when a reload got no clear answer, so the core may not run the file.
-static RELOAD_UNCERTAIN: AtomicBool = AtomicBool::new(false);
+pub(crate) static RELOAD_UNCERTAIN: AtomicBool = AtomicBool::new(false);
 
 /// Whether installing `candidate` needs `mihomo -t` and a reload.
 fn reload_needed(old: Option<&str>, candidate: &str, running: bool, uncertain: bool) -> bool {
     old != Some(candidate) || (running && uncertain)
+}
+
+/// Validate and save `text` with the runtime mode kept, without a reload; the
+/// caller applies the change live.
+pub fn install_config_keep_mode(cfg: &ControllerConfig, text: &str) -> Result<(), String> {
+    let text = keep_runtime_mode(cfg, text);
+    install_config_with(cfg, &text, false, discover_mihomo_binary, &INSTALL_LIMITS)
+        .map_err(|failure| failure.message)
+}
+
+/// `PATCH /configs` a key Mihomo applies live, then read it back. Listener rebuilds
+/// close only the listening socket, so established connections continue.
+/// An `Err` means the change may not be live and the caller should reload.
+pub fn patch_config_value(cfg: &ControllerConfig, key: &str, value: &Value) -> Result<(), String> {
+    let body = serde_json::json!({ key: value }).to_string();
+    let (status, text) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "PATCH",
+        "/configs",
+        Some(&body),
+        Duration::from_millis(1200),
+    )
+    .map_err(|e| e.to_string())?;
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status} {}", brief(&text)));
+    }
+    let runtime = read_runtime_config(cfg).map_err(|e| e.to_string())?;
+    // An older core that does not report the key cannot be checked.
+    let Some(actual) = runtime.get(key) else {
+        return Ok(());
+    };
+    let matches = match key {
+        "allow-lan" | "tcp-concurrent" => {
+            actual.as_bool().is_some() && actual.as_bool() == value.as_bool()
+        }
+        "find-process-mode" | "log-level" => actual
+            .as_str()
+            .zip(value.as_str())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)),
+        _ => actual.as_u64().is_some() && actual.as_u64() == value.as_u64(),
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(format!("{key} reads back as {actual}"))
+    }
 }
 
 pub fn persist_nested_bool(
@@ -3669,6 +3716,64 @@ mod listener_tests {
         assert!(reload_needed(Some(doc), "mode: global\n", false, false));
         assert!(reload_needed(None, doc, false, false));
         assert!(reload_needed(None, doc, true, false));
+    }
+
+    #[test]
+    fn live_patch_is_verified_by_reading_the_config_back() {
+        for (runtime, ok) in [
+            (r#"{"allow-lan":true,"mixed-port":7890}"#, true),
+            (r#"{"mixed-port":7890}"#, true),
+            (r#"{"allow-lan":false}"#, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let cfg = ControllerConfig {
+                addr: listener.local_addr().unwrap().to_string(),
+                ..ControllerConfig::default()
+            };
+            let server = serve(
+                listener,
+                vec![http("204 No Content", ""), http("200 OK", runtime)],
+            );
+            let result = patch_config_value(&cfg, "allow-lan", &Value::Bool(true));
+            let requests = server.join().unwrap();
+            assert!(requests[0].starts_with("PATCH /configs "), "{requests:?}");
+            assert!(
+                requests[0].ends_with("\r\n{\"allow-lan\":true}"),
+                "{requests:?}"
+            );
+            assert!(requests[1].starts_with("GET /configs "), "{requests:?}");
+            assert_eq!(result.is_ok(), ok, "{runtime}: {result:?}");
+            if !ok {
+                assert!(result
+                    .unwrap_err()
+                    .contains("allow-lan reads back as false"));
+            }
+        }
+
+        // Ports compare as integers and the enums ignore case.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            ..ControllerConfig::default()
+        };
+        let runtime = r#"{"mixed-port":7899,"log-level":"Warning"}"#;
+        let server = serve(
+            listener,
+            vec![
+                http("204 No Content", ""),
+                http("200 OK", runtime),
+                http("204 No Content", ""),
+                http("200 OK", runtime),
+                http("400 Bad Request", r#"{"message":"bad"}"#),
+            ],
+        );
+        assert!(patch_config_value(&cfg, "mixed-port", &7899.into()).is_ok());
+        assert!(patch_config_value(&cfg, "log-level", &"warning".into()).is_ok());
+        let err = patch_config_value(&cfg, "mixed-port", &7900.into()).unwrap_err();
+        assert!(err.starts_with("HTTP 400"), "{err}");
+        let requests = server.join().unwrap();
+        assert!(requests[0].ends_with("{\"mixed-port\":7899}"));
+        assert!(requests[2].ends_with("{\"log-level\":\"warning\"}"));
     }
 
     #[test]
