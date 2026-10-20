@@ -87,6 +87,8 @@ pub struct CoreSnapshot {
     pub groups: Vec<ProxyGroup>,
     pub nodes: HashMap<String, ProxyNode>,
     pub connections: Vec<ConnectionItem>,
+    /// `/connections` answered with JSON; an empty list is then real, not a fetch failure.
+    pub connections_ok: bool,
     pub upload_total: u64,
     pub download_total: u64,
     pub sub_info: Option<SubscriptionSummary>,
@@ -145,9 +147,17 @@ pub struct ConnectionItem {
     pub sniff_host: String,
     pub rule_payload: String,
     pub start: String,
+    /// `start` as unix milliseconds, parsed on the worker thread.
+    pub start_ms: Option<i64>,
+    /// Non-empty `providerChains`, outermost first like `chains`.
+    pub provider: String,
     pub dns_mode: String,
     pub dest_geo: String,
     pub dest_asn: String,
+    /// Filled by `conns::Tracker` from id-keyed diffs between snapshots.
+    pub up_rate: u64,
+    pub down_rate: u64,
+    pub ai: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -621,6 +631,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
     }
 
     let mut connections = Vec::new();
+    let mut connections_ok = false;
     let mut upload_total = 0;
     let mut download_total = 0;
 
@@ -628,6 +639,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
         http_request(&cfg.addr, &cfg.secret, "GET", "/connections", None, timeout)
     {
         if let Ok(v) = serde_json::from_str::<Value>(&conn_body) {
+            connections_ok = true;
             upload_total = v.get("uploadTotal").and_then(Value::as_u64).unwrap_or(0);
             download_total = v.get("downloadTotal").and_then(Value::as_u64).unwrap_or(0);
             if let Some(arr) = v.get("connections").and_then(Value::as_array) {
@@ -744,6 +756,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
         groups,
         nodes,
         connections,
+        connections_ok,
         upload_total,
         download_total,
         sub_info,
@@ -813,6 +826,7 @@ pub fn connection_from_value(value: &Value) -> Option<ConnectionItem> {
     } else {
         format!("{source_ip}:{source_port}")
     };
+    let start = value.get("start").and_then(Value::as_str).unwrap_or("");
     Some(ConnectionItem {
         id: value
             .get("id")
@@ -840,14 +854,27 @@ pub fn connection_from_value(value: &Value) -> Option<ConnectionItem> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        start: value
-            .get("start")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+        start: start.to_string(),
+        start_ms: crate::conns::parse_rfc3339_ms(start),
+        provider: value
+            .get("providerChains")
+            .and_then(Value::as_array)
+            .map(|chain| {
+                chain
+                    .iter()
+                    .rev()
+                    .filter_map(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" › ")
+            })
+            .unwrap_or_default(),
         dns_mode: text("dnsMode"),
         dest_geo: geo("destinationGeoIP"),
         dest_asn: text("destinationIPASN"),
+        up_rate: 0,
+        down_rate: 0,
+        ai: false,
     })
 }
 

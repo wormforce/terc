@@ -1096,7 +1096,12 @@ fn draw_logs_main(frame: &mut Frame, app: &mut App, area: Rect) {
 fn toolbar_line(app: &App, width: u16) -> Line<'static> {
     let theme = app.theme();
     let context = match app.main_tab {
-        MainTab::Connections => Some("↑↓ 选择  Enter 详情  x 断开  X 全部断开  Esc 返回"),
+        MainTab::Connections => Some(crate::manage::l3(
+            app,
+            "↑↓ 选择  Enter 详情  o 排序  f 长连接/AI  d 已断开  x 断开  X 全部断开  Esc 返回",
+            "↑↓ select  Enter detail  o sort  f long/AI  d closed  x close  X close all  Esc back",
+            "↑↓ 選択  Enter 詳細  o 並べ替え  f 長時間/AI  d 切断履歴  x 切断  X 全切断  Esc 戻る",
+        )),
         MainTab::Logs => Some("↑↓ 阅读  P 暂停/继续  / 搜索  Enter 全文  Esc 返回"),
         MainTab::Dns => Some("e 编辑  Enter 查询  [ ] 类型  F 清缓存  Esc 返回"),
         MainTab::Rules => Some("/ 搜索  e 测试目标  Enter 详情  x 临时禁用/恢复  F 刷新  Esc 返回"),
@@ -1384,6 +1389,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("Enter", app.t("help_enter")),
         ("↑↓ jk", app.t("help_jk")),
         ("c / L / p", app.t("help_tabs")),
+        ("c: o / f / d", app.t("help_conn_keys")),
         ("s", "设置：代理开关、配置方案、路由方案、界面、排查工具 / Settings: proxy, profiles, routing, appearance, diagnostics"),
         ("e  /", app.t("help_explain")),
         ("x", app.t("help_rule_x")),
