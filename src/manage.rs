@@ -283,9 +283,9 @@ impl App {
             self.set_status(
                 l3(
                     self,
-                    "内核未运行：按 K 启动后再测速",
-                    "Core stopped: press K first",
-                    "コア停止中：K で起動",
+                    "内核未运行：先在 设置 → 内核与代理 → 内核服务 启动",
+                    "Core stopped: start it in Settings → Core & Proxy → Core service first",
+                    "コア停止中：設定 → コア・プロキシ → Core service で起動",
                 ),
                 true,
             );
