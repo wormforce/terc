@@ -382,6 +382,8 @@ pub struct Tracker {
     closed: VecDeque<ClosedConn>,
     cause: Option<PendingCause>,
     was_running: bool,
+    totals: (u64, u64),
+    restarted: bool,
 }
 
 impl Tracker {
@@ -440,7 +442,7 @@ impl Tracker {
 
         let mut closed = Vec::new();
         let pending = self.cause.as_ref().filter(|p| p.active(now));
-        let stopped = self.was_running && !running;
+        let stopped = (self.was_running && !running) || std::mem::take(&mut self.restarted);
         self.seen.retain(|id, seen| {
             if seen.gen == gen {
                 return true;
@@ -497,6 +499,20 @@ impl Tracker {
             noted: Instant::now(),
             until: None,
         });
+    }
+
+    /// Mihomo's upload and download totals only grow within one process, so
+    /// lower totals mean the core restarted between two observations, even
+    /// when no poll saw it stopped (a supervisor restart within seconds).
+    /// Zero for both reads as unknown (a body without totals).
+    pub fn note_totals(&mut self, up: u64, down: u64) {
+        if (up, down) == (0, 0) {
+            return;
+        }
+        if up < self.totals.0 || down < self.totals.1 {
+            self.restarted = true;
+        }
+        self.totals = (up, down);
     }
 
     pub fn action_finished(&mut self, now: Instant) {
@@ -805,6 +821,29 @@ mod tests {
 
         let closed = tracker.observe(&mut [], true, t0 + Duration::from_secs(4), NOW_MS);
         assert_eq!(closed[0].bulk, 0);
+    }
+
+    #[test]
+    fn falling_totals_mark_a_restart() {
+        let mut tracker = Tracker::default();
+        let t0 = Instant::now();
+        let mut conns = vec![item("a", "a.test:443", Some(NOW_MS - 120_000))];
+        tracker.note_totals(500, 9000);
+        tracker.observe(&mut conns, true, t0, NOW_MS);
+        tracker.note_totals(600, 9500);
+        tracker.observe(&mut conns, true, t0 + Duration::from_secs(1), NOW_MS);
+        // Every id replaced and the totals restarted from zero.
+        let mut fresh = vec![item("b", "a.test:443", Some(NOW_MS - 1_000))];
+        tracker.note_totals(10, 40);
+        let closed = tracker.observe(&mut fresh, true, t0 + Duration::from_secs(2), NOW_MS);
+        assert_eq!(closed[0].cause, Some(Cause::CoreStopped));
+        // Only that one observation.
+        let mut long = vec![item("c", "c.test:443", Some(NOW_MS - 120_000))];
+        tracker.note_totals(20, 80);
+        tracker.observe(&mut long, true, t0 + Duration::from_secs(3), NOW_MS);
+        tracker.note_totals(30, 90);
+        let closed = tracker.observe(&mut [], true, t0 + Duration::from_secs(4), NOW_MS);
+        assert_eq!(closed[0].cause, None);
     }
 
     #[test]

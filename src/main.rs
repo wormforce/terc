@@ -1076,6 +1076,10 @@ impl App {
         let was_empty = self.conn_view.is_empty();
         let now_ms = conns::now_ms();
         let had_closed = !self.conns.closed().is_empty();
+        if running {
+            let (up, down) = (self.snapshot.upload_total, self.snapshot.download_total);
+            self.conns.note_totals(up, down);
+        }
         let closed = self
             .conns
             .observe(&mut list, running, Instant::now(), now_ms);
