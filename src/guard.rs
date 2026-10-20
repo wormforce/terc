@@ -337,6 +337,13 @@ mod tests {
             (Disrupt::Reload, App::reload_profile),
             (Disrupt::Reload, App::toggle_dns),
             (Disrupt::Reload, App::update_subscription),
+            (Disrupt::Reload, |app: &mut App| {
+                app.start_manage_input(crate::manage::ManageInput::EditSubscription);
+                app.manage_editor.load("https://sub.example/new");
+                app.submit_manage_input();
+                // Still open, so Enter again confirms.
+                assert!(app.manage_input.is_some());
+            }),
             (Disrupt::CloseAll, press),
         ];
         for (what, action) in first {

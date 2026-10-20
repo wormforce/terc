@@ -139,7 +139,8 @@ impl App {
                     self.set_status("请输入订阅地址 / Enter a subscription URL", true);
                     return;
                 }
-                if self.action_busy {
+                // The input stays open, so Enter again confirms.
+                if self.action_busy || !self.confirm_disruption(crate::guard::Disrupt::Reload) {
                     return;
                 }
                 let running = self.snapshot.running;
