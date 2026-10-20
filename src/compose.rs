@@ -25,7 +25,17 @@ pub const GENERATED_MARK: &str =
 pub const DEFAULT_AI_FILTER: &str = "(?i)(🇺🇸|🇯🇵|🇸🇬|🇹🇼|美国|美國|日本|新加坡|狮城|獅城|台湾|台灣|\\b(US|USA|JP|SG|TW|SEA|LAX|SJC|NRT|HND|SIN|TPE)\\b|United States|Japan|Tokyo|Osaka|Singapore|Taiwan|Taipei|Seattle|Los Angeles|San Jose|Silicon Valley|New York|Chicago|Dallas|Ashburn)";
 pub const DEFAULT_AI_EXCLUDE: &str =
     "(?i)(🇭🇰|港|\\bHK\\b|Hong ?Kong|🇨🇳|中国|回国|剩余|到期|流量|过期|官网|套餐|expire|traffic)";
-const INFO_EXCLUDE: &str = "(?i)(剩余|到期|流量|过期|官网|套餐|expire|traffic)";
+pub(crate) const INFO_EXCLUDE: &str = "(?i)(剩余|到期|流量|过期|官网|套餐|expire|traffic)";
+
+/// Plain-text form of INFO_EXCLUDE, for code that has no regex engine.
+pub(crate) fn is_info_name(name: &str) -> bool {
+    let name = name.to_lowercase();
+    [
+        "剩余", "到期", "流量", "过期", "官网", "套餐", "expire", "traffic",
+    ]
+    .iter()
+    .any(|w| name.contains(w))
+}
 
 /// AI services routed to the AI group. Kept as data so the UI and docs agree.
 pub const AI_PRESET: &[(&str, &[&str])] = &[
@@ -787,7 +797,7 @@ fn append_items(chunk: &mut YamlChunk, items: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn pick_name(base: &str, taken: &HashSet<String>) -> String {
+pub(crate) fn pick_name(base: &str, taken: &HashSet<String>) -> String {
     if !taken.contains(base) {
         return base.to_string();
     }
@@ -1466,12 +1476,21 @@ mod tests {
 /// Preserve the source's routing policy. Node-only sources get one simple selector.
 /// This is the only composition path exposed while custom routing is paused.
 pub fn compose_profile(input: &ComposeInput) -> Result<(String, ComposeReport), String> {
+    compose_profile_reserving(input, &HashSet::new())
+}
+
+/// compose_profile, with `reserved` group names (from the routing scheme that
+/// will replace the source's) kept free of manual node names.
+pub fn compose_profile_reserving(
+    input: &ComposeInput,
+    reserved: &HashSet<String>,
+) -> Result<(String, ComposeReport), String> {
     let mut report = ComposeReport::default();
     let mut chunks = match input.subscription.and_then(|s| s.clash_doc.as_deref()) {
         Some(doc) => split_chunks(doc),
         None => split_chunks(&template_base(input.controller_addr, input.secret)),
     };
-    chunks.retain(|c| c.key.as_deref() != Some("sub-rules"));
+    // Source sub-rules stay: its SUB-RULE rules reference them.
     let mut names = HashSet::new();
     if let Some(c) = chunks.iter().find(|c| c.key.as_deref() == Some("proxies")) {
         names.extend(clash_item_names(c));
@@ -1518,6 +1537,15 @@ pub fn compose_profile(input: &ComposeInput) -> Result<(String, ComposeReport), 
         }
     }
     report.sub_nodes = names.len();
+    // Manual nodes must not reuse a proxy or group name.
+    let mut taken = names.clone();
+    taken.extend(reserved.iter().cloned());
+    if let Some(c) = chunks
+        .iter()
+        .find(|c| c.key.as_deref() == Some("proxy-groups"))
+    {
+        taken.extend(clash_item_names(c));
+    }
     let mut manual_names = Vec::new();
     for node in input.manual {
         match &node.parsed {
@@ -1526,10 +1554,11 @@ pub fn compose_profile(input: &ComposeInput) -> Result<(String, ComposeReport), 
                 let base = node["name"].as_str().unwrap_or("node").to_string();
                 let mut name = base.clone();
                 let mut n = 2;
-                while names.contains(&name) {
+                while taken.contains(&name) {
                     name = format!("{base} ({n})");
                     n += 1;
                 }
+                taken.insert(name.clone());
                 names.insert(name.clone());
                 manual_names.push(name.clone());
                 node["name"] = json!(name);
@@ -1569,7 +1598,7 @@ pub fn compose_profile(input: &ComposeInput) -> Result<(String, ComposeReport), 
     let fallback = if let Some(name) = group_names.first() {
         name.clone()
     } else {
-        let name = pick_name("PROXY", &names);
+        let name = pick_name("PROXY", &taken);
         chunks.retain(|c| c.key.as_deref() != Some("proxy-groups"));
         let group =
             json!({"name":name,"type":"select","include-all":true,"exclude-filter":INFO_EXCLUDE});
@@ -1637,7 +1666,10 @@ fn append_manual_members(groups: &mut YamlChunk, names: &[String]) {
         if let Ok(mut value) =
             serde_json::from_str::<Value>(block[0].trim_start().trim_start_matches('-').trim())
         {
-            if value["type"] == "select" && value["include-all"] != true {
+            if value["type"] == "select"
+                && value["include-all"] != true
+                && value["include-all-proxies"] != true
+            {
                 if let Some(members) = value["proxies"].as_array_mut() {
                     members.extend(names.iter().map(|n| json!(n)));
                     groups.lines[*start] = format!("{}- {value}", " ".repeat(indent));
@@ -1645,92 +1677,82 @@ fn append_manual_members(groups: &mut YamlChunk, names: &[String]) {
             }
             continue;
         }
+        let members = names
+            .iter()
+            .map(|n| yaml_str(n))
+            .collect::<Vec<_>>()
+            .join(", ");
         let flow = block[0].trim_start().trim_start_matches('-').trim();
         if flow.starts_with('{') {
-            if flow_value(flow.trim_start_matches('{'), "type").as_deref() == Some("select")
-                && flow_value(flow.trim_start_matches('{'), "include-all").as_deref()
-                    != Some("true")
+            let inner = flow.trim_start_matches('{');
+            if flow_value(inner, "type").as_deref() == Some("select")
+                && ["include-all", "include-all-proxies"]
+                    .iter()
+                    .all(|k| flow_value(inner, k).as_deref() != Some("true"))
             {
-                if let Some(begin) = flow
-                    .find("proxies:")
-                    .map(|n| n + 8)
-                    .and_then(|n| flow[n..].find('[').map(|i| i + n))
-                {
-                    if let Some(close) = flow.rfind(']') {
-                        let sep = if flow[begin + 1..close].trim().is_empty() {
-                            ""
-                        } else {
-                            ", "
-                        };
-                        groups.lines[*start] = format!(
-                            "{}- {}{sep}{}{}",
-                            " ".repeat(indent),
-                            &flow[..close],
-                            names
-                                .iter()
-                                .map(|n| yaml_str(n))
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            &flow[close..]
-                        );
-                    }
-                } else if let Some(close) = flow.rfind('}') {
+                let pad = " ".repeat(indent);
+                if let Some((open, close)) = flow_key_list(flow, "proxies") {
+                    let sep = if flow[open + 1..close].trim().is_empty() {
+                        ""
+                    } else {
+                        ", "
+                    };
+                    groups.lines[*start] =
+                        format!("{pad}- {}{sep}{members}{}", &flow[..close], &flow[close..]);
+                } else if let Some(close) = matching_close(flow, 0) {
+                    let sep = if flow[1..close].trim().is_empty() {
+                        ""
+                    } else {
+                        ", "
+                    };
                     groups.lines[*start] = format!(
-                        "{}- {}, proxies: [{}]}}",
-                        " ".repeat(indent),
+                        "{pad}- {}{sep}proxies: [{members}]{}",
                         flow[..close].trim_end(),
-                        names
-                            .iter()
-                            .map(|n| yaml_str(n))
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        &flow[close..]
                     );
                 }
             }
             continue;
         }
         if !block.iter().any(|l| l.trim() == "type: select")
-            || block.iter().any(|l| l.trim() == "include-all: true")
+            || block.iter().any(|l| {
+                let t = l.trim().trim_start_matches('-').trim_start();
+                t == "include-all: true" || t == "include-all-proxies: true"
+            })
         {
             continue;
         }
-        let Some(pos) = block
-            .iter()
-            .position(|l| l.trim_start().starts_with("proxies:"))
-        else {
+        // The first field may share the item's `- ` line.
+        let Some(pos) = block.iter().enumerate().position(|(i, l)| {
+            let t = l.trim_start();
+            let t = if i == 0 {
+                t.trim_start_matches('-').trim_start()
+            } else {
+                t
+            };
+            t.starts_with("proxies:")
+        }) else {
             groups.lines.insert(
                 end,
-                format!(
-                    "{}proxies: [{}]",
-                    " ".repeat(indent + 2),
-                    names
-                        .iter()
-                        .map(|n| yaml_str(n))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+                format!("{}proxies: [{members}]", " ".repeat(indent + 2)),
             );
             continue;
         };
         let at = *start + pos;
         let line = &groups.lines[at];
-        if let Some(close) = line.rfind(']') {
-            let open = line.find('[').unwrap_or(close);
+        let key = line.find("proxies:").unwrap_or(0) + "proxies:".len();
+        let span = line[key..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|i| key + i)
+            .filter(|&i| line[i..].starts_with('['))
+            .and_then(|open| matching_close(line, open).map(|close| (open, close)));
+        if let Some((open, close)) = span {
             let sep = if line[open + 1..close].trim().is_empty() {
                 ""
             } else {
                 ", "
             };
-            groups.lines[at] = format!(
-                "{}{sep}{}{}",
-                &line[..close],
-                names
-                    .iter()
-                    .map(|n| yaml_str(n))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                &line[close..]
-            );
+            groups.lines[at] = format!("{}{sep}{members}{}", &line[..close], &line[close..]);
         } else {
             let field_indent = leading_spaces(line);
             let insert = groups.lines[at + 1..end]
@@ -1755,6 +1777,87 @@ fn append_manual_members(groups: &mut YamlChunk, names: &[String]) {
             );
         }
     }
+}
+
+/// Characters of YAML flow text outside quoted scalars, with their byte index.
+fn flow_unquoted(text: &str) -> Vec<(usize, char)> {
+    let mut out = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut prev = '{';
+    for (i, c) in text.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && q == '"' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        // A quote only opens a scalar where a value can start, not mid-word.
+        if (c == '"' || c == '\'') && matches!(prev, '{' | '[' | ',' | ':') {
+            quote = Some(c);
+            continue;
+        }
+        if !c.is_whitespace() {
+            prev = c;
+        }
+        out.push((i, c));
+    }
+    out
+}
+
+/// Byte index of the bracket closing the `[` or `{` at `open`.
+fn matching_close(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in flow_unquoted(&text[open..]) {
+        match c {
+            '[' | '{' => depth += 1,
+            ']' | '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Byte span of the `[...]` value of a top-level `key` in a YAML flow mapping.
+fn flow_key_list(flow: &str, key: &str) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut at_key = false;
+    for (i, c) in flow_unquoted(flow) {
+        if depth == 1 && at_key && !c.is_whitespace() {
+            at_key = false;
+            let value = flow[i..]
+                .strip_prefix(key)
+                .map(str::trim_start)
+                .and_then(|a| a.strip_prefix(':'));
+            if let Some(value) = value {
+                let value = value.trim_start();
+                let open = flow.len() - value.len();
+                return value
+                    .starts_with('[')
+                    .then(|| matching_close(flow, open).map(|close| (open, close)))
+                    .flatten();
+            }
+        }
+        match c {
+            '[' | '{' => {
+                depth += 1;
+                at_key = depth == 1;
+            }
+            ']' | '}' => depth = depth.saturating_sub(1),
+            ',' => at_key = depth == 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1805,6 +1908,89 @@ mod profile_tests {
         );
         let yaml = build(Some(&convert_subscription(&flow).unwrap()), &manual());
         assert!(yaml.contains("proxies: [HK, \"Own\"]"));
+    }
+
+    fn proxy_group_line(yaml: &str, name: &str) -> String {
+        yaml.lines()
+            .find(|l| l.contains(&format!("name: {name},")))
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn manual_nodes_join_flow_group_proxies_not_providers() {
+        let flow = CLASH.replace(
+            "  - name: Airport\n    type: select\n    proxies: [HK]",
+            "  - {name: Airport, type: select, include-all-proxies: false, proxies: [HK], use: [prov]}\n  - {name: Pool, type: select, use: [prov]}",
+        ) + "proxy-providers:\n  prov: {type: file, path: ./prov.yaml}\n";
+        let yaml = build(Some(&convert_subscription(&flow).unwrap()), &manual());
+        assert_eq!(
+            proxy_group_line(&yaml, "Airport").trim(),
+            "- {name: Airport, type: select, include-all-proxies: false, proxies: [HK, \"Own\"], use: [prov]}"
+        );
+        assert_eq!(
+            proxy_group_line(&yaml, "Pool").trim(),
+            "- {name: Pool, type: select, use: [prov], proxies: [\"Own\"]}"
+        );
+        let block = CLASH.replace(
+            "    proxies: [HK]",
+            "    proxies: [HK] # [note]\n    use: [prov]",
+        ) + "proxy-providers:\n  prov: {type: file, path: ./prov.yaml}\n";
+        let yaml = build(Some(&convert_subscription(&block).unwrap()), &manual());
+        assert!(yaml.contains("    proxies: [HK, \"Own\"] # [note]\n    use: [prov]\n"));
+        let flow = CLASH.replace(
+            "  - name: Airport\n    type: select\n    proxies: [HK]",
+            "  - {name: Airport, type: select, proxies: [HK], use: [P]}\n  - {name: All, type: select, include-all-proxies: true, use: [P]}\n  - name: Block\n    type: select\n    include-all-proxies: true\n    use: [P]\n  - {\"name\":\"Json\",\"type\":\"select\",\"include-all-proxies\":true,\"proxies\":[\"HK\"]}",
+        ) + "proxy-providers:\n  P: {type: file, path: ./p.yaml}\n";
+        let yaml = build(Some(&convert_subscription(&flow).unwrap()), &manual());
+        assert!(yaml.contains("- {name: Airport, type: select, proxies: [HK, \"Own\"], use: [P]}"));
+        assert!(yaml.contains("- {name: All, type: select, include-all-proxies: true, use: [P]}"));
+        assert!(yaml.contains("    include-all-proxies: true\n    use: [P]\n"));
+        assert!(!yaml.contains("[\"HK\",\"Own\"]"));
+        assert_eq!(yaml.matches("\"Own\"").count(), 2, "{yaml}");
+        let tricky = "{name: \"a, proxies: [x]\", note: it's, proxies: [\"]\", HK], use: [p]}";
+        let (open, close) = flow_key_list(tricky, "proxies").unwrap();
+        assert_eq!(&tricky[open..=close], "[\"]\", HK]");
+    }
+
+    #[test]
+    fn manual_node_named_like_a_group_is_renamed() {
+        let line = "Airport = ss, 192.0.2.2, 8388, encrypt-method=aes-128-gcm, password=fake";
+        let nodes = vec![ManualNode {
+            line: line.into(),
+            parsed: parse_node_line(line),
+        }];
+        let yaml = build(Some(&convert_subscription(CLASH).unwrap()), &nodes);
+        assert!(yaml.contains("\"name\":\"Airport (2)\""));
+        assert!(yaml.contains("proxies: [HK, \"Airport (2)\"]"));
+        let surge = "[Proxy]\nJP = trojan, 192.0.2.3, 443, password=fake\n[Proxy Group]\nAirport = select, JP\n[Rule]\nFINAL,Airport\n";
+        let yaml = build(Some(&convert_subscription(surge).unwrap()), &nodes);
+        assert!(yaml.contains("\"name\":\"Airport (2)\""));
+        assert!(!yaml.contains("\"name\":\"Airport\",\"server\""));
+        let (yaml, _) = compose_profile_reserving(
+            &ComposeInput {
+                subscription: None,
+                manual: &manual(),
+                rules: &PrivateRules::default(),
+                controller_addr: "127.0.0.1:9090",
+                secret: "",
+                test_url: "https://example.org",
+            },
+            &HashSet::from(["Own".to_string(), "Own (2)".to_string()]),
+        )
+        .unwrap();
+        assert!(yaml.contains("\"name\":\"Own (3)\""), "{yaml}");
+    }
+
+    #[test]
+    fn profile_keeps_source_sub_rules() {
+        let doc = CLASH.replace(
+            "  - MATCH,Airport\n",
+            "  - SUB-RULE,(NETWORK,tcp),s1\n  - MATCH,Airport\nsub-rules:\n  s1:\n    - DOMAIN-SUFFIX,example.net,Airport\n    - MATCH,DIRECT\n",
+        );
+        let yaml = build(Some(&convert_subscription(&doc).unwrap()), &manual());
+        assert!(yaml.contains("SUB-RULE,(NETWORK,tcp),s1"));
+        assert!(yaml.contains("sub-rules:\n  s1:\n    - DOMAIN-SUFFIX,example.net,Airport\n"));
     }
 
     #[test]
