@@ -247,6 +247,9 @@ pub enum Cause {
     UserClose,
     CloseAll,
     CoreStopped,
+    /// A config reload re-initialises proxy providers and drops their connections.
+    Reload,
+    Tun,
 }
 
 impl Cause {
@@ -261,6 +264,12 @@ impl Cause {
             (Self::CoreStopped, Lang::Zh) => "内核已停止或重启",
             (Self::CoreStopped, Lang::En) => "core stopped or restarted",
             (Self::CoreStopped, Lang::Ja) => "コア停止または再起動",
+            (Self::Reload, Lang::Zh) => "配置重载（订阅提供者节点）",
+            (Self::Reload, Lang::En) => "config reload (proxy-provider node)",
+            (Self::Reload, Lang::Ja) => "設定リロード（プロバイダーノード）",
+            (Self::Tun, Lang::Zh) => "TUN 重建",
+            (Self::Tun, Lang::En) => "TUN rebuilt",
+            (Self::Tun, Lang::Ja) => "TUN 再構築",
         }
     }
 }

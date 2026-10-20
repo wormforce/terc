@@ -509,8 +509,63 @@ impl App {
                     &modules,
                     &crate::ops::saved_switches(&raw),
                 )?;
-                crate::mihomo::install_config(&cfg, &generated, running)?;
-                Ok("设置已保存 / Settings saved".into())
+                // A module may override the key; then only a reload makes the
+                // core match the file.
+                let effective = crate::ops::split_chunks(&generated)
+                    .into_iter()
+                    .rev()
+                    .find(|c| c.key.as_deref() == Some(&key))
+                    .and_then(|c| {
+                        c.lines
+                            .first()
+                            .and_then(|l| l.split_once(':'))
+                            .map(|(_, v)| crate::ops::clean_scalar(v))
+                    });
+                let wanted = value.as_str().map_or_else(|| value.to_string(), str::to_string);
+                // `PATCH /configs` applies these without suspending the tunnel
+                // or re-initialising providers.
+                const LIVE: &[&str] = &[
+                    "allow-lan",
+                    "port",
+                    "socks-port",
+                    "mixed-port",
+                    "tcp-concurrent",
+                    "find-process-mode",
+                    "log-level",
+                ];
+                if !running
+                    || !LIVE.contains(&key.as_str())
+                    || effective.as_deref() != Some(wanted.as_str())
+                {
+                    crate::mihomo::install_config(&cfg, &generated, running)?;
+                    return Ok("设置已保存 / Settings saved".into());
+                }
+                // A reload would drop proxy-provider connections; PATCH only
+                // rebuilds the listener or switch that changed.
+                crate::mihomo::install_config_keep_mode(&cfg, &generated)?;
+                match crate::mihomo::patch_config_value(&cfg, &key, &value) {
+                    Ok(()) => Ok("设置已实时生效，未重载 / Applied live; no reload".into()),
+                    Err(err) => {
+                        use std::sync::atomic::Ordering;
+                        let uncertain = &crate::mihomo::RELOAD_UNCERTAIN;
+                        match crate::mihomo::reload_config(&cfg) {
+                            Ok(()) => {
+                                uncertain.store(false, Ordering::SeqCst);
+                                Ok(format!(
+                                    "实时修改未生效，已重载配置 / Live change failed ({err}); configuration reloaded"
+                                ))
+                            }
+                            Err(e) => {
+                                if matches!(e, crate::mihomo::ReloadError::Unknown(_)) {
+                                    uncertain.store(true, Ordering::SeqCst);
+                                }
+                                Err(format!(
+                                    "实时修改失败，重载也失败 / Live change failed ({err}); reload failed: {e}"
+                                ))
+                            }
+                        }
+                    }
+                }
             },
         );
     }

@@ -1060,6 +1060,9 @@ pub fn handle_profiles_key(app: &mut App, key: KeyEvent) {
                     return;
                 };
                 let id = plan.id.clone();
+                if !app.confirm_disruption(crate::guard::Disrupt::Reload) {
+                    return;
+                }
                 let running = app.snapshot.running;
                 let zh = app.lang() == Lang::Zh;
                 let catalog = crate::ops::module_catalog(&crate::ops::modules_dir(
