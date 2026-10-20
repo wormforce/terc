@@ -1647,8 +1647,23 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     let mut config = Config::load();
-    storage::migrate(&mut config).map_err(io::Error::other)?;
+    // Migration problems are shown in the UI; legacy files stay untouched.
+    let migration = storage::migrate(&mut config);
     let mut app = App::new(config);
+    match migration {
+        Ok(notes) if !notes.is_empty() => app.set_status(
+            &format!(
+                "迁移跳过 / Migration skipped / 移行スキップ: {}",
+                notes.join("; ")
+            ),
+            true,
+        ),
+        Ok(_) => {}
+        Err(err) => app.set_status(
+            &format!("迁移失败 / Migration failed / 移行失敗: {err}"),
+            true,
+        ),
+    }
     run(&mut app)
 }
 
