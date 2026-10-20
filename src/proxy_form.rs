@@ -455,9 +455,14 @@ impl Form {
                     .map_err(|_| "早期数据须为整数 / Early data must be a whole number")?
             };
             if size > 0 {
+                // Without a header name Mihomo appends early data to the path;
+                // an untouched value keeps that mode, a new one gets the header.
+                let changed = opts.get("max-early-data").and_then(Value::as_u64) != Some(size);
                 opts.insert("max-early-data".into(), json!(size));
-                opts.entry("early-data-header-name")
-                    .or_insert_with(|| json!("Sec-WebSocket-Protocol"));
+                if changed {
+                    opts.entry("early-data-header-name")
+                        .or_insert_with(|| json!("Sec-WebSocket-Protocol"));
+                }
             } else {
                 opts.remove("max-early-data");
                 opts.remove("early-data-header-name");
@@ -989,6 +994,19 @@ mod tests {
         );
         let f = Form::from_record("proxy-001".into(), ws_record(json!({"headers": {}})));
         assert_eq!(saved_opts(&f), json!({"path": "/", "headers": {}}));
+
+        // Path-based early data (no header name) survives an unrelated edit;
+        // a changed size switches to the header.
+        let opts = json!({"path": "/ws", "max-early-data": 2048});
+        let mut f = Form::from_record("proxy-001".into(), ws_record(opts.clone()));
+        f.port.load("8443");
+        assert_eq!(saved_opts(&f), opts);
+        f.early_data.load("4096");
+        assert_eq!(
+            saved_opts(&f),
+            json!({"path": "/ws", "max-early-data": 4096,
+                "early-data-header-name": "Sec-WebSocket-Protocol"})
+        );
     }
     #[test]
     fn http_upgrade_mode_saves_mihomo_keys() {
