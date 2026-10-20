@@ -22,7 +22,7 @@ use crate::{
 pub const GENERATED_MARK: &str =
     "# terc-generated: edit ~/.config/terc/rules.conf and nodes.conf instead of this file";
 
-pub const DEFAULT_AI_FILTER: &str = "(?i)(🇺🇸|🇯🇵|🇸🇬|🇹🇼|美国|美國|日本|新加坡|狮城|獅城|台湾|台灣|\\b(US|USA|JP|SG|TW)\\b|United States|America|Japan|Tokyo|Osaka|Singapore|Taiwan|Taipei|Seattle|SEA|Los Angeles|LAX|San Jose|SJC|Silicon Valley|New York|Chicago|Dallas|Ashburn)";
+pub const DEFAULT_AI_FILTER: &str = "(?i)(🇺🇸|🇯🇵|🇸🇬|🇹🇼|美国|美國|日本|新加坡|狮城|獅城|台湾|台灣|\\b(US|USA|JP|SG|TW|SEA|LAX|SJC|NRT|HND|SIN|TPE)\\b|United States|Japan|Tokyo|Osaka|Singapore|Taiwan|Taipei|Seattle|Los Angeles|San Jose|Silicon Valley|New York|Chicago|Dallas|Ashburn)";
 pub const DEFAULT_AI_EXCLUDE: &str =
     "(?i)(🇭🇰|港|\\bHK\\b|Hong ?Kong|🇨🇳|中国|回国|剩余|到期|流量|过期|官网|套餐|expire|traffic)";
 const INFO_EXCLUDE: &str = "(?i)(剩余|到期|流量|过期|官网|套餐|expire|traffic)";
@@ -286,7 +286,11 @@ impl PrivateRules {
                 continue;
             };
             let key = key.trim().to_ascii_lowercase();
-            let value = value.trim();
+            // Allow trailing "  # comment" on setting lines.
+            let value = match value.find(" #").or_else(|| value.find("\t#")) {
+                Some(at) => value[..at].trim(),
+                None => value.trim(),
+            };
             let flag = matches!(
                 value.to_ascii_lowercase().as_str(),
                 "true" | "1" | "yes" | "on"
@@ -1211,8 +1215,10 @@ mod tests {
         rules.ai.kind = "fallback".into();
         let text = rules.render();
         assert_eq!(PrivateRules::parse(&text), rules);
-        let hand = "[rules]\n# note\nIP-CIDR,1.2.3.0/24,DIRECT,no-resolve\n[ai]\nenabled = off\n";
+        let hand = "[rules]\n# note\nIP-CIDR,1.2.3.0/24,DIRECT,no-resolve\n[ai]\nenabled = off\nmembers =        # empty = auto\ntype = fallback  # or url-test\n";
         let parsed = PrivateRules::parse(hand);
+        assert!(parsed.ai.members.is_empty());
+        assert_eq!(parsed.ai.kind, "fallback");
         assert_eq!(parsed.rules, vec!["IP-CIDR,1.2.3.0/24,DIRECT,no-resolve"]);
         assert!(!parsed.ai.enabled);
         assert_eq!(parsed.ai.filter, DEFAULT_AI_FILTER);
