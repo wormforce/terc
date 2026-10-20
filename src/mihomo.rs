@@ -256,9 +256,14 @@ pub fn http_request(
 
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
-    let text = String::from_utf8_lossy(&raw);
 
-    let (headers, rest) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    // Keep the body as bytes until the chunk framing is gone: a chunk boundary
+    // may split a multibyte character, and lossy-decoding first shifts offsets.
+    let (head, rest) = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(pos) => (&raw[..pos], &raw[pos + 4..]),
+        None => (&raw[..], &[][..]),
+    };
+    let headers = String::from_utf8_lossy(head);
     let status = headers
         .lines()
         .next()
@@ -266,37 +271,36 @@ pub fn http_request(
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(500);
 
-    let decoded_body = if headers.lines().any(|l| {
+    let body = if headers.lines().any(|l| {
         l.to_ascii_lowercase()
             .contains("transfer-encoding: chunked")
     }) {
         decode_chunked(rest)
     } else {
-        rest.to_string()
+        rest.to_vec()
     };
 
-    Ok((status, decoded_body))
+    Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
-fn decode_chunked(mut input: &str) -> String {
-    let mut out = String::new();
-    loop {
-        let Some((len_line, after_len)) = input.split_once("\r\n") else {
-            break;
-        };
+fn decode_chunked(mut input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(line_end) = input.windows(2).position(|w| w == b"\r\n") {
+        let len_line = String::from_utf8_lossy(&input[..line_end]);
         let Ok(chunk_len) = usize::from_str_radix(len_line.trim(), 16) else {
             break;
         };
         if chunk_len == 0 {
             break;
         }
-        if after_len.len() < chunk_len {
-            out.push_str(after_len);
+        let after_len = &input[line_end + 2..];
+        let take = chunk_len.min(after_len.len());
+        out.extend_from_slice(&after_len[..take]);
+        if take < chunk_len {
             break;
         }
-        out.push_str(&after_len[..chunk_len]);
-        input = &after_len[chunk_len..];
-        if let Some(stripped) = input.strip_prefix("\r\n") {
+        input = &after_len[take..];
+        if let Some(stripped) = input.strip_prefix(b"\r\n") {
             input = stripped;
         }
     }
@@ -2818,5 +2822,69 @@ mod listener_tests {
         );
         let refused = Err(io::Error::from(io::ErrorKind::ConnectionRefused));
         assert_eq!(classify_probe(&refused), CoreProbe::Pending);
+    }
+
+    /// Answer one connection per canned response (empty closes without a
+    /// reply) and return each request line followed by its body.
+    fn serve(
+        listener: std::net::TcpListener,
+        responses: Vec<Vec<u8>>,
+    ) -> thread::JoinHandle<Vec<String>> {
+        thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.strip_prefix("Content-Length: ") {
+                        length = v.trim().parse::<usize>().unwrap();
+                    }
+                    if request.is_empty() {
+                        request = line;
+                    }
+                }
+                let mut payload = vec![0; length];
+                reader.read_exact(&mut payload).unwrap();
+                reader.get_mut().write_all(&response).unwrap();
+                requests.push(request + &String::from_utf8_lossy(&payload));
+            }
+            requests
+        })
+    }
+
+    #[test]
+    fn chunk_boundary_inside_a_character_decodes_to_the_character() {
+        assert_eq!(
+            decode_chunked(b"2\r\n\xE8\x8A\r\n1\r\n\x82\r\n0\r\n\r\n"),
+            "节".as_bytes()
+        );
+        // A truncated final chunk keeps what arrived instead of slicing past it.
+        assert_eq!(decode_chunked(b"5\r\nab"), b"ab");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = serve(
+            listener,
+            vec![
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                   8\r\n{\"n\":\"\xE8\x8A\r\n3\r\n\x82\"}\r\n0\r\n\r\n"
+                    .to_vec(),
+            ],
+        );
+        let (status, body) =
+            http_request(&addr, "", "GET", "/proxies", None, Duration::from_secs(3)).unwrap();
+        assert!(server.join().unwrap()[0].starts_with("GET /proxies "));
+        assert_eq!(status, 200);
+        assert_eq!(body, "{\"n\":\"节\"}");
     }
 }

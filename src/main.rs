@@ -205,6 +205,69 @@ impl Config {
     }
 }
 
+/// Deliver a worker's completion event even when the worker panics, so
+/// `snapshot_pending` and `action_busy` are always cleared.
+struct SendOnDrop {
+    tx: Sender<BackendEvent>,
+    event: Option<BackendEvent>,
+}
+
+impl SendOnDrop {
+    fn new(tx: Sender<BackendEvent>, fallback: BackendEvent) -> Self {
+        Self {
+            tx,
+            event: Some(fallback),
+        }
+    }
+
+    fn set(&mut self, event: BackendEvent) {
+        self.event = Some(event);
+    }
+}
+
+impl Drop for SendOnDrop {
+    fn drop(&mut self) {
+        if let Some(event) = self.event.take() {
+            let _ = self.tx.send(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod send_on_drop_tests {
+    use super::*;
+
+    #[test]
+    fn panicking_worker_still_reports_completion() {
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+            if done.event.is_some() {
+                panic!("fetch failed");
+            }
+            done.set(BackendEvent::StatusMessage {
+                text: String::new(),
+                is_error: false,
+            });
+        });
+        assert!(worker.join().is_err());
+        assert!(matches!(rx.try_recv(), Ok(BackendEvent::SnapshotDone(_))));
+
+        let (tx, rx) = mpsc::channel();
+        let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+        done.set(BackendEvent::StatusMessage {
+            text: "ok".into(),
+            is_error: false,
+        });
+        drop(done);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::StatusMessage { .. })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LineEditor {
     pub text: String,
@@ -876,8 +939,8 @@ impl App {
             let cfg = self.config.controller.clone();
             let tx = self.tx.clone();
             thread::spawn(move || {
-                let snap = fetch_snapshot(&cfg);
-                let _ = tx.send(BackendEvent::SnapshotDone(Box::new(snap)));
+                let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+                done.set(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
             });
         }
     }
@@ -915,7 +978,8 @@ impl App {
         let cfg = self.config.controller.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let _ = tx.send(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
+            let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
+            done.set(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
         });
     }
 
@@ -937,12 +1001,21 @@ impl App {
         let cfg = self.config.controller.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
+            let mut done = SendOnDrop::new(
+                tx.clone(),
+                BackendEvent::ActionDone {
+                    result: Err("Operation failed unexpectedly".into()),
+                    modules: None,
+                    profile: None,
+                },
+            );
             let result = action(cfg.clone());
-            let _ = tx.send(BackendEvent::ActionDone {
+            done.set(BackendEvent::ActionDone {
                 result,
                 modules,
                 profile,
             });
+            drop(done);
             let _ = tx.send(BackendEvent::Snapshot(Box::new(fetch_snapshot(&cfg))));
         });
     }
