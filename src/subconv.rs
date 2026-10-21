@@ -99,6 +99,11 @@ const URI_SCHEMES: &[&str] = &[
 /// last health check by any margin.
 const URL_TEST_TOLERANCE: u64 = 50;
 
+/// For TUIC nodes that name no congestion controller. Mihomo matches no case
+/// on an empty value, so quic-go keeps NewReno, which backs off hard on lossy
+/// long-haul UDP. This only affects client-to-server sending.
+const TUIC_CONGESTION: &str = "bbr";
+
 const SURGE_PROXY_TYPES: &[&str] = &[
     "ss",
     "shadowsocks",
@@ -1064,6 +1069,12 @@ fn parse_surge_proxy(
             if let Some(a) = kv.get("alpn") {
                 node.insert("alpn".into(), json!([a]));
             }
+            // Surge has no key for it; an empty value leaves quic-go on NewReno.
+            let cc = kv
+                .get("congestion-controller")
+                .cloned()
+                .unwrap_or_else(|| TUIC_CONGESTION.into());
+            node.insert("congestion-controller".into(), json!(cc));
         }
         "anytls" => {
             node.insert("type".into(), json!("anytls"));
@@ -1603,9 +1614,10 @@ pub fn parse_uri(raw: &str) -> Result<Value, String> {
                 let list: Vec<String> = a.split(',').map(|s| s.trim().to_string()).collect();
                 node.insert("alpn".into(), json!(list));
             }
-            if let Some(c) = url.q("congestion_control") {
-                node.insert("congestion-controller".into(), json!(c));
-            }
+            let cc = url
+                .q("congestion_control")
+                .unwrap_or_else(|| TUIC_CONGESTION.into());
+            node.insert("congestion-controller".into(), json!(cc));
             if let Some(m) = url.q("udp_relay_mode") {
                 node.insert("udp-relay-mode".into(), json!(m));
             }
@@ -2741,5 +2753,36 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
             assert!(!normalize_ws_network(&mut node));
             assert_eq!(node, other);
         }
+    }
+
+    #[test]
+    fn tuic_defaults_to_bbr_but_keeps_explicit_controllers() {
+        let out = convert_subscription(SURGE).unwrap();
+        assert_eq!(
+            by_name(&out.proxies, "TUIC")["congestion-controller"],
+            "bbr"
+        );
+        let surge = convert_subscription(
+            "[Proxy]\nT4 = tuic, 192.0.2.5, 443, token=fake\n\
+             TC = tuic-v5, 192.0.2.5, 443, uuid=u, password=fake, congestion-controller=cubic\n",
+        )
+        .unwrap();
+        assert_eq!(
+            by_name(&surge.proxies, "T4")["congestion-controller"],
+            "bbr"
+        );
+        assert_eq!(
+            by_name(&surge.proxies, "TC")["congestion-controller"],
+            "cubic"
+        );
+        let bare = parse_uri("tuic://uuid-x:fake@192.0.2.7:443?alpn=h3#TU").unwrap();
+        assert_eq!(bare["congestion-controller"], "bbr");
+        let cubic =
+            parse_uri("tuic://uuid-x:fake@192.0.2.7:443?congestion_control=cubic#TU").unwrap();
+        assert_eq!(cubic["congestion-controller"], "cubic");
+        // Only TUIC nodes get it.
+        assert!(by_name(&out.proxies, "TW-HY2")
+            .get("congestion-controller")
+            .is_none());
     }
 }
