@@ -216,7 +216,13 @@ pub fn parse_node_line(line: &str) -> Result<Value, String> {
         return Err("需要 Surge 节点行或节点链接 / expected a Surge line or URI".into());
     };
     let mut alias = HashMap::new();
-    match parse_surge_proxy(name.trim(), rest, &mut alias, &SurgeCtx::default())? {
+    match parse_surge_proxy(
+        name.trim(),
+        rest,
+        &mut alias,
+        &SurgeCtx::default(),
+        &mut Vec::new(),
+    )? {
         Some(node) => Ok(node),
         None => Err("DIRECT / REJECT 不是节点 / not a node".into()),
     }
@@ -313,7 +319,7 @@ fn convert_surge(text: &str) -> Converted {
             continue;
         };
         let name = unquote(name.trim());
-        match parse_surge_proxy(&name, rest, &mut alias, &ctx) {
+        match parse_surge_proxy(&name, rest, &mut alias, &ctx, &mut out.skipped) {
             Ok(Some(mut node)) => {
                 unique_name(&mut node, &mut names);
                 out.proxies.push(node);
@@ -817,12 +823,24 @@ fn keystore_private_key(name: &str, item: &str, ctx: &SurgeCtx) -> Result<String
     Ok(pem)
 }
 
+/// Matches Mihomo's `hop-interval` parser: `N` or `N-M`, unsigned 64-bit.
+fn hop_interval_range(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let ok = |p: Option<&str>| {
+        p.is_some_and(|p| {
+            !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u64>().is_ok()
+        })
+    };
+    ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
+}
+
 /// Ok(None) means the line defines a built-in policy alias (direct/reject).
 fn parse_surge_proxy(
     name: &str,
     rest: &str,
     alias: &mut HashMap<String, String>,
     ctx: &SurgeCtx,
+    skipped: &mut Vec<String>,
 ) -> Result<Option<Value>, String> {
     let name = unquote(name);
     if name.is_empty() {
@@ -1073,16 +1091,20 @@ fn parse_surge_proxy(
             if let Some(p) = kv.get("port-hopping") {
                 node.insert("ports".into(), json!(p.replace(';', ",")));
             }
-            // Mihomo also takes an `a-b` range here, so non-numbers pass through.
+            // Mihomo also takes an `a-b` range here. Anything else fails its
+            // config check for the whole profile, so it is dropped and noted.
             if let Some(i) = kv
                 .get("port-hopping-interval")
                 .map(|v| v.trim())
                 .filter(|v| !v.is_empty())
             {
-                match i.parse::<u64>() {
-                    Ok(secs) => node.insert("hop-interval".into(), json!(secs)),
-                    Err(_) => node.insert("hop-interval".into(), json!(i)),
-                };
+                if let Ok(secs) = i.parse::<u64>() {
+                    node.insert("hop-interval".into(), json!(secs));
+                } else if hop_interval_range(i) {
+                    node.insert("hop-interval".into(), json!(i));
+                } else {
+                    skipped.push(format!("Proxy {name}: port-hopping-interval"));
+                }
             }
         }
         "tuic" | "tuic-v5" => {
@@ -2842,6 +2864,38 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
         assert!(n.get("hop-interval").is_none());
         // Bandwidth is never guessed.
         assert!(n.get("up").is_none() && n.get("down").is_none());
+        assert!(out.skipped.is_empty());
+    }
+
+    #[test]
+    fn surge_hysteria2_bad_port_hopping_interval_is_dropped_not_fatal() {
+        // Mihomo rejects these with "invalid range", which would fail the
+        // whole profile's `mihomo -t`; the node must still import without it.
+        let bad = [
+            "30s",
+            "-1",
+            "30.5",
+            "10-",
+            "1-2-3",
+            "+5-9",
+            "99999999999999999999",
+        ];
+        for value in bad {
+            let out = convert_subscription(&format!(
+                "[Proxy]\nB = hysteria2, 192.0.2.4, 8443, password=fake, port-hopping=5000-6000, port-hopping-interval={value}\n"
+            ))
+            .unwrap();
+            let b = by_name(&out.proxies, "B");
+            assert_eq!(b["ports"], "5000-6000", "{value}");
+            assert!(b.get("hop-interval").is_none(), "{value}");
+            assert_eq!(out.skipped, ["Proxy B: port-hopping-interval"], "{value}");
+        }
+        // The single-node paste path drops it too.
+        let node = parse_node_line(
+            "B = hysteria2, 192.0.2.4, 8443, password=fake, port-hopping=5000-6000, port-hopping-interval=30s",
+        )
+        .unwrap();
+        assert!(node.get("hop-interval").is_none());
     }
 
     #[test]
