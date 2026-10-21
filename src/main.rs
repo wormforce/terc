@@ -2297,27 +2297,64 @@ impl crossterm::Command for ClickMouse {
     }
 }
 
-fn run(app: &mut App) -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        ClickMouse
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let result = run_app(&mut terminal, app);
-    app.stop_flag.store(true, Ordering::Relaxed);
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
+/// Undo everything `TerminalGuard::enter` turns on. Each step runs even when
+/// an earlier one fails, and it is safe to run twice.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
         DisableBracketedPaste,
         DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+}
+
+/// Restores the terminal however `run` ends: a return, an early `?` after
+/// raw mode is on, or a panic unwinding through it.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        // From here on any error drops the guard and restores raw mode.
+        let guard = Self;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            ClickMouse
+        )?;
+        Ok(guard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+/// A main-thread panic restores the terminal before the message prints, so it
+/// lands on the normal screen instead of the discarded alternate one. Worker
+/// panics leave the TUI running: `SendOnDrop` reports them as failures.
+fn install_panic_hook() {
+    let main = thread::current().id();
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if thread::current().id() == main {
+            restore_terminal();
+        }
+        default(info);
+    }));
+}
+
+fn run(app: &mut App) -> io::Result<()> {
+    install_panic_hook();
+    let _guard = TerminalGuard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let result = run_app(&mut terminal, app);
+    app.stop_flag.store(true, Ordering::Relaxed);
     result
 }
 
