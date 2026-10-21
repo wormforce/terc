@@ -2256,7 +2256,9 @@ pub fn regenerate_routing(
             compose::carry_runtime_state(&crate::ops::strip_marked_modules(doc), &base),
             crate::ops::saved_switches(doc),
         ),
-        None => (base, Vec::new()),
+        // Normalise the first file the way the next run will (it zeroes the
+        // listener keys a source leaves out), so that run finds it unchanged.
+        None => (compose::carry_runtime_state(&base, &base), Vec::new()),
     };
     let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
     // A reload re-initialises proxy providers and drops their connections, so
@@ -4753,6 +4755,18 @@ mod listener_tests {
     }
 
     #[test]
+    fn first_generation_is_a_fixed_point_of_the_carry() {
+        use crate::compose::carry_runtime_state as carry;
+        let base =
+            "mixed-port: 7890\nallow-lan: false\nmode: rule\ntun:\n  enable: false\nproxies: []\n";
+        // What regenerate writes when there is no previous file.
+        let first = carry(base, base);
+        assert!(first.contains("\nport: 0\n") && first.contains("\nsocks-port: 0\n"));
+        // What the next run derives from that file and the same source.
+        assert_eq!(carry(&first, base), first);
+    }
+
+    #[test]
     fn live_patch_is_verified_by_reading_the_config_back() {
         for (runtime, ok) in [
             (r#"{"allow-lan":true,"mixed-port":7890}"#, true),
@@ -4834,20 +4848,19 @@ mod listener_tests {
             "Own = ss, 192.0.2.2, 8388, encrypt-method=aes-128-gcm, password=fake",
         )
         .unwrap();
-        // The second pass carries listener keys over from the first file, so
-        // the output settles after two installs. Each runs the check and
-        // reloads; `regenerate_routing` and `install_config_with` read the mode.
+        // The first file is already a fixed point: the next pass carries the
+        // listener keys over from it and finds nothing to change. The install
+        // runs the check and reloads; `regenerate_routing` and
+        // `install_config_with` read the mode.
         let mode = || http("200 OK", r#"{"mode":"rule"}"#);
-        for pass in 1..=2 {
-            let server = serve(
-                listener.try_clone().unwrap(),
-                vec![mode(), mode(), http("204 No Content", "")],
-            );
-            let msg = regenerate_config(&cfg, &[], true, false, false).unwrap();
-            assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
-            assert!(msg.contains("validated & hot-reloaded"), "{msg}");
-            assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), pass);
-        }
+        let server = serve(
+            listener.try_clone().unwrap(),
+            vec![mode(), mode(), http("204 No Content", "")],
+        );
+        let msg = regenerate_config(&cfg, &[], true, false, false).unwrap();
+        assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
+        assert!(msg.contains("validated & hot-reloaded"), "{msg}");
+        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 1);
         let installed = read_config_text(&cfg).unwrap();
         let generated = compose_generated(&cfg);
         fs::remove_file(&generated).unwrap();
@@ -4864,7 +4877,7 @@ mod listener_tests {
             second.contains(" — unchanged; not reloaded, existing connections kept"),
             "{second}"
         );
-        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 2);
+        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 1);
         assert_eq!(read_config_text(&cfg).unwrap(), installed);
         // The routing choice and the generated copy are still written.
         assert_eq!(
@@ -4883,7 +4896,7 @@ mod listener_tests {
         assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
         assert!(third.contains("已校验并热重载"), "{third}");
         assert!(!RELOAD_UNCERTAIN.load(Ordering::SeqCst));
-        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 3);
+        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 2);
         fs::remove_dir_all(home).unwrap();
     }
 
