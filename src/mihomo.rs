@@ -115,6 +115,67 @@ pub struct CoreSnapshot {
     pub dns: DnsStatus,
     pub rules: Vec<RuleInfo>,
     pub providers: Vec<ProviderInfo>,
+    /// The optional endpoints this snapshot read; see `carry_skipped`.
+    pub fetched: Fetch,
+}
+
+/// The optional endpoints a snapshot poll reads. `/version` (the liveness
+/// probe), `/configs` and `/proxies` are read every time; the default reads
+/// everything, as every snapshot after an action does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fetch {
+    /// `/connections`; the WebSocket push supplies it while live.
+    pub connections: bool,
+    /// `/rules`, which only the Rules tab shows.
+    pub rules: bool,
+    /// `/providers/proxies` and `/providers/rules`: the Providers tab, plus
+    /// provider nodes and their delays, which `/proxies` omits since v1.19.28.
+    pub providers: bool,
+}
+
+impl Default for Fetch {
+    fn default() -> Self {
+        Self {
+            connections: true,
+            rules: true,
+            providers: true,
+        }
+    }
+}
+
+impl CoreSnapshot {
+    /// Take what this poll skipped from `old`, the snapshot it replaces:
+    /// rules, providers, and the provider nodes with their delays (`old` is
+    /// left without them). Connections are the caller's business.
+    pub fn carry_skipped(&mut self, old: &mut CoreSnapshot) {
+        if !self.running || !old.running {
+            return;
+        }
+        if !self.fetched.rules {
+            self.rules = std::mem::take(&mut old.rules);
+        }
+        if !self.fetched.providers {
+            self.providers = std::mem::take(&mut old.providers);
+            use std::collections::hash_map::Entry;
+            for (name, node) in old.nodes.drain() {
+                if node.provider.is_none() {
+                    continue;
+                }
+                match self.nodes.entry(name) {
+                    // Older cores still list provider nodes in /proxies.
+                    Entry::Occupied(mut fresh) => {
+                        let fresh = fresh.get_mut();
+                        if fresh.provider.is_none() {
+                            fresh.provider = node.provider;
+                        }
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(node);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1480,6 +1541,126 @@ mod snapshot_tests {
             assert!(!snap.connections_ok, "{body}");
         }
     }
+
+    const PROXIES: &str = r#"{"proxies":{
+        "GLOBAL":{"type":"Selector","all":["PROXY"],"now":"PROXY"},
+        "PROXY":{"type":"Selector","all":["Inline","JP 01"],"now":"JP 01"},
+        "Inline":{"type":"Shadowsocks","udp":true,"history":[{"delay":30}]}}}"#;
+    const PROVIDERS: &str = r#"{"providers":{
+        "default":{"name":"default","vehicleType":"Compatible","proxies":[{"name":"Inline","type":"Shadowsocks"}]},
+        "air":{"name":"air","vehicleType":"HTTP","proxies":[{"name":"JP 01","type":"Vmess","history":[{"delay":88}]}]}}}"#;
+
+    fn routes() -> Vec<(&'static str, String)> {
+        vec![
+            ("/version", r#"{"version":"v1.19.28"}"#.into()),
+            ("/configs", r#"{"mode":"rule","mixed-port":7890}"#.into()),
+            ("/proxies", PROXIES.into()),
+            ("/connections", r#"{"connections":[]}"#.into()),
+            (
+                "/rules",
+                r#"{"rules":[{"type":"Match","payload":"","proxy":"PROXY"}]}"#.into(),
+            ),
+            ("/providers/proxies", PROVIDERS.into()),
+            (
+                "/providers/rules",
+                r#"{"providers":{"ads":{"name":"ads","vehicleType":"HTTP","ruleCount":9}}}"#.into(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_tiered_poll_reads_only_what_it_was_asked_for() {
+        let (cfg, seen) = controller(routes());
+        let full = fetch_snapshot(&cfg);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "/version",
+                "/configs",
+                "/proxies",
+                "/connections",
+                "/rules",
+                "/providers/proxies",
+                "/providers/rules"
+            ]
+        );
+        assert_eq!(full.fetched, Fetch::default());
+        assert_eq!(full.rules.len(), 1);
+        // The reserved `default` provider is not listed; `air` brings its node.
+        let names: Vec<_> = full.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["air", "ads"]);
+        let jp = &full.nodes["JP 01"];
+        assert_eq!((jp.delay, jp.provider.as_deref()), (Some(88), Some("air")));
+        assert_eq!(full.nodes["Inline"].provider, None);
+
+        seen.lock().unwrap().clear();
+        let fetch = Fetch {
+            connections: false,
+            rules: false,
+            providers: false,
+        };
+        let lean = fetch_snapshot_with(&cfg, fetch);
+        assert_eq!(*seen.lock().unwrap(), ["/version", "/configs", "/proxies"]);
+        assert!(lean.running && !lean.connections_ok);
+        assert_eq!(lean.fetched, fetch);
+        assert_eq!(lean.mixed_port, 7890);
+        assert_eq!(lean.groups.len(), 1);
+        assert!(lean.rules.is_empty() && lean.providers.is_empty());
+        assert!(!lean.nodes.contains_key("JP 01"));
+    }
+
+    #[test]
+    fn skipped_parts_carry_over_with_provider_nodes_and_their_delays() {
+        let (cfg, _) = controller(routes());
+        let mut old = fetch_snapshot(&cfg);
+        // A latency test since then updated the provider node locally.
+        old.nodes.get_mut("JP 01").unwrap().delay = Some(61);
+        let fetch = Fetch {
+            connections: true,
+            rules: false,
+            providers: false,
+        };
+        let mut lean = fetch_snapshot_with(&cfg, fetch);
+        lean.carry_skipped(&mut old);
+        assert_eq!(lean.rules.len(), 1);
+        assert_eq!(lean.providers.len(), 2);
+        let jp = &lean.nodes["JP 01"];
+        assert_eq!((jp.delay, jp.provider.as_deref()), (Some(61), Some("air")));
+        assert_eq!(jp.kind, "Vmess");
+        // Fresh /proxies data wins for the nodes it lists.
+        assert_eq!(lean.nodes["Inline"].delay, Some(30));
+
+        // An older core lists provider nodes in /proxies too: the provider
+        // name still carries over, the fresh delay stays.
+        let mut old = fetch_snapshot(&cfg);
+        let mut lean = fetch_snapshot_with(&cfg, fetch);
+        lean.nodes.insert(
+            "JP 01".into(),
+            ProxyNode {
+                name: "JP 01".into(),
+                kind: "Vmess".into(),
+                udp: false,
+                delay: Some(70),
+                provider: None,
+            },
+        );
+        lean.carry_skipped(&mut old);
+        let jp = &lean.nodes["JP 01"];
+        assert_eq!((jp.delay, jp.provider.as_deref()), (Some(70), Some("air")));
+
+        // What a poll did read is never replaced, and a stopped core gets nothing.
+        let mut old = fetch_snapshot(&cfg);
+        let mut full = fetch_snapshot(&cfg);
+        full.rules.clear();
+        full.carry_skipped(&mut old);
+        assert!(full.rules.is_empty());
+        let mut stopped = CoreSnapshot {
+            fetched: fetch,
+            ..CoreSnapshot::default()
+        };
+        stopped.carry_skipped(&mut old);
+        assert!(stopped.rules.is_empty() && stopped.nodes.is_empty());
+    }
 }
 
 pub fn config_yaml_path(cfg: &ControllerConfig) -> PathBuf {
@@ -1498,14 +1679,17 @@ fn local_flags(cfg: &ControllerConfig) -> RuntimeFlags {
 }
 
 pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
-    fetch_snapshot_with(cfg, true)
+    fetch_snapshot_with(cfg, Fetch::default())
 }
 
-/// `include_connections: false` skips the `/connections` GET (the WebSocket
-/// push supplies it); the snapshot then has `connections_ok == false`.
-pub fn fetch_snapshot_with(cfg: &ControllerConfig, include_connections: bool) -> CoreSnapshot {
-    let mut snapshot = fetch_core_snapshot(cfg, include_connections);
-    if let Ok(raw) = read_config_text(cfg) {
+/// A snapshot reading only the optional endpoints in `fetch`. Without
+/// `connections` it has `connections_ok == false`; the other skipped parts
+/// stay empty until `CoreSnapshot::carry_skipped` fills them.
+pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot {
+    // One read serves both the runtime flags and the configured values.
+    let raw = read_config_text(cfg).ok();
+    let mut snapshot = fetch_core_snapshot(cfg, fetch, raw.as_deref());
+    if let Some(raw) = raw {
         for chunk in crate::ops::split_chunks(&raw) {
             if let Some(key) = chunk.key {
                 if ![
@@ -1555,13 +1739,13 @@ pub fn fetch_snapshot_with(cfg: &ControllerConfig, include_connections: bool) ->
     snapshot
 }
 
-fn fetch_core_snapshot(cfg: &ControllerConfig, include_connections: bool) -> CoreSnapshot {
+fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) -> CoreSnapshot {
     let timeout = Duration::from_millis(700);
     let (net_service, sysproxy_enabled) = detect_sysproxy();
     let core_bin_path = discover_mihomo_binary()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
-    let mut flags = local_flags(cfg);
+    let mut flags = raw.map(parse_yaml_flags).unwrap_or_default();
 
     let Ok((200, ver_body)) =
         http_request(&cfg.addr, &cfg.secret, "GET", "/version", None, timeout)
@@ -1699,7 +1883,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, include_connections: bool) -> Cor
     let mut upload_total = 0;
     let mut download_total = 0;
 
-    if include_connections {
+    if fetch.connections {
         if let Ok((200, conn_body)) =
             http_request(&cfg.addr, &cfg.secret, "GET", "/connections", None, timeout)
         {
@@ -1713,39 +1897,36 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, include_connections: bool) -> Cor
     }
 
     let mut rules = Vec::new();
-    if let Ok((200, body)) = http_request(&cfg.addr, &cfg.secret, "GET", "/rules", None, timeout) {
-        rules = parse_rules_json(&body);
-    }
-    let mut providers = Vec::new();
-    if let Ok((200, body)) = http_request(
-        &cfg.addr,
-        &cfg.secret,
-        "GET",
-        "/providers/proxies",
-        None,
-        timeout,
-    ) {
-        providers.extend(parse_providers_json(&body, "proxy"));
-        for found in crate::ops::parse_provider_nodes(&body) {
-            let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
-                name: found.name,
-                kind: found.kind,
-                udp: found.udp,
-                delay: found.delay,
-                provider: None,
-            });
-            node.provider.get_or_insert(found.provider);
+    if fetch.rules {
+        if let Ok((200, body)) =
+            http_request(&cfg.addr, &cfg.secret, "GET", "/rules", None, timeout)
+        {
+            rules = parse_rules_json(&body);
         }
     }
-    if let Ok((200, body)) = http_request(
-        &cfg.addr,
-        &cfg.secret,
-        "GET",
-        "/providers/rules",
-        None,
-        timeout,
-    ) {
-        providers.extend(parse_providers_json(&body, "rule"));
+    let mut providers = Vec::new();
+    let get = |path: &str| match http_request(&cfg.addr, &cfg.secret, "GET", path, None, timeout) {
+        Ok((200, body)) => serde_json::from_str::<Value>(&body).ok(),
+        _ => None,
+    };
+    if fetch.providers {
+        // One parse feeds both the provider list and the provider nodes.
+        if let Some(v) = get("/providers/proxies") {
+            providers.extend(crate::ops::providers_from_value(&v, "proxy"));
+            for found in crate::ops::provider_nodes_from_value(&v) {
+                let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
+                    name: found.name,
+                    kind: found.kind,
+                    udp: found.udp,
+                    delay: found.delay,
+                    provider: None,
+                });
+                node.provider.get_or_insert(found.provider);
+            }
+        }
+        if let Some(v) = get("/providers/rules") {
+            providers.extend(crate::ops::providers_from_value(&v, "rule"));
+        }
     }
 
     CoreSnapshot {
@@ -1777,6 +1958,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, include_connections: bool) -> Cor
         dns: flags.dns,
         rules,
         providers,
+        fetched: fetch,
     }
 }
 

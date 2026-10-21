@@ -661,14 +661,22 @@ pub fn parse_rules_json(body: &str) -> Vec<RuleInfo> {
 }
 
 pub fn parse_providers_json(body: &str, kind: &str) -> Vec<ProviderInfo> {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return Vec::new();
-    };
+    serde_json::from_str::<Value>(body)
+        .map(|value| providers_from_value(&value, kind))
+        .unwrap_or_default()
+}
+
+/// The providers in a parsed `/providers/*` body. Mihomo's reserved
+/// `default` proxy provider (vehicle `Compatible`, 88dcbf7
+/// `config/config.go:973`) only mirrors inline proxies and cannot be
+/// updated, so it is left out of the list.
+pub fn providers_from_value(value: &Value, kind: &str) -> Vec<ProviderInfo> {
     let Some(obj) = value.get("providers").and_then(Value::as_object) else {
         return Vec::new();
     };
     let mut out: Vec<ProviderInfo> = obj
         .iter()
+        .filter(|(_, item)| !json_string(item, "vehicleType").eq_ignore_ascii_case("Compatible"))
         .map(|(key, item)| {
             let name = {
                 let named = json_string(item, "name");
@@ -715,9 +723,13 @@ pub struct ProviderNode {
 /// read from GET /providers/proxies. The reserved `default` provider only
 /// mirrors inline proxies and groups, which /proxies already lists.
 pub fn parse_provider_nodes(body: &str) -> Vec<ProviderNode> {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return Vec::new();
-    };
+    serde_json::from_str::<Value>(body)
+        .map(|value| provider_nodes_from_value(&value))
+        .unwrap_or_default()
+}
+
+/// `parse_provider_nodes` on a body already parsed.
+pub fn provider_nodes_from_value(value: &Value) -> Vec<ProviderNode> {
     let Some(obj) = value.get("providers").and_then(Value::as_object) else {
         return Vec::new();
     };
@@ -1773,9 +1785,10 @@ ipv6: false
         assert_eq!(short_stamp(&rules[0].hit_at), "03:04:05");
 
         let proxies = parse_providers_json(
-            r#"{"providers":{"b":{"name":"","vehicleType":"File","proxies":[{},{}]},"a":{"name":"alpha","vehicleType":"HTTP","updatedAt":"t","proxies":[{}]}}}"#,
+            r#"{"providers":{"b":{"name":"","vehicleType":"File","proxies":[{},{}]},"a":{"name":"alpha","vehicleType":"HTTP","updatedAt":"t","proxies":[{}]},"default":{"name":"default","vehicleType":"Compatible","proxies":[{}]}}}"#,
             "proxy",
         );
+        assert_eq!(proxies.len(), 2);
         assert_eq!(proxies[0].name, "alpha");
         assert_eq!(proxies[1].name, "b");
         assert_eq!(proxies[1].count, 2);
