@@ -45,6 +45,15 @@ impl Disrupt {
         }
     }
 
+    /// A reload that also rebuilds TUN cuts its connections too.
+    fn tun_label(lang: Lang) -> &'static str {
+        match lang {
+            Lang::Zh => "重载配置（订阅提供者节点会重连，TUN 将重建）",
+            Lang::En => "Reloading the config (proxy-provider nodes reconnect, TUN is rebuilt)",
+            Lang::Ja => "設定リロード（プロバイダーノード再接続、TUN 再構築）",
+        }
+    }
+
     /// The closed-history cause noted on confirmation. `CloseAll` is noted by
     /// the `X` key itself; reloads and TUN changes are announced by the worker
     /// just before it sends them (`mihomo::announce_disruption`), since an
@@ -57,8 +66,13 @@ impl Disrupt {
     }
 }
 
-fn prompt(what: Disrupt, hit: conns::Affected, lang: Lang) -> String {
-    let (label, n, a) = (what.label(lang), hit.sessions, hit.ai);
+fn prompt(what: Disrupt, hit: conns::Affected, lang: Lang, tun_rebuild: bool) -> String {
+    let label = if tun_rebuild {
+        Disrupt::tun_label(lang)
+    } else {
+        what.label(lang)
+    };
+    let (n, a) = (hit.sessions, hit.ai);
     // A regenerated config identical to the running one is not reloaded.
     let may = what == Disrupt::Reload;
     match lang {
@@ -95,8 +109,24 @@ impl App {
             Disrupt::TunOff => {
                 conns::count_sessions(all.filter(|c| c.inbound.eq_ignore_ascii_case("tun")), now)
             }
-            Disrupt::Reload => conns::count_sessions(all.filter(|c| !c.provider.is_empty()), now),
+            Disrupt::Reload => {
+                let tun = self.reload_rebuilds_tun();
+                conns::count_sessions(
+                    all.filter(|c| {
+                        !c.provider.is_empty() || (tun && c.inbound.eq_ignore_ascii_case("tun"))
+                    }),
+                    now,
+                )
+            }
         }
+    }
+
+    /// Linux: the first regeneration after terc started writing `tun.gso`
+    /// changes a running TUN's settings, and Mihomo rebuilds TUN for it.
+    fn reload_rebuilds_tun(&self) -> bool {
+        self.snapshot.tun_enabled
+            && crate::mihomo::read_config_text(&self.config.controller)
+                .is_ok_and(|doc| crate::compose::reload_adds_tun_gso(&doc))
     }
 
     /// `true` when the caller may go ahead. The first press of an action that
@@ -108,12 +138,13 @@ impl App {
             return true;
         }
         let hit = self.affected(what);
+        let tun_rebuild = what == Disrupt::Reload && self.reload_rebuilds_tun();
         let again = self
             .pending_confirm
             .is_some_and(|(pending, at)| pending == what && at.elapsed() < CONFIRM_WINDOW);
         if hit.sessions > 0 && !again && self.screen != Screen::Setup {
             self.pending_confirm = Some((what, Instant::now()));
-            self.set_status(&prompt(what, hit, self.lang()), false);
+            self.set_status(&prompt(what, hit, self.lang(), tun_rebuild), false);
             return false;
         }
         self.pending_confirm = None;
@@ -306,6 +337,83 @@ mod tests {
                 }
             ] if id.is_empty()
         ));
+    }
+
+    #[test]
+    fn a_reload_that_adds_tun_gso_counts_tun_sessions() {
+        let dir = std::env::temp_dir().join(format!("terc-guard-gso-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Top-level node and DIRECT sessions through TUN, no provider.
+        let mut app = app_with(vec![
+            conn("ai", 120, true, "", "Tun"),
+            conn("direct", 120, false, "", "Tun"),
+            conn("mixed", 120, false, "", "Mixed"),
+        ]);
+        app.config.controller.config_dir = dir.display().to_string();
+        app.config.settings.lang = Lang::En;
+        app.snapshot.tun_enabled = true;
+        let write = |tun: &str| {
+            std::fs::write(dir.join("config.yaml"), format!("mixed-port: 7890\n{tun}")).unwrap()
+        };
+        write("tun:\n  enable: true\n  stack: mixed\n");
+        let linux = cfg!(target_os = "linux");
+        let hit = app.affected(Disrupt::Reload);
+        assert_eq!(hit.sessions, if linux { 2 } else { 0 });
+        if linux {
+            assert!(!app.confirm_disruption(Disrupt::Reload));
+            assert!(
+                app.status_message.starts_with(
+                    "Reloading the config (proxy-provider nodes reconnect, TUN is rebuilt) may drop 2"
+                ),
+                "{}",
+                app.status_message
+            );
+            assert!(app.confirm_disruption(Disrupt::Reload));
+        }
+        // Once the file has gso (or sets it either way) a reload keeps TUN.
+        for kept in [
+            "tun:\n  enable: true\n  gso: true\n",
+            "tun:\n  enable: true\n  gso: false\n",
+            "tun: {enable: true}\n",
+        ] {
+            write(kept);
+            assert_eq!(app.affected(Disrupt::Reload).sessions, 0, "{kept}");
+        }
+        // TUN off: no TUN session to count, and the file is not read.
+        write("tun:\n  enable: false\n");
+        app.snapshot.tun_enabled = false;
+        assert!(app.confirm_disruption(Disrupt::Reload));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reload_that_rebuilds_tun_blames_tun_connections_too() {
+        use crate::{conns::Scope, mihomo::BackendEvent};
+        let mut app = mixed();
+        // A worker composing a changed `tun:` block, then sending the reload.
+        let (tx, worker_tx) = (app.tx.clone(), app.tx.clone());
+        std::thread::spawn(move || {
+            crate::mihomo::report_disruptions(worker_tx);
+            crate::compose::carry_runtime_state(
+                "tun:\n  enable: true\n  stack: mixed\n",
+                "tun:\n  enable: true\n  stack: mixed\n  gso: true\n",
+            );
+        })
+        .join()
+        .unwrap();
+        tx.send(BackendEvent::Disrupting {
+            cause: Cause::Reload,
+            scope: Scope::Providers,
+        })
+        .unwrap();
+        app.drain_events();
+        assert_eq!(
+            cause_for(&mut app, conn("t", 120, false, "", "Tun")),
+            Some(Cause::Tun)
+        );
+        let provider = conn("p", 120, false, "airport", "Tun");
+        assert_eq!(cause_for(&mut app, provider), Some(Cause::Reload));
+        assert_eq!(cause(&mut app), None);
     }
 
     #[test]

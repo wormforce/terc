@@ -99,8 +99,16 @@ fn import_old(
             .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
         {
             // Old versions skipped bad lines too; one typo must not block startup.
-            match crate::subconv::parse_node_line(line) {
-                Ok(node) => source.nodes.push(node),
+            let mut dropped = Vec::new();
+            match crate::subconv::parse_node_line_noting(line, &mut dropped) {
+                Ok(node) => {
+                    source.nodes.push(node);
+                    skipped.extend(
+                        dropped
+                            .into_iter()
+                            .map(|what| format!("{}: {what}", nodes_conf.display())),
+                    );
+                }
                 Err(reason) => skipped.push(format!("{}: {reason}", nodes_conf.display())),
             }
         }

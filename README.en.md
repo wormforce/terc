@@ -77,7 +77,7 @@ Transparency follows your terminal profile. `terc` leaves the background at its 
 | **Controls** | System proxy, routing mode, and TUN |
 | **Traffic graph** | btop-style dual up/down rate history on an auto-scaled, labeled axis (`max …/s`), drawn as Braille or Blocks |
 | **Overview** | Aligned core, mode, proxy, TUN, memory, and connection metrics; port and quota below |
-| **Proxy subscriptions** | Add, update and switch subscriptions and manual nodes inside Settings |
+| **Proxy subscriptions** | Add, update and switch subscriptions and manual nodes inside Settings; generated configs fill in missing TCP racing, url-test tolerance, Reality fingerprints and Linux TUN GSO, and flag foreign direct DNS and nodes without UDP |
 | **Routing plans** | Independent rules and groups; each source remembers its assignment, and saved plans can be reused |
 | **Themes** | Spring, Vintage, and Mono; all preserve the terminal background |
 

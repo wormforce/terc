@@ -136,16 +136,24 @@ pub fn builtin_modules() -> Vec<ModuleSnippet> {
             id: "tun".into(),
             name: "TUN".into(),
             description: "Mixed TUN, auto-route, DNS hijack".into(),
-            body: "\
+            // GSO only on Linux: Darwin ignores it, but Mihomo compares it
+            // and would rebuild TUN on a reload for nothing.
+            body: format!(
+                "\
 tun:
   enable: true
   stack: mixed
-  auto-route: true
+{}  auto-route: true
   auto-detect-interface: true
   dns-hijack:
     - any:53
-    - tcp://any:53"
-                .into(),
+    - tcp://any:53",
+                if cfg!(target_os = "linux") {
+                    "  gso: true\n"
+                } else {
+                    ""
+                }
+            ),
             builtin: true,
         },
         ModuleSnippet {
@@ -1421,6 +1429,11 @@ fn set_block_scalar(doc: &str, block: &str, key: &str, literal: &str) -> String 
         .rev()
         .find(|chunk| chunk.key.as_deref().is_some_and(|name| name == block))
     {
+        // `dns: {enable: true, ...}`: a block line under it would be invalid.
+        if let Some(line) = crate::compose::set_flow_scalar(&chunk.lines[0], key, literal) {
+            chunk.lines[0] = line;
+            return join_chunks(&chunks);
+        }
         if let Some(pos) = chunk.lines.iter().rposition(|line| {
             line_key(line).is_some_and(|name| name == key)
                 && leading_spaces(line)
@@ -1563,6 +1576,25 @@ mod tests {
         assert!(has_subscription_source("proxies: []\n"));
         assert!(!has_subscription_source("# proxies: unavailable\n"));
         assert!(!has_subscription_source(""));
+    }
+
+    #[test]
+    fn switches_edit_a_flow_style_block_in_place() {
+        let doc =
+            "dns: {enable: true, nameserver: [223.5.5.5]}\ntun: {}\nsniffer: {enable: false,}\n";
+        let doc = set_nested_bool(doc, &["dns", "enable"], false);
+        let doc = set_nested_bool(&doc, &["tun", "enable"], true);
+        let doc = set_nested_bool(&doc, &["sniffer", "enable"], true);
+        assert_eq!(
+            doc,
+            "dns: {enable: false, nameserver: [223.5.5.5]}\ntun: {enable: true}\nsniffer: {enable: true,}\n"
+        );
+        let doc = set_nested_bool(
+            "dns: {nameserver: [223.5.5.5]} # x\n",
+            &["dns", "enable"],
+            true,
+        );
+        assert_eq!(doc, "dns: {nameserver: [223.5.5.5], enable: true} # x\n");
     }
 
     #[test]
