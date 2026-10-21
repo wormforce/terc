@@ -33,7 +33,7 @@ use crossterm::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event as CEvent,
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
-    execute,
+    execute, queue,
     terminal::{
         disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
         EnterAlternateScreen, LeaveAlternateScreen,
@@ -2150,9 +2150,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         redraw.observe(app, now);
         let frame = app.frame_duration();
         if redraw.due(now, frame) || (held.is_some() && redraw.pending()) {
-            execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+            // Queued, so Begin and End ride along with the frame's own flushes.
+            queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
             let draw_res = terminal.draw(|frame| draw(frame, app)).map(|_| ());
-            let sync_res = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+            let sync_res = queue!(terminal.backend_mut(), EndSynchronizedUpdate)
+                .and_then(|()| io::Write::flush(terminal.backend_mut()));
             draw_res?;
             sync_res?;
             redraw.drawn(app, Instant::now());
