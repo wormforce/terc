@@ -27,6 +27,16 @@ pub const DEFAULT_AI_EXCLUDE: &str =
     "(?i)(🇭🇰|港|\\bHK\\b|Hong ?Kong|🇨🇳|中国|回国|剩余|到期|流量|过期|官网|套餐|expire|traffic)";
 pub(crate) const INFO_EXCLUDE: &str = "(?i)(剩余|到期|流量|过期|官网|套餐|expire|traffic)";
 
+/// Whether INFO_EXCLUDE drops `name`: its alternatives are plain words.
+pub(crate) fn info_excluded(name: &str) -> bool {
+    let name = name.to_lowercase();
+    INFO_EXCLUDE
+        .trim_start_matches("(?i)(")
+        .trim_end_matches(')')
+        .split('|')
+        .any(|word| name.contains(word))
+}
+
 /// AI services routed to the AI group. Kept as data so the UI and docs agree.
 pub const AI_PRESET: &[(&str, &[&str])] = &[
     (
@@ -738,6 +748,13 @@ pub(crate) fn clash_item_names(chunk: &YamlChunk) -> Vec<String> {
             trimmed
         } else {
             continue;
+        };
+        // An anchored item, `- &g {name: …}`.
+        let body = match body.strip_prefix('&') {
+            Some(rest) => rest
+                .find(char::is_whitespace)
+                .map_or("", |end| rest[end..].trim_start()),
+            None => body,
         };
         if let Some(inner) = body.strip_prefix('{') {
             if let Ok(value) = serde_json::from_str::<Value>(body) {

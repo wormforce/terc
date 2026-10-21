@@ -895,7 +895,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == FocusPane::Nodes;
     let current_group: Option<&ProxyGroup> = app.snapshot.groups.get(app.group_index);
 
-    let title_str = match current_group {
+    let mut title_str = match current_group {
         Some(g) => format!("{}  {} ({})", app.t("nodes"), g.name, g.all.len()),
         None => app.t("nodes").to_string(),
     };
@@ -912,9 +912,20 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         _ => String::new(),
     };
+    let prefix = if focused { "▶ [2] " } else { "[2] " };
+    // The title holds area.width - 5 cells. The pin note outranks the node
+    // count and the end of a long group name.
+    let budget = (area.width as usize).saturating_sub(5);
+    if let Some(g) = current_group.filter(|_| !pin_note.is_empty()) {
+        let head = format!("{}  ", app.t("nodes"));
+        let room = budget.saturating_sub(prefix.width() + pin_note.width() + head.width());
+        if title_str.width() > budget.saturating_sub(prefix.width() + pin_note.width()) {
+            title_str = head + &fit_width(&g.name, room);
+        }
+    }
     let title = Line::from(vec![
         Span::styled(
-            if focused { "▶ [2] " } else { "[2] " },
+            prefix,
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -1747,6 +1758,24 @@ pub fn inset_rect(area: Rect, dx: u16, dy: u16) -> Rect {
         width: area.width.saturating_sub(dx * 2),
         height: area.height.saturating_sub(dy * 2),
     }
+}
+
+/// `s` cut to `width` cells, ending in `…` when cut.
+fn fit_width(s: &str, width: usize) -> String {
+    if s.width() <= width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for c in s.chars() {
+        if out.width() + c.width().unwrap_or(0) + 1 > width {
+            break;
+        }
+        out.push(c);
+    }
+    if width > 0 {
+        out.push('…');
+    }
+    out
 }
 
 pub fn truncate_str(s: &str, max_chars: usize) -> String {

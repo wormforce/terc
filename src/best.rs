@@ -42,22 +42,48 @@ pub fn country_hint(name: &str) -> Option<String> {
 pub fn country_hits(name: &str) -> Vec<String> {
     let chars: Vec<char> = name.chars().collect();
     let mut found = Vec::new();
-    for pair in chars.windows(2) {
-        if pair.iter().all(|c| ('\u{1f1e6}'..='\u{1f1ff}').contains(c)) {
+    // Flags pair up from the start of a run, so 🇦🇺🇸🇬 is AU and SG, not US.
+    let flag = |c: &char| ('\u{1f1e6}'..='\u{1f1ff}').contains(c);
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if flag(&chars[i]) && flag(&chars[i + 1]) {
             found.push(
-                pair.iter()
+                chars[i..i + 2]
+                    .iter()
                     .map(|c| (b'A' + (*c as u32 - 0x1f1e6) as u8) as char)
                     .collect::<String>(),
             );
+            i += 2;
+        } else {
+            i += 1;
         }
     }
     let lower = name.to_lowercase();
-    let tokens: Vec<_> = lower
-        .split(|c: char| !c.is_ascii_alphabetic())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Runs of ASCII letters, with where each starts.
+    let mut words: Vec<(usize, &str)> = Vec::new();
+    let mut start = None;
+    for (at, c) in name.char_indices().chain([(name.len(), ' ')]) {
+        match (c.is_ascii_alphabetic(), start) {
+            (true, None) => start = Some(at),
+            (false, Some(from)) => {
+                words.push((from, &name[from..at]));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    let tokens: Vec<String> = words.iter().map(|(_, w)| w.to_lowercase()).collect();
     for (code, aliases) in COUNTRIES {
-        let token_code = code.to_lowercase();
+        // A bare code is written US or us; "My" and "In" are words, and a
+        // GB right after a number is a traffic size.
+        let names_code = words.iter().any(|(at, word)| {
+            word.eq_ignore_ascii_case(code)
+                && (*word == code || *word == code.to_lowercase())
+                && !(code == "GB"
+                    && name[..*at]
+                        .trim_end()
+                        .ends_with(|c: char| c.is_ascii_digit()))
+        });
         let matches_alias = aliases.iter().any(|alias| {
             if alias.is_ascii() {
                 let words: Vec<_> = alias.split_whitespace().collect();
@@ -67,7 +93,7 @@ pub fn country_hits(name: &str) -> Vec<String> {
                 lower.contains(alias) && !(code == "IN" && lower.contains("印度尼西"))
             }
         });
-        if tokens.contains(&token_code.as_str()) || matches_alias {
+        if names_code || matches_alias {
             found.push(code.to_string());
         }
     }
@@ -132,8 +158,11 @@ pub fn candidates(
         .collect()
 }
 
-/// Nodes re-tested in the second best-pick round.
+/// Nodes re-tested after the first best-pick round.
 const RETEST_TOP: usize = 5;
+/// Samples per finalist: the first round and two re-tests, so the median
+/// discards a single timeout or spike rather than averaging it in.
+pub const ROUNDS: usize = 3;
 
 fn delay_of(results: &[(String, Option<u16>)], name: &str) -> Option<u16> {
     results
@@ -168,7 +197,8 @@ pub fn retest(
     names
 }
 
-/// Median with failures sorted last, so a failure in the middle drops the node.
+/// Median with failures sorted last: of three samples, one failure is
+/// outvoted, two drop the node.
 pub fn median(samples: &[Option<u16>]) -> Option<u16> {
     let mut sorted: Vec<u32> = samples
         .iter()
@@ -249,6 +279,7 @@ mod tests {
             all: names.iter().map(|s| s.to_string()).collect(),
             test_url: String::new(),
             expected_status: String::new(),
+            timeout_ms: 0,
         });
         for name in names {
             snapshot.nodes.insert(
@@ -289,6 +320,7 @@ mod tests {
             all: vec!["US 01".into()],
             test_url: String::new(),
             expected_status: String::new(),
+            timeout_ms: 0,
         });
         snapshot.groups[0].now = "Nested".into();
         assert_eq!(active_country(&snapshot, 0).as_deref(), Some("US"));
@@ -309,6 +341,15 @@ mod tests {
         assert_eq!(country_hint("Premium Auto"), None);
         assert_eq!(country_hint("RUSH-01"), None);
         assert_eq!(country_hint("🇺🇸 US → JP"), None);
+        // Flag pairs, words and traffic sizes that only look like codes.
+        assert_eq!(country_hits("🇦🇺🇸🇬 relay"), ["AU", "SG"]);
+        assert_eq!(country_hint("🇬🇧🇺🇸"), None);
+        assert_eq!(country_hint("Node 100GB"), None);
+        assert_eq!(country_hint("Node 100 GB"), None);
+        assert_eq!(country_hint("GB-London 1").as_deref(), Some("GB"));
+        assert_eq!(country_hint("My Home"), None);
+        assert_eq!(country_hint("my-01").as_deref(), Some("MY"));
+        assert_eq!(country_hint("Made In Taiwan").as_deref(), Some("TW"));
     }
 
     fn named(pairs: &[(&str, Option<u16>)]) -> Vec<(String, Option<u16>)> {
@@ -388,5 +429,33 @@ mod tests {
             pick(&candidates, &[&first, &second], "N0"),
             Pick::Keep { best: 0, .. }
         ));
+    }
+
+    #[test]
+    fn three_samples_outvote_one_timeout_or_spike() {
+        let candidates: Vec<_> = (0..2).map(|i| (i, format!("N{i}"))).collect();
+        // The current N1 times out once on a lossy link: 70 / - / 72.
+        let rounds = [
+            named(&[("N0", Some(75)), ("N1", Some(70))]),
+            named(&[("N0", Some(80)), ("N1", None)]),
+            named(&[("N0", Some(78)), ("N1", Some(72))]),
+        ];
+        let rounds: Vec<&[_]> = rounds.iter().map(Vec::as_slice).collect();
+        assert!(matches!(
+            pick(&candidates, &rounds, "N1"),
+            Pick::Keep {
+                best: 1,
+                current_ms: 72,
+                ..
+            }
+        ));
+        // One 900 ms spike does not hand the win to the slower N1.
+        let rounds = [
+            named(&[("N0", Some(40)), ("N1", Some(60))]),
+            named(&[("N0", Some(900)), ("N1", Some(65))]),
+            named(&[("N0", Some(42)), ("N1", Some(62))]),
+        ];
+        let rounds: Vec<&[_]> = rounds.iter().map(Vec::as_slice).collect();
+        assert_eq!(pick(&candidates, &rounds, "N9"), Pick::Switch(0));
     }
 }

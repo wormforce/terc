@@ -53,6 +53,8 @@ WebSocket and HTTPUpgrade nodes: for VMess, VLESS and Trojan, Transport cycles t
 
 Routing lists subscription routing, Proxy all, routing cached by each source and named saved plans. Enter assigns a plan to the active proxy; `c` saves current routing for reuse. Nodes always come from the active source.
 
+A plan keeps no node names: a group that listed nodes draws on every node of the active source instead. A regional group (a url-test / fallback / load-balance that listed only US nodes, say, or a select group whose own name names the country) gets a `filter` on flags, country names and standalone codes, so it does not rank every country's nodes. A group that also drew on proxy providers (`use`, `include-all-providers`) gets no filter, since nothing says which nodes the providers added. When the plan is applied to a source without proxy providers, the filter is checked there and dropped if no node matches, so the group takes every node. With providers the nodes are only known after the reload, so the filter stays together with `empty-fallback: REJECT`: if nothing matches, the group rejects connections instead of falling back to Mihomo's default `COMPATIBLE`, which dials directly, so AI traffic never leaves from your own address. Group settings shared through `<<: *anchor` in the source config are expanded when the plan is saved, so such plans apply to other sources as well.
+
 For example, source A can use its own routing and manual source B can use a shared plan. Switching restores each assignment. Updating B's nodes keeps its routing and never imports A's nodes. Original source caches remain separate. Validation failures keep the current configuration and routing assignment. Previous local snapshots remain selectable as policy only. Custom rule editing is still paused.
 
 ## Common settings
@@ -60,6 +62,8 @@ For example, source A can use its own routing and manual source B can use a shar
 Settings has four tabs: Proxy, Appearance, Sources & Routing and Diagnostics (Tab / Shift+Tab or 1–4).
 
 Proxy settings include mixed / HTTP / SOCKS ports, LAN access, TUN, DNS, IPv6, sniffing, concurrent TCP, process matching, the test URL and controller timeout. Port values range from 0 to 65535; 0 disables a listener. A mixed port supports both HTTP and SOCKS and must not duplicate another listener. Turn off system proxy before changing ports, then enable it again after saving.
+
+The test URL defaults to `https://www.gstatic.com/generate_204`, Mihomo's own default. The old saved default `http://www.gstatic.com/generate_204` moves to https on start; a URL you set yourself is kept. Over http some providers answer generate_204 at the entry relay, which reports a low delay that says nothing about the route. The timeout takes 500–32767 ms, the limit of Mihomo's delay route; a larger value saved earlier is sent as 32767. Mihomo records per test URL whether each node is alive, and url-test / fallback groups choose by that record; such a group without a `url` checks the default URL. So when the test URL is one a url-test / fallback group checks, terc tests with that group's timeout and `expected-status`, and never marks dead a node the group still uses.
 
 Process matching has a cost: Mihomo looks up the process behind each new connection synchronously before dialling, with no cache. The default `strict` mode looks it up only when rule matching reaches a process rule such as `PROCESS-NAME`; the Process name snippet (`find-process-mode: always`) looks it up for every TCP connection and every new UDP session. On Linux one lookup measured about 1–15 ms: the core scans `/proc/*/fd` of the same user's processes, so it slows with open files and is slowest for a late-started program (about 1.6 µs per file, which extrapolates to 10–30 ms with many more). On macOS it reads the whole TCP connection table, estimated at 0.3–2 ms and not measured. Private rules come before the AI preset and subscription rules, so one `PROCESS-NAME` rule makes every connection that no earlier private rule matched pay this cost, AI traffic included. Prefer a domain rule where one fits, and enable the Process name snippet only to see process names in Connections.
 
@@ -89,6 +93,15 @@ Settings → Tools → Snippets has two built-in DNS overlays for configs withou
 Both listen on `127.0.0.1:1053` only, so the LAN cannot use them as a resolver, carry no `fallback`, and keep `*.lan`, `+.local` and `localhost` out of fake-ip. A list the snippet names (`nameserver`, `fallback`, `fake-ip-filter` and so on) replaces the source's list as a whole; keys it does not name stay as the source wrote them. TUN DNS hijacking does not need the listener.
 
 The previous Fake-IP DNS snippet used foreign DoH with a fallback and listened on `0.0.0.0:1053`. If it was on, terc says so once at the first start after the upgrade; the new body applies from the next generated config. Enable Fake-IP DNS (global) to keep foreign DoH.
+
+## Nodes
+
+Groups are on the left and nodes on the right. Enter on a node switches to it.
+
+- `r` tests the current group. url-test / fallback groups test with their own `url`, `expected-status` and `timeout` (5000 ms by default), and the node list shows the delay the group ranks on: a node whose status misses `expected-status` shows as timed out, even though the delay route returned a number.
+- `a` chooses all countries or the connected node's country, then tests and switches to the fastest node. After all candidates, the five leaders (plus the current node) are tested twice more and compared by the median of three, so one timeout or one spike does not decide. The current node is kept when it is within 30 ms or 15% of the fastest, and the toast says so. Choosing a node by hand during the test cancels the pick instead of overriding you. Works on Selector, url-test and fallback groups.
+- On url-test / fallback groups, Enter and `a` pin the node: Mihomo uses it for as long as it is alive for the group's test URL, fails over to another node when it dies, and returns when it recovers. On these groups `a` always ends with a pin, also when it keeps the current node; otherwise url-test's next check could move the exit. A pinned node is marked `◆`; `◇` marks a pin that is down while the group uses another node, and the Nodes title reads "pin down, failed over".
+- `x` unpins a url-test / fallback group. It is sent even when no pin is shown: a fallback forgets a dead pin only in memory, and the saved one returns at the next reload.
 
 ## Connections
 

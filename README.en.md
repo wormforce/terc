@@ -112,9 +112,10 @@ Click a group to browse its nodes; click a node to activate it. Scrolling moves 
 | Dashboard | <kbd>K</kbd> | Start or stop the background `mihomo` process managed by terc |
 | Proxies | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Tab</kbd> | Switch focus between **Groups `[1]`** and **Nodes `[2]`** |
 | Any list | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd> | Move the selection |
-| Nodes | <kbd>Enter</kbd> | Activate the highlighted node in the current group |
+| Nodes | <kbd>Enter</kbd> | Activate the highlighted node in the current group; on url-test / fallback groups this pins it (`◆`, with automatic failover) |
 | Proxies | <kbd>r</kbd> | Run concurrent URL latency tests for the current group |
-| Proxies | <kbd>a</kbd> | Choose all countries or the connected node’s country, then test and select the fastest node |
+| Proxies | <kbd>a</kbd> | Choose all countries or the connected node’s country, then test, re-test the leaders and pick by median; a current node within 30 ms / 15% is kept |
+| Proxies | <kbd>x</kbd> | Unpin a url-test / fallback group, back to automatic choice |
 | Dashboard | <kbd>m</kbd> | Cycle routing mode (`Rule` → `Global` → `Direct`) |
 | Settings → Proxy subscriptions | Update subscription | Refresh the source and apply the selected routing plan |
 | Setup window | <kbd>Enter</kbd> | Save the subscription URL, write the config and start the core |
@@ -148,7 +149,7 @@ Install the core before submitting the first subscription (`Ctrl+D` in Setup dow
 
 Logs: `P` pauses/resumes display while capture continues, `/` searches, and Enter opens full text. Connections: Enter opens full details on narrow terminals. Results remain accessible with graphs hidden; `!` opens the full result and Backspace dismisses it. Help supports arrows and Page Up/Down.
 
-Best-node selection compares selectable proxy nodes in the current Selector group. Country hints come from the connected node’s flag, country name, or standalone country code, not IP geolocation. Unknown country or no reachable candidate leaves the current connection unchanged.
+Best-node selection compares selectable proxy nodes in the current Selector, url-test or fallback group; url-test / fallback groups are judged by their own test URL and expected status, and the result takes effect as a pin. Country hints come from the connected node’s flag, country name, or standalone country code, not IP geolocation. Unknown country or no reachable candidate leaves the current connection unchanged.
 
 ## Configuration
 

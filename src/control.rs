@@ -561,7 +561,12 @@ impl App {
             return;
         };
         self.set_status(&format!("{} {}", self.t("st_probe_busy"), peer.name), false);
-        test_node_async(self.config.controller.clone(), peer.name, self.tx.clone());
+        test_node_async(
+            self.config.controller.clone(),
+            peer.name,
+            self.snapshot.groups.clone(),
+            self.tx.clone(),
+        );
     }
 
     pub fn test_all_tunnels(&mut self) {
@@ -579,6 +584,7 @@ impl App {
             self.config.controller.clone(),
             "WireGuard".into(),
             names,
+            self.snapshot.groups.clone(),
             self.tx.clone(),
         );
     }

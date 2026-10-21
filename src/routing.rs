@@ -125,14 +125,7 @@ pub fn apply(
     if id == "subscription" {
         return Ok(base.into());
     }
-    let mut chunks = split_chunks(base);
-    let proxies: HashSet<String> = chunks
-        .iter()
-        .find(|c| c.key.as_deref() == Some("proxies"))
-        .map(crate::compose::clash_item_names)
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let proxies = node_names(&split_chunks(base));
     let yaml = if id == "all" {
         let name = crate::compose::pick_name("PROXY", &proxies);
         let group = json!({"name":name,"type":"select","include-all":true,"exclude-filter":crate::compose::INFO_EXCLUDE});
@@ -174,12 +167,30 @@ pub fn apply(
         .map_err(|e| e.to_string())?;
         plan.yaml
     };
+    merge_plan(base, &yaml)
+}
+
+fn node_names(chunks: &[YamlChunk]) -> HashSet<String> {
+    chunks
+        .iter()
+        .find(|c| c.key.as_deref() == Some("proxies"))
+        .map(crate::compose::clash_item_names)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// Puts the policy of a routing plan over `base`, whose nodes it draws on.
+fn merge_plan(base: &str, yaml: &str) -> Result<String, String> {
+    let mut chunks = split_chunks(base);
+    let proxies = node_names(&chunks);
     // Provider nodes are only known after the reload, so with providers a
-    // region filter is kept; matching nothing then fails closed.
+    // region filter is kept; matching nothing then fails closed through the
+    // `empty-fallback: REJECT` written beside it.
     let yaml = if has_providers(&chunks) {
-        yaml
+        yaml.to_string()
     } else {
-        drop_unmatched_regions(&yaml, &proxies)?
+        drop_unmatched_regions(yaml, &proxies)?
     };
     let yaml = avoid_names(&yaml, &proxies)?;
     chunks.retain(|c| !policy_key(c.key.as_deref()));
@@ -228,38 +239,134 @@ fn flow_parts(text: &str) -> Vec<String> {
     }
     parts
 }
-fn group_fields(lines: &[String]) -> Result<Vec<YamlChunk>, String> {
-    let first = lines[0].trim_start().trim_start_matches('-').trim();
-    if first.starts_with('{') {
-        let body = lines.iter().map(|s| s.trim()).collect::<Vec<_>>().join(" ");
-        let body = body.trim_start_matches('-').trim();
-        let inner = body
-            .strip_prefix('{')
-            .and_then(|s| s.strip_suffix('}'))
-            .ok_or("策略组格式不完整 / Incomplete group map")?;
-        return Ok(flow_parts(inner)
-            .into_iter()
-            .map(|field| {
-                let (key, value) = field
-                    .split_once(':')
-                    .ok_or("策略组字段无效 / Invalid group field")?;
-                let key = clean_scalar(key);
-                Ok(YamlChunk {
-                    key: Some(key.clone()),
-                    lines: vec![format!("{key}: {}", value.trim())],
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?);
+/// Splits `&name rest` into the anchor name and the rest.
+fn strip_anchor(text: &str) -> (Option<&str>, &str) {
+    match text.strip_prefix('&') {
+        Some(rest) => {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            (Some(&rest[..end]), rest[end..].trim_start())
+        }
+        None => (None, text),
     }
-    let indent = lines[0].len() - lines[0].trim_start().len() + 2;
-    let mut normalized = vec![first.to_string()];
-    normalized.extend(
-        lines
+}
+
+/// The fields of one group list item. An anchor on the item (`- &g {…}`)
+/// is returned so later groups can merge it.
+fn group_fields(lines: &[String]) -> Result<(Option<String>, Vec<YamlChunk>), String> {
+    let (anchor, first) = strip_anchor(lines[0].trim_start().trim_start_matches('-').trim());
+    let anchor = anchor.map(str::to_string);
+    if first.starts_with('{') {
+        let body = std::iter::once(first)
+            .chain(lines.iter().skip(1).map(|s| s.trim()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok((anchor, flow_fields(&body)?))
+    } else {
+        let indent = lines[0].len() - lines[0].trim_start().len() + 2;
+        let rest = lines
             .iter()
             .skip(1)
-            .map(|l| l.get(indent..).unwrap_or("").to_string()),
-    );
-    Ok(split_chunks(&normalized.join("\n")))
+            .map(|l| l.get(indent..).unwrap_or("").to_string());
+        let normalized: Vec<String> = std::iter::once(first.to_string())
+            .filter(|l| !l.is_empty())
+            .chain(rest)
+            .collect();
+        Ok((anchor, split_chunks(&normalized.join("\n"))))
+    }
+}
+/// The fields of a flow mapping `{key: value, …}`.
+fn flow_fields(body: &str) -> Result<Vec<YamlChunk>, String> {
+    let inner = body
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or("策略组格式不完整 / Incomplete group map")?;
+    flow_parts(inner)
+        .into_iter()
+        .map(|field| {
+            let (key, value) = field
+                .split_once(':')
+                .ok_or("策略组字段无效 / Invalid group field")?;
+            let key = clean_scalar(key);
+            Ok(YamlChunk {
+                key: Some(key.clone()),
+                lines: vec![format!("{key}: {}", value.trim())],
+            })
+        })
+        .collect()
+}
+/// Mappings anchored at the top level, such as `p: &p {type: url-test, …}`
+/// or `fb: &fb` over a block. A template keeps only policy keys, so groups
+/// that merge them with `<<: *p` are expanded instead of left dangling.
+fn top_anchors(chunks: &[YamlChunk]) -> HashMap<String, Vec<YamlChunk>> {
+    let mut anchors = HashMap::new();
+    for chunk in chunks {
+        let Some(value) = chunk.lines[0].split_once(':').map(|(_, v)| v.trim()) else {
+            continue;
+        };
+        let (Some(name), rest) = strip_anchor(value) else {
+            continue;
+        };
+        let rest = rest.split(" #").next().unwrap_or(rest).trim();
+        let fields = if rest.starts_with('{') {
+            let body = std::iter::once(rest)
+                .chain(chunk.lines.iter().skip(1).map(|s| s.trim()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            match flow_fields(&body) {
+                Ok(fields) => fields,
+                Err(_) => continue,
+            }
+        } else if rest.is_empty() {
+            let body: Vec<_> = chunk.lines.iter().skip(1).collect();
+            let indent = body
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| crate::ops::leading_spaces(l))
+                .min()
+                .unwrap_or(0);
+            let lines: Vec<_> = body.iter().map(|l| l.get(indent..).unwrap_or("")).collect();
+            split_chunks(&lines.join("\n"))
+        } else {
+            continue;
+        };
+        let mut fields: Vec<_> = fields.into_iter().filter(|f| f.key.is_some()).collect();
+        if expand_merges(&mut fields, &anchors).is_ok() {
+            anchors.insert(name.to_string(), fields);
+        }
+    }
+    anchors
+}
+/// Replaces `<<: *a` (or `<<: [*a, *b]`) with the anchored fields the group
+/// does not set itself, as YAML merge keys do; earlier merges win.
+fn expand_merges(
+    fields: &mut Vec<YamlChunk>,
+    anchors: &HashMap<String, Vec<YamlChunk>>,
+) -> Result<(), String> {
+    while let Some(i) = fields.iter().position(|f| f.key.as_deref() == Some("<<")) {
+        let value = fields[i].lines[0]
+            .split_once(':')
+            .map(|(_, v)| v.split(" #").next().unwrap_or(v).trim())
+            .unwrap_or("");
+        let aliases = match value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+            Some(inner) => flow_parts(inner),
+            None => vec![value.to_string()],
+        };
+        let mut merged: Vec<YamlChunk> = Vec::new();
+        for alias in aliases {
+            let source = alias
+                .strip_prefix('*')
+                .and_then(|name| anchors.get(name))
+                .ok_or_else(|| format!("策略组引用了未知锚点 / Unknown YAML anchor {alias}"))?;
+            for field in source {
+                let taken = |f: &YamlChunk| f.key == field.key;
+                if !fields.iter().any(taken) && !merged.iter().any(taken) {
+                    merged.push(field.clone());
+                }
+            }
+        }
+        fields.splice(i..=i, merged);
+    }
+    Ok(())
 }
 fn members(field: &YamlChunk) -> Result<Vec<String>, String> {
     let value = field.lines[0]
@@ -300,10 +407,13 @@ fn field_value(field: &YamlChunk) -> String {
     clean_scalar(value)
 }
 // Rewrite each group of a proxy-groups chunk as fields, keeping template layout.
+// Merge keys are expanded first, from `anchors` and from earlier groups.
 fn map_groups(
     groups: &YamlChunk,
+    anchors: &HashMap<String, Vec<YamlChunk>>,
     mut edit: impl FnMut(&mut Vec<YamlChunk>) -> Result<(), String>,
 ) -> Result<Vec<String>, String> {
+    let mut anchors = anchors.clone();
     let indent = groups
         .lines
         .iter()
@@ -324,7 +434,11 @@ fn map_groups(
     let mut output = vec!["proxy-groups:".into()];
     for (i, start) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(groups.lines.len());
-        let mut fields = group_fields(&groups.lines[*start..end])?;
+        let (anchor, mut fields) = group_fields(&groups.lines[*start..end])?;
+        expand_merges(&mut fields, &anchors)?;
+        if let Some(anchor) = anchor {
+            anchors.insert(anchor, fields.clone());
+        }
         edit(&mut fields)?;
         let lines = join_chunks(&fields);
         for (j, line) in lines.lines().enumerate() {
@@ -350,7 +464,8 @@ pub fn template(raw: &str) -> Result<String, String> {
                 "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS" | "COMPATIBLE" | "GLOBAL"
             )
     };
-    let output = map_groups(groups, |fields| {
+    let anchors = top_anchors(&chunks);
+    let output = map_groups(groups, &anchors, |fields| {
         let set = |fields: &Vec<YamlChunk>, keys: &[&str]| {
             fields.iter().any(|f| {
                 f.key.as_deref().is_some_and(|k| keys.contains(&k))
@@ -396,15 +511,21 @@ pub fn template(raw: &str) -> Result<String, String> {
         if all {
             return Ok(());
         }
-        // A regional group would otherwise rank every country's nodes.
-        if let Some(code) = (!filtered)
+        // A regional group would otherwise rank every country's nodes. The
+        // listed nodes say nothing about what providers added to the group.
+        if let Some(code) = (!filtered && !providers)
             .then(|| region(name.as_deref().unwrap_or(""), kind.as_deref(), &removed))
             .flatten()
         {
-            fields.retain(|f| f.key.as_deref() != Some("filter"));
+            fields.retain(|f| !matches!(f.key.as_deref(), Some("filter" | "empty-fallback")));
             fields.push(YamlChunk {
                 key: Some("filter".into()),
                 lines: vec![format!("filter: {}", json!(country_filter(&code)))],
+            });
+            // With no match Mihomo would use COMPATIBLE, a DIRECT dialer.
+            fields.push(YamlChunk {
+                key: Some("empty-fallback".into()),
+                lines: vec!["empty-fallback: REJECT".into()],
             });
         }
         // The group now draws on every node of whichever source the scheme is
@@ -464,15 +585,50 @@ fn region(name: &str, kind: Option<&str>, nodes: &[String]) -> Option<String> {
     }
 }
 
+/// Each group's `timeout:` in a config, merge keys included. Mihomo's
+/// group JSON leaves it out.
+pub(crate) fn group_timeouts(raw: &str) -> HashMap<String, u64> {
+    let chunks = split_chunks(raw);
+    let mut timeouts = HashMap::new();
+    let Some(groups) = chunks
+        .iter()
+        .find(|c| c.key.as_deref() == Some("proxy-groups"))
+    else {
+        return timeouts;
+    };
+    let _ = map_groups(groups, &top_anchors(&chunks), |fields| {
+        let value = |key: &str| {
+            fields
+                .iter()
+                .find(|f| f.key.as_deref() == Some(key))
+                .map(field_value)
+        };
+        if let (Some(name), Some(ms)) = (value("name"), value("timeout")) {
+            if let Ok(ms) = ms.parse::<u64>() {
+                timeouts.insert(name, ms);
+            }
+        }
+        Ok(())
+    });
+    timeouts
+}
+
+/// Lookbehind for a flag that starts a pair of regional indicators, so
+/// 🇦🇺🇸🇬 matches AU and SG but not the 🇺🇸 inside it.
+const FLAG_START: &str = "(?<=(?:^|[^🇦-🇿])(?:[🇦-🇿]{2})*)";
+
 /// A Mihomo (regexp2) filter for the labels country_hint reads as `code`.
 /// ASCII aliases are whole tokens between non-letters, so `US01` matches
-/// where `\bUS\b` would not. Codes outside the alias table come from flags.
+/// where `\bUS\b` would not. A bare code is matched as US or us, not as the
+/// word "Us", and GB after a number is a traffic size. Codes outside the
+/// alias table come from flags.
 fn country_filter(code: &str) -> String {
     let token = |word: String| format!("(?<![a-z]){word}(?![a-z])");
-    let mut parts = vec![code
+    let flag: String = code
         .bytes()
         .filter_map(|b| char::from_u32(0x1f1e6 + u32::from(b.wrapping_sub(b'A'))))
-        .collect::<String>()];
+        .collect();
+    let mut parts = vec![format!("{FLAG_START}{flag}")];
     if let Some((_, aliases)) = crate::best::COUNTRIES.iter().find(|(c, _)| *c == code) {
         parts.extend(aliases.iter().map(|alias| {
             if alias.is_ascii() {
@@ -483,7 +639,8 @@ fn country_filter(code: &str) -> String {
                 alias.to_string()
             }
         }));
-        parts.push(token(code.to_lowercase()));
+        let size = if code == "GB" { "(?<![0-9]\\s*)" } else { "" };
+        parts.push(token(format!("{size}(?-i:{code}|{})", code.to_lowercase())));
     }
     format!("(?i)({})", parts.join("|"))
 }
@@ -495,9 +652,11 @@ fn has_providers(chunks: &[YamlChunk]) -> bool {
     })
 }
 
-/// A region filter matching no node leaves its group with only COMPATIBLE,
-/// so it is dropped and the group draws on every node again. Only filters
-/// written by template() are judged, and only against nodes in the YAML.
+/// A region filter matching no node leaves its group with only REJECT, so it
+/// is dropped and the group draws on every node again. Only filters written
+/// by template() are judged, and only against nodes in the YAML that the
+/// info part of the exclude-filter keeps; a group whose own exclude-filter
+/// drops the rest still fails closed.
 fn drop_unmatched_regions(yaml: &str, proxies: &HashSet<String>) -> Result<String, String> {
     let mut chunks = split_chunks(yaml);
     let Some(groups) = chunks
@@ -507,7 +666,7 @@ fn drop_unmatched_regions(yaml: &str, proxies: &HashSet<String>) -> Result<Strin
         return Ok(yaml.into());
     };
     let mut changed = false;
-    let output = map_groups(groups, |fields| {
+    let output = map_groups(groups, &HashMap::new(), |fields| {
         let Some(i) = fields
             .iter()
             .position(|f| f.key.as_deref() == Some("filter"))
@@ -518,6 +677,7 @@ fn drop_unmatched_regions(yaml: &str, proxies: &HashSet<String>) -> Result<Strin
         // The flag leads every filter country_filter writes.
         let code: String = value
             .strip_prefix("(?i)(")
+            .and_then(|v| v.strip_prefix(FLAG_START))
             .unwrap_or("")
             .chars()
             .take(2)
@@ -528,7 +688,9 @@ fn drop_unmatched_regions(yaml: &str, proxies: &HashSet<String>) -> Result<Strin
             return Ok(());
         };
         if !proxies.iter().any(|n| {
-            !crate::mihomo::is_info_pseudo_node(n) && crate::best::country_hits(n).contains(&code)
+            !crate::mihomo::is_info_pseudo_node(n)
+                && !crate::compose::info_excluded(n)
+                && crate::best::country_hits(n).contains(&code)
         }) {
             fields.remove(i);
             changed = true;
@@ -604,7 +766,7 @@ fn avoid_names(yaml: &str, proxies: &HashSet<String>) -> Result<String, String> 
     if renames.is_empty() {
         return Ok(yaml.into());
     }
-    let output = map_groups(groups, |fields| {
+    let output = map_groups(groups, &HashMap::new(), |fields| {
         for field in fields.iter_mut() {
             match field.key.as_deref() {
                 Some("name") => {
@@ -713,12 +875,17 @@ mod tests {
 
     #[test]
     fn region_filters_mirror_country_hint_tokens() {
+        // Checked against regexp2 1.12, as Mihomo uses it: matches US01,
+        // us-02, United States 2 and HK-US relay; not Us Home, LAXUS-01,
+        // Russia, Plus or the 🇺🇸 inside 🇦🇺🇸🇬.
         assert_eq!(
             country_filter("US"),
-            "(?i)(🇺🇸|美国|美國|(?<![a-z])united[^a-z]+states(?![a-z])|(?<![a-z])usa(?![a-z])|(?<![a-z])us(?![a-z]))"
+            "(?i)((?<=(?:^|[^🇦-🇿])(?:[🇦-🇿]{2})*)🇺🇸|美国|美國|(?<![a-z])united[^a-z]+states(?![a-z])|(?<![a-z])usa(?![a-z])|(?<![a-z])(?-i:US|us)(?![a-z]))"
         );
         assert!(country_filter("IN").contains("|印度(?!尼西)|"));
-        assert_eq!(country_filter("IT"), "(?i)(🇮🇹)");
+        // GB right after a number is a traffic size, as in "100 GB".
+        assert!(country_filter("GB").ends_with("|(?<![a-z])(?<![0-9]\\s*)(?-i:GB|gb)(?![a-z]))"));
+        assert_eq!(country_filter("IT"), format!("(?i)({FLAG_START}🇮🇹)"));
     }
 
     #[test]
@@ -762,7 +929,7 @@ mod tests {
         let flag = "proxies:\n  - {name: 🇮🇹 Milan, type: ss}\nproxy-groups:\n  - {name: Italy, type: fallback, proxies: [🇮🇹 Milan]}\nrules:\n  - MATCH,Italy\n";
         let route = template(flag).unwrap();
         assert!(
-            route.contains(&format!("filter: {}", json!("(?i)(🇮🇹)"))),
+            route.contains(&format!("filter: {}", json!(country_filter("IT")))),
             "{route}"
         );
         let out = drop_unmatched_regions(&route, &nodes(&["US01"])).unwrap();
@@ -773,6 +940,99 @@ mod tests {
         assert!(has_providers(&chunks));
         chunks.retain(|c| c.key.as_deref() != Some("proxy-providers"));
         assert!(!has_providers(&chunks));
+        // The only US-labelled node is one the info exclude-filter drops.
+        let route = template(doc).unwrap();
+        let out = drop_unmatched_regions(&route, &nodes(&["官网 example.us", "HK1"])).unwrap();
+        assert!(!group(&out, "US").contains(&region), "{out}");
+    }
+
+    #[test]
+    fn region_groups_fail_closed_when_a_provider_target_has_no_match() {
+        // Saved from a source whose US group listed US nodes.
+        let doc = "proxies:\n  - {name: US01, type: ss}\n  - {name: HK01, type: ss}\nproxy-groups:\n  - {name: 🇺🇸 美国, type: url-test, proxies: [US01]}\n  - {name: Sel, type: select, proxies: [🇺🇸 美国, HK01]}\nrules:\n  - MATCH,Sel\n";
+        let plan = template(doc).unwrap();
+        let region = format!("    filter: {}", json!(country_filter("US")));
+        // Applied to a provider source whose US nodes are named by city:
+        // the filter stays, and Mihomo's empty fallback is REJECT, not the
+        // COMPATIBLE dialer that would send AI traffic out directly.
+        let providers = "proxies:\n  - {name: 洛杉矶 01, type: ss}\nproxy-providers:\n  Air:\n    type: http\n    url: https://airport.test/sub\nproxy-groups:\n  - {name: G, type: select, proxies: [洛杉矶 01]}\nrules:\n  - MATCH,G\n";
+        let out = merge_plan(providers, &plan).unwrap();
+        let us = group(&out, "🇺🇸 美国");
+        assert!(
+            us.contains(&region) && us.contains("empty-fallback: REJECT"),
+            "{us}"
+        );
+        assert!(
+            out.contains("proxy-providers:") && !out.contains("name: G"),
+            "{out}"
+        );
+        // Without providers the same filter is judged against the nodes.
+        let plain = "proxies:\n  - {name: 洛杉矶 01, type: ss}\nproxy-groups:\n  - {name: G, type: select, proxies: [洛杉矶 01]}\nrules:\n  - MATCH,G\n";
+        let out = merge_plan(plain, &plan).unwrap();
+        assert!(!group(&out, "🇺🇸 美国").contains(&region), "{out}");
+        let plain = plain.replace("洛杉矶 01", "US 洛杉矶 01");
+        let out = merge_plan(&plain, &plan).unwrap();
+        assert!(group(&out, "🇺🇸 美国").contains(&region), "{out}");
+    }
+
+    #[test]
+    fn groups_that_drew_on_providers_keep_every_country() {
+        let doc = "proxies:\n  - {name: US 自建, type: ss}\nproxy-providers:\n  Air:\n    type: http\n    url: https://airport.test/sub\nproxy-groups:\n  - {name: ♻️ 自动选择, type: url-test, use: [Air], proxies: [US 自建]}\n  - name: Auto2\n    type: url-test\n    include-all-providers: true\n    proxies: [US 自建]\nrules:\n  - MATCH,♻️ 自动选择\n";
+        let route = template(doc).unwrap();
+        for name in ["♻️ 自动选择", "Auto2"] {
+            let g = group(&route, name);
+            assert!(
+                g.contains("include-all: true") && !g.contains("    filter:"),
+                "{g}"
+            );
+        }
+    }
+
+    #[test]
+    fn templates_expand_merge_keys_from_anchors() {
+        let doc = "p: &p {type: url-test, url: 'https://cp.test/204', interval: 300, timeout: 2000}\nfb: &fb\n  type: fallback\n  interval: 600\nproxies:\n  - {name: 🇭🇰 香港 01, type: ss}\n  - {name: 🇭🇰 香港 02, type: ss}\n  - {name: 🇺🇸 美国 01, type: ss}\nproxy-groups:\n  - {name: 🇭🇰 香港节点, <<: *p, proxies: [🇭🇰 香港 01, 🇭🇰 香港 02]}\n  - name: 🇺🇸 美国节点\n    <<: *fb\n    interval: 120\n    proxies:\n      - 🇺🇸 美国 01\n  - &sel {name: Sel, type: select, proxies: [🇭🇰 香港节点, 🇺🇸 美国节点]}\n  - {name: Sel2, <<: *sel}\nrules:\n  - MATCH,Sel\n";
+        let route = template(doc).unwrap();
+        for anchor in ["<<", "*p", "*fb", "*sel", "&sel"] {
+            assert!(!route.contains(anchor), "{route}");
+        }
+        let hk = group(&route, "🇭🇰 香港节点");
+        assert!(
+            hk.contains("type: url-test") && hk.contains("timeout: 2000"),
+            "{hk}"
+        );
+        assert!(
+            hk.contains(&format!("    filter: {}", json!(country_filter("HK")))),
+            "{hk}"
+        );
+        let us = group(&route, "🇺🇸 美国节点");
+        // The group's own key wins over the merged one.
+        assert!(
+            us.contains("type: fallback") && us.contains("interval: 120"),
+            "{us}"
+        );
+        assert!(!us.contains("interval: 600"), "{us}");
+        assert!(
+            us.contains(&format!("    filter: {}", json!(country_filter("US")))),
+            "{us}"
+        );
+        let sel2 = group(&route, "Sel2");
+        assert!(
+            sel2.contains("type: select") && sel2.contains("[\"🇭🇰 香港节点\",\"🇺🇸 美国节点\"]"),
+            "{sel2}"
+        );
+        // Applied to another source, the plan no longer names the anchors.
+        let other = "proxies:\n  - {name: HK9, type: ss}\nproxy-groups:\n  - {name: G, type: select, proxies: [HK9]}\nrules:\n  - MATCH,G\n";
+        let out = merge_plan(other, &route).unwrap();
+        assert!(!out.contains("*p") && !out.contains("*fb"), "{out}");
+        assert_eq!(
+            group_timeouts(doc),
+            HashMap::from([("🇭🇰 香港节点".to_string(), 2000)])
+        );
+        assert!(
+            template("proxy-groups:\n  - {name: A, <<: *missing}\nrules:\n  - MATCH,A\n")
+                .unwrap_err()
+                .contains("missing")
+        );
     }
 
     #[test]
