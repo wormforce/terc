@@ -858,7 +858,17 @@ impl App {
                 self.set_status(self.t("setup_err_scheme"), true);
                 return;
             }
-            let dir = crate::compose::profile_dir(&self.config.controller);
+            let name = crate::subconv::parse_node_line(url.lines().next().unwrap_or(""))
+                .ok()
+                .and_then(|n| n["name"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "导入代理".into());
+            let dir = match self.setup_source_dir(name, "proxy", "") {
+                Ok(dir) => dir,
+                Err(err) => {
+                    self.set_status(&err, true);
+                    return;
+                }
+            };
             let mut added = 0;
             let mut last_err = String::new();
             for line in url.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -877,11 +887,39 @@ impl App {
             return;
         }
         let url = url.split_whitespace().next().unwrap_or("").to_string();
+        let name = storage::label("", &url, "new");
+        if let Err(err) = self.setup_source_dir(name, "subscription", &url) {
+            self.set_status(&err, true);
+            return;
+        }
         self.config.controller.subscription_url = url;
         self.save_profile_source();
         self.save_preferences();
         self.setup_phase = SetupPhase::Fetching;
         self.update_subscription();
+    }
+
+    /// Where Setup stores what it was given. A fresh install has no source
+    /// yet, and `profile_dir` would then be the pre-0.2 `~/.config/terc`,
+    /// which Sources & Routing does not list; so a new source is created
+    /// under `sources/` and made active first.
+    fn setup_source_dir(&mut self, name: String, kind: &str, url: &str) -> Result<PathBuf, String> {
+        if self.config.controller.profile_id.is_empty() {
+            let id = storage::next_id();
+            let record = crate::compose::ProfileSource {
+                name,
+                subscription_url: url.into(),
+                kind: kind.into(),
+                routing: "subscription".into(),
+                ..Default::default()
+            };
+            record.save(&storage::root().join(&id))?;
+            self.config.controller.profile_id = id.clone();
+            self.config.active_profile_label = record.name;
+            self.config.active_profile = id;
+            self.save_preferences();
+        }
+        Ok(crate::compose::profile_dir(&self.config.controller))
     }
 
     /// The built-in `dns-fakeip` module switched from foreign DoH with a
