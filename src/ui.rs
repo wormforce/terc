@@ -849,13 +849,15 @@ fn draw_groups_panel(frame: &mut Frame, app: &mut App, area: Rect) {
 
             let left = format!("{prefix}{}", g.name);
             let right = g.now.clone();
+            let pin = pin_marker(g);
             let left_w = left.width();
-            let right_w = right.width();
+            let right_w = right.width() + pin.width();
             let gap = max_w.saturating_sub(left_w + right_w).max(1);
 
             ListItem::new(Line::from(vec![
                 Span::styled(left, name_style),
                 Span::raw(" ".repeat(gap)),
+                Span::styled(pin, Style::default().fg(theme.accent)),
                 Span::styled(right, now_style),
             ]))
             .style(if selected && focused {
@@ -877,6 +879,17 @@ fn draw_groups_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// `◆ ` while the pinned node is in use, `◇ ` once the group failed over.
+fn pin_marker(group: &ProxyGroup) -> &'static str {
+    if group.fixed.is_empty() {
+        ""
+    } else if group.fixed == group.now {
+        "◆ "
+    } else {
+        "◇ "
+    }
+}
+
 fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme();
     let focused = app.focus == FocusPane::Nodes;
@@ -885,6 +898,19 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let title_str = match current_group {
         Some(g) => format!("{}  {} ({})", app.t("nodes"), g.name, g.all.len()),
         None => app.t("nodes").to_string(),
+    };
+    // Mihomo honours the pin only while it passes the group's own test URL.
+    let pin_note = match current_group {
+        Some(g) if !g.fixed.is_empty() => format!(
+            "  {}{}",
+            pin_marker(g),
+            if g.fixed == g.now {
+                app.t("pin_note")
+            } else {
+                app.t("pin_ignored")
+            }
+        ),
+        _ => String::new(),
     };
     let title = Line::from(vec![
         Span::styled(
@@ -897,6 +923,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             title_str,
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(pin_note, Style::default().fg(theme.muted)),
     ]);
 
     let inner = draw_panel(frame, area, theme, Some(title), focused);
@@ -928,6 +955,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|(idx, node_name)| {
             let selected = idx == app.node_index;
             let is_active = &group.now == node_name;
+            let is_pinned = &group.fixed == node_name;
             let is_info = is_info_pseudo_node(node_name);
 
             let cursor = if selected && focused {
@@ -939,6 +967,10 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let radio = if is_info {
                 "ℹ "
+            } else if is_pinned && is_active {
+                "◆ "
+            } else if is_pinned {
+                "◇ "
             } else if is_active {
                 "● "
             } else {
@@ -967,7 +999,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(theme.text)
             };
 
-            let radio_style = if is_active {
+            let radio_style = if is_active || is_pinned {
                 Style::default()
                     .fg(theme.accent)
                     .add_modifier(Modifier::BOLD)
@@ -1392,6 +1424,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("m", app.t("help_m")),
         ("r", app.t("help_r")),
         ("a", app.t("help_a")),
+        ("p: x", app.t("help_unpin")),
         ("Enter", app.t("help_enter")),
         ("↑↓ jk", app.t("help_jk")),
         ("c / L / p", app.t("help_tabs")),

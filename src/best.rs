@@ -150,6 +150,7 @@ mod tests {
             name: "Main".into(),
             kind: "Selector".into(),
             now: "JP 01".into(),
+            fixed: String::new(),
             all: names.iter().map(|s| s.to_string()).collect(),
         });
         for name in names {
@@ -186,6 +187,7 @@ mod tests {
             name: "Nested".into(),
             kind: "Selector".into(),
             now: "US 01".into(),
+            fixed: String::new(),
             all: vec!["US 01".into()],
         });
         snapshot.groups[0].now = "Nested".into();

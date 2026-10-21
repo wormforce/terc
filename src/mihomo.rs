@@ -196,7 +196,17 @@ pub struct ProxyGroup {
     pub name: String,
     pub kind: String,
     pub now: String,
+    /// Node pinned on a url-test/fallback group; Mihomo keeps using it while
+    /// it is alive for the group's own test URL, so `now` can differ.
+    pub fixed: String,
     pub all: Vec<String>,
+}
+
+impl ProxyGroup {
+    /// Groups where a PUT pins a node instead of selecting it.
+    pub fn pinnable(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("urltest") || self.kind.eq_ignore_ascii_case("fallback")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1633,6 +1643,62 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn url_test_and_fallback_groups_carry_their_pin() {
+        let proxies = r#"{"proxies":{
+            "PROXY":{"type":"Selector","all":["Auto","JP 01"],"now":"Auto"},
+            "Auto":{"type":"URLTest","all":["JP 01","US 01"],"now":"US 01","fixed":"JP 01"},
+            "Safe":{"type":"Fallback","all":["JP 01","US 01"],"now":"JP 01","fixed":""}}}"#;
+        let (cfg, _) = controller(vec![
+            ("/version", r#"{"version":"v1.19.28"}"#.into()),
+            ("/proxies", proxies.into()),
+        ]);
+        let snap = fetch_snapshot(&cfg);
+        let group = |name: &str| snap.groups.iter().find(|g| g.name == name).unwrap();
+        let auto = group("Auto");
+        assert_eq!((auto.fixed.as_str(), auto.now.as_str()), ("JP 01", "US 01"));
+        assert!(auto.pinnable());
+        assert!(group("Safe").fixed.is_empty() && group("Safe").pinnable());
+        assert!(group("PROXY").fixed.is_empty() && !group("PROXY").pinnable());
+    }
+
+    #[test]
+    fn unpin_deletes_the_group_pin() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            ..ControllerConfig::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for status in [204, 400] {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                tx.send(first.trim_end().to_string()).unwrap();
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        unpin_group(&cfg, "Auto 自动").unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            "DELETE /proxies/Auto%20%E8%87%AA%E5%8A%A8 HTTP/1.1"
+        );
+        // A Selector answers 400: the error reaches the status line.
+        assert!(unpin_group(&cfg, "PROXY").is_err());
+        assert_eq!(rx.recv().unwrap(), "DELETE /proxies/PROXY HTTP/1.1");
+    }
+
+    #[test]
     fn skipped_parts_carry_over_with_provider_nodes_and_their_delays() {
         let (cfg, _) = controller(routes());
         let mut old = fetch_snapshot(&cfg);
@@ -1955,10 +2021,16 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
+                        let fixed = item
+                            .get("fixed")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         groups.push(ProxyGroup {
                             name: name.clone(),
                             kind: kind.clone(),
                             now,
+                            fixed,
                             all,
                         });
                     }
@@ -2240,6 +2312,24 @@ pub fn select_group_node(cfg: &ControllerConfig, group: &str, node: &str) -> io:
         "PUT",
         &path,
         Some(&body),
+        Duration::from_millis(1200),
+    )?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("HTTP {status}")))
+    }
+}
+
+/// Clears the pin a PUT left on a url-test/fallback group.
+pub fn unpin_group(cfg: &ControllerConfig, group: &str) -> io::Result<()> {
+    let path = format!("/proxies/{}", percent_encode(group));
+    let (status, _) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "DELETE",
+        &path,
+        None,
         Duration::from_millis(1200),
     )?;
     if (200..300).contains(&status) {

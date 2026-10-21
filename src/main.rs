@@ -1393,9 +1393,35 @@ impl App {
         }
         let group_name = group.name.clone();
         let node_name = node.clone();
-        self.run_action("Switching node…", None, None, move |cfg| {
+        // On url-test/fallback the same PUT pins the node, so say so.
+        let (label, note) = if group.pinnable() {
+            (self.t("pin_setting"), format!("  {}", self.t("pin_note")))
+        } else {
+            ("Switching node…", String::new())
+        };
+        self.run_action(label, None, None, move |cfg| {
             select_group_node(&cfg, &group_name, &node_name).map_err(|e| e.to_string())?;
-            Ok(format!("{group_name} › {node_name}"))
+            Ok(format!("{group_name} › {node_name}{note}"))
+        });
+    }
+
+    pub fn unpin_selected_group(&mut self) {
+        let Some(group) = self.snapshot.groups.get(self.group_index) else {
+            return;
+        };
+        if !group.pinnable() {
+            self.set_status(self.t("pin_unpinnable"), true);
+            return;
+        }
+        if group.fixed.is_empty() {
+            self.set_status(self.t("pin_none"), false);
+            return;
+        }
+        let group_name = group.name.clone();
+        let done = self.t("pin_cleared");
+        self.run_action(self.t("pin_clearing"), None, None, move |cfg| {
+            mihomo::unpin_group(&cfg, &group_name).map_err(|e| e.to_string())?;
+            Ok(format!("{group_name}  {done}"))
         });
     }
 
@@ -1431,9 +1457,10 @@ impl App {
         let Some(group) = self.snapshot.groups.get(self.group_index) else {
             return;
         };
-        if !group.kind.eq_ignore_ascii_case("selector") {
+        // url-test/fallback take the pick as a pin with automatic failover.
+        if !group.kind.eq_ignore_ascii_case("selector") && !group.pinnable() {
             self.set_status(
-                "请选择可手动切换的策略组 / Select a manual Selector group",
+                "请选择 Selector / url-test / fallback 策略组 / Select a Selector, url-test or fallback group",
                 true,
             );
             return;
@@ -1832,6 +1859,30 @@ impl App {
             (_, "help_enter") => "Activate highlighted node in current group",
             (_, "help_r") => "Concurrent URL latency test for current group",
             (Lang::Zh, "help_a") => "选择全球或当前国家范围，测速后优选",
+            (Lang::Zh, "help_unpin") => "取消 url-test / fallback 组的固定（Enter 或 a 会固定节点）",
+            (Lang::En, "help_unpin") => "Unpin a url-test / fallback group (Enter or a pins a node)",
+            (Lang::Ja, "help_unpin") => "url-test / fallback の固定を解除（Enter か a で固定）",
+            (Lang::Zh, "pin_setting") => "正在固定节点…",
+            (Lang::En, "pin_setting") => "Pinning node…",
+            (Lang::Ja, "pin_setting") => "ノードを固定中…",
+            (Lang::Zh, "pin_note") => "已固定，失效时自动切换",
+            (Lang::En, "pin_note") => "pinned, auto-failover",
+            (Lang::Ja, "pin_note") => "固定・障害時は自動切替",
+            (Lang::Zh, "pin_ignored") => "固定节点不可用，已切换",
+            (Lang::En, "pin_ignored") => "pin down, failed over",
+            (Lang::Ja, "pin_ignored") => "固定先不通・切替中",
+            (Lang::Zh, "pin_none") => "此策略组未固定节点",
+            (Lang::En, "pin_none") => "No pinned node in this group",
+            (Lang::Ja, "pin_none") => "このグループは固定なし",
+            (Lang::Zh, "pin_clearing") => "正在取消固定…",
+            (Lang::En, "pin_clearing") => "Unpinning…",
+            (Lang::Ja, "pin_clearing") => "固定を解除中…",
+            (Lang::Zh, "pin_cleared") => "已取消固定，恢复自动选择",
+            (Lang::En, "pin_cleared") => "unpinned, automatic choice again",
+            (Lang::Ja, "pin_cleared") => "固定解除・自動選択に戻りました",
+            (Lang::Zh, "pin_unpinnable") => "仅 url-test / fallback 策略组可固定",
+            (Lang::En, "pin_unpinnable") => "Only url-test / fallback groups can be pinned",
+            (Lang::Ja, "pin_unpinnable") => "固定できるのは url-test / fallback のみ",
             (_, "help_a") => "Choose all countries or current country, test and select fastest",
             (_, "help_m") => "Cycle routing mode (Rule / Global / Direct)",
             (Lang::Zh, "help_u") => "更新当前方案的订阅，保留来源规则与策略组，校验后重载",
@@ -2744,6 +2795,7 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             app.connection_detail = false;
         }
         KeyCode::Char('x') if app.main_tab == MainTab::Rules => app.toggle_selected_rule(),
+        KeyCode::Char('x') if app.main_tab == MainTab::Proxies => app.unpin_selected_group(),
         KeyCode::Char('x') if app.main_tab == MainTab::Connections && !app.conn_closed_view => {
             if let Some(c) = app.selected_connection() {
                 let id = c.id.clone();
@@ -3462,6 +3514,7 @@ mod tests {
             name: "Main".into(),
             kind: "Selector".into(),
             now: "Unknown".into(),
+            fixed: String::new(),
             all: vec!["US 01".into()],
         });
         for (width, height) in [(42, 12), (80, 24)] {
@@ -3480,6 +3533,118 @@ mod tests {
         }
     }
 
+    /// Serves `count` requests with 204 and passes each request line back.
+    fn pin_controller(app: &mut App, count: usize) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        app.config.controller.addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten().take(count) {
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let _ = tx.send(first.trim_end().to_string());
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 204 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        rx
+    }
+
+    fn pinned_group(kind: &str, fixed: &str) -> mihomo::ProxyGroup {
+        mihomo::ProxyGroup {
+            name: "Auto".into(),
+            kind: kind.into(),
+            now: "US 01".into(),
+            fixed: fixed.into(),
+            all: vec!["JP 01".into(), "US 01".into()],
+        }
+    }
+
+    #[test]
+    fn x_unpins_url_test_and_fallback_groups_only() {
+        let mut app = offline_app();
+        app.snapshot.groups.push(pinned_group("Selector", ""));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.status_is_error && !app.action_busy);
+
+        app.snapshot.groups[0] = pinned_group("URLTest", "");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.status_is_error && !app.action_busy);
+        assert_eq!(app.status_message, app.t("pin_none"));
+
+        let rx = pin_controller(&mut app, 1);
+        app.snapshot.groups[0] = pinned_group("Fallback", "JP 01");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.action_busy);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "DELETE /proxies/Auto HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn best_pick_pins_url_test_groups() {
+        let mut app = offline_app();
+        app.snapshot.groups.push(pinned_group("URLTest", ""));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.overlay, Overlay::Best);
+        press(&mut app, KeyCode::Enter);
+        // No candidate nodes are known, but the group itself is accepted.
+        assert_eq!(
+            app.status_message,
+            "范围内没有可选代理节点 / No selectable proxy nodes in this scope"
+        );
+
+        // Enter on a url-test node pins it and says so.
+        let rx = pin_controller(&mut app, 1);
+        app.overlay = Overlay::None;
+        app.clear_status();
+        app.focus = FocusPane::Nodes;
+        app.node_index = 0;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status_message, app.t("pin_setting"));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "PUT /proxies/Auto HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn pinned_groups_show_the_pin_and_the_node_in_use() {
+        let mut app = offline_app();
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            // Pin honoured: the pinned node is the one in use.
+            app.snapshot.groups = vec![pinned_group("URLTest", "US 01")];
+            let view = render_text(&mut app, 80, 24);
+            assert!(view.contains("◆US01"), "{view}");
+            assert!(view.contains(&app.t("pin_note").replace(' ', "")), "{view}");
+            // Pin ignored: both the pin and the fallback node are shown.
+            app.snapshot.groups[0].fixed = "JP 01".into();
+            let view = render_text(&mut app, 80, 24);
+            assert!(view.contains("◇JP01"), "{view}");
+            assert!(view.contains("●US01"), "{view}");
+            assert!(
+                view.contains(&app.t("pin_ignored").replace(' ', "")),
+                "{view}"
+            );
+            // Unpinned: no marker at all.
+            app.snapshot.groups[0].fixed.clear();
+            let view = render_text(&mut app, 80, 24);
+            assert!(!view.contains('◆') && !view.contains('◇'), "{view}");
+        }
+    }
+
     #[test]
     fn toast_expires_without_moving_lists_and_keeps_full_result() {
         let mut app = offline_app();
@@ -3487,6 +3652,7 @@ mod tests {
             name: "Group".into(),
             kind: "Selector".into(),
             now: "node".into(),
+            fixed: String::new(),
             all: vec!["node".into()],
         });
         render_text(&mut app, 80, 24);
@@ -3516,6 +3682,7 @@ mod tests {
                 name: format!("Group{i}"),
                 kind: "Selector".into(),
                 now: "Node0".into(),
+                fixed: String::new(),
                 all: (0..40).map(|n| format!("Node{n}")).collect(),
             })
             .collect();
@@ -4096,6 +4263,7 @@ mod tests {
             name: "AUTO".into(),
             kind: "URLTest".into(),
             now: String::new(),
+            fixed: String::new(),
             all: vec![],
         });
         press(&mut app, KeyCode::Char(' '));
