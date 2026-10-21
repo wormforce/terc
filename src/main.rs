@@ -1245,7 +1245,8 @@ impl App {
             "Fetching and validating subscription…",
             None,
             None,
-            move |cfg| mihomo::regenerate_config(&cfg, &modules, running, true, zh),
+            // An unchanged result refreshes HTTP proxy providers in place.
+            move |cfg| mihomo::update_subscription(&cfg, &modules, running, zh),
         );
     }
 

@@ -2173,6 +2173,56 @@ pub fn regenerate_config(
     regenerate_routing(cfg, modules, running, refresh, zh, None)
 }
 
+/// `u`: download the subscription and regenerate. The outer document of a
+/// provider-style subscription rarely changes, and a reload would only
+/// re-read the providers' cached files while dropping their connections, so
+/// an unchanged result refreshes the HTTP proxy providers in place instead.
+/// After a reload Mihomo already pulls any provider whose cache is stale.
+pub fn update_subscription(
+    cfg: &ControllerConfig,
+    modules: &[crate::ops::ModuleSnippet],
+    running: bool,
+    zh: bool,
+) -> Result<String, String> {
+    let (message, reloaded) = regenerate_outcome(cfg, modules, running, true, zh, None)?;
+    Ok(match refresh_after_regenerate(cfg, running, reloaded) {
+        Some((ok, 0)) if zh => format!("{message}；已更新 {ok} 个订阅提供者"),
+        Some((ok, failed)) if zh => {
+            format!("{message}；订阅提供者更新 {ok} 个，失败 {failed} 个")
+        }
+        Some((ok, failed)) => format!("{message}; providers {ok} updated  {failed} failed"),
+        None => message,
+    })
+}
+
+/// Refresh the HTTP proxy providers the core lists, when regenerating left
+/// the running config untouched. `None` when there was nothing to refresh.
+fn refresh_after_regenerate(
+    cfg: &ControllerConfig,
+    running: bool,
+    reloaded: bool,
+) -> Option<(usize, usize)> {
+    if !running || reloaded {
+        return None;
+    }
+    let (status, body) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "GET",
+        "/providers/proxies",
+        None,
+        Duration::from_millis(cfg.timeout_ms.max(1500)),
+    )
+    .ok()?;
+    let list: Vec<(String, String)> = parse_providers_json(&body, "proxy")
+        .into_iter()
+        .filter(|p| status == 200 && refreshable_provider(p))
+        .filter(|p| p.vehicle.eq_ignore_ascii_case("HTTP"))
+        .map(|p| (p.kind, p.name))
+        .collect();
+    (!list.is_empty()).then(|| refresh_providers(cfg, &list))
+}
+
 pub fn regenerate_routing(
     cfg: &ControllerConfig,
     modules: &[crate::ops::ModuleSnippet],
@@ -2181,6 +2231,18 @@ pub fn regenerate_routing(
     zh: bool,
     selection: Option<&str>,
 ) -> Result<String, String> {
+    regenerate_outcome(cfg, modules, running, refresh, zh, selection).map(|(message, _)| message)
+}
+
+/// The status message and whether the core was reloaded.
+fn regenerate_outcome(
+    cfg: &ControllerConfig,
+    modules: &[crate::ops::ModuleSnippet],
+    running: bool,
+    refresh: bool,
+    zh: bool,
+    selection: Option<&str>,
+) -> Result<(String, bool), String> {
     use crate::compose;
     let dir = compose::profile_dir(cfg);
     let old = read_config_text(cfg).ok();
@@ -2321,7 +2383,10 @@ pub fn regenerate_routing(
         (true, false, true) => " — 已校验保存，内核未运行",
         (true, false, false) => " — validated & saved; core stopped",
     };
-    Ok(format!("{}{tail}{}", report.summary(zh), report.details()))
+    Ok((
+        format!("{}{tail}{}", report.summary(zh), report.details()),
+        reload && running,
+    ))
 }
 
 /// Validate before replacing the active file. Keep disk and runtime on the old
@@ -4004,6 +4069,36 @@ mod provider_tests {
         assert!(puts.contains(&&"PUT /providers/proxies/air HTTP/1.1".to_string()));
         // The list came from the UI, so no snapshot is fetched before the PUTs.
         assert!(lines[0].starts_with("PUT "), "{lines:?}");
+    }
+
+    #[test]
+    fn unchanged_update_refreshes_only_http_proxy_providers() {
+        let mock = recorder(Duration::ZERO, |path| match path {
+            "/providers/proxies" => (
+                200,
+                r#"{"providers":{"default":{"name":"default","vehicleType":"Compatible","proxies":[]},"air":{"name":"air","vehicleType":"HTTP","proxies":[]},"own":{"name":"own","vehicleType":"File","proxies":[]}}}"#,
+            ),
+            _ => (204, ""),
+        });
+        // A stopped core or a reload (which pulls stale providers itself)
+        // sends nothing.
+        assert_eq!(refresh_after_regenerate(&mock.cfg, false, false), None);
+        assert_eq!(refresh_after_regenerate(&mock.cfg, true, true), None);
+        assert!(mock.lines.lock().unwrap().is_empty());
+        assert_eq!(
+            refresh_after_regenerate(&mock.cfg, true, false),
+            Some((1, 0))
+        );
+        assert_eq!(
+            mock.lines.lock().unwrap().clone(),
+            [
+                "GET /providers/proxies HTTP/1.1",
+                "PUT /providers/proxies/air HTTP/1.1"
+            ]
+        );
+        // Inline `proxies:` only: nothing to refresh.
+        let inline = recorder(Duration::ZERO, |_| (200, r#"{"providers":{}}"#));
+        assert_eq!(refresh_after_regenerate(&inline.cfg, true, false), None);
     }
 
     #[test]
