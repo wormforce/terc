@@ -19,6 +19,8 @@ use std::{
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_HEADER: usize = 16 * 1024;
+/// Bytes asked of the socket per read once the handshake is done.
+const READ_CHUNK: usize = 64 * 1024;
 /// Largest single frame accepted before any of its payload is buffered.
 pub const DEFAULT_MAX_FRAME: usize = 16 << 20;
 /// Largest reassembled message.
@@ -486,13 +488,18 @@ impl<S: Read + Write> Client<S> {
                 self.rbuf.drain(..used);
                 return Ok(frame);
             }
-            let mut chunk = [0u8; 8192];
-            match self.stream.read(&mut chunk) {
+            // Read straight into the buffer's tail: a 1.5 MB snapshot then
+            // takes about 25 reads instead of about 200 through a stack chunk.
+            let filled = self.rbuf.len();
+            self.rbuf.resize(filled + READ_CHUNK, 0);
+            let read = self.stream.read(&mut self.rbuf[filled..]);
+            self.rbuf.truncate(filled + read.as_ref().map_or(0, |n| *n));
+            match read {
                 Ok(0) => {
                     self.closed = true;
                     return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
                 }
-                Ok(n) => self.rbuf.extend_from_slice(&chunk[..n]),
+                Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e.into()),
             }
@@ -646,6 +653,7 @@ mod tests {
         step: usize,
         stall: bool,
         stalled: bool,
+        reads: usize,
     }
 
     impl Pipe {
@@ -656,6 +664,7 @@ mod tests {
                 step: usize::MAX,
                 stall: false,
                 stalled: false,
+                reads: 0,
             }
         }
     }
@@ -667,6 +676,7 @@ mod tests {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
             self.stalled = false;
+            self.reads += 1;
             let n = buf.len().min(self.step);
             self.input.read(&mut buf[..n])
         }
@@ -817,6 +827,26 @@ mod tests {
         assert_eq!(next(), Message::Pong(Vec::new()));
         let (fin, op, body, _) = client_frame(&ws.stream.output);
         assert_eq!((fin, op, body), (true, OP_PONG, b"hb".to_vec()));
+    }
+
+    #[test]
+    fn a_large_snapshot_takes_few_reads_and_keeps_what_follows() {
+        let big = "x".repeat(300_000);
+        let mut input = server_frame(true, OP_TEXT, big.as_bytes());
+        input.extend(server_frame(true, OP_TEXT, b"next"));
+        let mut ws = client(input);
+        ws.stream.stall = true;
+        let mut next = || loop {
+            match ws.read_message() {
+                Err(WsError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                other => break other.unwrap(),
+            }
+        };
+        assert_eq!(next(), Message::Text(big));
+        assert_eq!(next(), Message::Text("next".into()));
+        // 300 kB in 64 KiB reads; a timeout in between drops no byte.
+        assert!(ws.stream.reads <= 6, "{}", ws.stream.reads);
+        assert!(ws.rbuf.is_empty());
     }
 
     #[test]
