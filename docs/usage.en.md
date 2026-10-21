@@ -59,6 +59,10 @@ Appearance includes theme, graph style, UI refresh rate, graph interval, languag
 
 Diagnostics contains the log level, core download, snippets, probe, runtime details, rules, providers and Live connection stream. Startup errors include a core-log excerpt. The Logs view also reads `terc-core.log`; the preceding startup log is kept as `terc-core.previous.log`. An occupied controller or an unresponsive managed process blocks another launch. A startup timeout cleans up the newly launched process.
 
+## Geodata
+
+The core downloads the files behind GEOIP, GEOSITE and IP-ASN rules the first time it needs them, waits 90 s per file, and fails validation when a download fails. Mihomo's defaults are GitHub release URLs. When the generated config has no `geox-url`, terc adds the jsDelivr mirror (`testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/` for `geoip.dat`, `geosite.dat`, `country.mmdb` and `GeoLite2-ASN.mmdb`). A subscription's own `geox-url`, even one with a single key, is kept as written.
+
 ## Sniffer
 
 Settings → Proxy toggles the Mihomo sniffer. Many flows arrive with only an IP. The sniffer reads the HTTP Host, TLS SNI, or QUIC name from the start of the flow and fills the domain back in, so domain rules can match. The connections view shows that sniffed host. It does not store page contents, and it is not a packet capture.
