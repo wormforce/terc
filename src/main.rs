@@ -227,6 +227,20 @@ impl Config {
 
 /// Deliver a worker's completion event even when the worker panics, so
 /// `snapshot_pending` and `action_busy` are always cleared.
+/// Space asks for the opposite of what the panel shows. A fresh lookup may
+/// disagree (the proxy changed outside terc since a cached poll, up to 15 s
+/// ago), and flipping that would undo what the user asked for; setting the
+/// shown opposite is harmless when the system already has it.
+fn sysproxy_toggle(
+    shown: bool,
+    ports: Result<(u16, u16), String>,
+    set: impl FnOnce(bool, u16, u16) -> Result<String, String>,
+) -> Result<String, String> {
+    let target = !shown;
+    let (http, socks) = if target { ports? } else { (0, 0) };
+    set(target, http, socks)
+}
+
 struct SendOnDrop {
     tx: Sender<BackendEvent>,
     event: Option<BackendEvent>,
@@ -433,6 +447,9 @@ pub struct App {
     pub best_scope_index: usize,
     pub action_busy: bool,
     pub snapshot_pending: bool,
+    /// A full refresh was asked for while a poll ran (whose host lookups may
+    /// be cached); it starts when that poll ends.
+    pub refresh_queued: bool,
     pub setting_index: usize,
     pub setting_input: Option<String>,
     pub rule_index: usize,
@@ -494,6 +511,9 @@ pub struct App {
     pub poll_tab: MainTab,
     /// When a snapshot last carried `/providers/*`.
     pub providers_polled_at: Option<Instant>,
+    /// The last accepted snapshot found the core. A `/traffic` push sets
+    /// `snapshot.running` but brings no groups, rules or providers.
+    pub core_polled: bool,
     pub setup_origin: Screen,
     pub setup_editor: LineEditor,
     pub setup_phase: SetupPhase,
@@ -570,6 +590,7 @@ impl App {
             best_scope_index: 0,
             action_busy: false,
             snapshot_pending: false,
+            refresh_queued: false,
             setting_index: 0,
             setting_input: None,
             rule_index: 0,
@@ -624,6 +645,7 @@ impl App {
             last_snapshot_poll: Instant::now(),
             poll_tab: MainTab::Proxies,
             providers_polled_at: None,
+            core_polled: false,
             setup_origin: Screen::Dashboard,
             setup_editor: LineEditor::default(),
             setup_phase: SetupPhase::Editing,
@@ -884,10 +906,14 @@ impl App {
                     result,
                     modules,
                     profile,
+                    snapshot_follows,
                 } => {
                     self.action_busy = false;
                     // The action thread fetches a snapshot next; skip the poll.
-                    self.last_snapshot_poll = Instant::now();
+                    // A panicked action sends none, so the next tick polls.
+                    if snapshot_follows {
+                        self.last_snapshot_poll = Instant::now();
+                    }
                     self.conns.action_finished(Instant::now());
                     let ok = result.is_ok();
                     match &result {
@@ -966,6 +992,9 @@ impl App {
                     self.snapshot_pending = false;
                     if !self.action_busy {
                         self.accept_snapshot(*snap);
+                    }
+                    if std::mem::take(&mut self.refresh_queued) {
+                        self.refresh_snapshot_now();
                     }
                 }
                 BackendEvent::Snapshot(snap) => {
@@ -1084,7 +1113,8 @@ impl App {
     /// the provider nodes' delays on the Proxies tab. A core that was not
     /// running gets everything, since it may have just started.
     fn poll_fetch(&self) -> mihomo::Fetch {
-        let fresh_core = !self.snapshot.running;
+        // After a poll that missed the core everything it carried is gone.
+        let fresh_core = !self.core_polled;
         let providers_due = self
             .providers_polled_at
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
@@ -1136,6 +1166,7 @@ impl App {
         if snapshot.running && snapshot.fetched.providers {
             self.providers_polled_at = Some(Instant::now());
         }
+        self.core_polled = snapshot.running;
         snapshot.carry_skipped(&mut self.snapshot);
         self.snapshot = snapshot;
         if !keep {
@@ -1258,6 +1289,7 @@ impl App {
 
     pub fn refresh_snapshot_now(&mut self) {
         if self.snapshot_pending {
+            self.refresh_queued = true;
             return;
         }
         self.snapshot_pending = true;
@@ -1294,6 +1326,7 @@ impl App {
                     result: Err("Operation failed unexpectedly".into()),
                     modules: None,
                     profile: None,
+                    snapshot_follows: false,
                 },
             );
             let result = action(cfg.clone());
@@ -1301,6 +1334,7 @@ impl App {
                 result,
                 modules,
                 profile,
+                snapshot_follows: true,
             });
             drop(done);
             let _ = tx.send(BackendEvent::Snapshot(Box::new(fetch_snapshot(&cfg))));
@@ -1462,12 +1496,9 @@ impl App {
                 return;
             }
         }
+        let shown = self.snapshot.sysproxy_enabled;
         self.run_action("Updating system proxy…", None, None, move |_| {
-            // The shown state can be a poll's cached lookup, up to 15 s old:
-            // flip what the system has now.
-            let target = !mihomo::detect_sysproxy().1;
-            let (http, socks) = if target { ports? } else { (0, 0) };
-            set_sysproxy(target, http, socks)
+            sysproxy_toggle(shown, ports, set_sysproxy)
         });
     }
 
@@ -2090,19 +2121,21 @@ fn main() -> io::Result<()> {
     if app.note_dns_module_change() {
         app.save_preferences();
     }
-    match migration {
-        Ok(notes) if !notes.is_empty() => app.set_status(
-            &format!(
-                "迁移跳过 / Migration skipped / 移行スキップ: {}",
-                notes.join("; ")
-            ),
-            true,
-        ),
-        Ok(_) => {}
-        Err(err) => app.set_status(
-            &format!("迁移失败 / Migration failed / 移行失敗: {err}"),
-            true,
-        ),
+    let migration = match migration {
+        Ok(notes) if !notes.is_empty() => Some(format!(
+            "迁移跳过 / Migration skipped / 移行スキップ: {}",
+            notes.join("; ")
+        )),
+        Ok(_) => None,
+        Err(err) => Some(format!("迁移失败 / Migration failed / 移行失敗: {err}")),
+    };
+    if let Some(text) = migration {
+        // The one-time DNS notice is already recorded as seen; keep it.
+        let text = match app.status_message.as_str() {
+            "" => text,
+            notice => format!("{text} | {notice}"),
+        };
+        app.set_status(&text, true);
     }
     run(&mut app)
 }
@@ -3892,6 +3925,71 @@ mod tests {
     }
 
     #[test]
+    fn refresh_asked_during_a_poll_runs_after_it() {
+        let (addr, paths) = recording_controller();
+        let mut app = offline_app();
+        app.config.controller.addr = addr;
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        // A finished core download asks while a cached poll is in flight.
+        app.snapshot_pending = true;
+        app.tx
+            .send(BackendEvent::CoreDownloadDone { ok: true })
+            .unwrap();
+        app.drain_events();
+        assert!(app.refresh_queued);
+        assert!(paths.try_iter().next().is_none());
+        // The queued full refresh starts when that poll ends.
+        app.tx
+            .send(BackendEvent::SnapshotDone(Box::default()))
+            .unwrap();
+        app.drain_events();
+        assert!(!app.refresh_queued);
+        let full = finish_poll(&mut app, &paths);
+        assert!(full.iter().any(|p| p == "/version"), "{full:?}");
+    }
+
+    #[test]
+    fn space_sets_the_opposite_of_the_shown_system_proxy_state() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let set = |on, http, socks| {
+            calls.borrow_mut().push((on, http, socks));
+            Ok(String::new())
+        };
+        // Shown ON but turned off outside terc since: Space still turns it off.
+        sysproxy_toggle(true, Ok((7890, 7891)), set).unwrap();
+        sysproxy_toggle(false, Ok((7890, 7891)), set).unwrap();
+        assert!(sysproxy_toggle(false, Err("no port".into()), set).is_err());
+        assert_eq!(*calls.borrow(), [(false, 0, 0), (true, 7890, 7891)]);
+    }
+
+    #[test]
+    fn poll_after_a_missed_version_reads_everything_despite_a_push() {
+        let (addr, paths) = recording_controller();
+        let mut app = offline_app();
+        app.config.controller.addr = addr;
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        let has = |got: &[String], path: &str| got.iter().any(|p| p == path);
+        let poll = |app: &mut App| {
+            app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
+            app.tick(Duration::from_millis(10));
+            finish_poll(app, &paths)
+        };
+        poll(&mut app);
+        // One poll misses `/version`; the `/traffic` stream keeps pushing.
+        app.accept_snapshot(CoreSnapshot::default());
+        app.tx
+            .send(BackendEvent::Traffic { up: 1, down: 1 })
+            .unwrap();
+        app.drain_events();
+        assert!(app.snapshot.running);
+        let next = poll(&mut app);
+        assert!(
+            has(&next, "/rules") && has(&next, "/providers/proxies"),
+            "{next:?}"
+        );
+    }
+
+    #[test]
     fn live_connection_stream_row_shows_its_transport() {
         for lang in [Lang::Zh, Lang::En, Lang::Ja] {
             for (width, height) in [(80, 24), (160, 40)] {
@@ -4481,6 +4579,7 @@ mod tests {
                 result: Ok("done".into()),
                 modules: None,
                 profile: None,
+                snapshot_follows: true,
             })
             .unwrap();
         assert!(app.drain_events());
@@ -4488,6 +4587,17 @@ mod tests {
         // The action thread's own snapshot is on its way; no second poll now.
         app.tick(Duration::from_millis(10));
         assert!(!app.snapshot_pending);
+        // A panicked action sends no snapshot: the overdue poll runs at once.
+        app.last_snapshot_poll = Instant::now() - Duration::from_secs(10);
+        app.run_action("", None, None, |_| panic!("action panicked"));
+        let start = Instant::now();
+        while app.action_busy && start.elapsed() < Duration::from_secs(5) {
+            app.drain_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.status_message.contains("failed unexpectedly"));
+        app.tick(Duration::from_millis(10));
+        assert!(app.snapshot_pending);
     }
 
     fn log(level: &str, payload: &str) -> BackendEvent {

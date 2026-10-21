@@ -364,21 +364,21 @@ impl App {
         } else {
             "st_module_off"
         });
-        let (same, live, fallback) = match self.lang() {
+        let (same, live, failed) = match self.lang() {
             crate::Lang::Zh => (
                 "生效配置未变化，未重载",
                 "已实时生效，未重载",
-                "实时修改未生效，已重载配置",
+                "实时修改未生效，未重载；再次切换将确认后重载",
             ),
             crate::Lang::En => (
                 "effective config unchanged; not reloaded",
                 "applied live; no reload",
-                "live change failed; configuration reloaded",
+                "live change failed; nothing reloaded. Toggle again to reload",
             ),
             crate::Lang::Ja => (
                 "有効な設定は変わらず、リロードなし",
                 "ライブ適用、リロードなし",
-                "ライブ適用に失敗、設定をリロード",
+                "ライブ適用に失敗、リロードなし。もう一度切り替えるとリロード",
             ),
         };
         self.run_action(
@@ -393,13 +393,13 @@ impl App {
                 ModuleChange::Live(keys) => {
                     for (key, value) in &keys {
                         if let Err(err) = patch_config_value(&cfg, key, value) {
-                            // As with live settings, a reload makes the core
-                            // match the file.
-                            crate::mihomo::install_config(&cfg, &next, true).inspect_err(|_| {
-                                crate::mihomo::RELOAD_UNCERTAIN
-                                    .store(true, std::sync::atomic::Ordering::SeqCst)
-                            })?;
-                            return Ok(format!("{done} — {fallback} ({err})"));
+                            // A reload would cut provider connections without
+                            // the prompt a reload toggle shows. Keys may be
+                            // half-applied, so the next toggle reloads, and
+                            // asks first.
+                            crate::mihomo::RELOAD_UNCERTAIN
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            return Err(format!("{failed} ({err})"));
                         }
                     }
                     save_config_unchecked(&cfg, &next, true)?;
@@ -635,36 +635,47 @@ const LIVE_MODULE_KEYS: &[&str] = &[
     "log-level",
 ];
 
-/// Compare the effective configs, i.e. without the `# terc-base` and
+/// The top-level chunks of `doc` without the `# terc-base` and
 /// `# terc-switches` header that `apply_modules_with_switches` writes.
-fn module_change(old: &str, next: &str) -> ModuleChange {
-    fn effective(doc: &str) -> std::collections::BTreeMap<String, Vec<String>> {
-        let mut parts = doc.splitn(3, '\n');
-        let body = match (parts.next(), parts.next(), parts.next()) {
-            (Some(head), Some(switches), Some(rest))
-                if head.starts_with("# terc-base: ")
-                    && switches.starts_with("# terc-switches: ") =>
-            {
-                rest
+fn effective_chunks(doc: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut parts = doc.splitn(3, '\n');
+    let body = match (parts.next(), parts.next(), parts.next()) {
+        (Some(head), Some(switches), Some(rest))
+            if head.starts_with("# terc-base: ") && switches.starts_with("# terc-switches: ") =>
+        {
+            rest
+        }
+        _ => doc,
+    };
+    // A later duplicate key wins, as in Mihomo's YAML decoder.
+    crate::ops::split_chunks(body)
+        .into_iter()
+        .filter_map(|chunk| {
+            let mut lines = chunk.lines;
+            while lines.last().is_some_and(|l| {
+                let t = l.trim();
+                t.is_empty() || t.starts_with('#')
+            }) {
+                lines.pop();
             }
-            _ => doc,
-        };
-        // A later duplicate key wins, as in Mihomo's YAML decoder.
-        crate::ops::split_chunks(body)
-            .into_iter()
-            .filter_map(|chunk| {
-                let mut lines = chunk.lines;
-                while lines.last().is_some_and(|l| {
-                    let t = l.trim();
-                    t.is_empty() || t.starts_with('#')
-                }) {
-                    lines.pop();
-                }
-                Some((chunk.key?, lines))
-            })
-            .collect()
-    }
-    let (old, next) = (effective(old), effective(next));
+            Some((chunk.key?, lines))
+        })
+        .collect()
+}
+
+/// Whether the effective configs differ in no top-level key but `key`. A
+/// regenerated file also carries every module's current text, which a live
+/// PATCH of one key does not bring to the core.
+pub(crate) fn differs_only_in(old: &str, next: &str, key: &str) -> bool {
+    let (mut old, mut next) = (effective_chunks(old), effective_chunks(next));
+    old.remove(key);
+    next.remove(key);
+    old == next
+}
+
+/// Compare the effective configs.
+fn module_change(old: &str, next: &str) -> ModuleChange {
+    let (old, next) = (effective_chunks(old), effective_chunks(next));
     let mut keys: Vec<&String> = old.keys().chain(next.keys()).collect();
     keys.sort();
     keys.dedup();
@@ -1058,6 +1069,75 @@ mod module_tests {
     }
 
     #[test]
+    fn failed_live_module_toggle_does_not_reload_unasked() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = std::env::temp_dir().join(format!("terc-live-toggle-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = crate::mihomo::ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            config_dir: dir.display().to_string(),
+            ..Default::default()
+        };
+        let path = dir.join("config.yaml");
+        fs::write(&path, BASE).unwrap();
+        // Answer the PATCH with 400; a reload would be a second request.
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let (mut head, mut length) = (String::new(), 0);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(v) = line.strip_prefix("Content-Length: ") {
+                    length = v.trim().parse().unwrap();
+                }
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let body = "bad value";
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            head
+        });
+        let mut app = App::from_snapshot(
+            crate::Config {
+                controller: cfg,
+                ..Default::default()
+            },
+            crate::mihomo::CoreSnapshot {
+                running: true,
+                ..Default::default()
+            },
+        );
+        app.catalog = builtin_modules();
+        app.module_index = app.catalog.iter().position(|m| m.id == "ipv6").unwrap();
+        app.toggle_selected_module();
+        let start = std::time::Instant::now();
+        while app.action_busy && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.drain_events();
+        }
+        assert!(server.join().unwrap().starts_with("PATCH /configs "));
+        assert!(app.status_is_error);
+        assert!(
+            app.status_message.contains("bad value"),
+            "{}",
+            app.status_message
+        );
+        assert!(app.config.enabled_modules.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), BASE);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn module_toggles_reload_only_when_the_core_cannot_take_the_change_live() {
         // The template already races TCP handshakes: nothing to apply.
         let tcp = with(BASE, &["tcp-concurrent"]);
@@ -1096,6 +1176,16 @@ mod module_tests {
         let on = with(bare, &["find-process"]);
         assert!(matches!(module_change(bare, &on), ModuleChange::Live(_)));
         assert_eq!(module_change(&on, bare), ModuleChange::Reload);
+        // A live setting may save only what differs in its own key.
+        let dns = with(BASE, &["dns-fakeip"]);
+        let lan = crate::ops::set_top_scalar(&dns, "allow-lan", "true");
+        assert!(differs_only_in(&dns, &lan, "allow-lan"));
+        assert!(!differs_only_in(&dns, &lan, "log-level"));
+        let edited = lan.replace("127.0.0.1:1053", "0.0.0.0:1053");
+        assert_ne!(edited, lan);
+        assert!(!differs_only_in(&dns, &edited, "allow-lan"));
+        assert!(differs_only_in(BASE, &dns, "dns"));
+        assert!(differs_only_in(BASE, &with(BASE, &["tcp-concurrent"]), "x"));
         // Trailing comments and blank lines do not count as a change.
         assert_eq!(
             module_change(

@@ -29,6 +29,8 @@ pub enum BackendEvent {
         result: Result<String, String>,
         modules: Option<Vec<String>>,
         profile: Option<String>,
+        /// The worker sends a snapshot next; false when the action panicked.
+        snapshot_follows: bool,
     },
     SnapshotDone(Box<CoreSnapshot>),
     Traffic {
@@ -1612,6 +1614,22 @@ mod snapshot_tests {
         assert_eq!(lean.groups.len(), 1);
         assert!(lean.rules.is_empty() && lean.providers.is_empty());
         assert!(!lean.nodes.contains_key("JP 01"));
+
+        // A failed GET is not reported as read, so the last data carries over.
+        let (cfg, _) = controller(
+            routes()
+                .into_iter()
+                .filter(|(path, _)| !matches!(*path, "/rules" | "/providers/proxies"))
+                .collect(),
+        );
+        let mut failed = fetch_snapshot(&cfg);
+        assert!(failed.running);
+        assert!(!failed.fetched.rules && !failed.fetched.providers);
+        let mut old = full;
+        failed.carry_skipped(&mut old);
+        assert_eq!(failed.rules.len(), 1);
+        assert_eq!(failed.providers.len(), 2);
+        assert_eq!(failed.nodes["JP 01"].delay, Some(88));
     }
 
     #[test]
@@ -1998,12 +2016,14 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
         }
     }
 
+    // `fetched` reports only what was read: a failed GET carries the last
+    // data over (`carry_skipped`) instead of emptying it until the next read.
+    let mut fetched = fetch;
     let mut rules = Vec::new();
     if fetch.rules {
-        if let Ok((200, body)) =
-            http_request(&cfg.addr, &cfg.secret, "GET", "/rules", None, timeout)
-        {
-            rules = parse_rules_json(&body);
+        match http_request(&cfg.addr, &cfg.secret, "GET", "/rules", None, timeout) {
+            Ok((200, body)) => rules = parse_rules_json(&body),
+            _ => fetched.rules = false,
         }
     }
     let mut providers = Vec::new();
@@ -2025,9 +2045,13 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
                 });
                 node.provider.get_or_insert(found.provider);
             }
+        } else {
+            fetched.providers = false;
         }
         if let Some(v) = get("/providers/rules") {
             providers.extend(crate::ops::providers_from_value(&v, "rule"));
+        } else {
+            fetched.providers = false;
         }
     }
 
@@ -2060,7 +2084,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
         dns: flags.dns,
         rules,
         providers,
-        fetched: fetch,
+        fetched,
     }
 }
 
@@ -2363,15 +2387,17 @@ pub fn discover_mihomo_binary() -> Option<PathBuf> {
     }
     candidates.push(PathBuf::from("/opt/homebrew/bin/mihomo"));
     candidates.push(PathBuf::from("/usr/local/bin/mihomo"));
-    // Distribution and AUR packages.
-    candidates.push(PathBuf::from("/usr/bin/mihomo"));
 
     for p in candidates {
         if p.is_file() {
             return Some(p);
         }
     }
-    std::env::var_os("PATH").and_then(|path| find_executable(&path, "mihomo"))
+    // A newer build earlier on PATH wins over the distribution or AUR
+    // package, which is only the fallback for a PATH without /usr/bin.
+    std::env::var_os("PATH")
+        .and_then(|path| find_executable(&path, "mihomo"))
+        .or_else(|| Some(PathBuf::from("/usr/bin/mihomo")).filter(|p| p.is_file()))
 }
 
 /// What `which` does, without starting it: the first executable `name` in
@@ -2724,26 +2750,24 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
 }
 
 /// Airport CDNs often gzip and now and then answer 5xx or 429, which curl
-/// retries. Each attempt is capped at 30 s and no retry starts after 40 s,
-/// so the worst case stays near the former single 60 s attempt; a link that
-/// stalls below 1 KB/s for 15 s fails instead of running the full time.
+/// retries. A panel or converter may build the file for half a minute before
+/// its first byte, and curl's low-speed check counts that wait, so there is
+/// none: one attempt keeps the former 60 s. Only a failure within 20 s is
+/// retried, so a timed-out attempt is not repeated and the worst case stays
+/// near 80 s.
 const SUBSCRIPTION_CURL: &[&str] = &[
     "-fsSL",
     "--compressed",
     "--connect-timeout",
     "10",
     "--max-time",
-    "30",
+    "60",
     "--retry",
     "2",
     "--retry-delay",
     "1",
     "--retry-max-time",
-    "40",
-    "--speed-limit",
-    "1024",
-    "--speed-time",
-    "15",
+    "20",
     "-A",
     "clash.meta/1.19.32",
 ];
@@ -3062,21 +3086,29 @@ fn install_config_with(
     // stopped core cannot, and missing geodata would be downloaded inside the
     // PUT handler, past the reload timeout; the check fetches it first with
     // its own budget.
-    if !running || needs_missing_geodata(&text, Path::new(&cfg.config_dir)) {
+    let mut find_bin = Some(find_bin);
+    // `mihomo -t` on a candidate copy, which a stopped core's file becomes.
+    let mut check = |install: bool| -> Result<(), String> {
         let candidate = Path::new(&cfg.config_dir).join(".terc-candidate.yaml");
         write_private(&candidate, text.as_bytes()).map_err(|e| e.to_string())?;
         let checked = (|| {
-            let bin = find_bin()
+            let bin = find_bin
+                .take()
+                .and_then(|find| find())
                 .ok_or("Install the managed Mihomo core before saving a configuration")?;
             check_candidate(&bin, cfg, &candidate, limits)?;
-            if running {
-                Ok(())
-            } else {
+            if install {
                 fs::rename(&candidate, &path).map_err(|e| e.to_string())
+            } else {
+                Ok(())
             }
         })();
         let _ = fs::remove_file(candidate);
-        checked?;
+        checked
+    };
+    let checked = !running || needs_missing_geodata(&text, Path::new(&cfg.config_dir));
+    if checked {
+        check(!running)?;
         if !running {
             return Ok(());
         }
@@ -3101,8 +3133,19 @@ fn install_config_with(
         // config may already be live; keep it on disk too. Either way the
         // running config may differ from the file, so the next regeneration
         // reloads even when its output is unchanged.
+        //
+        // A handler that dropped the connection without applying anything
+        // looks the same, so the core's own parse never vouched for this
+        // text: check it before it can outlive a core that then restarts.
         Err(ReloadError::Unknown(err)) => {
             RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+            if !checked {
+                check(false).map_err(|e| {
+                    format!(
+                        "热重载结果未知，新配置未通过校验，未保存 / Reload outcome unknown ({err}); the new configuration failed validation and was not saved: {e}"
+                    )
+                })?;
+            }
             save()?;
             if controller_answers(cfg, limits.settle) {
                 return Ok(());
@@ -3920,7 +3963,7 @@ pub fn set_rule_disabled(cfg: &ControllerConfig, index: usize, disabled: bool) -
 /// Only an explicit rejection proves the core kept its previous configuration.
 #[derive(Debug)]
 pub enum ReloadError {
-    /// The controller answered with an HTTP error.
+    /// The controller answered with an HTTP error or refused the connection.
     Rejected(String),
     /// No answer (I/O error or timeout); the core may still apply the file.
     Unknown(String),
@@ -3977,6 +4020,11 @@ fn put_config(cfg: &ControllerConfig, body: &str) -> Result<(), ReloadError> {
                 "reload HTTP {status} {}",
                 brief(&text)
             )))
+        }
+        // Refused at connect: the core is gone and received nothing.
+        Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+            announce_disruption(Cause::Reload, Scope::Id(String::new()));
+            Err(ReloadError::Rejected(format!("reload failed: {err}")))
         }
         Err(err) => Err(ReloadError::Unknown(err.to_string())),
     }
@@ -5725,6 +5773,78 @@ mod listener_tests {
 
     #[test]
     #[cfg(unix)]
+    fn reload_that_never_reached_the_core_saves_only_a_checked_file() {
+        let previous = "mode: rule\n";
+        let invalid = "mode: rule\nproxies:\n  - {name: x, type: nosuch}\n";
+        // Refused: the core is gone and got nothing, so nothing is kept.
+        let (dir, _) = install_fixture("refused", "exit 0");
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: closed.local_addr().unwrap().to_string(),
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        drop(closed);
+        fs::write(config_yaml_path(&cfg), previous).unwrap();
+        let failure = install_config_with(
+            &cfg,
+            invalid,
+            true,
+            || panic!("a refused reload needs no check"),
+            &TEST_LIMITS,
+        )
+        .err()
+        .unwrap();
+        assert!(!failure.kept);
+        assert!(failure.message.contains("previous configuration kept"));
+        assert_eq!(read_config_text(&cfg).unwrap(), previous);
+        fs::remove_dir_all(dir).unwrap();
+        // Dropped without a reply: `mihomo -t` decides whether the file is kept.
+        for valid in [false, true] {
+            let (dir, bin) = install_fixture(
+                "dropped",
+                if valid {
+                    "exit 0"
+                } else {
+                    "echo 'unsupported type' >&2; exit 1"
+                },
+            );
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let cfg = ControllerConfig {
+                addr: listener.local_addr().unwrap().to_string(),
+                config_dir: dir.display().to_string(),
+                ..ControllerConfig::default()
+            };
+            fs::write(config_yaml_path(&cfg), previous).unwrap();
+            let mut responses = vec![http("200 OK", "{}"), Vec::new()];
+            if valid {
+                responses.push(http("200 OK", "{\"version\":\"v1\"}"));
+            }
+            let server = serve(listener, responses);
+            let next = if valid {
+                "mode: rule\nipv6: true\n"
+            } else {
+                invalid
+            };
+            let result = install_config_with(&cfg, next, true, || Some(bin), &TEST_LIMITS);
+            server.join().unwrap();
+            if valid {
+                assert!(result.is_ok());
+                assert_eq!(read_config_text(&cfg).unwrap(), next);
+            } else {
+                let failure = result.err().unwrap();
+                assert!(!failure.kept);
+                assert!(failure.message.contains("not saved"), "{}", failure.message);
+                assert!(failure.message.contains("unsupported type"));
+                assert_eq!(read_config_text(&cfg).unwrap(), previous);
+            }
+            assert!(!dir.join(".terc-candidate.yaml").exists());
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn hung_config_check_is_stopped_and_leaves_the_file() {
         let (dir, bin) = install_fixture("hung", "exec sleep 30");
         let cfg = ControllerConfig {
@@ -6315,6 +6435,19 @@ mod download_tests {
         assert!(err.contains("damaged"), "{err}");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn subscription_download_waits_for_a_slow_first_byte() {
+        let flag = |name: &str| {
+            let at = SUBSCRIPTION_CURL.iter().position(|a| *a == name).unwrap();
+            SUBSCRIPTION_CURL[at + 1].parse::<u64>().unwrap()
+        };
+        // A low-speed window would also time the wait before the first byte.
+        assert!(!SUBSCRIPTION_CURL.contains(&"--speed-limit"));
+        assert_eq!(flag("--max-time"), 60);
+        // An attempt that ran out of time is past the retry window.
+        assert!(flag("--retry-max-time") < flag("--max-time"));
     }
 
     #[test]

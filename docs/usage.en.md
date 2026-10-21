@@ -19,11 +19,15 @@ The download reads the latest release's `version.txt` and then fetches that exac
 
 ## Subscription URL and Providers
 
-The airport subscription is the single URL you paste. It is fetched with gzip allowed and retried twice on 5xx, 429 or a timeout, at most 30 s per attempt and about 60 s overall as before; a transfer below 1 KB/s for 15 s gives up early. Settings → Proxy subscriptions → Update subscription downloads it, combines it with the active profile’s manual nodes in `config.yaml`, preserving source routing, validates, and hot-reloads the core. Set the source URL in Settings first.
+The airport subscription is the single URL you paste. It is fetched with gzip allowed and one attempt may take 60 s as before, so a panel or converter that spends half a minute building the file still finishes. A 5xx, 429 or timeout within the first 20 s is retried, at most twice; an attempt that ran the full 60 s is not repeated. Settings → Proxy subscriptions → Update subscription downloads it, combines it with the active profile’s manual nodes in `config.yaml`, preserving source routing, validates, and hot-reloads the core. Set the source URL in Settings first.
 
 Settings → Tools opens **订阅源 / Providers**. That page is `proxy-providers` and `rule-providers` inside the Mihomo config: extra URLs the core uses to refresh a node list or a rule list. It is not the airport URL. Refreshing a provider does not replace the subscription link in `~/.config/terc/config.json`.
 
 On that page, Enter refreshes the selected provider, `F` refreshes all of them, and `H` health-checks a proxy provider. Rule providers have no latency check.
+
+`F` refreshes four providers at a time. When updating the subscription leaves the config unchanged, so nothing reloads, terc refreshes the HTTP proxy providers through the controller instead (also four at a time, skipping `default` and file providers) and adds how many were updated and failed to the notice. That fetches new nodes without closing connections through the providers.
+
+Providers and rules can be large, so background refreshes read them only where needed: on the Providers page every refresh reads the providers, elsewhere every 30 s (provider nodes' protocol and delay come from there too); rules are read only on the Rules tab. After the core starts, or after a refresh that could not reach it, the next one reads everything.
 
 ## Subscription formats
 
@@ -59,6 +63,8 @@ Proxy settings include mixed / HTTP / SOCKS ports, LAN access, TUN, DNS, IPv6, s
 
 Appearance includes theme, graph style, UI refresh rate, graph interval, language, top panels and the shortcut footer. The graph interval stays in Settings rather than cluttering the traffic graph.
 
+The UI refresh rate is a redraw cap, not a fixed frame rate: keys and mouse clicks redraw at once (no faster than the cap), background data such as connections and rates at most every 100 ms, and an unchanged screen only once a second. A higher rate only makes input feel quicker; it costs no CPU while idle.
+
 Diagnostics contains the log level, core download, snippets, probe, runtime details, rules, providers and Live connection stream. Startup errors include a core-log excerpt. The Logs view also reads `terc-core.log`; the preceding startup log is kept as `terc-core.previous.log`. New configs set `log-level: warning`, so `terc-core.log` no longer gets a line per new connection; the Logs view always subscribes at info and shows the same lines as before. A subscription's own `log-level` is kept. An occupied controller or an unresponsive managed process blocks another launch. A startup timeout cleans up the newly launched process.
 
 ## Geodata
@@ -76,7 +82,7 @@ Settings → Tools → Snippets has two built-in DNS overlays for configs withou
 | Snippet | Resolvers | Notes |
 | --- | --- | --- |
 | Fake-IP DNS | `doh.pub` and `dns.alidns.com` DoH, bootstrapped by `223.5.5.5` / `119.29.29.29` | Same as terc's template; suited to mainland China |
-| Fake-IP DNS (global) | `dns.google` and `cloudflare-dns.com` DoH, dialed through the rules (`respect-rules`) | Node hostnames still use mainland DoH |
+| Fake-IP DNS (global) | `dns.google` and `cloudflare-dns.com` DoH, dialed through the rules (`respect-rules`) | Node hostnames still use mainland DoH. In Direct mode the DoH goes direct too, which fails from mainland China, so direct domains stop resolving; turn it off there before switching to Direct |
 
 Both listen on `127.0.0.1:1053` only, so the LAN cannot use them as a resolver, carry no `fallback`, and keep `*.lan`, `+.local` and `localhost` out of fake-ip. A list the snippet names (`nameserver`, `fallback`, `fake-ip-filter` and so on) replaces the source's list as a whole; keys it does not name stay as the source wrote them. TUN DNS hijacking does not need the listener.
 
