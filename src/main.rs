@@ -1726,6 +1726,7 @@ impl App {
     pub fn t(&self, key: &str) -> &'static str {
         match (self.config.settings.lang, key) {
             (Lang::Zh, "cat_diagnostics") => "排查工具",
+            (Lang::Ja, "cat_diagnostics") => "診断ツール",
             (_, "cat_diagnostics") => "Diagnostics",
             (_, "too_small") => "Terminal window too small",
             (Lang::Zh, "traffic") => "实时速率",
@@ -2004,18 +2005,42 @@ impl App {
             (Lang::Zh, "help_space") => "开关系统代理。macOS 用 networksetup，Linux 用 GNOME gsettings",
             (Lang::En, "help_space") => "Toggle the system proxy (networksetup, or GNOME gsettings)",
             (Lang::Ja, "help_space") => "システムプロキシを切替（networksetup または GNOME gsettings）",
-            (_, "help_hl") => "Switch focus between Groups [1] and Nodes [2]",
-            (_, "help_jk") => "Navigate up / down in current list",
-            (_, "help_enter") => "Activate highlighted node in current group",
-            (_, "help_r") => "Concurrent URL latency test for current group",
+            (Lang::Zh, "help_hl") => "代理页：在策略组 [1] 和节点 [2] 之间切换焦点",
+            (Lang::En, "help_hl") => "Proxies: move focus between Groups [1] and Nodes [2]",
+            (Lang::Ja, "help_hl") => "プロキシ：グループ [1] とノード [2] のフォーカスを切替",
+            (Lang::Zh, "help_jk") => "在当前列表中上下移动",
+            (Lang::En, "help_jk") => "Move up / down in the current list",
+            (Lang::Ja, "help_jk") => "現在のリストを上下に移動",
+            (Lang::Zh, "help_enter") => "在当前策略组中启用选中的节点",
+            (Lang::En, "help_enter") => "Use the highlighted node in the current group",
+            (Lang::Ja, "help_enter") => "選択中のノードを現在のグループで使用",
+            (Lang::Zh, "help_r") => "并发测试当前策略组的延迟",
+            (Lang::En, "help_r") => "Concurrent URL latency test for the current group",
+            (Lang::Ja, "help_r") => "現在のグループを並列で遅延計測",
             (Lang::Zh, "help_a") => "选择全球或当前国家范围，测速后优选",
-            (_, "help_a") => "Choose all countries or current country, test and select fastest",
-            (_, "help_m") => "Cycle routing mode (Rule / Global / Direct)",
+            (Lang::En, "help_a") => "Choose all countries or the current one, test and select the fastest",
+            (Lang::Ja, "help_a") => "全体か現在の国を選び、計測して最速を選択",
+            (Lang::Zh, "help_m") => "切换分流模式（规则 / 全局 / 直连）",
+            (Lang::En, "help_m") => "Cycle routing mode (Rule / Global / Direct)",
+            (Lang::Ja, "help_m") => "ルーティングモードを切替（Rule / Global / Direct）",
             (Lang::Zh, "help_u") => "更新当前方案的订阅，保留来源规则与策略组，校验后重载",
             (_, "help_u") => "Update the active profile subscription; preserve source rules and groups, validate and reload",
-            (_, "help_tabs") => "Switch view: [p] Proxies  [c] Connections  [L] Logs",
+            (Lang::Zh, "help_tabs") => "切换视图：[p] 代理  [c] 连接  [L] 日志；DNS、规则、Provider 在 设置 → 排查工具",
+            (Lang::En, "help_tabs") => "Switch view: [p] Proxies  [c] Connections  [L] Logs; DNS, rules and providers are under Settings → Diagnostics",
+            (Lang::Ja, "help_tabs") => "表示切替：[p] プロキシ  [c] 接続  [L] ログ。DNS・ルール・プロバイダは 設定 → 診断ツール",
             (_, "help_t") => "Toggle top Traffic & Overview panels",
-            (_, "help_s") => "Open Settings board (Core / Theme / Subscription)",
+            (Lang::Zh, "help_s") => "设置：内核与代理、视觉与主题、订阅与分流、排查工具（Tab 或 1–4 切换）",
+            (Lang::En, "help_s") => "Settings: Core & Proxy, Appearance, Sources & Routing, Diagnostics (Tab or 1–4)",
+            (Lang::Ja, "help_s") => "設定：コア・プロキシ、外観・テーマ、サブスクリプション、診断ツール（Tab か 1–4）",
+            (Lang::Zh, "help_conn_close") => "连接：x 断开选中的连接  X 断开全部（会断开长连接或 AI 会话时先确认）",
+            (Lang::En, "help_conn_close") => "Connections: x closes the selected one  X closes all (asks first if long-lived or AI sessions would drop)",
+            (Lang::Ja, "help_conn_close") => "接続：x 選択中を切断  X 全切断（長時間・AI セッションが切れる場合は確認）",
+            (Lang::Zh, "help_dns_keys") => "DNS：e 编辑域名，Enter 查询，[ ] 切换记录类型",
+            (Lang::En, "help_dns_keys") => "DNS: e edits the name, Enter queries, [ ] changes the record type",
+            (Lang::Ja, "help_dns_keys") => "DNS：e 名前を編集、Enter 照会、[ ] レコード種別を切替",
+            (Lang::Zh, "help_provider_keys") => "Provider：Enter 刷新选中项，H 健康检查",
+            (Lang::En, "help_provider_keys") => "Providers: Enter refreshes the selected one, H runs a health check",
+            (Lang::Ja, "help_provider_keys") => "プロバイダ：Enter 選択中を更新、H ヘルスチェック",
             (Lang::Zh, "help_q") => "退出 terc（后台内核继续运行）",
             (Lang::En, "help_q") => "Quit terc (background core stays running)",
             (Lang::Ja, "help_q") => "終了（バックグラウンドのコアは継続）",
@@ -2220,15 +2245,15 @@ impl App {
             (Lang::Zh, "help_views") => "DNS / 规则 / Provider / 片段 / 配置 / 探测 / 运行时",
             (Lang::En, "help_views") => "DNS / rules / providers / snippets / profiles / probe / runtime",
             (Lang::Ja, "help_views") => "DNS / ルール / プロバイダ / スニペット / プロファイル / 計測 / 状態",
-            (Lang::Zh, "help_rule_x") => "禁用或恢复当前规则（连接页仍是断开连接）",
-            (Lang::En, "help_rule_x") => "Disable or restore the selected rule",
-            (Lang::Ja, "help_rule_x") => "選択中のルールを無効化 / 復帰",
+            (Lang::Zh, "help_rule_x") => "规则：临时禁用或恢复选中的规则",
+            (Lang::En, "help_rule_x") => "Rules: disable or restore the selected rule",
+            (Lang::Ja, "help_rule_x") => "ルール：選択中のルールを一時無効化 / 復帰",
             (Lang::Zh, "help_flush") => "DNS 清空缓存；规则与 Provider 页刷新",
             (Lang::En, "help_flush") => "Flush DNS, or refresh rules and providers",
             (Lang::Ja, "help_flush") => "DNS 消去、またはルールとプロバイダを更新",
-            (Lang::Zh, "help_explain") => "输入目标，解释会命中哪条规则",
-            (Lang::En, "help_explain") => "Type a target and explain which rule hits",
-            (Lang::Ja, "help_explain") => "対象を入力して一致ルールを説明",
+            (Lang::Zh, "help_explain") => "规则：e 输入目标并解释会命中哪条规则，/ 搜索",
+            (Lang::En, "help_explain") => "Rules: e explains which rule a target hits, / searches",
+            (Lang::Ja, "help_explain") => "ルール：e 対象の一致ルールを説明、/ 検索",
             (Lang::Zh, "ov_modules") => "片段会追加到配置末尾，关闭后恢复原文",
             (Lang::En, "ov_modules") => "Snippets append to the config and restore it when removed",
             (Lang::Ja, "ov_modules") => "スニペットは末尾に追加され、外すと元に戻ります",
@@ -3293,6 +3318,58 @@ mod tests {
 
     fn press(app: &mut App, key: KeyCode) -> bool {
         handle_key(app, KeyEvent::new(key, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn hints_and_help_name_only_live_keys_in_each_language() {
+        let mut app = offline_app();
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            app.screen = Screen::Dashboard;
+            for tab in [
+                MainTab::Proxies,
+                MainTab::Connections,
+                MainTab::Logs,
+                MainTab::Dns,
+                MainTab::Rules,
+                MainTab::Providers,
+            ] {
+                app.main_tab = tab;
+                let text = render_text(&mut app, 160, 50);
+                // Panel-title hotkeys removed from the dashboard in 0.2.
+                for dead in ["[t]", "[v]", "[d]"] {
+                    assert!(!text.contains(dead), "{lang:?} {tab:?}: {dead}");
+                }
+                // Footers speak the selected language, not always Chinese.
+                let chinese_footer = ["返回", "阅读"].iter().any(|w| text.contains(w));
+                if tab != MainTab::Proxies {
+                    assert_eq!(chinese_footer, lang == Lang::Zh, "{lang:?} {tab:?}");
+                }
+            }
+            app.main_tab = MainTab::Proxies;
+            let footer = render_text(&mut app, 160, 50);
+            let quit = match lang {
+                Lang::Zh => "q退出",
+                Lang::En => "qQuit",
+                Lang::Ja => "q終了",
+            };
+            assert!(footer.contains(quit), "{lang:?}");
+
+            app.screen = Screen::Help;
+            app.help_scroll = 0;
+            let help = render_text(&mut app, 200, 80);
+            for key in ["c:x/X", "Providers:Enter/H", "DNS:e/Enter/[]", "Tab←→hl12"] {
+                assert!(help.contains(key), "{lang:?}: {key}");
+            }
+            for id in ["help_conn_close", "help_rule_x", "help_hl", "help_s"] {
+                assert!(
+                    help.contains(&prefix(&app.t(id).replace(' ', ""), 8)),
+                    "{lang:?}: {id}"
+                );
+            }
+            // The zh/en pairs that were shown to every language are gone.
+            assert!(!help.contains("Logs:pause,search"), "{lang:?}");
+        }
     }
 
     #[test]

@@ -309,7 +309,7 @@ fn draw_rule_detail(frame: &mut Frame, app: &App, area: Rect) {
 
 pub fn draw_providers(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
-    let title = module_title_line(theme, app.lang(), 'v', "Providers", app.t("providers"));
+    let title = crate::ui::panel_title(app.t("providers").to_string(), theme);
     let inner = draw_panel(frame, area, theme, Some(title), true);
     if inner.width < 10 || inner.height < 1 {
         return;
@@ -777,7 +777,7 @@ fn draw_dns_query(frame: &mut Frame, app: &App, area: Rect) {
         frame,
         area,
         theme,
-        Some(module_title_line(theme, app.lang(), 'd', "DNS", &title)),
+        Some(crate::ui::panel_title(title, theme)),
         true,
     );
     if inner.height < 1 {
@@ -944,7 +944,16 @@ fn draw_connection_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         area,
         theme,
         Some(panel_title(
-            format!("{}  Enter/Esc 返回  ↑↓ scroll", app.t("connections")),
+            format!(
+                "{}  {}",
+                app.t("connections"),
+                crate::manage::l3(
+                    app,
+                    "Enter/Esc 返回  ↑↓ 滚动",
+                    "Enter/Esc back  ↑↓ scroll",
+                    "Enter/Esc 戻る  ↑↓ スクロール",
+                )
+            ),
             theme,
         )),
         false,

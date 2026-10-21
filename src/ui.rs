@@ -451,7 +451,7 @@ fn draw_dashboard(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_traffic_panel(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
-    let title = module_title_line(theme, app.lang(), 't', "Traffic", app.t("traffic"));
+    let title = panel_title(app.t("traffic").to_string(), theme);
     let inner = draw_panel(frame, area, theme, Some(title), false);
     if inner.width < 10 || inner.height < 2 {
         return;
@@ -1108,17 +1108,37 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
             "↑↓ select  Enter detail  o sort  f long/AI  d closed  x close  X all  Esc back",
             "↑↓ 選択  Enter 詳細  o 並べ替え  f 長時間/AI  d 履歴  x 切断  X 全切断  Esc 戻る",
         )),
-        MainTab::Logs => Some("↑↓ 阅读  P 暂停/继续  / 搜索  Enter 全文  Esc 返回"),
-        MainTab::Dns => Some("e 编辑  Enter 查询  [ ] 类型  F 清缓存  Esc 返回"),
-        MainTab::Rules => Some("/ 搜索  e 测试目标  Enter 详情  x 临时禁用/恢复  F 刷新  Esc 返回"),
-        MainTab::Providers => Some("Enter 刷新当前  F 全部刷新  H 健康检查  Esc 返回"),
+        MainTab::Logs => Some(crate::manage::l3(
+            app,
+            "↑↓ 阅读  P 暂停/继续  / 搜索  Enter 全文  Esc 返回",
+            "↑↓ read  P pause/resume  / search  Enter full text  Esc back",
+            "↑↓ 閲覧  P 一時停止/再開  / 検索  Enter 全文  Esc 戻る",
+        )),
+        MainTab::Dns => Some(crate::manage::l3(
+            app,
+            "e 编辑  Enter 查询  [ ] 类型  F 清缓存  Esc 返回",
+            "e edit  Enter query  [ ] type  F flush cache  Esc back",
+            "e 編集  Enter 照会  [ ] 種別  F キャッシュ消去  Esc 戻る",
+        )),
+        MainTab::Rules => Some(crate::manage::l3(
+            app,
+            "/ 搜索  e 测试目标  Enter 详情  x 临时禁用/恢复  F 刷新  Esc 返回",
+            "/ search  e test target  Enter detail  x disable/restore  F refresh  Esc back",
+            "/ 検索  e 対象を判定  Enter 詳細  x 一時無効/復帰  F 更新  Esc 戻る",
+        )),
+        MainTab::Providers => Some(crate::manage::l3(
+            app,
+            "Enter 刷新当前  F 全部刷新  H 健康检查  Esc 返回",
+            "Enter refresh selected  F refresh all  H health check  Esc back",
+            "Enter 選択を更新  F 全更新  H ヘルスチェック  Esc 戻る",
+        )),
         MainTab::Proxies => None,
     };
     if let Some(text) = context {
         return Line::styled(text, Style::default().fg(theme.muted));
     }
-    let hints = if app.lang() == Lang::Zh {
-        [
+    let hints = match app.lang() {
+        Lang::Zh => [
             "Space 代理",
             "↵ 选节点",
             "r 测速",
@@ -1128,9 +1148,19 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
             "s 设置",
             "? 帮助",
             "q 退出",
-        ]
-    } else {
-        [
+        ],
+        Lang::Ja => [
+            "Space プロキシ",
+            "↵ 選択",
+            "r 計測",
+            "m モード",
+            "a 最速",
+            "c 接続",
+            "s 設定",
+            "? ヘルプ",
+            "q 終了",
+        ],
+        Lang::En => [
             "Space Proxy",
             "↵ Select",
             "r Test",
@@ -1140,7 +1170,7 @@ fn toolbar_line(app: &App, width: u16) -> Line<'static> {
             "s Settings",
             "? Help",
             "q Quit",
-        ]
+        ],
     };
     let mut text = String::new();
     // Reserve help and quit so narrow windows still offer a way to discover controls.
@@ -1191,8 +1221,10 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
 fn settings_hint(app: &App) -> &'static str {
     match (app.lang(), app.setting_input.is_some()) {
         (Lang::Zh, true) => "Enter 保存  Esc 取消  Ctrl+U 清空",
+        (Lang::Ja, true) => "Enter 保存  Esc 取消  Ctrl+U 消去",
         (_, true) => "Enter Save  Esc Cancel  Ctrl+U Clear",
         (Lang::Zh, false) => "Tab 分类  ↑↓ 选择  ←→ 调整  ↵ 编辑  Esc",
+        (Lang::Ja, false) => "Tab タブ  ↑↓ 選択  ←→ 調整  ↵ 編集  Esc",
         (_, false) => "Tab Tabs  ↑↓ Select  ←→ Adjust  ↵ Edit  Esc",
     }
 }
@@ -1215,10 +1247,10 @@ fn draw_settings_tabs(frame: &mut Frame, app: &App, area: Rect) {
     .enumerate()
     {
         let name = if area.width < 60 {
-            if app.lang() == Lang::Zh {
-                ["代理", "外观", "配置", "排查"][i]
-            } else {
-                ["Proxy", "UI", "Sources", "Tools"][i]
+            match app.lang() {
+                Lang::Zh => ["代理", "外观", "配置", "排查"][i],
+                Lang::Ja => ["コア", "外観", "ソース", "診断"][i],
+                Lang::En => ["Proxy", "UI", "Sources", "Diag"][i],
             }
         } else {
             app.t(key)
@@ -1387,6 +1419,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         true,
     );
 
+    let l3 = |zh, en, ja| crate::manage::l3(app, zh, en, ja);
     let shortcuts = [
         ("Space", app.t("help_space")),
         ("m", app.t("help_m")),
@@ -1394,19 +1427,31 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("a", app.t("help_a")),
         ("Enter", app.t("help_enter")),
         ("↑↓ jk", app.t("help_jk")),
-        ("c / L / p", app.t("help_tabs")),
+        ("Tab ←→ hl  1 2", app.t("help_hl")),
+        ("p / c / L", app.t("help_tabs")),
         ("c: o / f / d", app.t("help_conn_keys")),
-        ("s", "设置：代理开关、配置方案、路由方案、界面、排查工具 / Settings: proxy, profiles, routing, appearance, diagnostics"),
-        ("e  /", app.t("help_explain")),
-        ("x", app.t("help_rule_x")),
+        ("c: x / X", app.t("help_conn_close")),
+        ("s", app.t("help_s")),
+        ("Rules: e / /", app.t("help_explain")),
+        ("Rules: x", app.t("help_rule_x")),
+        ("DNS: e / Enter / [ ]", app.t("help_dns_keys")),
+        ("Providers: Enter / H", app.t("help_provider_keys")),
         ("F", app.t("help_flush")),
         (
-            "Logs: P / Enter",
-            "日志：暂停、搜索、全文  Logs: pause, search, full text",
+            "Logs: P / / / Enter",
+            l3(
+                "日志：P 暂停/继续，/ 搜索，Enter 全文",
+                "Logs: P pause/resume, / search, Enter full text",
+                "ログ：P 一時停止/再開、/ 検索、Enter 全文",
+            ),
         ),
         (
             "! / Backspace",
-            "操作结果：全文 / 收起  Result: details / dismiss",
+            l3(
+                "操作结果：全文 / 收起",
+                "Result: details / dismiss",
+                "操作結果：全文 / 閉じる",
+            ),
         ),
         ("q", app.t("help_q")),
         ("Esc", app.t("help_esc")),
