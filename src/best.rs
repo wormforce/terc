@@ -123,19 +123,105 @@ pub fn candidates(
         .collect()
 }
 
-pub fn fastest(candidates: &[(usize, String)], results: &[(String, Option<u16>)]) -> Option<usize> {
-    candidates
+/// Nodes re-tested in the second best-pick round.
+const RETEST_TOP: usize = 5;
+
+fn delay_of(results: &[(String, Option<u16>)], name: &str) -> Option<u16> {
+    results
         .iter()
+        .find(|(node, _)| node == name)
+        .and_then(|(_, delay)| *delay)
+        .filter(|delay| *delay > 0)
+}
+
+/// The five fastest of the first round, plus the current node when it
+/// answered, so the hysteresis compares medians with medians.
+pub fn retest(
+    candidates: &[(usize, String)],
+    results: &[(String, Option<u16>)],
+    current: &str,
+) -> Vec<String> {
+    let mut reachable: Vec<_> = candidates
+        .iter()
+        .filter_map(|(_, name)| delay_of(results, name).map(|delay| (delay, name)))
+        .collect();
+    reachable.sort_by_key(|(delay, _)| *delay);
+    let mut names: Vec<String> = reachable
+        .iter()
+        .take(RETEST_TOP)
+        .map(|(_, name)| name.to_string())
+        .collect();
+    if !names.iter().any(|name| name == current)
+        && reachable.iter().any(|(_, name)| *name == current)
+    {
+        names.push(current.to_string());
+    }
+    names
+}
+
+/// Median with failures sorted last, so a failure in the middle drops the node.
+pub fn median(samples: &[Option<u16>]) -> Option<u16> {
+    let mut sorted: Vec<u32> = samples
+        .iter()
+        .map(|s| s.filter(|d| *d > 0).map_or(u32::MAX, u32::from))
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_unstable();
+    let (lo, hi) = (sorted[(sorted.len() - 1) / 2], sorted[sorted.len() / 2]);
+    (hi != u32::MAX).then(|| ((lo + hi) / 2) as u16)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// Group index of the node to switch to.
+    Switch(usize),
+    /// The current node is the best or close enough to it.
+    Keep {
+        best: usize,
+        current_ms: u16,
+        best_ms: u16,
+    },
+    None,
+}
+
+/// Ranks the nodes of the last round by the median of their samples across
+/// all rounds. Nodes the last round skipped had one lucky chance at most.
+pub fn pick(
+    candidates: &[(usize, String)],
+    rounds: &[&[(String, Option<u16>)]],
+    current: &str,
+) -> Pick {
+    let Some(last) = rounds.last() else {
+        return Pick::None;
+    };
+    let medians: Vec<(usize, &str, u16)> = candidates
+        .iter()
+        .filter(|(_, name)| last.iter().any(|(node, _)| node == name))
         .filter_map(|(index, name)| {
-            results
+            let samples: Vec<_> = rounds
                 .iter()
-                .find(|(node, _)| node == name)
-                .and_then(|(_, delay)| *delay)
-                .filter(|delay| *delay > 0)
-                .map(|delay| (*index, delay))
+                .filter(|round| round.iter().any(|(node, _)| node == name))
+                .map(|round| delay_of(round, name))
+                .collect();
+            median(&samples).map(|ms| (*index, name.as_str(), ms))
         })
-        .min_by_key(|(_, delay)| *delay)
-        .map(|(index, _)| index)
+        .collect();
+    let Some(&(best, _, best_ms)) = medians.iter().min_by_key(|(_, _, ms)| *ms) else {
+        return Pick::None;
+    };
+    let margin = (u32::from(best_ms) * 15 / 100).max(30);
+    match medians.iter().find(|(_, name, _)| *name == current) {
+        Some(&(_, _, current_ms)) if u32::from(current_ms) <= u32::from(best_ms) + margin => {
+            Pick::Keep {
+                best,
+                current_ms,
+                best_ms,
+            }
+        }
+        _ => Pick::Switch(best),
+    }
 }
 
 #[cfg(test)]
@@ -179,9 +265,9 @@ mod tests {
             ("JP 01".into(), None),
             ("JP 02".into(), Some(20)),
         ];
-        assert_eq!(fastest(&local, &results), Some(2));
-        assert_eq!(fastest(&all, &results), Some(1));
-        assert_eq!(fastest(&local, &[]), None);
+        assert_eq!(pick(&local, &[&results], "US 01"), Pick::Switch(2));
+        assert_eq!(pick(&all, &[&results], "JP 01"), Pick::Switch(1));
+        assert_eq!(pick(&local, &[&[]], "JP 01"), Pick::None);
         snapshot.groups.push(ProxyGroup {
             name: "Nested".into(),
             kind: "Selector".into(),
@@ -207,5 +293,84 @@ mod tests {
         assert_eq!(country_hint("Premium Auto"), None);
         assert_eq!(country_hint("RUSH-01"), None);
         assert_eq!(country_hint("🇺🇸 US → JP"), None);
+    }
+
+    fn named(pairs: &[(&str, Option<u16>)]) -> Vec<(String, Option<u16>)> {
+        pairs.iter().map(|(n, d)| (n.to_string(), *d)).collect()
+    }
+
+    #[test]
+    fn median_drops_nodes_whose_middle_sample_failed() {
+        assert_eq!(median(&[]), None);
+        assert_eq!(median(&[Some(40)]), Some(40));
+        assert_eq!(median(&[Some(40), Some(60)]), Some(50));
+        assert_eq!(median(&[Some(40), None]), None);
+        assert_eq!(median(&[Some(40), Some(0)]), None);
+        assert_eq!(median(&[Some(90), None, Some(40)]), Some(90));
+        assert_eq!(median(&[None, None, Some(40)]), None);
+    }
+
+    #[test]
+    fn retest_takes_top_five_and_the_reachable_current_node() {
+        let candidates: Vec<_> = (0..8).map(|i| (i, format!("N{i}"))).collect();
+        let first = named(&[
+            ("N0", Some(70)),
+            ("N1", Some(10)),
+            ("N2", None),
+            ("N3", Some(30)),
+            ("N4", Some(20)),
+            ("N5", Some(50)),
+            ("N6", Some(40)),
+            ("N7", Some(90)),
+        ]);
+        assert_eq!(
+            retest(&candidates, &first, "N7"),
+            ["N1", "N4", "N3", "N6", "N5", "N7"]
+        );
+        assert_eq!(retest(&candidates, &first, "N4").len(), 5);
+        assert_eq!(retest(&candidates, &first, "N2").len(), 5);
+        assert!(retest(&candidates, &[], "N0").is_empty());
+    }
+
+    #[test]
+    fn pick_uses_medians_and_keeps_a_close_current_node() {
+        let candidates: Vec<_> = (0..4).map(|i| (i, format!("N{i}"))).collect();
+        // N3 was lucky once; only re-tested nodes compete.
+        let first = named(&[
+            ("N0", Some(100)),
+            ("N1", Some(10)),
+            ("N2", Some(120)),
+            ("N3", Some(5)),
+        ]);
+        let second = named(&[("N0", Some(100)), ("N1", Some(300)), ("N2", Some(120))]);
+        assert_eq!(pick(&candidates, &[&first, &second], "N3"), Pick::Switch(0));
+        // A median of 120 is within max(30 ms, 15%) of 100.
+        assert_eq!(
+            pick(&candidates, &[&first, &second], "N2"),
+            Pick::Keep {
+                best: 0,
+                current_ms: 120,
+                best_ms: 100
+            }
+        );
+        let second = named(&[("N0", Some(100)), ("N1", Some(300)), ("N2", Some(150))]);
+        assert_eq!(pick(&candidates, &[&first, &second], "N2"), Pick::Switch(0));
+        // 15% beats 30 ms for slow nodes: 400 + 60.
+        let first = named(&[("N0", Some(400)), ("N1", Some(460))]);
+        let second = named(&[("N0", Some(400)), ("N1", Some(460))]);
+        assert!(matches!(
+            pick(&candidates, &[&first, &second], "N1"),
+            Pick::Keep { best: 0, .. }
+        ));
+        let second = named(&[("N0", Some(400)), ("N1", Some(480))]);
+        assert_eq!(pick(&candidates, &[&first, &second], "N1"), Pick::Switch(0));
+        // A current node that failed the re-test is not kept.
+        let second = named(&[("N0", Some(400)), ("N1", None)]);
+        assert_eq!(pick(&candidates, &[&first, &second], "N1"), Pick::Switch(0));
+        // The best node is the current one.
+        assert!(matches!(
+            pick(&candidates, &[&first, &second], "N0"),
+            Pick::Keep { best: 0, .. }
+        ));
     }
 }
