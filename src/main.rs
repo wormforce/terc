@@ -464,6 +464,8 @@ pub struct App {
     pub log_detail: bool,
     pub log_index: usize,
     pub pending_best_group: Option<(String, Option<String>)>,
+    /// First-round results while the top nodes are re-tested.
+    pub best_first_round: Option<Vec<(String, Option<u16>)>>,
     pub best_scope_index: usize,
     pub action_busy: bool,
     pub snapshot_pending: bool,
@@ -607,6 +609,7 @@ impl App {
             log_detail: false,
             log_index: 0,
             pending_best_group: None,
+            best_first_round: None,
             best_scope_index: 0,
             action_busy: false,
             snapshot_pending: false,
@@ -1057,7 +1060,7 @@ impl App {
                             let previous_group = self.group_index;
                             let previous_node = self.node_index;
                             self.group_index = index;
-                            self.select_best_node_in_group_after_test(country.as_deref(), &results);
+                            self.select_best_node_in_group_after_test(country, results);
                             if previous_group != index {
                                 self.group_index = previous_group;
                                 self.node_index = previous_node;
@@ -1479,6 +1482,7 @@ impl App {
         }
         let group_name = group.name.clone();
         self.pending_best_group = Some((group_name.clone(), country));
+        self.best_first_round = None;
         self.overlay = Overlay::None;
         self.set_status("正在测速并优选 / Testing candidates…", false);
         mihomo::test_best_delays_async(
@@ -1491,16 +1495,73 @@ impl App {
 
     fn select_best_node_in_group_after_test(
         &mut self,
-        country: Option<&str>,
-        results: &[(String, Option<u16>)],
+        country: Option<String>,
+        results: Vec<(String, Option<u16>)>,
     ) {
-        let candidates = best::candidates(&self.snapshot, self.group_index, country);
-        let selected = best::fastest(&candidates, results);
-        if let Some(index) = selected {
-            self.node_index = index;
-            self.activate_selected_node();
-        } else {
-            self.set_status("范围内没有可达节点 / No reachable node in this scope", true);
+        let Some(group) = self.snapshot.groups.get(self.group_index) else {
+            return;
+        };
+        let (group_name, current) = (group.name.clone(), group.now.clone());
+        let candidates = best::candidates(&self.snapshot, self.group_index, country.as_deref());
+        // One sample favours whichever node got lucky, so the leaders run again.
+        let pick = match self.best_first_round.take() {
+            None => {
+                let retest = best::retest(&candidates, &results, &current);
+                if retest.len() > 1 {
+                    self.set_status(
+                        &format!(
+                            "正在复测领先的 {0} 个节点 / Re-testing {0} leading nodes…",
+                            retest.len()
+                        ),
+                        false,
+                    );
+                    self.best_first_round = Some(results);
+                    self.pending_best_group = Some((group_name.clone(), country));
+                    mihomo::test_best_delays_async(
+                        self.config.controller.clone(),
+                        group_name,
+                        retest,
+                        self.tx.clone(),
+                    );
+                    return;
+                }
+                best::pick(&candidates, &[&results], &current)
+            }
+            Some(first) => best::pick(&candidates, &[&first, &results], &current),
+        };
+        match pick {
+            best::Pick::Switch(index) => {
+                self.node_index = index;
+                self.activate_selected_node();
+            }
+            best::Pick::Keep {
+                best,
+                current_ms,
+                best_ms,
+            } => {
+                let fastest = candidates
+                    .iter()
+                    .find(|(index, _)| *index == best)
+                    .map_or("", |(_, name)| name.as_str());
+                let text = match (self.lang(), fastest == current) {
+                    (Lang::Zh, true) => format!("当前节点 {current} 已是最快（{best_ms} ms）"),
+                    (Lang::En, true) => format!("{current} is already the fastest ({best_ms} ms)"),
+                    (Lang::Ja, true) => format!("現在の {current} が最速です（{best_ms} ms）"),
+                    (Lang::Zh, false) => format!(
+                        "保留当前节点 {current}（{current_ms} ms），与最快的 {fastest}（{best_ms} ms）差距在 30 ms / 15% 内"
+                    ),
+                    (Lang::En, false) => format!(
+                        "Kept {current} ({current_ms} ms): within 30 ms / 15% of the fastest, {fastest} ({best_ms} ms)"
+                    ),
+                    (Lang::Ja, false) => format!(
+                        "現在の {current}（{current_ms} ms）を維持：最速の {fastest}（{best_ms} ms）との差が 30 ms / 15% 以内"
+                    ),
+                };
+                self.set_status(&text, false);
+            }
+            best::Pick::None => {
+                self.set_status("范围内没有可达节点 / No reachable node in this scope", true)
+            }
         }
     }
 
@@ -3473,6 +3534,53 @@ mod tests {
         let previous = app.up_history.clone();
         app.advance_graph(Duration::from_secs(2));
         assert_eq!(app.up_history, previous);
+    }
+
+    #[test]
+    fn best_pick_retests_leaders_and_keeps_a_close_current_node() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        // Round two must not reach a real controller.
+        app.config.controller.addr = "127.0.0.1:1".into();
+        let names = ["N0", "N1", "N2"];
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "Main".into(),
+            kind: "Selector".into(),
+            now: "N1".into(),
+            all: names.iter().map(|s| s.to_string()).collect(),
+        });
+        for name in names {
+            app.snapshot.nodes.insert(
+                name.into(),
+                mihomo::ProxyNode {
+                    name: name.into(),
+                    kind: "Shadowsocks".into(),
+                    udp: true,
+                    delay: None,
+                    provider: None,
+                },
+            );
+        }
+        let first = vec![
+            ("N0".to_string(), Some(40)),
+            ("N1".to_string(), Some(70)),
+            ("N2".to_string(), None),
+        ];
+        app.pending_best_group = Some(("Main".into(), None));
+        app.select_best_node_in_group_after_test(None, first.clone());
+        assert!(app.pending_best_group.is_some());
+        assert_eq!(app.best_first_round.as_deref(), Some(&first[..]));
+        assert!(app.status_message.contains("Re-testing 2 leading"));
+
+        // Medians 50 and 75: N1 stays within 30 ms of N0.
+        app.pending_best_group = None;
+        let second = vec![("N0".to_string(), Some(60)), ("N1".to_string(), Some(80))];
+        app.select_best_node_in_group_after_test(None, second);
+        assert!(app.pending_best_group.is_none());
+        assert!(app.best_first_round.is_none());
+        assert!(!app.action_busy);
+        assert!(app.status_message.starts_with("Kept N1 (75 ms)"));
+        assert!(app.status_message.contains("N0 (50 ms)"));
     }
 
     #[test]
