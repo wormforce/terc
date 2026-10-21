@@ -54,15 +54,15 @@ cd terc
 cargo run --release --locked
 ```
 
-`terc` opens on the dashboard. Press **Space** to toggle the system proxy (macOS `networksetup`, or Linux GNOME `gsettings` when `org.gnome.system.proxy` is present; otherwise it stays unchanged and says so), or press **K** to start/stop the background `mihomo` daemon.
+`terc` opens on the dashboard. Press **Space** there to toggle the system proxy (macOS `networksetup`, or Linux GNOME `gsettings` when `org.gnome.system.proxy` is present; otherwise it stays unchanged and says so). Start or stop the background `mihomo` managed by terc from Settings → Core & Proxy → Core service. Stopping the core turns off only a system proxy that still points at terc's port on 127.0.0.1; any other proxy, such as a corporate one, is left alone.
 
-On macOS, <kbd>T</kbd> opens the system administrator authorization dialog when enabling TUN requires elevated privileges. After approval, terc restarts its managed Mihomo as administrator; existing connections briefly disconnect, while the TUI stays an ordinary user process. Cancelling preserves the original core and restores the configuration. Stopping the elevated core with <kbd>K</kbd> may also require authorization; starting a core with TUN already enabled requests authorization immediately. TUN failures show the core error rather than reporting success from the API response alone. A manually launched local Mihomo using the same config directory can be adopted and restarted after authorization; terc checks its listening port, executable, and configuration arguments first. Stop Homebrew/launchd-managed cores through their service manager before starting one with K. On Linux, run Mihomo through a system service or grant the required network privileges.
+On macOS, turning on Settings → Core & Proxy → TUN opens the system administrator authorization dialog when enabling TUN requires elevated privileges. After approval, terc restarts its managed Mihomo as administrator; existing connections briefly disconnect, while the TUI stays an ordinary user process. Cancelling preserves the original core and restores the configuration. Stopping the elevated core from Core service may also require authorization; starting a core with TUN already enabled requests authorization immediately. TUN failures show the core error rather than reporting success from the API response alone. A manually launched local Mihomo using the same config directory can be adopted and restarted after authorization; terc checks its listening port, executable, and configuration arguments first. Stop Homebrew/launchd-managed cores through their service manager before starting one from Core service. On Linux, run Mihomo through a system service or grant the required network privileges.
 
 Disconnect other full-tunnel VPNs, such as Shadowrocket, before enabling TUN to avoid conflicting routes. terc reports conflicting tunnel routes without deleting them. When a VPN becomes the primary interface, system proxy settings still use the active underlying hardware service, such as Wi-Fi.
 
 Run `terc --version` to verify the installed version.
 
-Setup appears only when there is no subscription URL, no `config.yaml`, and the core is not running: locate or download `mihomo` first, then paste a subscription URL (<kbd>Ctrl+D</kbd> downloads `darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` for this machine) and start the core. An existing config skips that and lands on the dashboard. <kbd>Esc</kbd> dismisses Setup and <kbd>u</kbd> brings it back while no subscription is configured — the system proxy is never switched on for you.
+Setup appears only when there is no subscription URL, no `config.yaml`, and the core is not running: locate or download `mihomo` first, then paste a subscription URL (<kbd>Ctrl+D</kbd> downloads `darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` for this machine) and start the core. An existing config skips that and lands on the dashboard. <kbd>Esc</kbd> dismisses Setup for this run; add a subscription or node later with `a` in Settings → Sources & Routing, and download the core from Settings → Diagnostics → Download / update core. The system proxy is never switched on for you.
 
 > [!NOTE]
 > `terc` decouples the UI lifecycle from the proxy core. Closing `terc` with <kbd>q</kbd> immediately frees all terminal UI resources while your background `mihomo` tunnel continues running uninterrupted.
@@ -92,7 +92,7 @@ Press `s` → Sources & Routing for the named proxy list; Tab opens routing plan
 | **Connections** | Process, inbound, sniff host, rule payload, chain, and geo/ASN; age, per-connection rate, AI tags, and recently closed long-lived/AI connections with an inferred cause; one-key close, with a prompt before actions that cut sessions |
 | **DNS** | Resolver status from the config, live lookup, and DNS / Fake-IP flush |
 | **Rules** | Ordered list with live hit counts, local explain, and runtime disable |
-| **Providers (Settings → Tools)** | `proxy-providers` and `rule-providers`, not the airport subscription URL. Refresh one or all; proxy providers can run a health check |
+| **Providers (Settings → Diagnostics)** | `proxy-providers` and `rule-providers`, not the airport subscription URL. Refresh one or all; proxy providers can run a health check |
 | **Snippets** | YAML overlays for TUN, sniffer, Fake-IP, process lookup, TCP racing, and IPv6 |
 | **Probe** | DNS answers plus a delay test of the selected node |
 | **Runtime** | TUN device and any WireGuard or Tailscale outbound the core already exposes |
@@ -108,24 +108,25 @@ Click a group to browse its nodes; click a node to activate it. Scrolling moves 
 
 | Where | Key | Action |
 | --- | --- | --- |
-| Dashboard / Settings | <kbd>Space</kbd> | Toggle the system proxy. macOS uses `networksetup`; Linux uses GNOME `gsettings` and otherwise leaves it unchanged. Never toggled for you |
-| Dashboard | <kbd>K</kbd> | Start or stop the background `mihomo` process managed by terc |
+| Dashboard | <kbd>Space</kbd> | Toggle the system proxy. macOS uses `networksetup`; Linux uses GNOME `gsettings` and otherwise leaves it unchanged. Never toggled for you. In Settings → Core & Proxy → System proxy, use <kbd>←</kbd> <kbd>→</kbd> or <kbd>Enter</kbd> |
+| Settings → Core & Proxy | Core service | Start or stop the background `mihomo` process managed by terc |
+| Settings → Core & Proxy | TUN | Turn TUN on or off; macOS asks for administrator authorization |
 | Proxies | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Tab</kbd> | Switch focus between **Groups `[1]`** and **Nodes `[2]`** |
 | Any list | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd> | Move the selection |
 | Nodes | <kbd>Enter</kbd> | Activate the highlighted node in the current group |
 | Proxies | <kbd>r</kbd> | Run concurrent URL latency tests for the current group |
 | Proxies | <kbd>a</kbd> | Choose all countries or the connected node’s country, then test and select the fastest node |
 | Dashboard | <kbd>m</kbd> | Cycle routing mode (`Rule` → `Global` → `Direct`) |
-| Settings → Proxy subscriptions | Update subscription | Refresh the source and apply the selected routing plan |
-| Setup window | <kbd>Enter</kbd> | Save the subscription URL, write the config and start the core |
-| Setup window | <kbd>Ctrl+U</kbd> / <kbd>Ctrl+D</kbd> | Clear the input line / download a managed `mihomo` core |
-| Setup window | <kbd>Esc</kbd> | Dismiss for now — reopen through Settings → Proxy subscriptions |
-| Dashboard | <kbd>p</kbd> / <kbd>c</kbd> / <kbd>L</kbd> | Switch main pane: **Proxies** / **Connections** / **Logs** |
+| Settings → Sources & Routing | <kbd>u</kbd> | Refresh the active subscription and apply its routing plan |
+| Setup | <kbd>Enter</kbd> | Save the subscription URL or node, write the config and start the core |
+| Setup | <kbd>Ctrl+U</kbd> / <kbd>Ctrl+D</kbd> | Clear the input line / download a managed `mihomo` core |
+| Setup | <kbd>Esc</kbd> | Dismiss and open the dashboard; add sources later with <kbd>a</kbd> in Settings → Sources & Routing |
+| Dashboard | <kbd>p</kbd> / <kbd>c</kbd> / <kbd>L</kbd> | Switch main pane: **Proxies** / **Connections** / **Logs**. DNS, Rules and Providers open from Settings → Diagnostics |
 | Settings → Appearance | Top panels | Show or hide traffic and overview panels |
 | Dashboard | <kbd>s</kbd> | Open the dual-pane Settings board. Press again there to return |
 | Settings | <kbd>←</kbd> <kbd>→</kbd>, <kbd>h</kbd> <kbd>l</kbd>, or <kbd>Enter</kbd> | Adjust setting or trigger action |
-| Settings | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> / <kbd>1</kbd>–<kbd>4</kbd> | Switch category pages (`Proxy` / `Appearance` / `Sources & Routing` / `Tools`) |
-| Any view | <kbd>?</kbd> | Open keyboard shortcut help. Press again to return to the dashboard |
+| Settings | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> / <kbd>1</kbd>–<kbd>4</kbd> | Switch category pages (`Core & Proxy` / `Appearance` / `Sources & Routing` / `Diagnostics`) |
+| Dashboard | <kbd>?</kbd> | Open keyboard shortcut help. <kbd>?</kbd>, <kbd>Esc</kbd> or <kbd>q</kbd> returns to the dashboard |
 | Dashboard | <kbd>q</kbd> | Quit (`mihomo` stays running in the background) |
 | Dashboard | <kbd>Esc</kbd> | Return to the proxy list; press q to quit |
 | Settings / Help | <kbd>Esc</kbd> | Return to the dashboard |
@@ -144,7 +145,7 @@ Click a group to browse its nodes; click a node to activate it. Scrolling moves 
 
 </details>
 
-Install the core before submitting the first subscription (`Ctrl+D` in Setup downloads it). Subscription, snippet and profile changes are validated with `mihomo -t` before replacing the configuration; rejected reloads restore the previous file. Enabled snippets are reapplied on subscription updates and profile switches. The Core service setting stops only a core started by terc; use the service manager for external cores.
+Install the core before submitting the first subscription (`Ctrl+D` in Setup downloads it; later, Settings → Diagnostics → Download / update core). While the core runs, a new config goes to it as `PUT /configs?force=true`, so the running core validates and loads it, and a rejected config leaves the file unchanged. When the core is stopped, or the config needs GeoIP / GeoSite data that is not on disk yet, `mihomo -t` validates it before it is written. Live settings such as ports and LAN access use `PATCH /configs` with no reload, and a regenerated config that has not changed is not reloaded. Enabled snippets are reapplied on subscription updates and source switches. The Core service setting stops only a core started by terc; use the service manager for external cores.
 
 Logs: `P` pauses/resumes display while capture continues, `/` searches, and Enter opens full text. Connections: Enter opens full details on narrow terminals. Results remain accessible with graphs hidden; `!` opens the full result and Backspace dismisses it. Help supports arrows and Page Up/Down.
 
@@ -156,7 +157,8 @@ Open **Settings** with <kbd>s</kbd>. UI preferences save to `~/.config/terc/conf
 
 | Category | Options |
 | --- | --- |
-| **Core & Proxy** | Start/stop `mihomo`, toggle the system proxy, switch routing mode, download `mihomo-darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` into `~/.config/terc/core/mihomo` |
+| **Core & Proxy** | Start/stop `mihomo`, toggle the system proxy, switch routing mode |
+| **Diagnostics** | Download `mihomo-darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` into `~/.config/terc/core/mihomo`; DNS, rules, providers, snippets, probe, runtime, logs, core log level, live connection stream |
 | **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling recursively merges mappings; disabling restores the source. Mihomo validates candidates before applying |
 | **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), UI refresh rate (`15` / `30` / `60` / `120 Hz`, a redraw cap; an unchanged screen is not redrawn), graph interval (`1000–86400000 ms`, arrows adjust by `100 ms`, Enter accepts a typed value; averaged rates, clears history on change), UI language |
 | **Sources & routing** | Independent node sources and routing plans, per-source assignments, reusable policies, validation before applying. Custom rule and AI preset editing is paused |

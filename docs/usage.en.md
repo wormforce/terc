@@ -13,15 +13,15 @@ First launch opens Setup only when three things are all true: no subscription UR
 | Linux arm64 | `mihomo-linux-arm64` |
 | Linux x86_64 | `mihomo-linux-amd64-v1` |
 
-There is no Windows build. The system proxy is never turned on by Setup. On x86_64 terc takes the `-v1` baseline build: the plain `amd64` asset needs AVX2 and does not start on older CPUs and some VMs.
+There is no Windows build. The system proxy is never turned on by Setup. What Setup is given is saved as a new source under `sources/`, so it shows up in Settings → Sources & Routing right away. Esc dismisses Setup for this run; afterwards add sources with `a` in Settings → Sources & Routing and download the core from Settings → Diagnostics → Download / update core. On x86_64 terc takes the `-v1` baseline build: the plain `amd64` asset needs AVX2 and does not start on older CPUs and some VMs.
 
 The download reads the latest release's `version.txt` and then fetches that exact file, without api.github.com and its 60-requests-per-hour limit. An attempt is abandoned only after 60 s below 1 KB/s; the next one resumes the partial file, so a slow but moving link always finishes. A failure shows curl's reason. While the core is running without TUN, terc first downloads through the core's own local listener (the mixed or HTTP port on `127.0.0.1`) and falls back to a direct download; this applies to that curl only and never touches the system proxy. Stable releases ship no `checksums.txt`, so integrity rests on GitHub's TLS.
 
 ## Subscription URL and Providers
 
-The airport subscription is the single URL you paste. It is fetched with gzip allowed and one attempt may take 60 s as before, so a panel or converter that spends half a minute building the file still finishes. A 5xx, 429 or timeout within the first 20 s is retried, at most twice; an attempt that ran the full 60 s is not repeated. Settings → Proxy subscriptions → Update subscription downloads it, combines it with the active profile’s manual nodes in `config.yaml`, preserving source routing, validates, and hot-reloads the core. Set the source URL in Settings first.
+The airport subscription is the single URL you paste. It is fetched with gzip allowed and one attempt may take 60 s as before, so a panel or converter that spends half a minute building the file still finishes. A 5xx, 429 or timeout within the first 20 s is retried, at most twice; an attempt that ran the full 60 s is not repeated. In Settings → Sources & Routing, `u` downloads the active subscription, combines it with the source's attached nodes in `config.yaml`, preserving source routing, and hands it to the core to validate and load. Set the source URL in Settings first.
 
-Settings → Tools opens **订阅源 / Providers**. That page is `proxy-providers` and `rule-providers` inside the Mihomo config: extra URLs the core uses to refresh a node list or a rule list. It is not the airport URL. Refreshing a provider does not replace the subscription link in `~/.config/terc/config.json`.
+Settings → Diagnostics opens **订阅源 / Providers**. That page is `proxy-providers` and `rule-providers` inside the Mihomo config: extra URLs the core uses to refresh a node list or a rule list. It is not the airport URL. Refreshing a provider does not replace the subscription link in `~/.config/terc/config.json`.
 
 On that page, Enter refreshes the selected provider, `F` refreshes all of them, and `H` health-checks a proxy provider. Rule providers have no latency check.
 
@@ -41,7 +41,7 @@ Surge proxies converted: `ss` (obfs, shadow-tls, 2022 ciphers), `trojan` (ws), `
 
 Snell v4/v5 needs Mihomo v1.19.26 or newer (`Ctrl+D` fetches the latest). Mihomo speaks v5 as the v4 wire protocol; Surge's QUIC Proxy Mode is not available.
 
-Skipped, never fatal: `external`, snell v6, listen-only WireGuard sections (`listen-port` with peers lacking `endpoint`), `ssid`/`subnet` groups, `policy-path`, `USER-AGENT`, `URL-REGEX`, `RULE-SET,SYSTEM`/`LAN`, rules pointing at unknown policies, unsupported ciphers. The result toast says "N skipped"; press `!` for the list (names and types only, never secrets). Only a recognizable download replaces `~/.config/terc/subscription.cache`.
+Skipped, never fatal: `external`, snell v6, listen-only WireGuard sections (`listen-port` with peers lacking `endpoint`), `ssid`/`subnet` groups, `policy-path`, `USER-AGENT`, `URL-REGEX`, `RULE-SET,SYSTEM`/`LAN`, rules pointing at unknown policies, unsupported ciphers. The result toast says "N skipped"; press `!` for the list (names and types only, never secrets). Only a recognizable download replaces the source's cache, `~/.config/terc/sources/<id>/subscription.yaml`.
 
 ## Proxy subscriptions and routing plans
 
@@ -57,7 +57,7 @@ For example, source A can use its own routing and manual source B can use a shar
 
 ## Common settings
 
-Settings has four tabs: Proxy, Appearance, Sources & Routing and Diagnostics (Tab / Shift+Tab or 1–4).
+Settings has four tabs: Core & Proxy, Appearance, Sources & Routing and Diagnostics (Tab / Shift+Tab or 1–4).
 
 Proxy settings include mixed / HTTP / SOCKS ports, LAN access, TUN, DNS, IPv6, sniffing, concurrent TCP, process matching, the test URL and controller timeout. Port values range from 0 to 65535; 0 disables a listener. A mixed port supports both HTTP and SOCKS and must not duplicate another listener. Turn off system proxy before changing ports, then enable it again after saving.
 
@@ -67,17 +67,19 @@ The UI refresh rate is a redraw cap, not a fixed frame rate: keys and mouse clic
 
 Diagnostics contains the log level, core download, snippets, probe, runtime details, rules, providers and Live connection stream. Startup errors include a core-log excerpt. The Logs view also reads `terc-core.log`; the preceding startup log is kept as `terc-core.previous.log`. New configs set `log-level: warning`, so `terc-core.log` no longer gets a line per new connection; the Logs view always subscribes at info and shows the same lines as before. A subscription's own `log-level` is kept. An occupied controller or an unresponsive managed process blocks another launch. A startup timeout cleans up the newly launched process.
 
+While the core runs, a new config is sent as `PUT /configs?force=true`, so the running core validates and loads it; a rejected config leaves the file unchanged. `mihomo -t` validates first only when the core is stopped or the config needs GeoIP / GeoSite data that is not on disk yet. A regenerated config that has not changed is not reloaded.
+
 ## Geodata
 
 The core downloads the files behind GEOIP, GEOSITE and IP-ASN rules the first time it needs them, waits 90 s per file, and fails validation when a download fails. Mihomo's defaults are GitHub release URLs. When the generated config has no `geox-url`, terc adds the jsDelivr mirror (`testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/` for `geoip.dat`, `geosite.dat`, `country.mmdb` and `GeoLite2-ASN.mmdb`). A subscription's own `geox-url`, even one with a single key, is kept as written.
 
 ## Sniffer
 
-Settings → Proxy toggles the Mihomo sniffer. Many flows arrive with only an IP. The sniffer reads the HTTP Host, TLS SNI, or QUIC name from the start of the flow and fills the domain back in, so domain rules can match. The connections view shows that sniffed host. It does not store page contents, and it is not a packet capture.
+Settings → Core & Proxy toggles the Mihomo sniffer. Many flows arrive with only an IP. The sniffer reads the HTTP Host, TLS SNI, or QUIC name from the start of the flow and fills the domain back in, so domain rules can match. The connections view shows that sniffed host. It does not store page contents, and it is not a packet capture.
 
 ## DNS snippets
 
-Settings → Tools → Snippets has two built-in DNS overlays for configs without a usable `dns` block:
+Settings → Diagnostics → Config snippets has two built-in DNS overlays for configs without a usable `dns` block:
 
 | Snippet | Resolvers | Notes |
 | --- | --- | --- |
@@ -108,16 +110,16 @@ The core pushes the connection list over WebSocket once a second. If the push is
 
 | Key | View |
 | --- | --- |
-| Settings → Proxy | TUN, DNS, IPv6, sniffer, core service |
-| Settings → Proxy subscriptions | Sources and manual nodes; separate Routing plans entry |
-| Settings → Tools | DNS lookup, effective rules, providers, snippets, probe and runtime |
+| Settings → Core & Proxy | TUN, DNS, IPv6, sniffer, core service |
+| Settings → Sources & Routing | Sources and manual nodes; separate Routing plans entry |
+| Settings → Diagnostics | DNS lookup, effective rules, providers, snippets, probe, runtime, logs and core download |
 | `s` / `?` | Settings and help. Esc returns to the dashboard |
-| `q` | Quit the UI. The core keeps running. Settings → Proxy → Core service starts or stops it |
+| `q` | Quit the UI. The core keeps running. Settings → Core & Proxy → Core service starts or stops it |
 | Esc | From a subview, return to proxies. From proxies, stay on the dashboard; q quits |
 
 ## Linux and macOS
 
-System proxy on macOS uses `networksetup` on the active network service. On Linux it uses GNOME `gsettings` (`org.gnome.system.proxy`) when that schema is present, and otherwise does nothing and says so. Linux never calls `networksetup`. Neither platform enables the proxy on its own.
+System proxy on macOS uses `networksetup` on the active network service. Stopping the core turns off only proxy entries that still point at terc's port on `127.0.0.1`; another proxy, such as a corporate one, stays on. On Linux it uses GNOME `gsettings` (`org.gnome.system.proxy`) when that schema is present, and otherwise does nothing and says so. Linux never calls `networksetup`. Neither platform enables the proxy on its own.
 
 Local control is `TcpStream` to `127.0.0.1:9090`. Remote downloads use the system `curl`.
 
