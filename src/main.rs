@@ -773,7 +773,7 @@ impl App {
         }
         self.clear_status();
         self.core_downloading = true;
-        download_managed_core_async(self.tx.clone());
+        download_managed_core_async(self.tx.clone(), mihomo::core_download_proxy(&self.snapshot));
     }
 
     fn finish_setup_fetch(&mut self, ok: bool) {

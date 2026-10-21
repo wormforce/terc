@@ -9,11 +9,13 @@ First launch opens Setup only when three things are all true: no subscription UR
 | Host | Asset |
 | --- | --- |
 | macOS Apple silicon | `mihomo-darwin-arm64` |
-| macOS Intel | `mihomo-darwin-amd64` |
+| macOS Intel | `mihomo-darwin-amd64-v1` |
 | Linux arm64 | `mihomo-linux-arm64` |
-| Linux x86_64 | `mihomo-linux-amd64` |
+| Linux x86_64 | `mihomo-linux-amd64-v1` |
 
-There is no Windows build. The system proxy is never turned on by Setup.
+There is no Windows build. The system proxy is never turned on by Setup. On x86_64 terc takes the `-v1` baseline build: the plain `amd64` asset needs AVX2 and does not start on older CPUs and some VMs.
+
+The download reads the latest release's `version.txt` and then fetches that exact file, without api.github.com and its 60-requests-per-hour limit. An attempt is abandoned only after 60 s below 1 KB/s; the next one resumes the partial file, so a slow but moving link always finishes. A failure shows curl's reason. While the core is running without TUN, terc first downloads through the core's own local listener (the mixed or HTTP port on `127.0.0.1`) and falls back to a direct download; this applies to that curl only and never touches the system proxy. Stable releases ship no `checksums.txt`, so integrity rests on GitHub's TLS.
 
 ## Subscription URL and Providers
 
