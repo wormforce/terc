@@ -3599,7 +3599,10 @@ mod tests {
             name: "Main".into(),
             kind: "Selector".into(),
             now: "N1".into(),
+            fixed: String::new(),
             all: names.iter().map(|s| s.to_string()).collect(),
+            test_url: String::new(),
+            expected_status: String::new(),
         });
         for name in names {
             app.snapshot.nodes.insert(
@@ -3610,6 +3613,7 @@ mod tests {
                     udp: true,
                     delay: None,
                     provider: None,
+                    url_delays: Default::default(),
                 },
             );
         }
@@ -3697,6 +3701,8 @@ mod tests {
             now: "US 01".into(),
             fixed: fixed.into(),
             all: vec!["JP 01".into(), "US 01".into()],
+            test_url: String::new(),
+            expected_status: String::new(),
         }
     }
 

@@ -4679,6 +4679,7 @@ fn fetch_group(cfg: &ControllerConfig, name: &str) -> Option<ProxyGroup> {
         name: name.to_string(),
         kind: json_str(&item, "type"),
         now: json_str(&item, "now"),
+        fixed: json_str(&item, "fixed"),
         all: Vec::new(),
         test_url: json_str(&item, "testUrl"),
         expected_status: json_str(&item, "expectedStatus"),
