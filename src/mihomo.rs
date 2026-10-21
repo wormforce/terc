@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -303,14 +303,34 @@ pub fn percent_encode(input: &str) -> String {
     out
 }
 
-fn parse_socket_addr(addr: &str) -> SocketAddr {
+/// Where terc connects for the controller `addr`, the same string the core
+/// gets as `-ext-ctl`. A host name resolves IPv4 first, as Go's listener
+/// does, and an empty host means loopback. An address that does not resolve
+/// is an error: guessing 127.0.0.1:9090 would reach, and send the secret to,
+/// whatever else listens there.
+pub fn controller_socket_addr(addr: &str) -> io::Result<SocketAddr> {
     let clean = addr
+        .trim()
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .trim_end_matches('/');
-    clean
-        .parse()
-        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9090)))
+    let invalid = |why: &dyn std::fmt::Display| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid controller address {addr:?} in config.json: {why}"),
+        )
+    };
+    let clean = match clean.strip_prefix(':') {
+        Some(port) => format!("127.0.0.1:{port}"),
+        None => clean.to_string(),
+    };
+    let found: Vec<SocketAddr> = clean.to_socket_addrs().map_err(|e| invalid(&e))?.collect();
+    found
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or(found.first())
+        .copied()
+        .ok_or_else(|| invalid(&"no address"))
 }
 
 pub fn http_request(
@@ -321,7 +341,7 @@ pub fn http_request(
     body: Option<&str>,
     timeout: Duration,
 ) -> io::Result<(u16, String)> {
-    let sock_addr = parse_socket_addr(addr);
+    let sock_addr = controller_socket_addr(addr)?;
     let mut stream = TcpStream::connect_timeout(&sock_addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -485,7 +505,10 @@ fn stream_json_lines<F>(
 ) where
     F: FnMut(Value),
 {
-    let sock_addr = parse_socket_addr(addr);
+    // A bad address is reported once at startup and by every request.
+    let Ok(sock_addr) = controller_socket_addr(addr) else {
+        return;
+    };
     while !stop.load(Ordering::Relaxed) {
         if let Ok(mut stream) = TcpStream::connect_timeout(&sock_addr, Duration::from_millis(800)) {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
@@ -644,7 +667,9 @@ fn stream_connections_with(
     conn_stream: &ConnStream,
     t: &StreamTiming,
 ) {
-    let sock_addr = parse_socket_addr(addr);
+    let Ok(sock_addr) = controller_socket_addr(addr) else {
+        return;
+    };
     // A header keeps the secret out of the URL; Mihomo accepts Bearer for WS.
     let auth = format!("Bearer {secret}");
     let headers: Vec<(&str, &str)> = if secret.is_empty() {
@@ -2546,6 +2571,7 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     if !config_file.is_file() {
         return Err(format!("config not found: {}", config_file.display()));
     }
+    let address = controller_socket_addr(&cfg.addr).map_err(|e| e.to_string())?;
     if matches!(
         http_request(
             &cfg.addr,
@@ -2562,10 +2588,8 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     if let Ok((pid, _)) = crate::privilege::managed_core(cfg) {
         return Err(format!("Mihomo (PID {pid}) is still running but its controller is not responding. Stop the existing core before restarting.\n{}", core_log_excerpt(cfg)));
     }
-    if let Ok(address) = cfg.addr.parse::<SocketAddr>() {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(400)).is_ok() {
-            return Err(format!("Controller {} is occupied but did not accept this client. Check the controller secret or existing Mihomo service. No additional core was started.", cfg.addr));
-        }
+    if TcpStream::connect_timeout(&address, Duration::from_millis(400)).is_ok() {
+        return Err(format!("Controller {} is occupied but did not accept this client. Check the controller secret or existing Mihomo service. No additional core was started.", cfg.addr));
     }
     let raw = read_config_text(cfg)?;
     validate_listener_ports(&raw)?;
@@ -4979,6 +5003,40 @@ mod provider_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_address_resolves_or_fails_loudly() {
+        let v4 = |s: &str| controller_socket_addr(s).unwrap();
+        assert_eq!(
+            v4("127.0.0.1:9097"),
+            SocketAddr::from(([127, 0, 0, 1], 9097))
+        );
+        assert_eq!(
+            v4("http://127.0.0.1:9097/"),
+            SocketAddr::from(([127, 0, 0, 1], 9097))
+        );
+        assert_eq!(v4(":9091"), SocketAddr::from(([127, 0, 0, 1], 9091)));
+        assert_eq!(v4("[::1]:9092").port(), 9092);
+        // The core listens on the port it is given; terc must probe the same one.
+        let local = v4("localhost:9097");
+        assert_eq!(local.port(), 9097);
+        assert!(local.ip().is_loopback());
+        for bad in ["127.0.0.1", "127.0.0.1:port", "", "127.0.0.1:99999"] {
+            let err = controller_socket_addr(bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad}");
+            assert!(err.to_string().contains("invalid controller address"));
+        }
+        let err = http_request(
+            "localhost",
+            "",
+            "GET",
+            "/version",
+            None,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn vpn_primary_interface_uses_connected_hardware_service() {

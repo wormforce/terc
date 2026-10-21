@@ -2272,6 +2272,9 @@ fn main() -> io::Result<()> {
         Ok(_) => {}
         Err(err) => problems.push(format!("迁移失败 / Migration failed / 移行失敗: {err}")),
     }
+    if let Err(err) = mihomo::controller_socket_addr(&app.config.controller.addr) {
+        problems.push(err.to_string());
+    }
     if !problems.is_empty() {
         // The one-time DNS notice is already recorded as seen; keep it.
         if !app.status_message.is_empty() {
