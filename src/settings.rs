@@ -260,8 +260,8 @@ impl App {
             "节点测速地址",
             "Latency test URL",
             self.config.controller.test_url.clone(),
-            "Enter 编辑 HTTP / HTTPS 测速地址，用于手动节点测速。",
-            "Enter an HTTP / HTTPS URL for manual node latency tests.",
+            "Enter 编辑 HTTP / HTTPS 测速地址，用于手动节点测速与优选。默认 https://www.gstatic.com/generate_204；走 Cloudflare 边缘的路径（如 OpenAI）可用 https://cp.cloudflare.com/generate_204。URLTest / Fallback 组按组内 url 测速。",
+            "Enter an HTTP / HTTPS URL for manual latency tests and best-node selection. Default https://www.gstatic.com/generate_204; https://cp.cloudflare.com/generate_204 tests the Cloudflare edge, as OpenAI-like paths use. URLTest / Fallback groups test with their own url.",
         );
         add(
             Timeout,
@@ -269,8 +269,8 @@ impl App {
             "测速 / 查询超时",
             "Test / query timeout",
             format!("{} ms", self.config.controller.timeout_ms),
-            "Enter 输入 500–60000 毫秒。",
-            "Enter a timeout from 500 to 60000 milliseconds.",
+            "Enter 输入 500–32767 毫秒（Mihomo 测速接口的上限）。URLTest / Fallback 组至少按 5000 毫秒测速。",
+            "Enter a timeout from 500 to 32767 milliseconds, the limit of Mihomo's delay route. URLTest / Fallback groups test with at least 5000.",
         );
         add(
             Traffic,
@@ -618,7 +618,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 let valid = match id {
                     GraphInterval => n.is_some_and(|n| (1000..=86_400_000).contains(&n)),
                     MixedPort | HttpPort | SocksPort => n.is_some_and(|n| n <= 65535),
-                    Timeout => n.is_some_and(|n| (500..=60000).contains(&n)),
+                    Timeout => {
+                        n.is_some_and(|n| (500..=crate::mihomo::MAX_DELAY_TIMEOUT_MS).contains(&n))
+                    }
                     TestUrl => text.starts_with("http://") || text.starts_with("https://"),
                     _ => false,
                 };

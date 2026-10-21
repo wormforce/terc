@@ -199,7 +199,12 @@ impl Config {
     pub fn load() -> Self {
         let path = Self::path();
         if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(cfg) = serde_json::from_str::<Self>(&raw) {
+            if let Ok(mut cfg) = serde_json::from_str::<Self>(&raw) {
+                if cfg.migrate() {
+                    if let Err(err) = cfg.save() {
+                        eprintln!("Cannot save preferences: {err}");
+                    }
+                }
                 return cfg;
             }
         }
@@ -208,6 +213,21 @@ impl Config {
             eprintln!("Cannot save preferences: {err}");
         }
         cfg
+    }
+
+    /// Moves the old http default test URL to the https one, never a URL the
+    /// user set, and caps a timeout saved before the delay route's limit.
+    /// Returns whether anything changed.
+    fn migrate(&mut self) -> bool {
+        let controller = &mut self.controller;
+        let before = (controller.test_url.clone(), controller.timeout_ms);
+        if controller.test_url == crate::mihomo::OLD_DEFAULT_TEST_URL {
+            controller.test_url = crate::mihomo::DEFAULT_TEST_URL.to_string();
+        }
+        controller.timeout_ms = controller
+            .timeout_ms
+            .min(crate::mihomo::MAX_DELAY_TIMEOUT_MS);
+        before != (controller.test_url.clone(), controller.timeout_ms)
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -3463,6 +3483,8 @@ mod tests {
             kind: "Selector".into(),
             now: "Unknown".into(),
             all: vec!["US 01".into()],
+            test_url: String::new(),
+            expected_status: String::new(),
         });
         for (width, height) in [(42, 12), (80, 24)] {
             press(&mut app, KeyCode::Char('a'));
@@ -3488,6 +3510,8 @@ mod tests {
             kind: "Selector".into(),
             now: "node".into(),
             all: vec!["node".into()],
+            test_url: String::new(),
+            expected_status: String::new(),
         });
         render_text(&mut app, 80, 24);
         let before = app.proxy_hits.clone();
@@ -3517,6 +3541,8 @@ mod tests {
                 kind: "Selector".into(),
                 now: "Node0".into(),
                 all: (0..40).map(|n| format!("Node{n}")).collect(),
+                test_url: String::new(),
+                expected_status: String::new(),
             })
             .collect();
         for (width, height) in [(42, 12), (80, 24), (120, 30)] {
@@ -3740,6 +3766,25 @@ mod tests {
         assert_eq!(cfg.settings.theme, ThemeId::Mono);
         assert_eq!(cfg.settings.graph_interval_secs, 1);
         assert!(cfg.settings.connections_stream);
+    }
+
+    #[test]
+    fn load_migrates_only_the_old_default_test_url_and_caps_the_timeout() {
+        let mut cfg = Config::default();
+        cfg.controller.test_url = mihomo::OLD_DEFAULT_TEST_URL.into();
+        cfg.controller.timeout_ms = 60_000;
+        assert!(cfg.migrate());
+        assert_eq!(cfg.controller.test_url, mihomo::DEFAULT_TEST_URL);
+        assert_eq!(cfg.controller.timeout_ms, mihomo::MAX_DELAY_TIMEOUT_MS);
+        assert!(!cfg.migrate());
+        for own in [
+            "http://www.gstatic.com/generate_204?x",
+            "http://cp.cloudflare.com/generate_204",
+        ] {
+            cfg.controller.test_url = own.into();
+            assert!(!cfg.migrate());
+            assert_eq!(cfg.controller.test_url, own);
+        }
     }
 
     #[test]
@@ -4097,6 +4142,8 @@ mod tests {
             kind: "URLTest".into(),
             now: String::new(),
             all: vec![],
+            test_url: String::new(),
+            expected_status: String::new(),
         });
         press(&mut app, KeyCode::Char(' '));
         assert_eq!(app.ai_picker_selected, vec!["AUTO".to_string()]);
