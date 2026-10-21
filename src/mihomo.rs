@@ -2571,7 +2571,9 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     validate_listener_ports(&raw)?;
     check_startup_ports(&raw)?;
     if cfg!(target_os = "macos") && local_flags(cfg).tun_enabled {
-        return crate::privilege::start_core(cfg, None);
+        let started = crate::privilege::start_core(cfg, None);
+        CORE_REFRESHED.with(|cell| cell.set(started.is_ok()));
+        return started;
     }
     let log_path = Path::new(&cfg.config_dir).join("terc-core.log");
     if log_path.is_file() {
@@ -2637,6 +2639,7 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
                     let _ = child.wait();
                 });
                 if step == StartupStep::Ready {
+                    CORE_REFRESHED.with(|cell| cell.set(true));
                     return Ok(format!("Started mihomo ({})", bin.display()));
                 }
                 // The PID record stays, so the managed-core guard blocks a second launch.
@@ -4011,7 +4014,10 @@ fn put_config(cfg: &ControllerConfig, body: &str) -> Result<(), ReloadError> {
         Some(body),
         Duration::from_millis(cfg.timeout_ms.max(90_000)),
     ) {
-        Ok((status, _)) if (200..300).contains(&status) => Ok(()),
+        Ok((status, _)) if (200..300).contains(&status) => {
+            CORE_REFRESHED.with(|cell| cell.set(true));
+            Ok(())
+        }
         Ok((status, text)) => {
             // Mihomo answers 400 before applying anything, so nothing was cut:
             // replace the announcement with one that covers no connection.
@@ -4038,6 +4044,17 @@ thread_local! {
     /// so a thread-local reaches the reload and TUN paths deep inside it.
     static DISRUPTION_TX: std::cell::RefCell<Option<Sender<BackendEvent>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// Set when this thread's reload or core start left the core on a fresh
+    /// resolver, whose cache is empty; `take_core_refreshed` consumes it.
+    static CORE_REFRESHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread reloaded or started the core since the last call.
+pub fn take_core_refreshed() -> bool {
+    CORE_REFRESHED.with(|cell| cell.replace(false))
 }
 
 /// Lets this thread's reloads and TUN rebuilds report themselves to the UI.
@@ -4192,6 +4209,333 @@ pub fn dns_query_async(
         };
         let _ = tx.send(BackendEvent::DnsLookup { lines, is_error });
     });
+}
+
+/// At most this many node hostnames are warmed after a reload or start.
+const PREWARM_HOSTS: usize = 16;
+/// Wall-clock budget of one warm, so a broken resolver cannot keep it alive.
+const PREWARM_BUDGET: Duration = Duration::from_secs(10);
+
+/// Resolve the selected nodes' hostnames through `/dns/query` in the
+/// background. Every config apply rebuilds Mihomo's resolver with an empty
+/// cache, and the first dial through each node would otherwise pay that
+/// lookup and the DoH handshake. Without `proxy-server-nameserver` the dial
+/// and `/dns/query` share one resolver cache. Errors are ignored.
+pub fn prewarm_node_dns_async(cfg: ControllerConfig) {
+    thread::spawn(move || {
+        prewarm_node_dns(&cfg);
+    });
+}
+
+/// The number of hostnames queried.
+fn prewarm_node_dns(cfg: &ControllerConfig) -> usize {
+    let Ok(text) = read_config_text(cfg) else {
+        return 0;
+    };
+    // With the dns block disabled `/dns/query` has no resolver, and a
+    // dedicated node resolver keeps its own cache the warm cannot reach.
+    if !crate::ops::parse_dns_block(&text).enable || proxy_server_nameserver_set(&text) {
+        return 0;
+    }
+    let started = Instant::now();
+    let Ok((200, body)) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "GET",
+        "/proxies",
+        None,
+        Duration::from_millis(1500),
+    ) else {
+        return 0;
+    };
+    let Ok(proxies) = serde_json::from_str::<Value>(&body) else {
+        return 0;
+    };
+    let hosts = prewarm_hosts(&proxies, &text, Path::new(&cfg.config_dir));
+    let qtypes: &[&str] = if parse_yaml_flags(&text).ipv6 {
+        &["A", "AAAA"]
+    } else {
+        &["A"]
+    };
+    let quick = ControllerConfig {
+        timeout_ms: 2000,
+        ..cfg.clone()
+    };
+    let mut queried = 0;
+    for host in &hosts {
+        if started.elapsed() > PREWARM_BUDGET {
+            break;
+        }
+        for qtype in qtypes {
+            let _ = query_dns(&quick, host, qtype);
+        }
+        queried += 1;
+    }
+    queried
+}
+
+/// Whether the dns block names its own resolver for node hostnames.
+fn proxy_server_nameserver_set(doc: &str) -> bool {
+    let Some(chunk) = crate::ops::split_chunks(doc)
+        .into_iter()
+        .rev()
+        .find(|chunk| chunk.key.as_deref() == Some("dns"))
+    else {
+        return false;
+    };
+    let lines = &chunk.lines;
+    let Some(at) = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("proxy-server-nameserver:"))
+    else {
+        return false;
+    };
+    let indent = crate::ops::leading_spaces(&lines[at]);
+    let inline = crate::ops::clean_scalar(lines[at].split_once(':').map_or("", |(_, v)| v));
+    if !inline.is_empty() {
+        return inline.trim_start_matches('[').trim_end_matches(']').trim() != "";
+    }
+    lines[at + 1..]
+        .iter()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .take_while(|line| crate::ops::leading_spaces(line) > indent)
+        .any(|line| line.trim_start().starts_with('-'))
+}
+
+/// Distinct non-IP server hostnames of each group's selected node, its
+/// relay hops and `dialer-proxy`, capped at `PREWARM_HOSTS`. `/proxies`
+/// names the selection but not the servers, so those come from the composed
+/// `proxies:` list or, for provider nodes, the provider's cache file.
+fn prewarm_hosts(proxies: &Value, doc: &str, home: &Path) -> Vec<String> {
+    let Some(table) = proxies.get("proxies").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let kind = |name: &str| {
+        table
+            .get(name)
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    let members = |name: &str| -> Vec<String> {
+        table
+            .get(name)
+            .and_then(|item| item.get("all"))
+            .and_then(Value::as_array)
+            .map(|all| {
+                all.iter()
+                    .filter_map(|m| m.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let now = |name: &str| {
+        table
+            .get(name)
+            .and_then(|item| item.get("now"))
+            .and_then(Value::as_str)
+            .filter(|now| !now.is_empty())
+            .map(String::from)
+    };
+    // A group's selection, one level of nesting deep; a relay is its chain.
+    let leaves = |name: &str| -> Vec<String> {
+        let pick = |name: &str| match kind(name).as_str() {
+            "relay" => members(name),
+            "selector" | "urltest" | "fallback" => now(name).into_iter().collect(),
+            _ => vec![name.to_string()],
+        };
+        pick(name)
+            .into_iter()
+            .flat_map(|first| match kind(&first).as_str() {
+                "relay" | "selector" | "urltest" | "fallback" => pick(&first),
+                _ => vec![first],
+            })
+            .collect()
+    };
+    let mut entries = proxy_entries(doc);
+    let providers = provider_paths(doc);
+    let mut loaded = std::collections::HashSet::new();
+    let mut hosts: Vec<String> = Vec::new();
+    for group in table.keys() {
+        if !matches!(
+            kind(group).as_str(),
+            "selector" | "urltest" | "fallback" | "relay"
+        ) {
+            continue;
+        }
+        for leaf in leaves(group) {
+            if !entries.contains_key(&leaf) {
+                let provider = table
+                    .get(&leaf)
+                    .and_then(|node| node.get("provider-name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if let Some(path) = providers.get(provider) {
+                    if loaded.insert(provider.to_string()) {
+                        let file = home.join(path);
+                        let cached = fs::read_to_string(file).unwrap_or_default();
+                        for (name, entry) in proxy_entries(&cached) {
+                            entries.entry(name).or_insert(entry);
+                        }
+                    }
+                }
+            }
+            let Some((server, dialer)) = entries.get(&leaf).cloned() else {
+                continue;
+            };
+            let hop = dialer
+                .iter()
+                .flat_map(|name| leaves(name))
+                .filter_map(|name| entries.get(&name).map(|(server, _)| server.clone()));
+            for host in std::iter::once(server).chain(hop) {
+                let bare = host.trim_start_matches('[').trim_end_matches(']');
+                if host.is_empty()
+                    || bare.parse::<std::net::IpAddr>().is_ok()
+                    || hosts.contains(&host)
+                {
+                    continue;
+                }
+                hosts.push(host);
+                if hosts.len() >= PREWARM_HOSTS {
+                    return hosts;
+                }
+            }
+        }
+    }
+    hosts
+}
+
+/// `name` → (`server`, `dialer-proxy`) of each item in a `proxies:` list,
+/// written as flow maps (`- {name: a, server: b}`) or block maps.
+fn proxy_entries(doc: &str) -> HashMap<String, (String, Option<String>)> {
+    let mut entries = HashMap::new();
+    let Some(chunk) = crate::ops::split_chunks(doc)
+        .into_iter()
+        .rev()
+        .find(|chunk| chunk.key.as_deref() == Some("proxies"))
+    else {
+        return entries;
+    };
+    let mut items: Vec<HashMap<String, String>> = Vec::new();
+    let mut item_indent = None;
+    for line in chunk.lines.iter().skip(1) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = crate::ops::leading_spaces(line);
+        let item_indent = *item_indent.get_or_insert(indent);
+        let body = if indent == item_indent {
+            let Some(rest) = trimmed.strip_prefix('-') else {
+                continue;
+            };
+            items.push(HashMap::new());
+            rest.trim_start()
+        } else {
+            trimmed
+        };
+        let Some(item) = items.last_mut() else {
+            continue;
+        };
+        if body.starts_with('{') {
+            item.extend(flow_pairs(body));
+        } else if indent == item_indent || indent == item_indent + 2 {
+            // Keys of nested maps (`ws-opts:` children) sit deeper.
+            if let Some((key, value)) = body.split_once(':') {
+                let value = value.split(" #").next().unwrap_or(value);
+                item.insert(key.trim().to_string(), crate::ops::clean_scalar(value));
+            }
+        }
+    }
+    for mut item in items {
+        let (Some(name), Some(server)) = (item.remove("name"), item.remove("server")) else {
+            continue;
+        };
+        let dialer = item.remove("dialer-proxy").filter(|d| !d.is_empty());
+        entries.insert(name, (server, dialer));
+    }
+    entries
+}
+
+/// Top-level scalar pairs of a one-line flow map; nested values are skipped.
+fn flow_pairs(flow: &str) -> Vec<(String, String)> {
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(flow) {
+        return map
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_string())))
+            .collect();
+    }
+    let inner = flow.trim().trim_start_matches('{');
+    let inner = inner.strip_suffix('}').unwrap_or(inner);
+    let mut parts = Vec::new();
+    let (mut depth, mut quote, mut start) = (0usize, None, 0usize);
+    for (i, c) in inner.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '{' | '[') => depth += 1,
+            (None, '}' | ']') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    parts
+        .into_iter()
+        .filter_map(|part| {
+            let (key, value) = part.split_once(':')?;
+            let value = value.trim();
+            if value.starts_with(['{', '[']) {
+                return None;
+            }
+            Some((
+                crate::ops::clean_scalar(key),
+                value.trim_matches('"').trim_matches('\'').to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// `name` → `path` of each entry in `proxy-providers:`.
+fn provider_paths(doc: &str) -> HashMap<String, String> {
+    let mut paths = HashMap::new();
+    let Some(chunk) = crate::ops::split_chunks(doc)
+        .into_iter()
+        .rev()
+        .find(|chunk| chunk.key.as_deref() == Some("proxy-providers"))
+    else {
+        return paths;
+    };
+    let (mut name_indent, mut key_indent) = (None, None);
+    let mut current = None;
+    for line in chunk.lines.iter().skip(1) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = crate::ops::leading_spaces(line);
+        let name_indent = *name_indent.get_or_insert(indent);
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if indent == name_indent {
+            current = Some(crate::ops::clean_scalar(key));
+            key_indent = None;
+            continue;
+        }
+        // `health-check:` and `override:` children sit deeper.
+        if indent == *key_indent.get_or_insert(indent) && key.trim() == "path" {
+            if let Some(name) = current.clone() {
+                paths.insert(name, crate::ops::clean_scalar(value));
+            }
+        }
+    }
+    paths
 }
 
 fn format_dns_lines(name: &str, qtype: &str, msg: &DnsMessage) -> Vec<String> {
@@ -5571,6 +5915,196 @@ mod listener_tests {
             body.len()
         )
         .into_bytes()
+    }
+
+    fn prewarm_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "terc-prewarm-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("proxies")).unwrap();
+        dir
+    }
+
+    const PREWARM_PROXIES: &str = r#"{"proxies":{
+        "GLOBAL":{"type":"Selector","all":["PROXY"],"now":"PROXY"},
+        "PROXY":{"type":"Selector","all":["Auto","Chain","IP","Pool 1"],"now":"Auto"},
+        "Auto":{"type":"URLTest","all":["JP 01","US 01"],"now":"JP 01"},
+        "Chain":{"type":"Relay","all":["US 01","IP"]},
+        "Pool":{"type":"Selector","all":["Pool 1"],"now":"Pool 1"},
+        "Balance":{"type":"LoadBalance","all":["HK 01"]},
+        "JP 01":{"type":"Trojan"},
+        "US 01":{"type":"Vmess"},
+        "HK 01":{"type":"Vmess"},
+        "IP":{"type":"Shadowsocks"},
+        "Pool 1":{"type":"Shadowsocks","provider-name":"sub"},
+        "DIRECT":{"type":"Direct"}
+    }}"#;
+
+    const PREWARM_CONFIG: &str = "\
+dns:
+  enable: true
+  nameserver:
+    - https://doh.pub/dns-query
+proxies:
+  - {name: \"JP 01\", type: trojan, server: jp.example.com, port: 443, dialer-proxy: Hop}
+  - name: US 01
+    type: vmess
+    server: us.example.com # edge
+    port: 443
+    ws-opts:
+      headers:
+        server: nested.example.com
+  - {\"name\":\"IP\",\"type\":\"ss\",\"server\":\"203.0.113.9\",\"port\":8388}
+  - {name: HK 01, type: vmess, server: hk.example.com, port: 443}
+  - {name: Hop, type: ss, server: hop.example.com, port: 8388}
+proxy-providers:
+  sub:
+    type: http
+    url: https://example.com/sub
+    path: ./proxies/sub.yaml
+    health-check:
+      path: ignored.yaml
+";
+
+    #[test]
+    fn prewarm_takes_selected_servers_relay_hops_and_provider_nodes() {
+        let dir = prewarm_dir("hosts");
+        fs::write(
+            dir.join("proxies/sub.yaml"),
+            "proxies:\n  - {name: Pool 1, type: ss, server: pool.example.net, port: 1}\n",
+        )
+        .unwrap();
+        let proxies: Value = serde_json::from_str(PREWARM_PROXIES).unwrap();
+        let hosts = prewarm_hosts(&proxies, PREWARM_CONFIG, &dir);
+        // Load-balance groups have no selection, IP literals need no lookup,
+        // and a nested map's `server` is not the node's.
+        assert_eq!(
+            hosts,
+            [
+                "jp.example.com",
+                "hop.example.com",
+                "us.example.com",
+                "pool.example.net"
+            ]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prewarm_caps_the_number_of_hostnames() {
+        let mut table = serde_json::Map::new();
+        let mut doc = String::from("proxies:\n");
+        for i in 0..40 {
+            table.insert(
+                format!("G{i}"),
+                serde_json::json!({"type":"Selector","all":[format!("N{i}")],"now":format!("N{i}")}),
+            );
+            doc.push_str(&format!("  - {{name: N{i}, server: n{i}.example.com}}\n"));
+        }
+        let proxies = serde_json::json!({ "proxies": table });
+        let hosts = prewarm_hosts(&proxies, &doc, Path::new("/nonexistent"));
+        assert_eq!(hosts.len(), PREWARM_HOSTS);
+    }
+
+    #[test]
+    fn only_a_listed_proxy_server_nameserver_counts_as_set() {
+        assert!(!proxy_server_nameserver_set("dns:\n  enable: true\n"));
+        assert!(!proxy_server_nameserver_set(
+            "dns:\n  proxy-server-nameserver: []\n  nameserver:\n    - 1.1.1.1\n"
+        ));
+        assert!(!proxy_server_nameserver_set(
+            "dns:\n  proxy-server-nameserver:\n  nameserver:\n    - 1.1.1.1\n"
+        ));
+        assert!(proxy_server_nameserver_set(
+            "dns:\n  proxy-server-nameserver: [https://doh.pub/dns-query]\n"
+        ));
+        assert!(proxy_server_nameserver_set(
+            "dns:\n  proxy-server-nameserver:\n    # mainland\n    - https://doh.pub/dns-query\n"
+        ));
+        assert!(!proxy_server_nameserver_set(
+            "proxy-server-nameserver:\n  - x\ndns:\n  enable: true\n"
+        ));
+    }
+
+    #[test]
+    fn prewarm_queries_each_host_through_the_controller() {
+        let dir = prewarm_dir("query");
+        fs::write(
+            dir.join("config.yaml"),
+            format!("ipv6: true\n{PREWARM_CONFIG}"),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut responses = vec![http("200 OK", PREWARM_PROXIES)];
+        // Three hosts (the provider file is missing), A and AAAA each.
+        responses.extend((0..6).map(|_| http("200 OK", r#"{"Status":0}"#)));
+        let server = serve(listener, responses);
+        let cfg = ControllerConfig {
+            addr,
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        assert_eq!(prewarm_node_dns(&cfg), 3);
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /proxies "));
+        assert!(requests[1].starts_with("GET /dns/query?name=jp.example.com&type=A "));
+        assert!(requests[2].starts_with("GET /dns/query?name=jp.example.com&type=AAAA "));
+        assert!(requests[6].starts_with("GET /dns/query?name=us.example.com&type=AAAA "));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prewarm_is_skipped_without_dns_or_with_a_node_resolver() {
+        // Nothing listens: a skipped warm never connects.
+        let cfg = |dir: &Path| ControllerConfig {
+            addr: "127.0.0.1:1".into(),
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let dir = prewarm_dir("skip");
+        fs::write(
+            dir.join("config.yaml"),
+            PREWARM_CONFIG.replace("enable: true", "enable: false"),
+        )
+        .unwrap();
+        assert_eq!(prewarm_node_dns(&cfg(&dir)), 0);
+        fs::write(
+            dir.join("config.yaml"),
+            PREWARM_CONFIG.replace(
+                "  nameserver:\n",
+                "  proxy-server-nameserver:\n    - https://doh.pub/dns-query\n  nameserver:\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(prewarm_node_dns(&cfg(&dir)), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_accepted_reload_marks_the_core_refreshed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = serve(
+            listener,
+            vec![http("400 Bad Request", "bad"), http("204 No Content", "")],
+        );
+        let cfg = ControllerConfig {
+            addr,
+            ..ControllerConfig::default()
+        };
+        assert!(!take_core_refreshed());
+        assert!(reload_config_text(&cfg, "mode: rule\n").is_err());
+        assert!(!take_core_refreshed());
+        reload_config_text(&cfg, "mode: rule\n").unwrap();
+        assert!(take_core_refreshed());
+        assert!(!take_core_refreshed());
+        server.join().unwrap();
     }
 
     /// A temporary config dir with a stand-in for `mihomo -t` (never a real core).
