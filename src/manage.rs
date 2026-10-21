@@ -78,6 +78,11 @@ impl App {
 
     /// Regenerate config.yaml from the cached subscription + manual nodes + rules.
     pub fn apply_composed(&mut self) {
+        self.apply_composed_noting(None);
+    }
+
+    /// `note` follows the result, so it outlasts the progress line.
+    fn apply_composed_noting(&mut self, note: Option<&'static str>) {
         if self.action_busy {
             self.pending_regen = true;
             return;
@@ -95,7 +100,11 @@ impl App {
             "設定を生成・検証中…",
         );
         self.run_action(label, None, None, move |cfg| {
-            crate::mihomo::regenerate_config(&cfg, &modules, running, false, zh)
+            let done = crate::mihomo::regenerate_config(&cfg, &modules, running, false, zh)?;
+            Ok(match note {
+                Some(note) => format!("{done}  {note}"),
+                None => done,
+            })
         });
     }
 
@@ -195,10 +204,27 @@ impl App {
                     } else {
                         (self.private_rule_index + 1).min(self.private_rules.rules.len())
                     };
+                    // Private rules run first, so every connection they do
+                    // not match earlier pays for the process lookup.
+                    let note = rule.starts_with("PROCESS-").then(|| {
+                        l3(
+                            self,
+                            "进程规则较慢：私有规则最先匹配，之前未命中的每个连接都要查进程（Linux 约 1–15 ms），能用域名规则时更省",
+                            "Process rules are slower: private rules match first, so every connection not matched before looks up its process (about 1–15 ms on Linux); a domain rule is cheaper where it fits",
+                            "プロセス規則は低速：プライベート規則が最初に評価され、それまでに一致しない接続ごとにプロセスを検索します（Linux で約 1–15 ms）。ドメイン規則の方が軽量です",
+                        )
+                    });
                     self.private_rules.rules.insert(at, rule);
                     self.private_rule_index = at;
                     self.manage_input = None;
-                    self.save_rules_and_apply();
+                    if let Err(err) = self
+                        .private_rules
+                        .save(&crate::compose::profile_dir(&self.config.controller))
+                    {
+                        self.set_status(&err, true);
+                    } else {
+                        self.apply_composed_noting(note);
+                    }
                 }
                 Err(err) => self.set_status(&err, true),
             },
@@ -301,7 +327,12 @@ impl App {
                 .unwrap_or_default()
         };
         for name in names {
-            test_node_async(self.config.controller.clone(), name, self.tx.clone());
+            test_node_async(
+                self.config.controller.clone(),
+                name,
+                self.snapshot.groups.clone(),
+                self.tx.clone(),
+            );
         }
         self.set_status(l3(self, "测速中…", "Testing latency…", "測定中…"), false);
     }
@@ -939,8 +970,8 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
                 list_inner,
                 l3(
                     app,
-                    "还没有私有规则。按 a 添加，例如 example.com,AI　或　DOMAIN-KEYWORD,steam,DIRECT　或　PROCESS-NAME,Cursor,AI",
-                    "No private rules. Press a, e.g. example.com,AI  or  DOMAIN-KEYWORD,steam,DIRECT  or  PROCESS-NAME,Cursor,AI",
+                    "还没有私有规则。按 a 添加，例如 example.com,AI　或　DOMAIN-KEYWORD,steam,DIRECT　或　PROCESS-NAME,Cursor,AI（较慢：每个连接都要查进程）",
+                    "No private rules. Press a, e.g. example.com,AI  or  DOMAIN-KEYWORD,steam,DIRECT  or  PROCESS-NAME,Cursor,AI (slower: looks up the process per connection)",
                     "a で追加。例：example.com,AI",
                 ),
             );

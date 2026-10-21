@@ -228,7 +228,20 @@ impl Config {
             }
         };
         match serde_json::from_str::<Self>(&raw) {
-            Ok(cfg) => (cfg, None),
+            Ok(mut cfg) => {
+                // Only a file that parsed is rewritten, and only when a
+                // stored default actually moved.
+                let notice = if cfg.migrate() {
+                    cfg.save_to(path).err().map(|err| {
+                        LoadIssue::Unsaved(format!(
+                            "无法保存偏好 / Could not save preferences / 設定を保存できません: {err}"
+                        ))
+                    })
+                } else {
+                    None
+                };
+                (cfg, notice)
+            }
             Err(err) => {
                 let name = path
                     .file_name()
@@ -247,6 +260,21 @@ impl Config {
                 )
             }
         }
+    }
+
+    /// Moves the old http default test URL to the https one, never a URL the
+    /// user set, and caps a timeout saved before the delay route's limit.
+    /// Returns whether anything changed.
+    fn migrate(&mut self) -> bool {
+        let controller = &mut self.controller;
+        let before = (controller.test_url.clone(), controller.timeout_ms);
+        if controller.test_url == crate::mihomo::OLD_DEFAULT_TEST_URL {
+            controller.test_url = crate::mihomo::DEFAULT_TEST_URL.to_string();
+        }
+        controller.timeout_ms = controller
+            .timeout_ms
+            .min(crate::mihomo::MAX_DELAY_TIMEOUT_MS);
+        before != (controller.test_url.clone(), controller.timeout_ms)
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -583,6 +611,13 @@ pub struct App {
     pub log_detail: bool,
     pub log_index: usize,
     pub pending_best_group: Option<(String, Option<String>)>,
+    /// Results of the rounds so far while the leaders are re-tested.
+    pub best_rounds: Vec<Vec<(String, Option<u16>)>>,
+    /// The leaders every re-test round measures.
+    pub best_retest: Vec<String>,
+    /// The group's selection (its pin on url-test/fallback) when the best
+    /// pick started; a different one later means the user chose meanwhile.
+    pub best_choice: String,
     pub best_scope_index: usize,
     pub action_busy: bool,
     pub snapshot_pending: bool,
@@ -726,6 +761,9 @@ impl App {
             log_detail: false,
             log_index: 0,
             pending_best_group: None,
+            best_rounds: Vec::new(),
+            best_retest: Vec::new(),
+            best_choice: String::new(),
             best_scope_index: 0,
             action_busy: false,
             snapshot_pending: false,
@@ -1214,7 +1252,7 @@ impl App {
                             let previous_group = self.group_index;
                             let previous_node = self.node_index;
                             self.group_index = index;
-                            self.select_best_node_in_group_after_test(country.as_deref(), &results);
+                            self.select_best_node_in_group_after_test(country, results);
                             if previous_group != index {
                                 self.group_index = previous_group;
                                 self.node_index = previous_node;
@@ -1573,9 +1611,35 @@ impl App {
         }
         let group_name = group.name.clone();
         let node_name = node.clone();
-        self.run_action("Switching node…", None, None, move |cfg| {
-            select_group_node(&cfg, &group_name, &node_name).map_err(|e| e.to_string())?;
-            Ok(format!("{group_name} › {node_name}"))
+        // On url-test/fallback the same PUT pins the node, so say so.
+        let pin = group.pinnable();
+        let (label, note) = if pin {
+            (self.t("pin_setting"), format!("  {}", self.t("pin_note")))
+        } else {
+            ("Switching node…", String::new())
+        };
+        self.run_action(label, None, None, move |cfg| {
+            select_group_node(&cfg, &group_name, &node_name, pin).map_err(|e| e.to_string())?;
+            Ok(format!("{group_name} › {node_name}{note}"))
+        });
+    }
+
+    pub fn unpin_selected_group(&mut self) {
+        let Some(group) = self.snapshot.groups.get(self.group_index) else {
+            return;
+        };
+        if !group.pinnable() {
+            self.set_status(self.t("pin_unpinnable"), true);
+            return;
+        }
+        // Sent even with no pin shown: a Fallback forgets a dead pin only in
+        // memory, and the saved one comes back at the next reload. DELETE
+        // clears both and is harmless when there is none.
+        let group_name = group.name.clone();
+        let done = self.t("pin_cleared");
+        self.run_action(self.t("pin_clearing"), None, None, move |cfg| {
+            mihomo::unpin_group(&cfg, &group_name).map_err(|e| e.to_string())?;
+            Ok(format!("{group_name}  {done}"))
         });
     }
 
@@ -1595,6 +1659,7 @@ impl App {
             self.config.controller.clone(),
             group.name.clone(),
             group.all.clone(),
+            self.snapshot.groups.clone(),
             self.tx.clone(),
         );
     }
@@ -1611,9 +1676,10 @@ impl App {
         let Some(group) = self.snapshot.groups.get(self.group_index) else {
             return;
         };
-        if !group.kind.eq_ignore_ascii_case("selector") {
+        // url-test/fallback take the pick as a pin with automatic failover.
+        if !group.kind.eq_ignore_ascii_case("selector") && !group.pinnable() {
             self.set_status(
-                "请选择可手动切换的策略组 / Select a manual Selector group",
+                "请选择 Selector / url-test / fallback 策略组 / Select a Selector, url-test or fallback group",
                 true,
             );
             return;
@@ -1638,29 +1704,114 @@ impl App {
             return;
         }
         let group_name = group.name.clone();
+        self.best_choice = best_choice(group).to_string();
         self.pending_best_group = Some((group_name.clone(), country));
+        self.best_rounds.clear();
+        self.best_retest.clear();
         self.overlay = Overlay::None;
         self.set_status("正在测速并优选 / Testing candidates…", false);
         mihomo::test_best_delays_async(
             self.config.controller.clone(),
             group_name,
             candidates.into_iter().map(|(_, name)| name).collect(),
+            self.snapshot.groups.clone(),
             self.tx.clone(),
         );
     }
 
     fn select_best_node_in_group_after_test(
         &mut self,
-        country: Option<&str>,
-        results: &[(String, Option<u16>)],
+        country: Option<String>,
+        results: Vec<(String, Option<u16>)>,
     ) {
-        let candidates = best::candidates(&self.snapshot, self.group_index, country);
-        let selected = best::fastest(&candidates, results);
-        if let Some(index) = selected {
-            self.node_index = index;
-            self.activate_selected_node();
-        } else {
-            self.set_status("范围内没有可达节点 / No reachable node in this scope", true);
+        let Some(group) = self.snapshot.groups.get(self.group_index) else {
+            return;
+        };
+        let (group_name, current) = (group.name.clone(), group.now.clone());
+        let pinnable = group.pinnable();
+        let pinned_current = group.fixed == current;
+        // A node chosen by hand during the test is not overridden. A
+        // Fallback clearing a dead pin by itself is not a choice.
+        let choice = best_choice(group);
+        if choice != self.best_choice && !(pinnable && choice.is_empty()) {
+            self.best_rounds.clear();
+            self.best_retest.clear();
+            self.set_status(self.t("best_choice_changed"), false);
+            return;
+        }
+        let candidates = best::candidates(&self.snapshot, self.group_index, country.as_deref());
+        self.best_rounds.push(results);
+        // One sample favours whichever node got lucky, so the leaders run
+        // again until each has best::ROUNDS samples for a median.
+        if self.best_rounds.len() == 1 {
+            self.best_retest = best::retest(&candidates, &self.best_rounds[0], &current);
+        }
+        if self.best_retest.len() > 1 && self.best_rounds.len() < best::ROUNDS {
+            let (n, round) = (self.best_retest.len(), self.best_rounds.len());
+            let of = best::ROUNDS - 1;
+            self.set_status(
+                &format!(
+                    "正在复测领先的 {n} 个节点（{round}/{of}）/ Re-testing {n} leading nodes ({round}/{of})…"
+                ),
+                false,
+            );
+            self.pending_best_group = Some((group_name.clone(), country));
+            mihomo::test_best_delays_async(
+                self.config.controller.clone(),
+                group_name,
+                self.best_retest.clone(),
+                self.snapshot.groups.clone(),
+                self.tx.clone(),
+            );
+            return;
+        }
+        let rounds = std::mem::take(&mut self.best_rounds);
+        self.best_retest.clear();
+        let rounds: Vec<&[(String, Option<u16>)]> = rounds.iter().map(Vec::as_slice).collect();
+        match best::pick(&candidates, &rounds, &current) {
+            best::Pick::Switch(index) => {
+                self.node_index = index;
+                self.activate_selected_node();
+            }
+            best::Pick::Keep {
+                best,
+                current_ms,
+                best_ms,
+            } => {
+                let fastest = candidates
+                    .iter()
+                    .find(|(index, _)| *index == best)
+                    .map_or("", |(_, name)| name.as_str());
+                let text = match (self.lang(), fastest == current) {
+                    (Lang::Zh, true) => format!("当前节点 {current} 已是最快（{best_ms} ms）"),
+                    (Lang::En, true) => format!("{current} is already the fastest ({best_ms} ms)"),
+                    (Lang::Ja, true) => format!("現在の {current} が最速です（{best_ms} ms）"),
+                    (Lang::Zh, false) => format!(
+                        "保留当前节点 {current}（{current_ms} ms），与最快的 {fastest}（{best_ms} ms）差距在 30 ms / 15% 内"
+                    ),
+                    (Lang::En, false) => format!(
+                        "Kept {current} ({current_ms} ms): within 30 ms / 15% of the fastest, {fastest} ({best_ms} ms)"
+                    ),
+                    (Lang::Ja, false) => format!(
+                        "現在の {current}（{current_ms} ms）を維持：最速の {fastest}（{best_ms} ms）との差が 30 ms / 15% 以内"
+                    ),
+                };
+                // On url-test/fallback the kept node is only Mihomo's choice
+                // of the moment until it is pinned; 'a' always ends pinned.
+                if pinnable && !pinned_current {
+                    let note = format!("{text}  {}", self.t("pin_note"));
+                    self.run_action(self.t("pin_setting"), None, None, move |cfg| {
+                        select_group_node(&cfg, &group_name, &current, true)
+                            .map_err(|e| e.to_string())?;
+                        Ok(note)
+                    });
+                } else {
+                    self.set_status(&text, false);
+                }
+            }
+            best::Pick::None => {
+                self.set_status("范围内没有可达节点 / No reachable node in this scope", true)
+            }
         }
     }
 
@@ -2026,6 +2177,30 @@ impl App {
             (Lang::Zh, "help_m") => "切换分流模式（规则 / 全局 / 直连）",
             (Lang::En, "help_m") => "Cycle routing mode (Rule / Global / Direct)",
             (Lang::Ja, "help_m") => "ルーティングモードを切替（Rule / Global / Direct）",
+            (Lang::Zh, "help_unpin") => "取消 url-test / fallback 组的固定（Enter 或 a 会固定节点）",
+            (Lang::En, "help_unpin") => "Unpin a url-test / fallback group (Enter or a pins a node)",
+            (Lang::Ja, "help_unpin") => "url-test / fallback の固定を解除（Enter か a で固定）",
+            (Lang::Zh, "pin_setting") => "正在固定节点…",
+            (Lang::En, "pin_setting") => "Pinning node…",
+            (Lang::Ja, "pin_setting") => "ノードを固定中…",
+            (Lang::Zh, "pin_note") => "已固定，失效时自动切换",
+            (Lang::En, "pin_note") => "pinned, auto-failover",
+            (Lang::Ja, "pin_note") => "固定・障害時は自動切替",
+            (Lang::Zh, "pin_ignored") => "固定节点不可用，已切换",
+            (Lang::En, "pin_ignored") => "pin down, failed over",
+            (Lang::Ja, "pin_ignored") => "固定先不通・切替中",
+            (Lang::Zh, "best_choice_changed") => "测速期间已手动更改节点，优选取消",
+            (Lang::En, "best_choice_changed") => "The node was changed during the test; best pick cancelled",
+            (Lang::Ja, "best_choice_changed") => "測定中にノードが変更されたため、最適選択を中止しました",
+            (Lang::Zh, "pin_clearing") => "正在取消固定…",
+            (Lang::En, "pin_clearing") => "Unpinning…",
+            (Lang::Ja, "pin_clearing") => "固定を解除中…",
+            (Lang::Zh, "pin_cleared") => "已取消固定，恢复自动选择",
+            (Lang::En, "pin_cleared") => "unpinned, automatic choice again",
+            (Lang::Ja, "pin_cleared") => "固定解除・自動選択に戻りました",
+            (Lang::Zh, "pin_unpinnable") => "仅 url-test / fallback 策略组可固定",
+            (Lang::En, "pin_unpinnable") => "Only url-test / fallback groups can be pinned",
+            (Lang::Ja, "pin_unpinnable") => "固定できるのは url-test / fallback のみ",
             (Lang::Zh, "help_u") => "更新当前方案的订阅，保留来源规则与策略组，校验后重载",
             (_, "help_u") => "Update the active profile subscription; preserve source rules and groups, validate and reload",
             (Lang::Zh, "help_tabs") => "切换视图：[p] 代理  [c] 连接  [L] 日志；DNS、规则、Provider 在 设置 → 排查工具",
@@ -2218,9 +2393,9 @@ impl App {
             (Lang::Zh, "mod_find_process") => "进程名",
             (Lang::En, "mod_find_process") => "Process name",
             (Lang::Ja, "mod_find_process") => "プロセス名",
-            (Lang::Zh, "mod_find_process_desc") => "连接上始终带上进程名",
-            (Lang::En, "mod_find_process_desc") => "Attach a process name to every connection",
-            (Lang::Ja, "mod_find_process_desc") => "接続にプロセス名を付与",
+            (Lang::Zh, "mod_find_process_desc") => "连接上始终带上进程名；每个新连接拨号前都要查进程（Linux 约 1–15 ms）",
+            (Lang::En, "mod_find_process_desc") => "Attach a process name to every connection; each new connection looks it up before dialling (about 1–15 ms on Linux)",
+            (Lang::Ja, "mod_find_process_desc") => "接続にプロセス名を付与。新しい接続ごとに発信前に検索します（Linux で約 1–15 ms）",
             (Lang::Zh, "mod_tcp_concurrent") => "并发连接",
             (Lang::En, "mod_tcp_concurrent") => "TCP concurrent",
             (Lang::Ja, "mod_tcp_concurrent") => "TCP 同時接続",
@@ -2996,6 +3171,7 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             app.connection_detail = false;
         }
         KeyCode::Char('x') if app.main_tab == MainTab::Rules => app.toggle_selected_rule(),
+        KeyCode::Char('x') if app.main_tab == MainTab::Proxies => app.unpin_selected_group(),
         KeyCode::Char('x') if app.main_tab == MainTab::Connections && !app.conn_closed_view => {
             if let Some(c) = app.selected_connection() {
                 let id = c.id.clone();
@@ -3309,6 +3485,16 @@ fn handle_help_key(app: &mut App, key: KeyEvent) -> bool {
         _ => {}
     }
     false
+}
+
+/// What only a person changes in a group: the pin on url-test/fallback,
+/// the selection on a Selector.
+fn best_choice(group: &mihomo::ProxyGroup) -> &str {
+    if group.pinnable() {
+        &group.fixed
+    } else {
+        &group.now
+    }
 }
 
 #[cfg(test)]
@@ -3760,13 +3946,277 @@ mod tests {
     }
 
     #[test]
+    fn best_pick_retests_leaders_and_keeps_a_close_current_node() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        // Round two must not reach a real controller.
+        app.config.controller.addr = "127.0.0.1:1".into();
+        let names = ["N0", "N1", "N2"];
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "Main".into(),
+            kind: "Selector".into(),
+            now: "N1".into(),
+            fixed: String::new(),
+            all: names.iter().map(|s| s.to_string()).collect(),
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
+        });
+        for name in names {
+            app.snapshot.nodes.insert(
+                name.into(),
+                mihomo::ProxyNode {
+                    name: name.into(),
+                    kind: "Shadowsocks".into(),
+                    udp: true,
+                    delay: None,
+                    provider: None,
+                    url_delays: Default::default(),
+                },
+            );
+        }
+        let first = vec![
+            ("N0".to_string(), Some(40)),
+            ("N1".to_string(), Some(70)),
+            ("N2".to_string(), None),
+        ];
+        app.best_choice = "N1".into();
+        app.pending_best_group = Some(("Main".into(), None));
+        app.select_best_node_in_group_after_test(None, first.clone());
+        assert!(app.pending_best_group.is_some());
+        assert_eq!(app.best_rounds, std::slice::from_ref(&first));
+        assert_eq!(app.best_retest, ["N0", "N1"]);
+        assert!(app
+            .status_message
+            .contains("Re-testing 2 leading nodes (1/2)"));
+
+        // One timeout of the current node in a re-test does not drop it.
+        app.pending_best_group = None;
+        let second = vec![("N0".to_string(), Some(60)), ("N1".to_string(), None)];
+        app.select_best_node_in_group_after_test(None, second);
+        assert!(app.pending_best_group.is_some());
+        assert!(app.status_message.contains("(2/2)"));
+
+        // Medians 50 and 70: N1 stays within 30 ms of N0.
+        app.pending_best_group = None;
+        let third = vec![("N0".to_string(), Some(50)), ("N1".to_string(), Some(75))];
+        app.select_best_node_in_group_after_test(None, third);
+        assert!(app.pending_best_group.is_none());
+        assert!(app.best_rounds.is_empty() && app.best_retest.is_empty());
+        // A Selector keeps its node without a request.
+        assert!(!app.action_busy);
+        assert!(
+            app.status_message.starts_with("Kept N1 (75 ms)"),
+            "{}",
+            app.status_message
+        );
+        assert!(app.status_message.contains("N0 (50 ms)"));
+    }
+
+    #[test]
+    fn best_pick_stops_when_the_node_is_changed_by_hand_meanwhile() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        app.config.controller.addr = "127.0.0.1:1".into();
+        app.snapshot.groups.push(pinned_group("Selector", ""));
+        app.best_choice = "JP 01".into();
+        app.best_rounds = vec![vec![("JP 01".into(), Some(40))]];
+        app.select_best_node_in_group_after_test(None, vec![("JP 01".into(), Some(40))]);
+        assert_eq!(app.status_message, app.t("best_choice_changed"));
+        assert!(app.best_rounds.is_empty() && !app.action_busy);
+    }
+
+    /// Answers each request with `reply(method, path)`, passing back
+    /// `METHOD path body` for each.
+    fn mock_controller(
+        app: &mut App,
+        reply: fn(&str, &str) -> (u16, String),
+    ) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        app.config.controller.addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    let mut first = String::new();
+                    let _ = reader.read_line(&mut first);
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    let _ = reader.read_exact(&mut body);
+                    let mut parts = first.split_whitespace();
+                    let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                    let _ = tx.send(format!(
+                        "{method} {path} {}",
+                        String::from_utf8_lossy(&body)
+                    ));
+                    let (status, text) = reply(method, path);
+                    let _ = write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                });
+            }
+        });
+        rx
+    }
+
+    /// `AI` is an unpinned url-test on https://ai.test/x now using N1. The
+    /// delay route answers 200 for every node, but N0 misses the expected
+    /// status, so only `extra` shows it unusable for the group.
+    fn url_test_reply(method: &str, path: &str) -> (u16, String) {
+        let group = r#""AI":{"type":"URLTest","all":["N0","N1","N2"],"now":"N1","fixed":"","testUrl":"https://ai.test/x","expectedStatus":"204"}"#;
+        let node = |name: &str, alive: bool, ms: u16| {
+            format!(
+                r#""{name}":{{"type":"Vmess","history":[{{"delay":5}}],"extra":{{"https://ai.test/x":{{"alive":{alive},"history":[{{"delay":{ms}}}]}}}}}}"#
+            )
+        };
+        match (method, path) {
+            ("GET", "/version") => (200, r#"{"version":"v1.19.28"}"#.into()),
+            ("GET", "/proxies/AI") => (200, group[5..].to_string()),
+            ("GET", "/proxies") => (
+                200,
+                format!(
+                    "{{\"proxies\":{{{group},{},{},{}}}}}",
+                    node("N0", false, 10),
+                    node("N1", true, 70),
+                    node("N2", true, 60)
+                ),
+            ),
+            ("GET", p) if p.contains("/delay?") => (200, r#"{"delay":5}"#.into()),
+            ("PUT", "/proxies/AI") => (204, String::new()),
+            _ => (404, String::new()),
+        }
+    }
+
+    fn pump_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done(app) {
+            assert!(Instant::now() < deadline, "{}", app.status_message);
+            app.drain_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn best_pick_on_url_test_ranks_on_extra_and_always_ends_pinned() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        let rx = mock_controller(&mut app, url_test_reply);
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "AI".into(),
+            kind: "URLTest".into(),
+            now: "N1".into(),
+            all: vec!["N0".into(), "N1".into(), "N2".into()],
+            ..Default::default()
+        });
+        for name in ["N0", "N1", "N2"] {
+            app.snapshot.nodes.insert(
+                name.into(),
+                mihomo::ProxyNode {
+                    name: name.into(),
+                    kind: "Vmess".into(),
+                    udp: true,
+                    delay: Some(5),
+                    provider: None,
+                    url_delays: Default::default(),
+                },
+            );
+        }
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+        pump_until(&mut app, |app| {
+            app.pending_best_group.is_none()
+                && !app.action_busy
+                && app.status_message.contains("Kept")
+        });
+        // N0 answered fastest on the delay route but is dead for the group;
+        // N1 (70) is within 30 ms of N2 (60), and is pinned so url-test
+        // does not move off it at its next check.
+        assert!(
+            app.status_message.starts_with("Kept N1 (70 ms)"),
+            "{}",
+            app.status_message
+        );
+        assert!(app.status_message.contains(app.t("pin_note")));
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert!(
+            lines.contains(&r#"PUT /proxies/AI {"name":"N1"}"#.to_string()),
+            "{lines:?}"
+        );
+        let tests = lines.iter().filter(|l| l.contains("/delay?")).count();
+        // Three nodes, then the two live leaders twice.
+        assert_eq!(tests, 3 + 2 + 2, "{lines:?}");
+        assert!(lines
+            .iter()
+            .filter(|l| l.contains("/delay?"))
+            .all(|l| l.contains("url=https%3A%2F%2Fai.test%2Fx&timeout=5000&expected=204")));
+        // The node list shows what the group ranks on, not the 5 ms history.
+        app.group_index = 0;
+        let view = render_text(&mut app, 80, 24);
+        assert!(view.contains("70ms") && view.contains("60ms"), "{view}");
+        assert!(!view.contains("5ms"), "{view}");
+    }
+
+    #[test]
+    fn best_pick_keeps_a_pin_that_is_already_set_without_a_request() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        app.config.controller.addr = "127.0.0.1:1".into();
+        let mut group = pinned_group("URLTest", "US 01");
+        group.now = "US 01".into();
+        app.snapshot.groups.push(group);
+        for name in ["JP 01", "US 01"] {
+            app.snapshot.nodes.insert(
+                name.into(),
+                mihomo::ProxyNode {
+                    name: name.into(),
+                    kind: "Vmess".into(),
+                    udp: true,
+                    delay: None,
+                    provider: None,
+                    url_delays: Default::default(),
+                },
+            );
+        }
+        app.best_choice = "US 01".into();
+        let round = vec![
+            ("JP 01".to_string(), Some(50)),
+            ("US 01".to_string(), Some(40)),
+        ];
+        app.best_rounds = vec![round.clone(), round.clone()];
+        app.best_retest = vec!["US 01".into(), "JP 01".into()];
+        app.select_best_node_in_group_after_test(None, round);
+        assert!(app
+            .status_message
+            .starts_with("US 01 is already the fastest"));
+        assert!(!app.action_busy);
+    }
+
+    #[test]
     fn best_scope_popup_uses_active_country_and_rejects_unknown_country() {
         let mut app = offline_app();
         app.snapshot.groups.push(mihomo::ProxyGroup {
             name: "Main".into(),
             kind: "Selector".into(),
             now: "Unknown".into(),
+            fixed: String::new(),
             all: vec!["US 01".into()],
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
         });
         for (width, height) in [(42, 12), (80, 24)] {
             press(&mut app, KeyCode::Char('a'));
@@ -3784,6 +4234,134 @@ mod tests {
         }
     }
 
+    /// Serves `count` requests with 204 and passes each request line back.
+    fn pin_controller(app: &mut App, count: usize) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        app.config.controller.addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten().take(count) {
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let _ = tx.send(first.trim_end().to_string());
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 204 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        rx
+    }
+
+    fn pinned_group(kind: &str, fixed: &str) -> mihomo::ProxyGroup {
+        mihomo::ProxyGroup {
+            name: "Auto".into(),
+            kind: kind.into(),
+            now: "US 01".into(),
+            fixed: fixed.into(),
+            all: vec!["JP 01".into(), "US 01".into()],
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
+        }
+    }
+
+    #[test]
+    fn x_unpins_url_test_and_fallback_groups_only() {
+        let mut app = offline_app();
+        app.snapshot.groups.push(pinned_group("Selector", ""));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.status_is_error && !app.action_busy);
+
+        // A Fallback reports no pin once the pinned node died, but the
+        // saved pin returns at the next reload, so DELETE goes out anyway.
+        let rx = pin_controller(&mut app, 1);
+        app.snapshot.groups[0] = pinned_group("Fallback", "");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.action_busy);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "DELETE /proxies/Auto HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn best_pick_pins_url_test_groups() {
+        let mut app = offline_app();
+        app.snapshot.groups.push(pinned_group("URLTest", ""));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.overlay, Overlay::Best);
+        press(&mut app, KeyCode::Enter);
+        // No candidate nodes are known, but the group itself is accepted.
+        assert_eq!(
+            app.status_message,
+            "范围内没有可选代理节点 / No selectable proxy nodes in this scope"
+        );
+
+        // Enter on a url-test node pins it and says so.
+        let rx = pin_controller(&mut app, 1);
+        app.overlay = Overlay::None;
+        app.clear_status();
+        app.focus = FocusPane::Nodes;
+        app.node_index = 0;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status_message, app.t("pin_setting"));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "PUT /proxies/Auto HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn pinned_groups_show_the_pin_and_the_node_in_use() {
+        let mut app = offline_app();
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            // Pin honoured: the pinned node is the one in use.
+            app.snapshot.groups = vec![pinned_group("URLTest", "US 01")];
+            let view = render_text(&mut app, 80, 24);
+            assert!(view.contains("◆US01"), "{view}");
+            assert!(view.contains(&app.t("pin_note").replace(' ', "")), "{view}");
+            // Pin ignored: both the pin and the fallback node are shown.
+            app.snapshot.groups[0].fixed = "JP 01".into();
+            let view = render_text(&mut app, 80, 24);
+            assert!(view.contains("◇JP01"), "{view}");
+            assert!(view.contains("●US01"), "{view}");
+            assert!(
+                view.contains(&app.t("pin_ignored").replace(' ', "")),
+                "{view}"
+            );
+            // Unpinned: no marker at all.
+            app.snapshot.groups[0].fixed.clear();
+            let view = render_text(&mut app, 80, 24);
+            assert!(!view.contains('◆') && !view.contains('◇'), "{view}");
+        }
+    }
+
+    #[test]
+    fn the_failed_over_pin_note_survives_long_group_names_at_80_columns() {
+        let mut app = offline_app();
+        let mut group = pinned_group("URLTest", "JP 01");
+        group.name = "🚀 节点选择-自动测速".into();
+        group.all = (0..120).map(|i| format!("Node {i}")).collect();
+        app.snapshot.groups = vec![group];
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            let view = render_text(&mut app, 80, 24);
+            let note = app.t("pin_ignored").replace(' ', "");
+            assert!(view.contains(&format!("◇{note}┌")), "{view}");
+            assert!(view.contains("🚀"), "{view}");
+        }
+    }
+
     #[test]
     fn toast_expires_without_moving_lists_and_keeps_full_result() {
         let mut app = offline_app();
@@ -3791,7 +4369,11 @@ mod tests {
             name: "Group".into(),
             kind: "Selector".into(),
             now: "node".into(),
+            fixed: String::new(),
             all: vec!["node".into()],
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
         });
         render_text(&mut app, 80, 24);
         let before = app.proxy_hits.clone();
@@ -3820,7 +4402,11 @@ mod tests {
                 name: format!("Group{i}"),
                 kind: "Selector".into(),
                 now: "Node0".into(),
+                fixed: String::new(),
                 all: (0..40).map(|n| format!("Node{n}")).collect(),
+                test_url: String::new(),
+                expected_status: String::new(),
+                timeout_ms: 0,
             })
             .collect();
         for (width, height) in [(42, 12), (80, 24), (120, 30)] {
@@ -4044,6 +4630,25 @@ mod tests {
         assert_eq!(cfg.settings.theme, ThemeId::Mono);
         assert_eq!(cfg.settings.graph_interval_secs, 1);
         assert!(cfg.settings.connections_stream);
+    }
+
+    #[test]
+    fn load_migrates_only_the_old_default_test_url_and_caps_the_timeout() {
+        let mut cfg = Config::default();
+        cfg.controller.test_url = mihomo::OLD_DEFAULT_TEST_URL.into();
+        cfg.controller.timeout_ms = 60_000;
+        assert!(cfg.migrate());
+        assert_eq!(cfg.controller.test_url, mihomo::DEFAULT_TEST_URL);
+        assert_eq!(cfg.controller.timeout_ms, mihomo::MAX_DELAY_TIMEOUT_MS);
+        assert!(!cfg.migrate());
+        for own in [
+            "http://www.gstatic.com/generate_204?x",
+            "http://cp.cloudflare.com/generate_204",
+        ] {
+            cfg.controller.test_url = own.into();
+            assert!(!cfg.migrate());
+            assert_eq!(cfg.controller.test_url, own);
+        }
     }
 
     #[test]
@@ -4400,7 +5005,11 @@ mod tests {
             name: "AUTO".into(),
             kind: "URLTest".into(),
             now: String::new(),
+            fixed: String::new(),
             all: vec![],
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
         });
         press(&mut app, KeyCode::Char(' '));
         assert_eq!(app.ai_picker_selected, vec!["AUTO".to_string()]);

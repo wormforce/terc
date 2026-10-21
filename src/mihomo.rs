@@ -191,12 +191,57 @@ pub struct SubscriptionSummary {
     pub expire: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ProxyGroup {
     pub name: String,
     pub kind: String,
     pub now: String,
+    /// Node pinned on a url-test/fallback group; Mihomo keeps using it while
+    /// it is alive for the group's own test URL, so `now` can differ.
+    pub fixed: String,
     pub all: Vec<String>,
+    /// `testUrl`; Selectors omit it when it is Mihomo's default.
+    pub test_url: String,
+    /// `expectedStatus`, such as `204` or `200-299/302`; empty accepts any.
+    pub expected_status: String,
+    /// The group's `timeout:` from the config file, which the group JSON
+    /// leaves out; 0 when unset.
+    pub timeout_ms: u64,
+}
+
+impl ProxyGroup {
+    /// The URL whose `extra` state the group ranks on. Only URLTest and
+    /// Fallback rank, and only those tests run with the group's own URL.
+    pub fn ranking_url(&self) -> Option<&str> {
+        let ranks = ["urltest", "fallback"].contains(&self.kind.to_ascii_lowercase().as_str());
+        Some(self.test_url.as_str()).filter(|url| ranks && !url.is_empty())
+    }
+
+    /// The delay the group ranks `node` on: its `extra` state for the
+    /// group's URL, or the global history for every other group.
+    pub fn member_delay(&self, node: &ProxyNode) -> Option<u16> {
+        match self.ranking_url() {
+            Some(url) => node.url_delays.get(url).copied().flatten(),
+            None => node.delay,
+        }
+    }
+}
+
+impl ProxyGroup {
+    /// Groups where a PUT pins a node instead of selecting it.
+    pub fn pinnable(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("urltest") || self.kind.eq_ignore_ascii_case("fallback")
+    }
+
+    /// The timeout of the group's own health checks: Mihomo uses 5000 ms
+    /// when `timeout:` is unset.
+    pub fn check_timeout_ms(&self) -> u64 {
+        if self.timeout_ms == 0 {
+            GROUP_DELAY_TIMEOUT_MS
+        } else {
+            self.timeout_ms
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +252,9 @@ pub struct ProxyNode {
     pub delay: Option<u16>,
     /// Owning proxy provider, used for the provider healthcheck delay route.
     pub provider: Option<String>,
+    /// Per test URL, the last delay of `extra` while alive. Unlike `delay`,
+    /// a test that missed the expected status leaves no number here.
+    pub url_delays: HashMap<String, Option<u16>>,
 }
 
 #[derive(Clone, Debug)]
@@ -258,12 +306,23 @@ impl Default for ControllerConfig {
             secret: String::new(),
             config_dir: default_config_dir(),
             subscription_url: String::new(),
-            test_url: "http://www.gstatic.com/generate_204".to_string(),
+            test_url: DEFAULT_TEST_URL.to_string(),
             timeout_ms: 4000,
             profile_id: String::new(),
         }
     }
 }
+
+/// Mihomo's own `DefaultTestURL`. Over plain HTTP a provider can answer
+/// generate_204 at the entry relay and report a fake-low delay.
+pub const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
+/// terc's default before it followed Mihomo; migrated on config load.
+pub const OLD_DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
+/// The delay routes parse `timeout` as int16, so larger values get HTTP 400.
+pub const MAX_DELAY_TIMEOUT_MS: u64 = 32_767;
+/// Mihomo's default group healthcheck timeout. A shorter terc test would
+/// mark nodes dead in `extra` that the group itself keeps.
+const GROUP_DELAY_TIMEOUT_MS: u64 = 5000;
 
 const HOMEBREW_CONFIG_DIR: &str = "/opt/homebrew/etc/mihomo";
 
@@ -1658,6 +1717,62 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn url_test_and_fallback_groups_carry_their_pin() {
+        let proxies = r#"{"proxies":{
+            "PROXY":{"type":"Selector","all":["Auto","JP 01"],"now":"Auto"},
+            "Auto":{"type":"URLTest","all":["JP 01","US 01"],"now":"US 01","fixed":"JP 01"},
+            "Safe":{"type":"Fallback","all":["JP 01","US 01"],"now":"JP 01","fixed":""}}}"#;
+        let (cfg, _) = controller(vec![
+            ("/version", r#"{"version":"v1.19.28"}"#.into()),
+            ("/proxies", proxies.into()),
+        ]);
+        let snap = fetch_snapshot(&cfg);
+        let group = |name: &str| snap.groups.iter().find(|g| g.name == name).unwrap();
+        let auto = group("Auto");
+        assert_eq!((auto.fixed.as_str(), auto.now.as_str()), ("JP 01", "US 01"));
+        assert!(auto.pinnable());
+        assert!(group("Safe").fixed.is_empty() && group("Safe").pinnable());
+        assert!(group("PROXY").fixed.is_empty() && !group("PROXY").pinnable());
+    }
+
+    #[test]
+    fn unpin_deletes_the_group_pin() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            ..ControllerConfig::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for status in [204, 400] {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                tx.send(first.trim_end().to_string()).unwrap();
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        unpin_group(&cfg, "Auto 自动").unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            "DELETE /proxies/Auto%20%E8%87%AA%E5%8A%A8 HTTP/1.1"
+        );
+        // A Selector answers 400: the error reaches the status line.
+        assert!(unpin_group(&cfg, "PROXY").is_err());
+        assert_eq!(rx.recv().unwrap(), "DELETE /proxies/PROXY HTTP/1.1");
+    }
+
+    #[test]
     fn skipped_parts_carry_over_with_provider_nodes_and_their_delays() {
         let (cfg, _) = controller(routes());
         let mut old = fetch_snapshot(&cfg);
@@ -1690,6 +1805,7 @@ mod snapshot_tests {
                 udp: false,
                 delay: Some(70),
                 provider: None,
+                url_delays: HashMap::new(),
             },
         );
         lean.carry_skipped(&mut old);
@@ -1831,6 +1947,15 @@ pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot
     // One read serves both the runtime flags and the configured values.
     let raw = read_config_text(cfg).ok();
     let mut snapshot = fetch_core_snapshot(cfg, fetch, raw.as_deref());
+    if let Some(raw) = raw
+        .as_deref()
+        .filter(|_| snapshot.groups.iter().any(ProxyGroup::pinnable))
+    {
+        let timeouts = crate::routing::group_timeouts(raw);
+        for group in &mut snapshot.groups {
+            group.timeout_ms = timeouts.get(&group.name).copied().unwrap_or(0);
+        }
+    }
     if let Some(raw) = raw {
         for chunk in crate::ops::split_chunks(&raw) {
             if let Some(key) = chunk.key {
@@ -1980,11 +2105,20 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
+                        let fixed = item
+                            .get("fixed")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         groups.push(ProxyGroup {
                             name: name.clone(),
                             kind: kind.clone(),
                             now,
+                            fixed,
                             all,
+                            test_url: json_str(item, "testUrl"),
+                            expected_status: json_str(item, "expectedStatus"),
+                            timeout_ms: 0,
                         });
                     }
 
@@ -1996,6 +2130,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
                             udp,
                             delay,
                             provider: None,
+                            url_delays: url_delays(item),
                         },
                     );
                 }
@@ -2060,13 +2195,16 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
         // One parse feeds both the provider list and the provider nodes.
         if let Some(v) = get("/providers/proxies") {
             providers.extend(crate::ops::providers_from_value(&v, "proxy"));
+            let mut extras = provider_url_delays(&v);
             for found in crate::ops::provider_nodes_from_value(&v) {
+                let url_delays = extras.remove(&found.name).unwrap_or_default();
                 let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
                     name: found.name,
                     kind: found.kind,
                     udp: found.udp,
                     delay: found.delay,
                     provider: None,
+                    url_delays,
                 });
                 node.provider.get_or_insert(found.provider);
             }
@@ -2256,15 +2394,46 @@ fn extract_subscription_summary(nodes: &[String]) -> Option<SubscriptionSummary>
     }
 }
 
-pub fn select_group_node(cfg: &ControllerConfig, group: &str, node: &str) -> io::Result<()> {
+/// Selects `node`, or pins it when `pin` (url-test/fallback). A Fallback
+/// re-tests a dead node for up to 5 s before it answers, and has stored the
+/// pin by then, so a pin waits that long instead of reporting a failure.
+pub fn select_group_node(
+    cfg: &ControllerConfig,
+    group: &str,
+    node: &str,
+    pin: bool,
+) -> io::Result<()> {
     let path = format!("/proxies/{}", percent_encode(group));
     let body = serde_json::json!({ "name": node }).to_string();
+    let wait = if pin {
+        GROUP_DELAY_TIMEOUT_MS + 1500
+    } else {
+        1200
+    };
     let (status, _) = http_request(
         &cfg.addr,
         &cfg.secret,
         "PUT",
         &path,
         Some(&body),
+        Duration::from_millis(wait),
+    )?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("HTTP {status}")))
+    }
+}
+
+/// Clears the pin a PUT left on a url-test/fallback group.
+pub fn unpin_group(cfg: &ControllerConfig, group: &str) -> io::Result<()> {
+    let path = format!("/proxies/{}", percent_encode(group));
+    let (status, _) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "DELETE",
+        &path,
+        None,
         Duration::from_millis(1200),
     )?;
     if (200..300).contains(&status) {
@@ -2311,22 +2480,26 @@ pub fn close_connection(cfg: &ControllerConfig, id: Option<&str>) -> io::Result<
     }
 }
 
+/// `groups` are the snapshot's: they stand in for a group the core does
+/// not describe in time, and say which groups check the configured URL.
 pub fn test_group_delays_async(
     cfg: ControllerConfig,
     group_name: String,
     nodes: Vec<String>,
+    groups: Vec<ProxyGroup>,
     tx: Sender<BackendEvent>,
 ) {
-    test_delays_async(cfg, group_name, nodes, tx, false);
+    test_delays_async(cfg, group_name, nodes, groups, tx, false);
 }
 
 pub fn test_best_delays_async(
     cfg: ControllerConfig,
     group_name: String,
     nodes: Vec<String>,
+    groups: Vec<ProxyGroup>,
     tx: Sender<BackendEvent>,
 ) {
-    test_delays_async(cfg, group_name, nodes, tx, true);
+    test_delays_async(cfg, group_name, nodes, groups, tx, true);
 }
 
 /// Concurrent delay probes per test run. Workers pull the next node as soon
@@ -2337,6 +2510,7 @@ fn test_delays_async(
     cfg: ControllerConfig,
     group_name: String,
     nodes: Vec<String>,
+    groups: Vec<ProxyGroup>,
     tx: Sender<BackendEvent>,
     best: bool,
 ) {
@@ -2345,14 +2519,29 @@ fn test_delays_async(
             .into_iter()
             .filter(|node| !is_info_pseudo_node(node))
             .collect();
+        // The core's answer is current; the snapshot keeps the configured
+        // timeout, and stands in when the core does not answer in time.
+        let known = groups.iter().find(|g| g.name == group_name);
+        let group = match (fetch_group(&cfg, &group_name), known) {
+            (Some(fresh), Some(known)) => Some(ProxyGroup {
+                timeout_ms: known.timeout_ms,
+                ..fresh
+            }),
+            (fresh, known) => fresh.or_else(|| known.cloned()),
+        };
+        let ranking_url = group.as_ref().and_then(ProxyGroup::ranking_url);
+        let probe = match (&group, ranking_url) {
+            (Some(group), Some(url)) => DelayProbe::checking(group, url),
+            _ => DelayProbe::for_url(&cfg, &cfg.test_url, &groups),
+        };
         let next = std::sync::atomic::AtomicUsize::new(0);
         let providers = std::sync::OnceLock::new();
         let mut indexed: Vec<(usize, Option<u16>)> = thread::scope(|scope| {
             let workers: Vec<_> = (0..DELAY_WORKERS.min(queue.len()))
                 .map(|_| {
                     let tx = tx.clone();
-                    let (cfg, group_name, queue, next, providers) =
-                        (&cfg, &group_name, &queue, &next, &providers);
+                    let (cfg, group_name, queue, next, providers, probe) =
+                        (&cfg, &group_name, &queue, &next, &providers, &probe);
                     scope.spawn(move || {
                         let mut done = Vec::new();
                         loop {
@@ -2360,9 +2549,7 @@ fn test_delays_async(
                             let Some(node) = queue.get(index) else {
                                 break;
                             };
-                            let delay = node_delay_with(cfg, node, &cfg.test_url, providers)
-                                .ok()
-                                .flatten();
+                            let delay = node_delay_with(cfg, node, probe, providers).ok().flatten();
                             let _ = tx.send(BackendEvent::DelayResult {
                                 group: group_name.clone(),
                                 node: node.clone(),
@@ -2382,10 +2569,24 @@ fn test_delays_async(
         });
         // BestTestDone keeps the group order, as the batched version did.
         indexed.sort_by_key(|(index, _)| *index);
-        let results = indexed
+        let mut results: Vec<(String, Option<u16>)> = indexed
             .into_iter()
             .map(|(index, delay)| (queue[index].clone(), delay))
             .collect();
+        // The route answers 200 with a delay even when the status missed the
+        // expected range; only `extra` records whether the group can use it.
+        if let Some(url) = ranking_url {
+            let fresh = fetch_snapshot(&cfg);
+            for (node, delay) in &mut results {
+                *delay = fresh
+                    .nodes
+                    .get(node)
+                    .and_then(|n| n.url_delays.get(url).copied().flatten());
+            }
+            if fresh.running {
+                let _ = tx.send(BackendEvent::Snapshot(Box::new(fresh)));
+            }
+        }
         let _ = tx.send(if best {
             BackendEvent::BestTestDone {
                 group: group_name,
@@ -2395,6 +2596,48 @@ fn test_delays_async(
             BackendEvent::GroupTestDone { group: group_name }
         });
     });
+}
+
+fn json_str(item: &Value, key: &str) -> String {
+    item.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A proxy's `extra`: per test URL, the last delay while the state is alive.
+/// The global history records a delay even when the expected status missed.
+fn url_delays(item: &Value) -> HashMap<String, Option<u16>> {
+    item.get("extra")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(url, state)| {
+            let alive = state.get("alive").and_then(Value::as_bool) == Some(true);
+            let delay = state
+                .get("history")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.last())
+                .and_then(|h| h.get("delay"))
+                .and_then(Value::as_u64)
+                .and_then(|d| if alive && d > 0 { Some(d as u16) } else { None });
+            (url.clone(), delay)
+        })
+        .collect()
+}
+
+/// `url_delays` of every node in a `/providers/proxies` body, by node name.
+fn provider_url_delays(value: &Value) -> HashMap<String, HashMap<String, Option<u16>>> {
+    value
+        .get("providers")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|obj| obj.values())
+        .filter_map(|item| item.get("proxies").and_then(Value::as_array))
+        .flatten()
+        .map(|proxy| (json_str(proxy, "name"), url_delays(proxy)))
+        .filter(|(name, extra)| !name.is_empty() && !extra.is_empty())
+        .collect()
 }
 
 pub fn is_info_pseudo_node(name: &str) -> bool {
@@ -4983,7 +5226,89 @@ pub fn test_node_delay(
     node: &str,
     url: &str,
 ) -> Result<Option<u16>, String> {
-    node_delay_with(cfg, node, url, &std::sync::OnceLock::new())
+    node_delay_with(
+        cfg,
+        node,
+        &DelayProbe::plain(cfg, url),
+        &std::sync::OnceLock::new(),
+    )
+}
+
+/// The query of one delay test.
+struct DelayProbe<'a> {
+    url: &'a str,
+    /// Mihomo's `expected=`; empty sends none and accepts any status.
+    expected: &'a str,
+    timeout_ms: u64,
+}
+
+impl<'a> DelayProbe<'a> {
+    fn plain(cfg: &ControllerConfig, url: &'a str) -> Self {
+        Self {
+            url,
+            expected: "",
+            timeout_ms: cfg.timeout_ms,
+        }
+    }
+
+    /// A test the way `group` checks `url` itself, so the `extra` state it
+    /// writes is the one the group would write.
+    fn checking(group: &'a ProxyGroup, url: &'a str) -> Self {
+        Self {
+            url,
+            expected: &group.expected_status,
+            timeout_ms: group.check_timeout_ms(),
+        }
+    }
+
+    /// A test of `url`. Mihomo keeps one `extra` state per URL, so when a
+    /// URLTest/Fallback group checks the same URL (with no `url:`, every
+    /// such group checks the default), the test takes that group's expected
+    /// status and timeout rather than mark nodes dead that it keeps.
+    fn for_url(cfg: &ControllerConfig, url: &'a str, groups: &'a [ProxyGroup]) -> Self {
+        match groups.iter().find(|g| g.ranking_url() == Some(url)) {
+            Some(group) => Self::checking(group, url),
+            None => Self::plain(cfg, url),
+        }
+    }
+
+    /// Capped for saved settings from before the cap, too.
+    fn timeout_ms(&self) -> u64 {
+        self.timeout_ms.min(MAX_DELAY_TIMEOUT_MS)
+    }
+
+    fn query(&self) -> String {
+        let mut query = format!(
+            "url={}&timeout={}",
+            percent_encode(self.url),
+            self.timeout_ms()
+        );
+        if !self.expected.is_empty() {
+            query.push_str(&format!("&expected={}", percent_encode(self.expected)));
+        }
+        query
+    }
+}
+
+/// GET /proxies/{group}: its type, `testUrl` and `expectedStatus`, read at
+/// the start of each test so the round uses what the core ranks on now.
+fn fetch_group(cfg: &ControllerConfig, name: &str) -> Option<ProxyGroup> {
+    let path = format!("/proxies/{}", percent_encode(name));
+    let timeout = Duration::from_millis(cfg.timeout_ms.max(1500));
+    let Ok((200, body)) = http_request(&cfg.addr, &cfg.secret, "GET", &path, None, timeout) else {
+        return None;
+    };
+    let item = serde_json::from_str::<Value>(&body).ok()?;
+    Some(ProxyGroup {
+        name: name.to_string(),
+        kind: json_str(&item, "type"),
+        now: json_str(&item, "now"),
+        fixed: json_str(&item, "fixed"),
+        all: Vec::new(),
+        test_url: json_str(&item, "testUrl"),
+        expected_status: json_str(&item, "expectedStatus"),
+        timeout_ms: 0,
+    })
 }
 
 /// GET /proxies/{name}/delay, falling back to the provider healthcheck route
@@ -4992,10 +5317,10 @@ pub fn test_node_delay(
 fn node_delay_with(
     cfg: &ControllerConfig,
     node: &str,
-    url: &str,
+    probe: &DelayProbe,
     providers: &std::sync::OnceLock<HashMap<String, String>>,
 ) -> Result<Option<u16>, String> {
-    let query = format!("url={}&timeout={}", percent_encode(url), cfg.timeout_ms);
+    let query = probe.query();
     let get = |path: &str| {
         http_request(
             &cfg.addr,
@@ -5003,7 +5328,7 @@ fn node_delay_with(
             "GET",
             path,
             None,
-            Duration::from_millis(cfg.timeout_ms + 500),
+            Duration::from_millis(probe.timeout_ms() + 500),
         )
     };
     let mut response = get(&format!("/proxies/{}/delay?{query}", percent_encode(node)));
@@ -5035,9 +5360,17 @@ fn node_delay_with(
     }
 }
 
-pub fn test_node_async(cfg: ControllerConfig, node: String, tx: Sender<BackendEvent>) {
+pub fn test_node_async(
+    cfg: ControllerConfig,
+    node: String,
+    groups: Vec<ProxyGroup>,
+    tx: Sender<BackendEvent>,
+) {
     thread::spawn(move || {
-        let delay = test_node_delay(&cfg, &node, &cfg.test_url).ok().flatten();
+        let probe = DelayProbe::for_url(&cfg, &cfg.test_url, &groups);
+        let delay = node_delay_with(&cfg, &node, &probe, &std::sync::OnceLock::new())
+            .ok()
+            .flatten();
         let _ = tx.send(BackendEvent::DelayResult {
             group: String::new(),
             node,
@@ -5317,6 +5650,7 @@ mod provider_tests {
             cfg,
             "Main".into(),
             nodes.iter().map(|s| s.to_string()).collect(),
+            Vec::new(),
             tx,
         );
         let mut streamed = Vec::new();
@@ -5349,6 +5683,202 @@ mod provider_tests {
         sorted.sort();
         assert_eq!(streamed, sorted);
         assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn delay_timeout_is_capped_to_what_mihomo_parses() {
+        let mut mock = recorder(Duration::ZERO, |_| (200, r#"{"delay":9}"#));
+        mock.cfg.timeout_ms = 60_000;
+        let url = DEFAULT_TEST_URL;
+        assert_eq!(test_node_delay(&mock.cfg, "A", url), Ok(Some(9)));
+        let lines = mock.lines.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            ["GET /proxies/A/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=32767 HTTP/1.1"]
+        );
+    }
+
+    /// `Auto` ranks on its own URL and status; `Main` is a Selector whose
+    /// non-default `testUrl` terc does not use. The delay route answers 200
+    /// for both nodes, but `B` missed the expected status.
+    fn group_reply(path: &str) -> (u16, &'static str) {
+        match path {
+            "/version" => (200, r#"{"version":"v1.19.28"}"#),
+            "/configs" => (200, r#"{"mode":"rule"}"#),
+            "/proxies/Auto" => (
+                200,
+                r#"{"name":"Auto","type":"URLTest","all":["A","B","P"],"testUrl":"https://ai.test/x","expectedStatus":"200/204"}"#,
+            ),
+            "/proxies/Main" => (
+                200,
+                r#"{"name":"Main","type":"Selector","all":["A","B"],"testUrl":"https://ai.test/x"}"#,
+            ),
+            "/proxies" => (
+                200,
+                r#"{"proxies":{
+                "Auto":{"type":"URLTest","all":["A","B","P"],"now":"A","testUrl":"https://ai.test/x","expectedStatus":"200/204"},
+                "Main":{"type":"Selector","all":["A","B"],"now":"A"},
+                "A":{"type":"Vmess","history":[{"delay":35}],"extra":{"https://ai.test/x":{"alive":true,"history":[{"delay":40}]}}},
+                "B":{"type":"Vmess","history":[{"delay":30}],"extra":{"https://ai.test/x":{"alive":false,"history":[{"delay":30}]}}}}}"#,
+            ),
+            "/providers/proxies" => (
+                200,
+                r#"{"providers":{"air":{"name":"air","vehicleType":"HTTP","proxies":[{"name":"P","type":"Trojan","history":[{"delay":12}],"extra":{"https://ai.test/x":{"alive":true,"history":[{"delay":50}]}}}]}}}"#,
+            ),
+            p if p.starts_with("/proxies/P/delay?") => (404, ""),
+            p if p.starts_with("/proxies/") && p.contains("/delay?") => (200, r#"{"delay":30}"#),
+            p if p.starts_with("/providers/proxies/air/P/healthcheck?") => (200, r#"{"delay":50}"#),
+            _ => (404, r#"{"message":"resource not found"}"#),
+        }
+    }
+
+    fn run_best(
+        cfg: &ControllerConfig,
+        group: &str,
+        nodes: &[&str],
+        groups: Vec<ProxyGroup>,
+    ) -> (Vec<(String, Option<u16>)>, Option<CoreSnapshot>) {
+        let (tx, rx) = mpsc::channel();
+        test_best_delays_async(
+            cfg.clone(),
+            group.into(),
+            nodes.iter().map(|s| s.to_string()).collect(),
+            groups,
+            tx,
+        );
+        let mut snapshot = None;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                BackendEvent::DelayResult { .. } => {}
+                BackendEvent::Snapshot(snap) => snapshot = Some(*snap),
+                BackendEvent::BestTestDone { results, .. } => break (results, snapshot),
+                _ => panic!("unexpected event"),
+            }
+        }
+    }
+
+    #[test]
+    fn urltest_rounds_use_the_group_url_and_rank_on_extra() {
+        let mock = recorder(Duration::ZERO, group_reply);
+        let (results, snapshot) = run_best(&mock.cfg, "Auto", &["A", "B", "P"], Vec::new());
+        // B answered 200 with a delay, yet the group counts it as dead.
+        let expected: Vec<(String, Option<u16>)> = vec![
+            ("A".into(), Some(40)),
+            ("B".into(), None),
+            ("P".into(), Some(50)),
+        ];
+        assert_eq!(results, expected);
+        let lines = mock.lines.lock().unwrap().clone();
+        let query = "url=https%3A%2F%2Fai.test%2Fx&timeout=5000&expected=200%2F204 HTTP/1.1";
+        for line in [
+            format!("GET /proxies/A/delay?{query}"),
+            format!("GET /proxies/B/delay?{query}"),
+            format!("GET /providers/proxies/air/P/healthcheck?{query}"),
+        ] {
+            assert!(lines.contains(&line), "{line} not in {lines:?}");
+        }
+        // The fresh state goes to the UI, which shows what the group ranks on.
+        let snap = snapshot.expect("a snapshot after the round");
+        let auto = snap.groups.iter().find(|g| g.name == "Auto").unwrap();
+        assert_eq!(auto.ranking_url(), Some("https://ai.test/x"));
+        assert_eq!(auto.expected_status, "200/204");
+        let delays: Vec<_> = ["A", "B", "P"]
+            .iter()
+            .map(|n| auto.member_delay(&snap.nodes[*n]))
+            .collect();
+        assert_eq!(delays, [Some(40), None, Some(50)]);
+        let main = snap.groups.iter().find(|g| g.name == "Main").unwrap();
+        assert_eq!(main.ranking_url(), None);
+        assert_eq!(main.member_delay(&snap.nodes["B"]), Some(30));
+    }
+
+    #[test]
+    fn selector_rounds_keep_the_configured_url_and_history() {
+        let mock = recorder(Duration::ZERO, group_reply);
+        let (results, snapshot) = run_best(&mock.cfg, "Main", &["A", "B"], Vec::new());
+        assert_eq!(results, [("A".into(), Some(30)), ("B".into(), Some(30))]);
+        assert!(snapshot.is_none());
+        let lines = mock.lines.lock().unwrap().clone();
+        assert!(lines.contains(
+            &"GET /proxies/A/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=500 HTTP/1.1"
+                .to_string()
+        ));
+        assert!(lines
+            .iter()
+            .all(|l| !l.contains("expected=") && l != "GET /proxies HTTP/1.1"));
+    }
+
+    fn snapshot_group(name: &str, kind: &str, url: &str, expected: &str, ms: u64) -> ProxyGroup {
+        ProxyGroup {
+            name: name.into(),
+            kind: kind.into(),
+            test_url: url.into(),
+            expected_status: expected.into(),
+            timeout_ms: ms,
+            ..ProxyGroup::default()
+        }
+    }
+
+    #[test]
+    fn rounds_on_a_url_a_group_checks_take_that_groups_status_and_timeout() {
+        let mock = recorder(Duration::ZERO, group_reply);
+        // A url-test with no `url:` checks Mihomo's default, terc's URL too.
+        let groups = vec![
+            snapshot_group("Main", "Selector", "", "", 0),
+            snapshot_group("Fast", "URLTest", DEFAULT_TEST_URL, "204", 0),
+        ];
+        run_best(&mock.cfg, "Main", &["A"], groups.clone());
+        let (tx, rx) = mpsc::channel();
+        test_node_async(mock.cfg.clone(), "B".into(), groups, tx);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            BackendEvent::DelayResult {
+                delay: Some(30),
+                ..
+            }
+        ));
+        let lines = mock.lines.lock().unwrap().clone();
+        let query = "url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=5000&expected=204";
+        for node in ["A", "B"] {
+            let line = format!("GET /proxies/{node}/delay?{query} HTTP/1.1");
+            assert!(lines.contains(&line), "{line} not in {lines:?}");
+        }
+    }
+
+    #[test]
+    fn urltest_rounds_use_the_configured_group_timeout() {
+        let mock = recorder(Duration::ZERO, group_reply);
+        let groups = vec![snapshot_group(
+            "Auto",
+            "URLTest",
+            "https://ai.test/x",
+            "200/204",
+            10_000,
+        )];
+        run_best(&mock.cfg, "Auto", &["A"], groups);
+        let lines = mock.lines.lock().unwrap().clone();
+        let line = "GET /proxies/A/delay?url=https%3A%2F%2Fai.test%2Fx&timeout=10000&expected=200%2F204 HTTP/1.1";
+        assert!(lines.contains(&line.to_string()), "{lines:?}");
+    }
+
+    #[test]
+    fn urltest_rounds_fall_back_to_the_snapshot_group() {
+        let mock = recorder(Duration::ZERO, group_reply);
+        // GET /proxies/Gone answers 404, as when it times out: the snapshot
+        // still says it ranks on its own URL, so the round does too.
+        let groups = vec![snapshot_group(
+            "Gone",
+            "URLTest",
+            "https://ai.test/x",
+            "200/204",
+            0,
+        )];
+        let (results, snapshot) = run_best(&mock.cfg, "Gone", &["A", "B"], groups);
+        assert_eq!(results, [("A".into(), Some(40)), ("B".into(), None)]);
+        assert!(snapshot.is_some());
+        let lines = mock.lines.lock().unwrap().clone();
+        let line = "GET /proxies/B/delay?url=https%3A%2F%2Fai.test%2Fx&timeout=5000&expected=200%2F204 HTTP/1.1";
+        assert!(lines.contains(&line.to_string()), "{lines:?}");
     }
 
     /// Mock controller that records each request line, answers `PUT`s after

@@ -849,13 +849,15 @@ fn draw_groups_panel(frame: &mut Frame, app: &mut App, area: Rect) {
 
             let left = format!("{prefix}{}", g.name);
             let right = g.now.clone();
+            let pin = pin_marker(g);
             let left_w = left.width();
-            let right_w = right.width();
+            let right_w = right.width() + pin.width();
             let gap = max_w.saturating_sub(left_w + right_w).max(1);
 
             ListItem::new(Line::from(vec![
                 Span::styled(left, name_style),
                 Span::raw(" ".repeat(gap)),
+                Span::styled(pin, Style::default().fg(theme.accent)),
                 Span::styled(right, now_style),
             ]))
             .style(if selected && focused {
@@ -877,18 +879,53 @@ fn draw_groups_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// `◆ ` while the pinned node is in use, `◇ ` once the group failed over.
+fn pin_marker(group: &ProxyGroup) -> &'static str {
+    if group.fixed.is_empty() {
+        ""
+    } else if group.fixed == group.now {
+        "◆ "
+    } else {
+        "◇ "
+    }
+}
+
 fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme();
     let focused = app.focus == FocusPane::Nodes;
     let current_group: Option<&ProxyGroup> = app.snapshot.groups.get(app.group_index);
 
-    let title_str = match current_group {
+    let mut title_str = match current_group {
         Some(g) => format!("{}  {} ({})", app.t("nodes"), g.name, g.all.len()),
         None => app.t("nodes").to_string(),
     };
+    // Mihomo honours the pin only while it passes the group's own test URL.
+    let pin_note = match current_group {
+        Some(g) if !g.fixed.is_empty() => format!(
+            "  {}{}",
+            pin_marker(g),
+            if g.fixed == g.now {
+                app.t("pin_note")
+            } else {
+                app.t("pin_ignored")
+            }
+        ),
+        _ => String::new(),
+    };
+    let prefix = if focused { "▶ [2] " } else { "[2] " };
+    // The title holds area.width - 5 cells. The pin note outranks the node
+    // count and the end of a long group name.
+    let budget = (area.width as usize).saturating_sub(5);
+    if let Some(g) = current_group.filter(|_| !pin_note.is_empty()) {
+        let head = format!("{}  ", app.t("nodes"));
+        let room = budget.saturating_sub(prefix.width() + pin_note.width() + head.width());
+        if title_str.width() > budget.saturating_sub(prefix.width() + pin_note.width()) {
+            title_str = head + &fit_width(&g.name, room);
+        }
+    }
     let title = Line::from(vec![
         Span::styled(
-            if focused { "▶ [2] " } else { "[2] " },
+            prefix,
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -897,6 +934,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             title_str,
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(pin_note, Style::default().fg(theme.muted)),
     ]);
 
     let inner = draw_panel(frame, area, theme, Some(title), focused);
@@ -928,6 +966,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|(idx, node_name)| {
             let selected = idx == app.node_index;
             let is_active = &group.now == node_name;
+            let is_pinned = &group.fixed == node_name;
             let is_info = is_info_pseudo_node(node_name);
 
             let cursor = if selected && focused {
@@ -939,6 +978,10 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let radio = if is_info {
                 "ℹ "
+            } else if is_pinned && is_active {
+                "◆ "
+            } else if is_pinned {
+                "◇ "
             } else if is_active {
                 "● "
             } else {
@@ -947,7 +990,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
 
             let node_meta = app.snapshot.nodes.get(node_name);
             let proto = node_meta.map(|n| n.kind.as_str()).unwrap_or("").to_string();
-            let delay = node_meta.and_then(|n| n.delay);
+            let delay = node_meta.and_then(|n| group.member_delay(n));
 
             let delay_str = match delay {
                 Some(ms) => format!("{ms:>4} ms"),
@@ -967,7 +1010,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(theme.text)
             };
 
-            let radio_style = if is_active {
+            let radio_style = if is_active || is_pinned {
                 Style::default()
                     .fg(theme.accent)
                     .add_modifier(Modifier::BOLD)
@@ -1425,6 +1468,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("m", app.t("help_m")),
         ("r", app.t("help_r")),
         ("a", app.t("help_a")),
+        ("p: x", app.t("help_unpin")),
         ("Enter", app.t("help_enter")),
         ("↑↓ jk", app.t("help_jk")),
         ("Tab ←→ hl  1 2", app.t("help_hl")),
@@ -1759,6 +1803,24 @@ pub fn inset_rect(area: Rect, dx: u16, dy: u16) -> Rect {
         width: area.width.saturating_sub(dx * 2),
         height: area.height.saturating_sub(dy * 2),
     }
+}
+
+/// `s` cut to `width` cells, ending in `…` when cut.
+fn fit_width(s: &str, width: usize) -> String {
+    if s.width() <= width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for c in s.chars() {
+        if out.width() + c.width().unwrap_or(0) + 1 > width {
+            break;
+        }
+        out.push(c);
+    }
+    if width > 0 {
+        out.push('…');
+    }
+    out
 }
 
 pub fn truncate_str(s: &str, max_chars: usize) -> String {

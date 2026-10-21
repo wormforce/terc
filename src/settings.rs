@@ -242,8 +242,8 @@ impl App {
             "进程识别",
             "Process matching",
             self.core_setting("find-process-mode", "strict"),
-            "strict 按需识别；always 始终识别；off 关闭。",
-            "strict: on demand; always: always inspect; off: disable.",
+            "strict 只在规则走到进程规则时识别；always 每个新连接都识别；off 关闭。识别在拨号前同步进行，Linux 上每次约 1–15 ms。",
+            "strict: only when matching reaches a process rule; always: every new connection; off: never. The lookup runs before dialling, about 1–15 ms each on Linux.",
         );
         add(
             LogLevel,
@@ -260,8 +260,8 @@ impl App {
             "节点测速地址",
             "Latency test URL",
             self.config.controller.test_url.clone(),
-            "Enter 编辑 HTTP / HTTPS 测速地址，用于手动节点测速。",
-            "Enter an HTTP / HTTPS URL for manual node latency tests.",
+            "Enter 编辑 HTTP / HTTPS 测速地址，用于手动节点测速与优选。默认 https://www.gstatic.com/generate_204；走 Cloudflare 边缘的路径（如 OpenAI）可用 https://cp.cloudflare.com/generate_204。URLTest / Fallback 组按组内 url 测速。",
+            "Enter an HTTP / HTTPS URL for manual latency tests and best-node selection. Default https://www.gstatic.com/generate_204; https://cp.cloudflare.com/generate_204 tests the Cloudflare edge, as OpenAI-like paths use. URLTest / Fallback groups test with their own url.",
         );
         add(
             Timeout,
@@ -269,8 +269,8 @@ impl App {
             "测速 / 查询超时",
             "Test / query timeout",
             format!("{} ms", self.config.controller.timeout_ms),
-            "Enter 输入 500–60000 毫秒。",
-            "Enter a timeout from 500 to 60000 milliseconds.",
+            "Enter 输入 500–32767 毫秒（Mihomo 测速接口的上限）。URLTest / Fallback 组按组自己的 timeout（默认 5000）测速；测速地址与某个这类组相同时，也按该组的超时与期望状态码，免得把组仍在用的节点记成失效。",
+            "Enter a timeout from 500 to 32767 milliseconds, the limit of Mihomo's delay route. URLTest / Fallback groups test with their own timeout (5000 by default); when the test URL is one such a group checks, tests use that group's timeout and expected status, so they never mark dead a node the group still uses.",
         );
         add(
             Traffic,
@@ -622,7 +622,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 let valid = match id {
                     GraphInterval => n.is_some_and(|n| (1000..=86_400_000).contains(&n)),
                     MixedPort | HttpPort | SocksPort => n.is_some_and(|n| n <= 65535),
-                    Timeout => n.is_some_and(|n| (500..=60000).contains(&n)),
+                    Timeout => {
+                        n.is_some_and(|n| (500..=crate::mihomo::MAX_DELAY_TIMEOUT_MS).contains(&n))
+                    }
                     TestUrl => text.starts_with("http://") || text.starts_with("https://"),
                     _ => false,
                 };
