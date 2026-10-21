@@ -2317,13 +2317,17 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     let (mut config, load_issue) = Config::load();
+    // Nothing is written at startup after an unusable config.json: the user
+    // sees the error first, and only an explicit change saves defaults.
+    let unusable = matches!(load_issue, Some(LoadIssue::Unusable(_)));
     // Migration problems are shown in the UI; legacy files stay untouched.
-    let migration = match &load_issue {
-        Some(LoadIssue::Unusable(_)) => Ok(Vec::new()),
-        _ => storage::migrate(&mut config),
+    let migration = if unusable {
+        Ok(Vec::new())
+    } else {
+        storage::migrate(&mut config)
     };
     let mut app = App::new(config);
-    if app.note_dns_module_change() {
+    if app.note_dns_module_change() && !unusable {
         app.save_preferences();
     }
     let mut problems: Vec<String> = load_issue.iter().map(|i| i.text().to_string()).collect();
