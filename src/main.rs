@@ -201,14 +201,15 @@ impl Config {
         Self::load_from(&Self::path(), unix_now())
     }
 
-    /// A missing file starts fresh with defaults. A file
+    /// A missing file starts fresh with a random controller secret. A file
     /// that will not parse is renamed to `config.json.broken-<now>` and never
     /// overwritten, so a typo cannot wipe the secret, sources or modules.
     fn load_from(path: &std::path::Path, now: u64) -> (Self, Option<LoadIssue>) {
         let raw = match fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                let cfg = Self::default();
+                let mut cfg = Self::default();
+                cfg.controller.secret = random_secret().unwrap_or_default();
                 let notice = cfg.save_to(path).err().map(|err| {
                     LoadIssue::Unsaved(format!(
                         "无法保存偏好 / Could not save preferences / 設定を保存できません: {err}"
@@ -286,6 +287,18 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// 32 hex characters from `/dev/urandom`. Mihomo installs no auth at all for
+/// an empty secret, and its default CORS lets any web page reach the
+/// controller, so a fresh config never starts without one.
+fn random_secret() -> Option<String> {
+    use std::io::Read as _;
+    let mut bytes = [0u8; 16];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Deliver a worker's completion event even when the worker panics, so
@@ -375,6 +388,29 @@ mod io_tests {
         assert!(!path.exists(), "nothing is written back in its place");
         let backup = dir.join("config.json.broken-1700000000");
         assert_eq!(fs::read_to_string(&backup).unwrap(), raw);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_preferences_get_a_random_secret() {
+        let dir = env::temp_dir().join(format!("terc-fresh-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+        let (cfg, issue) = Config::load_from(&path, 0);
+        assert!(issue.is_none());
+        let secret = &cfg.controller.secret;
+        assert_eq!(secret.len(), 32);
+        assert!(secret.bytes().all(|b| b.is_ascii_hexdigit()));
+        let (again, issue) = Config::load_from(&path, 0);
+        assert!(issue.is_none());
+        assert_eq!(&again.controller.secret, secret, "loaded, not regenerated");
+        assert_ne!(
+            Config::load_from(&dir.join("other.json"), 0)
+                .0
+                .controller
+                .secret,
+            *secret
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
