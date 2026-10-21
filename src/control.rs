@@ -8,10 +8,11 @@ use std::{fs, path::PathBuf};
 
 use crate::{
     mihomo::{
-        dns_query_async, flush_dns_async, is_info_pseudo_node, persist_nested_bool, probe_async,
-        provider_healthcheck, read_config_text, refresh_all_providers_async,
-        refresh_provider_async, set_bool_config, set_rule_disabled, test_group_delays_async,
-        test_node_async, ProxyNode,
+        dns_query_async, flush_dns_async, is_info_pseudo_node, patch_config_value,
+        persist_live_bool, persist_nested_bool, probe_async, provider_healthcheck_async,
+        read_config_text, refresh_all_providers_async, refresh_provider_async,
+        refreshable_provider, save_config_unchecked, set_bool_config, set_rule_disabled,
+        test_group_delays_async, test_node_async, verify_runtime_value, HealthTexts, ProxyNode,
     },
     ops::{
         apply_enabled_modules, enabled_snippets, explain_rules, is_runtime_tunnel, module_catalog,
@@ -121,18 +122,27 @@ impl App {
         let field = field.to_string();
         let running = self.snapshot.running;
         self.run_action("Applying runtime switch…", None, None, move |cfg| {
+            let refs: Vec<&str> = path.iter().map(String::as_str).collect();
             if running {
+                // The core accepted the value, so saving it skips `mihomo -t`.
                 set_bool_config(&cfg, &field, next)
                     .map_err(|err| format!("Runtime change rejected: {err}"))?;
-            }
-            let refs: Vec<&str> = path.iter().map(String::as_str).collect();
-            persist_nested_bool(&cfg, &refs, next).map_err(|err| {
-                if running {
-                    format!("Runtime changed, but could not save: {err}")
-                } else {
-                    err
+                let live = verify_runtime_value(&cfg, &field, &next.into());
+                persist_live_bool(&cfg, &refs, next)
+                    .map_err(|err| format!("Runtime changed, but could not save: {err}"))?;
+                // Mihomo ignores `sniffing` while the sniffer was off at load.
+                // The file now differs from the core, so the next
+                // regeneration reloads even when its output is unchanged.
+                if let Err(err) = live {
+                    crate::mihomo::RELOAD_UNCERTAIN
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(format!(
+                        "已保存，重载配置或重启内核后生效 / Saved; the core did not apply it live ({err}), so it takes effect after the next reload or core restart"
+                    ));
                 }
-            })?;
+            } else {
+                persist_nested_bool(&cfg, &refs, next)?;
+            }
             Ok(if running {
                 "Runtime changed and saved"
             } else {
@@ -260,19 +270,39 @@ impl App {
             self.set_status(self.t("st_provider_rule"), false);
             return;
         }
-        self.run_action("Running provider health check…", None, None, move |cfg| {
-            provider_healthcheck(&cfg, &provider.name)?;
-            Ok(format!("Health check requested: {}", provider.name))
-        });
+        let name = provider.name;
+        let texts = match self.lang() {
+            crate::Lang::Zh => HealthTexts {
+                done: format!("健康检查完成  {name}"),
+                still: format!("内核仍在检测 {name}，延迟会陆续更新"),
+            },
+            crate::Lang::En => HealthTexts {
+                done: format!("Health check finished  {name}"),
+                still: format!("The core is still checking {name}; delays update as they come in"),
+            },
+            crate::Lang::Ja => HealthTexts {
+                done: format!("ヘルスチェック完了  {name}"),
+                still: format!("コアが {name} を検査中。遅延は順次更新されます"),
+            },
+        };
+        self.set_status(&format!("{}  {name}", self.t("st_provider_health")), false);
+        provider_healthcheck_async(self.config.controller.clone(), name, texts, self.tx.clone());
     }
 
     pub fn refresh_all_providers(&mut self) {
-        if self.snapshot.providers.is_empty() {
+        let providers: Vec<_> = self
+            .snapshot
+            .providers
+            .iter()
+            .filter(|p| refreshable_provider(p))
+            .cloned()
+            .collect();
+        if providers.is_empty() {
             self.set_status(self.t("st_no_provider"), true);
             return;
         }
         self.set_status(self.t("st_provider_all"), false);
-        refresh_all_providers_async(self.config.controller.clone(), self.tx.clone());
+        refresh_all_providers_async(self.config.controller.clone(), providers, self.tx.clone());
     }
 
     pub fn open_modules(&mut self) {
@@ -307,24 +337,78 @@ impl App {
         } else {
             ids.retain(|id| id != &module.id);
         }
-        let snippets = enabled_snippets(&self.catalog, &ids);
-        if !self.confirm_disruption(crate::guard::Disrupt::Reload) {
+        let next = match apply_enabled_modules(&raw, &enabled_snippets(&self.catalog, &ids)) {
+            Ok(text) => text,
+            Err(err) => {
+                self.set_status(&err, true);
+                return;
+            }
+        };
+        let running = self.snapshot.running;
+        // After an unanswered reload the core may not run the file, so only a
+        // reload makes them match.
+        let uncertain =
+            running && crate::mihomo::RELOAD_UNCERTAIN.load(std::sync::atomic::Ordering::SeqCst);
+        let change = match module_change(&raw, &next) {
+            ModuleChange::Live(_) if !running => ModuleChange::Reload,
+            _ if uncertain => ModuleChange::Reload,
+            change => change,
+        };
+        // Only a reload re-initialises providers, so only it asks first.
+        if change == ModuleChange::Reload && !self.confirm_disruption(crate::guard::Disrupt::Reload)
+        {
             return;
         }
-        let running = self.snapshot.running;
+        let done = self.t(if enabling {
+            "st_module_on"
+        } else {
+            "st_module_off"
+        });
+        let (same, live, fallback) = match self.lang() {
+            crate::Lang::Zh => (
+                "生效配置未变化，未重载",
+                "已实时生效，未重载",
+                "实时修改未生效，已重载配置",
+            ),
+            crate::Lang::En => (
+                "effective config unchanged; not reloaded",
+                "applied live; no reload",
+                "live change failed; configuration reloaded",
+            ),
+            crate::Lang::Ja => (
+                "有効な設定は変わらず、リロードなし",
+                "ライブ適用、リロードなし",
+                "ライブ適用に失敗、設定をリロード",
+            ),
+        };
         self.run_action(
             "Applying module configuration…",
             Some(ids),
             None,
-            move |cfg| {
-                let next = apply_enabled_modules(&raw, &snippets)?;
-                crate::mihomo::install_config(&cfg, &next, running)?;
-                Ok(if enabling {
-                    "Module enabled"
-                } else {
-                    "Module disabled"
+            move |cfg| match change {
+                ModuleChange::Same => {
+                    save_config_unchecked(&cfg, &next, running)?;
+                    Ok(format!("{done} — {same}"))
                 }
-                .into())
+                ModuleChange::Live(keys) => {
+                    for (key, value) in &keys {
+                        if let Err(err) = patch_config_value(&cfg, key, value) {
+                            // As with live settings, a reload makes the core
+                            // match the file.
+                            crate::mihomo::install_config(&cfg, &next, true).inspect_err(|_| {
+                                crate::mihomo::RELOAD_UNCERTAIN
+                                    .store(true, std::sync::atomic::Ordering::SeqCst)
+                            })?;
+                            return Ok(format!("{done} — {fallback} ({err})"));
+                        }
+                    }
+                    save_config_unchecked(&cfg, &next, true)?;
+                    Ok(format!("{done} — {live}"))
+                }
+                ModuleChange::Reload => {
+                    crate::mihomo::install_config(&cfg, &next, running)?;
+                    Ok(done.into())
+                }
             },
         );
     }
@@ -530,6 +614,87 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// What a module toggle changes in the config the core runs.
+#[derive(Debug, PartialEq)]
+enum ModuleChange {
+    /// Only the module bookkeeping in the header differs.
+    Same,
+    /// Only top-level keys `PATCH /configs` applies, with their new values.
+    Live(Vec<(String, serde_json::Value)>),
+    Reload,
+}
+
+/// Top-level keys a module may set that the core applies without a reload.
+const LIVE_MODULE_KEYS: &[&str] = &[
+    "allow-lan",
+    "tcp-concurrent",
+    "ipv6",
+    "find-process-mode",
+    "log-level",
+];
+
+/// Compare the effective configs, i.e. without the `# terc-base` and
+/// `# terc-switches` header that `apply_modules_with_switches` writes.
+fn module_change(old: &str, next: &str) -> ModuleChange {
+    fn effective(doc: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut parts = doc.splitn(3, '\n');
+        let body = match (parts.next(), parts.next(), parts.next()) {
+            (Some(head), Some(switches), Some(rest))
+                if head.starts_with("# terc-base: ")
+                    && switches.starts_with("# terc-switches: ") =>
+            {
+                rest
+            }
+            _ => doc,
+        };
+        // A later duplicate key wins, as in Mihomo's YAML decoder.
+        crate::ops::split_chunks(body)
+            .into_iter()
+            .filter_map(|chunk| {
+                let mut lines = chunk.lines;
+                while lines.last().is_some_and(|l| {
+                    let t = l.trim();
+                    t.is_empty() || t.starts_with('#')
+                }) {
+                    lines.pop();
+                }
+                Some((chunk.key?, lines))
+            })
+            .collect()
+    }
+    let (old, next) = (effective(old), effective(next));
+    let mut keys: Vec<&String> = old.keys().chain(next.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut live = Vec::new();
+    for key in keys {
+        let new_lines = next.get(key);
+        if old.get(key) == new_lines {
+            continue;
+        }
+        // A removed key falls back to a default the core cannot be told.
+        let value = new_lines
+            .filter(|lines| lines.len() == 1 && LIVE_MODULE_KEYS.contains(&key.as_str()))
+            .and_then(|lines| lines[0].split_once(':'))
+            .map(|(_, v)| crate::ops::clean_scalar(v))
+            .and_then(|v| match key.as_str() {
+                "allow-lan" | "tcp-concurrent" | "ipv6" => {
+                    v.to_ascii_lowercase().parse::<bool>().ok().map(Into::into)
+                }
+                _ => (!v.is_empty()).then(|| v.into()),
+            });
+        match value {
+            Some(value) => live.push((key.clone(), value)),
+            None => return ModuleChange::Reload,
+        }
+    }
+    if live.is_empty() {
+        ModuleChange::Same
+    } else {
+        ModuleChange::Live(live)
+    }
 }
 
 impl App {
@@ -877,5 +1042,67 @@ mod profile_integration_tests {
             previous_config
         );
         fs::remove_dir_all(home).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod module_tests {
+    use super::*;
+    use crate::ops::builtin_modules;
+
+    const BASE: &str = "mixed-port: 7890\nmode: rule\nipv6: false\ntcp-concurrent: true\nfind-process-mode: strict\nproxies: []\nrules:\n  - MATCH,DIRECT\n";
+
+    fn with(base: &str, ids: &[&str]) -> String {
+        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        apply_enabled_modules(base, &enabled_snippets(&builtin_modules(), &ids)).unwrap()
+    }
+
+    #[test]
+    fn module_toggles_reload_only_when_the_core_cannot_take_the_change_live() {
+        // The template already races TCP handshakes: nothing to apply.
+        let tcp = with(BASE, &["tcp-concurrent"]);
+        assert_eq!(module_change(BASE, &tcp), ModuleChange::Same);
+        assert_eq!(module_change(&tcp, BASE), ModuleChange::Same);
+        assert_eq!(
+            module_change(&tcp, &with(BASE, &["tcp-concurrent", "ipv6"])),
+            ModuleChange::Live(vec![("ipv6".into(), true.into())])
+        );
+        assert_eq!(
+            module_change(BASE, &with(BASE, &["find-process", "ipv6"])),
+            ModuleChange::Live(vec![
+                ("find-process-mode".into(), "always".into()),
+                ("ipv6".into(), true.into()),
+            ])
+        );
+        // Turning the module off restores the base value, also live.
+        assert_eq!(
+            module_change(&with(BASE, &["find-process"]), BASE),
+            ModuleChange::Live(vec![("find-process-mode".into(), "strict".into())])
+        );
+        // Blocks and keys outside the PATCH set need a reload.
+        for id in ["sniffer", "dns-fakeip", "tun"] {
+            assert_eq!(
+                module_change(BASE, &with(BASE, &[id])),
+                ModuleChange::Reload,
+                "{id}"
+            );
+        }
+        assert_eq!(
+            module_change(BASE, &with(BASE, &["find-process", "sniffer"])),
+            ModuleChange::Reload
+        );
+        // A key the base lacks has no value to PATCH back once removed.
+        let bare = "mode: rule\nproxies: []\n";
+        let on = with(bare, &["find-process"]);
+        assert!(matches!(module_change(bare, &on), ModuleChange::Live(_)));
+        assert_eq!(module_change(&on, bare), ModuleChange::Reload);
+        // Trailing comments and blank lines do not count as a change.
+        assert_eq!(
+            module_change(
+                "ipv6: false\n\n# note\nmode: rule\n",
+                "ipv6: false\nmode: rule\n"
+            ),
+            ModuleChange::Same
+        );
     }
 }

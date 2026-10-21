@@ -2161,7 +2161,8 @@ pub fn download_subscription(cfg: &ControllerConfig) -> Result<String, String> {
 }
 
 /// Download (when `refresh`) and compose subscription + own nodes + private
-/// rules into `config.yaml`, validate it with `mihomo -t`, and hot-reload.
+/// rules into `config.yaml`, validate it (the running core checks it on reload,
+/// `mihomo -t` otherwise), and hot-reload.
 pub fn regenerate_config(
     cfg: &ControllerConfig,
     modules: &[crate::ops::ModuleSnippet],
@@ -2172,6 +2173,56 @@ pub fn regenerate_config(
     regenerate_routing(cfg, modules, running, refresh, zh, None)
 }
 
+/// `u`: download the subscription and regenerate. The outer document of a
+/// provider-style subscription rarely changes, and a reload would only
+/// re-read the providers' cached files while dropping their connections, so
+/// an unchanged result refreshes the HTTP proxy providers in place instead.
+/// After a reload Mihomo already pulls any provider whose cache is stale.
+pub fn update_subscription(
+    cfg: &ControllerConfig,
+    modules: &[crate::ops::ModuleSnippet],
+    running: bool,
+    zh: bool,
+) -> Result<String, String> {
+    let (message, reloaded) = regenerate_outcome(cfg, modules, running, true, zh, None)?;
+    Ok(match refresh_after_regenerate(cfg, running, reloaded) {
+        Some((ok, 0)) if zh => format!("{message}；已更新 {ok} 个订阅提供者"),
+        Some((ok, failed)) if zh => {
+            format!("{message}；订阅提供者更新 {ok} 个，失败 {failed} 个")
+        }
+        Some((ok, failed)) => format!("{message}; providers {ok} updated  {failed} failed"),
+        None => message,
+    })
+}
+
+/// Refresh the HTTP proxy providers the core lists, when regenerating left
+/// the running config untouched. `None` when there was nothing to refresh.
+fn refresh_after_regenerate(
+    cfg: &ControllerConfig,
+    running: bool,
+    reloaded: bool,
+) -> Option<(usize, usize)> {
+    if !running || reloaded {
+        return None;
+    }
+    let (status, body) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "GET",
+        "/providers/proxies",
+        None,
+        Duration::from_millis(cfg.timeout_ms.max(1500)),
+    )
+    .ok()?;
+    let list: Vec<(String, String)> = parse_providers_json(&body, "proxy")
+        .into_iter()
+        .filter(|p| status == 200 && refreshable_provider(p))
+        .filter(|p| p.vehicle.eq_ignore_ascii_case("HTTP"))
+        .map(|p| (p.kind, p.name))
+        .collect();
+    (!list.is_empty()).then(|| refresh_providers(cfg, &list))
+}
+
 pub fn regenerate_routing(
     cfg: &ControllerConfig,
     modules: &[crate::ops::ModuleSnippet],
@@ -2180,6 +2231,18 @@ pub fn regenerate_routing(
     zh: bool,
     selection: Option<&str>,
 ) -> Result<String, String> {
+    regenerate_outcome(cfg, modules, running, refresh, zh, selection).map(|(message, _)| message)
+}
+
+/// The status message and whether the core was reloaded.
+fn regenerate_outcome(
+    cfg: &ControllerConfig,
+    modules: &[crate::ops::ModuleSnippet],
+    running: bool,
+    refresh: bool,
+    zh: bool,
+    selection: Option<&str>,
+) -> Result<(String, bool), String> {
     use crate::compose;
     let dir = compose::profile_dir(cfg);
     let old = read_config_text(cfg).ok();
@@ -2256,7 +2319,9 @@ pub fn regenerate_routing(
             compose::carry_runtime_state(&crate::ops::strip_marked_modules(doc), &base),
             crate::ops::saved_switches(doc),
         ),
-        None => (base, Vec::new()),
+        // Normalise the first file the way the next run will (it zeroes the
+        // listener keys a source leaves out), so that run finds it unchanged.
+        None => (compose::carry_runtime_state(&base, &base), Vec::new()),
     };
     let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
     // A reload re-initialises proxy providers and drops their connections, so
@@ -2318,7 +2383,10 @@ pub fn regenerate_routing(
         (true, false, true) => " — 已校验保存，内核未运行",
         (true, false, false) => " — validated & saved; core stopped",
     };
-    Ok(format!("{}{tail}{}", report.summary(zh), report.details()))
+    Ok((
+        format!("{}{tail}{}", report.summary(zh), report.details()),
+        reload && running,
+    ))
 }
 
 /// Validate before replacing the active file. Keep disk and runtime on the old
@@ -2382,61 +2450,110 @@ fn install_config_with(
     } else {
         text.to_string()
     };
-    let candidate = Path::new(&cfg.config_dir).join(".terc-candidate.yaml");
-    write_private(&candidate, text.as_bytes()).map_err(|e| e.to_string())?;
-    let result = (|| {
-        let bin =
-            find_bin().ok_or("Install the managed Mihomo core before saving a configuration")?;
-        check_candidate(&bin, cfg, &candidate, limits)?;
-        let path = config_yaml_path(cfg);
-        let previous = match fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.to_string().into()),
-        };
-        fs::rename(&candidate, &path).map_err(|e| e.to_string())?;
+    let path = config_yaml_path(cfg);
+    // A running core parses the payload with the same code as `mihomo -t` and
+    // answers 400 before applying anything, so it validates for free. A
+    // stopped core cannot, and missing geodata would be downloaded inside the
+    // PUT handler, past the reload timeout; the check fetches it first with
+    // its own budget.
+    if !running || needs_missing_geodata(&text, Path::new(&cfg.config_dir)) {
+        let candidate = Path::new(&cfg.config_dir).join(".terc-candidate.yaml");
+        write_private(&candidate, text.as_bytes()).map_err(|e| e.to_string())?;
+        let checked = (|| {
+            let bin = find_bin()
+                .ok_or("Install the managed Mihomo core before saving a configuration")?;
+            check_candidate(&bin, cfg, &candidate, limits)?;
+            if running {
+                Ok(())
+            } else {
+                fs::rename(&candidate, &path).map_err(|e| e.to_string())
+            }
+        })();
+        let _ = fs::remove_file(candidate);
+        checked?;
         if !running {
             return Ok(());
         }
-        match reload_config(cfg) {
-            Ok(()) => {
-                RELOAD_UNCERTAIN.store(false, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(ReloadError::Rejected(err)) => {
-                let restored = match previous {
-                    Some(bytes) => write_private(&path, &bytes),
-                    None => fs::remove_file(&path),
-                };
-                Err(match restored {
-                    Ok(()) => format!("{err}; previous configuration restored"),
-                    Err(restore) => {
-                        format!("{err}; could not restore previous configuration: {restore}")
-                    }
-                }
-                .into())
-            }
-            // Mihomo finishes applying a PUT after the client gives up, so the
-            // new file may already be live. Never roll back on a lost reply.
-            // Either way the running config may differ from the file, so the
-            // next regeneration reloads even when its output is unchanged.
-            Err(ReloadError::Unknown(_)) if controller_answers(cfg, limits.settle) => {
-                RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(ReloadError::Unknown(err)) => {
-                RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
-                Err(InstallFailure {
-                    message: format!(
-                        "热重载结果未知，新配置已保留在磁盘上 / Reload outcome unknown ({err}); the new configuration was kept on disk"
-                    ),
-                    kept: true,
-                })
-            }
+    }
+    let save = || write_private(&path, text.as_bytes()).map_err(|e| e.to_string());
+    match reload_config_text(cfg, &text) {
+        Ok(()) => {
+            // The core runs the new config; until the file matches, the next
+            // regeneration must reload even when its output is unchanged.
+            let saved = save();
+            RELOAD_UNCERTAIN.store(saved.is_err(), Ordering::SeqCst);
+            saved.map_err(|err| {
+                format!("新配置已生效，但保存失败 / Applied, but could not save config.yaml: {err}")
+                    .into()
+            })
         }
-    })();
-    let _ = fs::remove_file(candidate);
-    result
+        // The core kept its configuration and the file was never touched.
+        Err(ReloadError::Rejected(err)) => {
+            Err(format!("{err}; previous configuration kept").into())
+        }
+        // Mihomo finishes applying a PUT after the client gives up, so the new
+        // config may already be live; keep it on disk too. Either way the
+        // running config may differ from the file, so the next regeneration
+        // reloads even when its output is unchanged.
+        Err(ReloadError::Unknown(err)) => {
+            RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+            save()?;
+            if controller_answers(cfg, limits.settle) {
+                return Ok(());
+            }
+            Err(InstallFailure {
+                message: format!(
+                    "热重载结果未知，新配置已保留在磁盘上 / Reload outcome unknown ({err}); the new configuration was kept on disk"
+                ),
+                kept: true,
+            })
+        }
+    }
+}
+
+/// Whether `text` uses geodata that `dir` lacks. Mihomo looks the files up in
+/// its home directory, case-insensitively; a false positive only costs a
+/// `mihomo -t`.
+fn needs_missing_geodata(text: &str, dir: &Path) -> bool {
+    let (mut geoip, mut geosite, mut asn, mut geodata_mode) = (false, false, false, false);
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if raw.len() == line.len() {
+            section = lower.split(':').next().unwrap_or("").to_string();
+        }
+        // Download URLs and loader settings name the files without using them.
+        if section == "geox-url" || section.starts_with("geodata-") {
+            geodata_mode |= lower.starts_with("geodata-mode:") && lower.contains("true");
+            continue;
+        }
+        // A DNS `fallback` list filters with GEOIP,CN unless told otherwise.
+        geoip |= lower.contains("geoip") || lower.starts_with("fallback:");
+        geosite |= lower.contains("geosite");
+        asn |= lower.contains("ip-asn");
+    }
+    if !(geoip || geosite || asn) {
+        return false;
+    }
+    let names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let has = |wanted: &[&str]| wanted.iter().any(|w| names.iter().any(|n| n == w));
+    let ip_files: &[&str] = if geodata_mode {
+        &["geoip.dat"]
+    } else {
+        &["country.mmdb", "geoip.db", "geoip.metadb"]
+    };
+    (geoip && !has(ip_files)) || (geosite && !has(&["geosite.dat"])) || (asn && !has(&["asn.mmdb"]))
 }
 
 /// Run `mihomo -t` on the candidate, stopping a check that hangs.
@@ -3020,16 +3137,30 @@ impl std::fmt::Display for ReloadError {
     }
 }
 
+/// Reload the core from `config.yaml`.
 pub fn reload_config(cfg: &ControllerConfig) -> Result<(), ReloadError> {
     let path = config_yaml_path(cfg);
-    let body = serde_json::json!({
-        "path": path.display().to_string(),
-        "payload": ""
-    })
-    .to_string();
+    put_config(
+        cfg,
+        &serde_json::json!({
+            "path": path.display().to_string(),
+            "payload": ""
+        })
+        .to_string(),
+    )
+}
+
+/// Reload the core from `text` before it is written. Sending the content also
+/// spares Mihomo's safe-path check on a core whose home is elsewhere.
+fn reload_config_text(cfg: &ControllerConfig, text: &str) -> Result<(), ReloadError> {
+    put_config(cfg, &serde_json::json!({ "payload": text }).to_string())
+}
+
+fn put_config(cfg: &ControllerConfig, body: &str) -> Result<(), ReloadError> {
+    use crate::conns::{Cause, Scope};
     // Mihomo re-initialises every proxy provider on reload (§2.2 of
     // docs/websocket-plan.md); top-level `proxies:` connections stay.
-    announce_disruption(crate::conns::Cause::Reload, crate::conns::Scope::Providers);
+    announce_disruption(Cause::Reload, Scope::Providers);
     // The first fetch of new providers runs inside the request, so allow well
     // beyond Mihomo's own provider download timeout.
     match http_request(
@@ -3037,14 +3168,19 @@ pub fn reload_config(cfg: &ControllerConfig) -> Result<(), ReloadError> {
         &cfg.secret,
         "PUT",
         "/configs?force=true",
-        Some(&body),
+        Some(body),
         Duration::from_millis(cfg.timeout_ms.max(90_000)),
     ) {
         Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-        Ok((status, text)) => Err(ReloadError::Rejected(format!(
-            "reload HTTP {status} {}",
-            brief(&text)
-        ))),
+        Ok((status, text)) => {
+            // Mihomo answers 400 before applying anything, so nothing was cut:
+            // replace the announcement with one that covers no connection.
+            announce_disruption(Cause::Reload, Scope::Id(String::new()));
+            Err(ReloadError::Rejected(format!(
+                "reload HTTP {status} {}",
+                brief(&text)
+            )))
+        }
         Err(err) => Err(ReloadError::Unknown(err.to_string())),
     }
 }
@@ -3079,12 +3215,30 @@ fn reload_needed(old: Option<&str>, candidate: &str, running: bool, uncertain: b
     old != Some(candidate) || (running && uncertain)
 }
 
-/// Validate and save `text` with the runtime mode kept, without a reload; the
-/// caller applies the change live.
-pub fn install_config_keep_mode(cfg: &ControllerConfig, text: &str) -> Result<(), String> {
-    let text = keep_runtime_mode(cfg, text);
-    install_config_with(cfg, &text, false, discover_mihomo_binary, &INSTALL_LIMITS)
-        .map_err(|failure| failure.message)
+/// Save `text` without `mihomo -t` or a reload, when what it changes is
+/// already known to hold: the running core accepted and read back each
+/// changed key, or the effective config equals the active one. With the core
+/// running, a mode switched at runtime is kept.
+pub fn save_config_unchecked(
+    cfg: &ControllerConfig,
+    text: &str,
+    running: bool,
+) -> Result<(), String> {
+    validate_listener_ports(text)?;
+    let text = if running {
+        keep_runtime_mode(cfg, text)
+    } else {
+        text.to_string()
+    };
+    let saved = fs::create_dir_all(&cfg.config_dir)
+        .and_then(|()| write_private(&config_yaml_path(cfg), text.as_bytes()))
+        .map_err(|e| e.to_string());
+    // The core now runs a value the file lacks, so the next regeneration
+    // must reload even when its output is unchanged.
+    if saved.is_err() && running {
+        RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+    }
+    saved
 }
 
 /// `PATCH /configs` a key Mihomo applies live, then read it back. Listener rebuilds
@@ -3104,13 +3258,22 @@ pub fn patch_config_value(cfg: &ControllerConfig, key: &str, value: &Value) -> R
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status} {}", brief(&text)));
     }
+    verify_runtime_value(cfg, key, value)
+}
+
+/// Read `key` back from `GET /configs` after a PATCH.
+pub fn verify_runtime_value(
+    cfg: &ControllerConfig,
+    key: &str,
+    value: &Value,
+) -> Result<(), String> {
     let runtime = read_runtime_config(cfg).map_err(|e| e.to_string())?;
     // An older core that does not report the key cannot be checked.
     let Some(actual) = runtime.get(key) else {
         return Ok(());
     };
     let matches = match key {
-        "allow-lan" | "tcp-concurrent" => {
+        "allow-lan" | "tcp-concurrent" | "ipv6" | "sniffing" => {
             actual.as_bool().is_some() && actual.as_bool() == value.as_bool()
         }
         "find-process-mode" | "log-level" => actual
@@ -3134,6 +3297,13 @@ pub fn persist_nested_bool(
     let raw = read_config_text(cfg)?;
     let next = crate::ops::set_nested_bool(&raw, path, value);
     install_config(cfg, &next, false)
+}
+
+/// Record a switch the running core already applied and read back; the edit
+/// is one bool in a file that already validated, so no `mihomo -t`.
+pub fn persist_live_bool(cfg: &ControllerConfig, path: &[&str], value: bool) -> Result<(), String> {
+    let raw = read_config_text(cfg)?;
+    save_config_unchecked(cfg, &crate::ops::set_nested_bool(&raw, path, value), true)
 }
 
 /// Record a mode switched at runtime so later reloads and restarts keep it.
@@ -3233,8 +3403,24 @@ pub fn flush_dns_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
     });
 }
 
+/// The controller route for a provider kind. `ProviderInfo.kind` keeps the
+/// singular label the UI compares; Mihomo mounts only the plural routes.
+fn provider_route(kind: &str) -> &str {
+    match kind {
+        "proxy" => "proxies",
+        "rule" => "rules",
+        other => other,
+    }
+}
+
+/// Unlike a reload, this swaps the provider's content without closing the
+/// connections through its nodes.
 pub fn refresh_provider(cfg: &ControllerConfig, kind: &str, name: &str) -> Result<(), String> {
-    let path = format!("/providers/{kind}/{}", percent_encode(name));
+    let path = format!(
+        "/providers/{}/{}",
+        provider_route(kind),
+        percent_encode(name)
+    );
     match http_request(
         &cfg.addr,
         &cfg.secret,
@@ -3250,20 +3436,97 @@ pub fn refresh_provider(cfg: &ControllerConfig, kind: &str, name: &str) -> Resul
     }
 }
 
-pub fn provider_healthcheck(cfg: &ControllerConfig, name: &str) -> Result<(), String> {
+/// Mihomo's reserved `default` provider is its only `Compatible` one, and
+/// updating it does nothing.
+pub fn refreshable_provider(provider: &ProviderInfo) -> bool {
+    !provider.vehicle.eq_ignore_ascii_case("Compatible")
+        && !(provider.kind == "proxy" && provider.name == "default")
+}
+
+/// Each refresh is a download inside the core; a few run at once.
+const PROVIDER_WORKERS: usize = 4;
+
+/// Refresh `(kind, name)` pairs concurrently; returns (updated, failed).
+fn refresh_providers(cfg: &ControllerConfig, providers: &[(String, String)]) -> (usize, usize) {
+    use std::sync::atomic::AtomicUsize;
+    let next = AtomicUsize::new(0);
+    let ok = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..PROVIDER_WORKERS.min(providers.len()) {
+            scope.spawn(|| {
+                while let Some((kind, name)) = providers.get(next.fetch_add(1, Ordering::SeqCst)) {
+                    if refresh_provider(cfg, kind, name).is_ok() {
+                        ok.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+    });
+    let ok = ok.into_inner();
+    (ok, providers.len() - ok)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HealthCheck {
+    Done,
+    /// No answer within the cap. The core keeps checking and records the
+    /// delays, which the next poll picks up.
+    StillRunning,
+    Failed(String),
+}
+
+/// Mihomo answers only after every node was tried, ten at a time and each up
+/// to its own timeout, so a large provider takes well over a few seconds.
+const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub fn provider_healthcheck(cfg: &ControllerConfig, name: &str) -> HealthCheck {
+    provider_healthcheck_with(cfg, name, HEALTHCHECK_TIMEOUT)
+}
+
+fn provider_healthcheck_with(cfg: &ControllerConfig, name: &str, timeout: Duration) -> HealthCheck {
     let path = format!("/providers/proxies/{}/healthcheck", percent_encode(name));
-    match http_request(
-        &cfg.addr,
-        &cfg.secret,
-        "GET",
-        &path,
-        None,
-        Duration::from_millis(4000),
-    ) {
-        Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-        Ok((status, body)) => Err(format!("HTTP {status} {}", brief(&body))),
-        Err(err) => Err(err.to_string()),
+    match http_request(&cfg.addr, &cfg.secret, "GET", &path, None, timeout) {
+        Ok((status, _)) if (200..300).contains(&status) => HealthCheck::Done,
+        Ok((status, body)) => HealthCheck::Failed(format!("HTTP {status} {}", brief(&body))),
+        // A read timeout surfaces as WouldBlock on Unix.
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            HealthCheck::StillRunning
+        }
+        Err(err) => HealthCheck::Failed(err.to_string()),
     }
+}
+
+/// Health check outcomes in the UI language.
+pub struct HealthTexts {
+    pub done: String,
+    pub still: String,
+}
+
+/// Runs beside the action queue, so polling continues and delays show up
+/// while the core checks.
+pub fn provider_healthcheck_async(
+    cfg: ControllerConfig,
+    name: String,
+    texts: HealthTexts,
+    tx: Sender<BackendEvent>,
+) {
+    thread::spawn(move || {
+        let (text, is_error) = match provider_healthcheck(&cfg, &name) {
+            HealthCheck::Done => {
+                let snap = fetch_snapshot(&cfg);
+                let _ = tx.send(BackendEvent::Snapshot(Box::new(snap)));
+                (texts.done, false)
+            }
+            HealthCheck::StillRunning => (texts.still, false),
+            HealthCheck::Failed(err) => (err, true),
+        };
+        let _ = tx.send(BackendEvent::StatusMessage { text, is_error });
+    });
 }
 
 pub fn refresh_provider_async(
@@ -3290,18 +3553,20 @@ pub fn refresh_provider_async(
     });
 }
 
-pub fn refresh_all_providers_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
+/// Refresh the providers the UI already lists, then take one snapshot for the
+/// new nodes and rule counts.
+pub fn refresh_all_providers_async(
+    cfg: ControllerConfig,
+    providers: Vec<ProviderInfo>,
+    tx: Sender<BackendEvent>,
+) {
     thread::spawn(move || {
-        let snap = fetch_snapshot(&cfg);
-        let mut ok = 0usize;
-        let mut failed = 0usize;
-        for provider in &snap.providers {
-            if refresh_provider(&cfg, &provider.kind, &provider.name).is_ok() {
-                ok += 1;
-            } else {
-                failed += 1;
-            }
-        }
+        let list: Vec<(String, String)> = providers
+            .into_iter()
+            .filter(refreshable_provider)
+            .map(|p| (p.kind, p.name))
+            .collect();
+        let (ok, failed) = refresh_providers(&cfg, &list);
         let fresh = fetch_snapshot(&cfg);
         let _ = tx.send(BackendEvent::Snapshot(Box::new(fresh)));
         let _ = tx.send(BackendEvent::StatusMessage {
@@ -3678,6 +3943,192 @@ mod provider_tests {
         assert_eq!(streamed, sorted);
         assert_eq!(lookups.load(Ordering::SeqCst), 1);
     }
+
+    /// Mock controller that records each request line, answers `PUT`s after
+    /// `delay` and tracks how many were in flight at once.
+    struct Recorder {
+        cfg: ControllerConfig,
+        lines: Arc<Mutex<Vec<String>>>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    fn recorder(delay: Duration, reply: fn(&str) -> (u16, &'static str)) -> Recorder {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let peak: Arc<AtomicUsize> = Arc::default();
+        let busy: Arc<AtomicUsize> = Arc::default();
+        let (seen, high) = (lines.clone(), peak.clone());
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (seen, high, busy) = (seen.clone(), high.clone(), busy.clone());
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let line = first.trim_end().to_string();
+                    seen.lock().unwrap().push(line.clone());
+                    if line.starts_with("PUT ") {
+                        let now = busy.fetch_add(1, Ordering::SeqCst) + 1;
+                        high.fetch_max(now, Ordering::SeqCst);
+                        thread::sleep(delay);
+                        busy.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    let path = line.split_whitespace().nth(1).unwrap_or("");
+                    let (status, body) = reply(path);
+                    let _ = write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        Recorder {
+            cfg: ControllerConfig {
+                addr,
+                timeout_ms: 500,
+                ..ControllerConfig::default()
+            },
+            lines,
+            peak,
+        }
+    }
+
+    fn provider(kind: &str, name: &str, vehicle: &str) -> ProviderInfo {
+        ProviderInfo {
+            name: name.into(),
+            kind: kind.into(),
+            vehicle: vehicle.into(),
+            behavior: String::new(),
+            count: 0,
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn provider_refresh_puts_to_the_plural_routes_mihomo_mounts() {
+        let mock = recorder(Duration::ZERO, |path| {
+            if path.starts_with("/providers/proxies/") || path.starts_with("/providers/rules/") {
+                (204, "")
+            } else {
+                (404, r#"{"message":"resource not found"}"#)
+            }
+        });
+        assert_eq!(refresh_provider(&mock.cfg, "proxy", "air port"), Ok(()));
+        assert_eq!(refresh_provider(&mock.cfg, "rule", "reject"), Ok(()));
+        let lines = mock.lines.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            [
+                "PUT /providers/proxies/air%20port HTTP/1.1",
+                "PUT /providers/rules/reject HTTP/1.1"
+            ]
+        );
+    }
+
+    #[test]
+    fn refresh_all_runs_four_at_once_and_skips_the_reserved_provider() {
+        let mock = recorder(Duration::from_millis(250), |path| match path {
+            "/providers/rules/broken" => (500, r#"{"message":"download failed"}"#),
+            p if p.starts_with("/providers/") => (204, ""),
+            _ => (404, ""),
+        });
+        let mut providers = vec![
+            provider("proxy", "default", "Compatible"),
+            provider("proxy", "air", "HTTP"),
+            provider("rule", "broken", "HTTP"),
+        ];
+        for i in 0..6 {
+            providers.push(provider("rule", &format!("r{i}"), "HTTP"));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        refresh_all_providers_async(mock.cfg.clone(), providers, tx);
+        let status = loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                BackendEvent::StatusMessage { text, is_error } => break (text, is_error),
+                BackendEvent::Snapshot(_) => {}
+                _ => panic!("unexpected event"),
+            }
+        };
+        // 8 PUTs of 250 ms, four at a time: two rounds, not eight.
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert_eq!(status, ("providers 7 updated  1 failed".into(), false));
+        assert_eq!(mock.peak.load(Ordering::SeqCst), PROVIDER_WORKERS);
+        let lines = mock.lines.lock().unwrap().clone();
+        let puts: Vec<_> = lines.iter().filter(|l| l.starts_with("PUT ")).collect();
+        assert_eq!(puts.len(), 8);
+        assert!(puts.iter().all(|l| !l.contains("default")));
+        assert!(puts.contains(&&"PUT /providers/proxies/air HTTP/1.1".to_string()));
+        // The list came from the UI, so no snapshot is fetched before the PUTs.
+        assert!(lines[0].starts_with("PUT "), "{lines:?}");
+    }
+
+    #[test]
+    fn unchanged_update_refreshes_only_http_proxy_providers() {
+        let mock = recorder(Duration::ZERO, |path| match path {
+            "/providers/proxies" => (
+                200,
+                r#"{"providers":{"default":{"name":"default","vehicleType":"Compatible","proxies":[]},"air":{"name":"air","vehicleType":"HTTP","proxies":[]},"own":{"name":"own","vehicleType":"File","proxies":[]}}}"#,
+            ),
+            _ => (204, ""),
+        });
+        // A stopped core or a reload (which pulls stale providers itself)
+        // sends nothing.
+        assert_eq!(refresh_after_regenerate(&mock.cfg, false, false), None);
+        assert_eq!(refresh_after_regenerate(&mock.cfg, true, true), None);
+        assert!(mock.lines.lock().unwrap().is_empty());
+        assert_eq!(
+            refresh_after_regenerate(&mock.cfg, true, false),
+            Some((1, 0))
+        );
+        assert_eq!(
+            mock.lines.lock().unwrap().clone(),
+            [
+                "GET /providers/proxies HTTP/1.1",
+                "PUT /providers/proxies/air HTTP/1.1"
+            ]
+        );
+        // Inline `proxies:` only: nothing to refresh.
+        let inline = recorder(Duration::ZERO, |_| (200, r#"{"providers":{}}"#));
+        assert_eq!(refresh_after_regenerate(&inline.cfg, true, false), None);
+    }
+
+    #[test]
+    fn slow_health_check_reports_the_core_still_checking() {
+        let mock = recorder(Duration::ZERO, |path| match path {
+            "/providers/proxies/air/healthcheck" => (204, ""),
+            _ => (404, r#"{"message":"resource not found"}"#),
+        });
+        assert_eq!(provider_healthcheck(&mock.cfg, "air"), HealthCheck::Done);
+        assert!(matches!(
+            provider_healthcheck(&mock.cfg, "gone"),
+            HealthCheck::Failed(err) if err.starts_with("HTTP 404")
+        ));
+        // A controller that accepts but stays silent past the cap.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            ..ControllerConfig::default()
+        };
+        let hold = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(800));
+            drop(stream);
+        });
+        assert_eq!(
+            provider_healthcheck_with(&cfg, "air", Duration::from_millis(200)),
+            HealthCheck::StillRunning
+        );
+        hold.join().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -3834,7 +4285,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an installed Mihomo binary; only validates temporary configs and calls a mock controller"]
-    fn real_core_validates_overlays_and_config_updates_restore_on_failure() {
+    fn real_core_validates_overlays_and_config_updates_keep_the_file_on_failure() {
         use std::net::TcpListener;
         let directory = std::env::temp_dir().join(format!(
             "terc-config-test-{}-{}",
@@ -3909,9 +4360,7 @@ mod tests {
             let result = install_config(&cfg, next, true);
             server.join().unwrap();
             if status == 400 {
-                assert!(result
-                    .unwrap_err()
-                    .contains("previous configuration restored"));
+                assert!(result.unwrap_err().contains("previous configuration kept"));
                 assert_eq!(read_config_text(&cfg).unwrap(), provider_only);
             } else {
                 result.unwrap();
@@ -4264,8 +4713,9 @@ mod listener_tests {
 
     #[test]
     #[cfg(unix)]
-    fn rejected_reload_restores_previous_file_privately() {
-        let (dir, bin) = install_fixture("rejected", "exit 0");
+    fn rejected_reload_leaves_the_file_and_withdraws_the_disruption() {
+        use crate::conns::{Cause, Scope};
+        let (dir, _) = install_fixture("rejected", "exit 0");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let cfg = ControllerConfig {
             addr: listener.local_addr().unwrap().to_string(),
@@ -4278,22 +4728,119 @@ mod listener_tests {
             listener,
             vec![http("200 OK", "{}"), http("400 Bad Request", "bad")],
         );
+        let (tx, rx) = std::sync::mpsc::channel();
+        report_disruptions(tx);
+        // The running core validates; no `mihomo -t` is needed.
         let failure = install_config_with(
             &cfg,
             "mode: rule\nipv6: true\n",
             true,
-            || Some(bin),
+            || panic!("no check while the core runs"),
             &TEST_LIMITS,
         )
         .err()
         .unwrap();
         let requests = server.join().unwrap();
         assert!(requests[1].starts_with("PUT /configs?force=true "));
+        assert!(requests[1].ends_with(r#"{"payload":"mode: rule\nipv6: true\n"}"#));
         assert!(!failure.kept);
-        assert!(failure.message.contains("previous configuration restored"));
+        assert!(failure.message.contains("previous configuration kept"));
         assert_eq!(read_config_text(&cfg).unwrap(), previous);
-        assert_eq!(mode_of(&config_yaml_path(&cfg)) & 0o077, 0);
         assert!(!dir.join(".terc-candidate.yaml").exists());
+        // Nothing was applied, so no closure may be blamed on this reload.
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(
+            &events[..],
+            [
+                BackendEvent::Disrupting {
+                    cause: Cause::Reload,
+                    scope: Scope::Providers
+                },
+                BackendEvent::Disrupting {
+                    cause: Cause::Reload,
+                    scope: Scope::Id(id)
+                }
+            ] if id.is_empty()
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn running_core_validates_the_payload_and_the_file_follows() {
+        let (dir, bin) = install_fixture(
+            "payload",
+            "echo run >> \"$(dirname \"$0\")/checks\"; exit 0",
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let checks = dir.join("checks");
+        let next = "mode: rule\nrules:\n  - GEOSITE,cn,DIRECT\n";
+        let ok = || {
+            vec![
+                http("200 OK", r#"{"mode":"rule"}"#),
+                http("204 No Content", ""),
+            ]
+        };
+        // GeoSite.dat is missing: `mihomo -t` fetches it before the PUT.
+        let server = serve(listener.try_clone().unwrap(), ok());
+        install_config_with(&cfg, next, true, || Some(bin.clone()), &TEST_LIMITS)
+            .ok()
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[1].contains(r#"{"payload":"mode: \"rule\"\nrules:"#));
+        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 1);
+        assert!(read_config_text(&cfg)
+            .unwrap()
+            .contains("GEOSITE,cn,DIRECT"));
+        assert_eq!(mode_of(&config_yaml_path(&cfg)) & 0o077, 0);
+        // With the file present the PUT alone validates and applies.
+        fs::write(dir.join("GeoSite.dat"), "").unwrap();
+        let server = serve(listener, ok());
+        let other = "mode: rule\nipv6: true\nrules:\n  - GEOSITE,cn,DIRECT\n";
+        install_config_with(&cfg, other, true, || None, &TEST_LIMITS)
+            .ok()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 1);
+        assert!(read_config_text(&cfg).unwrap().contains("ipv6: true"));
+        assert!(!dir.join(".terc-candidate.yaml").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn geodata_need_follows_the_rules_dns_and_files_present() {
+        let dir = std::env::temp_dir().join(format!("terc-geo-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let need = |text: &str| needs_missing_geodata(text, &dir);
+        assert!(!need(
+            "rules:\n  - DOMAIN-SUFFIX,example.com,DIRECT\n  - MATCH,DIRECT\n"
+        ));
+        assert!(!need("# GEOSITE,cn,DIRECT only in a comment\nrules: []\n"));
+        assert!(!need(
+            "geodata-mode: false\ngeox-url:\n  geoip: \"https://x/geoip.dat\"\n  geosite: \"https://x/geosite.dat\"\n  asn: \"https://x/GeoLite2-ASN.mmdb\"\nrules: []\n"
+        ));
+        assert!(need("rules:\n  - GEOIP,CN,DIRECT\n"));
+        assert!(need(
+            "rules:\n  - AND,((GEOSITE,cn),(NETWORK,UDP)),REJECT\n"
+        ));
+        assert!(need("rules:\n  - IP-ASN,13335,DIRECT\n"));
+        assert!(need(
+            "dns:\n  nameserver-policy:\n    'geosite:cn': 223.5.5.5\n"
+        ));
+        assert!(need("dns:\n  fallback:\n    - tls://1.1.1.1\n"));
+        fs::write(dir.join("Country.mmdb"), "").unwrap();
+        fs::write(dir.join("geosite.dat"), "").unwrap();
+        assert!(!need(
+            "rules:\n  - GEOIP,CN,DIRECT\n  - GEOSITE,cn,DIRECT\n"
+        ));
+        // geodata-mode reads GeoIP.dat instead of the mmdb.
+        assert!(need("geodata-mode: true\nrules:\n  - GEOIP,CN,DIRECT\n"));
+        assert!(need("rules:\n  - SRC-IP-ASN,13335,DIRECT\n"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4502,6 +5049,70 @@ mod listener_tests {
     }
 
     #[test]
+    fn first_generation_is_a_fixed_point_of_the_carry() {
+        use crate::compose::carry_runtime_state as carry;
+        let base =
+            "mixed-port: 7890\nallow-lan: false\nmode: rule\ntun:\n  enable: false\nproxies: []\n";
+        // What regenerate writes when there is no previous file.
+        let first = carry(base, base);
+        assert!(first.contains("\nport: 0\n") && first.contains("\nsocks-port: 0\n"));
+        // What the next run derives from that file and the same source.
+        assert_eq!(carry(&first, base), first);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_changes_are_saved_without_a_check_or_reload() {
+        let (dir, _) = install_fixture("live", "exit 1");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        fs::write(config_yaml_path(&cfg), "mode: rule\nipv6: false\n").unwrap();
+        // Only the runtime mode is read: no PUT, and no `mihomo -t` to reject it.
+        let mode = || http("200 OK", r#"{"mode":"Global","ipv6":true}"#);
+        let server = serve(listener.try_clone().unwrap(), vec![mode(), mode()]);
+        persist_live_bool(&cfg, &["ipv6"], true).unwrap();
+        assert_eq!(
+            read_config_text(&cfg).unwrap(),
+            "mode: \"global\"\nipv6: true\n"
+        );
+        assert_eq!(mode_of(&config_yaml_path(&cfg)) & 0o077, 0);
+        save_config_unchecked(&cfg, "mode: rule\nmixed-port: 7899\n", true).unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests.iter().all(|r| r.starts_with("GET /configs ")));
+        assert_eq!(
+            read_config_text(&cfg).unwrap(),
+            "mode: \"global\"\nmixed-port: 7899\n"
+        );
+        // Listener clashes are still refused, and a stopped core reads nothing.
+        assert!(save_config_unchecked(&cfg, "port: 7899\nmixed-port: 7899\n", false).is_err());
+        save_config_unchecked(&cfg, "mode: rule\n", false).unwrap();
+        assert_eq!(read_config_text(&cfg).unwrap(), "mode: rule\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn switches_read_back_as_bools() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            ..ControllerConfig::default()
+        };
+        let runtime = r#"{"ipv6":true,"sniffing":false}"#;
+        let server = serve(
+            listener,
+            vec![http("200 OK", runtime), http("200 OK", runtime)],
+        );
+        assert!(verify_runtime_value(&cfg, "ipv6", &true.into()).is_ok());
+        let err = verify_runtime_value(&cfg, "sniffing", &true.into()).unwrap_err();
+        assert!(err.contains("sniffing reads back as false"), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn live_patch_is_verified_by_reading_the_config_back() {
         for (runtime, ok) in [
             (r#"{"allow-lan":true,"mixed-port":7890}"#, true),
@@ -4570,6 +5181,7 @@ mod listener_tests {
         fs::create_dir_all(&core).unwrap();
         fs::rename(&bin, core.join("mihomo")).unwrap();
         let checks = core.join("checks");
+        let checks_run = || fs::read_to_string(&checks).map_or(0, |t| t.lines().count());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let cfg = ControllerConfig {
             addr: listener.local_addr().unwrap().to_string(),
@@ -4583,20 +5195,19 @@ mod listener_tests {
             "Own = ss, 192.0.2.2, 8388, encrypt-method=aes-128-gcm, password=fake",
         )
         .unwrap();
-        // The second pass carries listener keys over from the first file, so
-        // the output settles after two installs. Each runs the check and
-        // reloads; `regenerate_routing` and `install_config_with` read the mode.
+        // The first file is already a fixed point: the next pass carries the
+        // listener keys over from it and finds nothing to change. The running
+        // core validates the PUT itself, so no install runs the check;
+        // `regenerate_routing` and `install_config_with` read the mode.
         let mode = || http("200 OK", r#"{"mode":"rule"}"#);
-        for pass in 1..=2 {
-            let server = serve(
-                listener.try_clone().unwrap(),
-                vec![mode(), mode(), http("204 No Content", "")],
-            );
-            let msg = regenerate_config(&cfg, &[], true, false, false).unwrap();
-            assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
-            assert!(msg.contains("validated & hot-reloaded"), "{msg}");
-            assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), pass);
-        }
+        let server = serve(
+            listener.try_clone().unwrap(),
+            vec![mode(), mode(), http("204 No Content", "")],
+        );
+        let msg = regenerate_config(&cfg, &[], true, false, false).unwrap();
+        assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
+        assert!(msg.contains("validated & hot-reloaded"), "{msg}");
+        assert_eq!(checks_run(), 0);
         let installed = read_config_text(&cfg).unwrap();
         let generated = compose_generated(&cfg);
         fs::remove_file(&generated).unwrap();
@@ -4613,7 +5224,7 @@ mod listener_tests {
             second.contains(" — unchanged; not reloaded, existing connections kept"),
             "{second}"
         );
-        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 2);
+        assert_eq!(checks_run(), 0);
         assert_eq!(read_config_text(&cfg).unwrap(), installed);
         // The routing choice and the generated copy are still written.
         assert_eq!(
@@ -4632,7 +5243,7 @@ mod listener_tests {
         assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
         assert!(third.contains("已校验并热重载"), "{third}");
         assert!(!RELOAD_UNCERTAIN.load(Ordering::SeqCst));
-        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 3);
+        assert_eq!(checks_run(), 0);
         fs::remove_dir_all(home).unwrap();
     }
 
