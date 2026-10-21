@@ -174,6 +174,13 @@ pub fn apply(
         .map_err(|e| e.to_string())?;
         plan.yaml
     };
+    // Provider nodes are only known after the reload, so with providers a
+    // region filter is kept; matching nothing then fails closed.
+    let yaml = if has_providers(&chunks) {
+        yaml
+    } else {
+        drop_unmatched_regions(&yaml, &proxies)?
+    };
     let yaml = avoid_names(&yaml, &proxies)?;
     chunks.retain(|c| !policy_key(c.key.as_deref()));
     chunks.extend(
@@ -352,6 +359,14 @@ pub fn template(raw: &str) -> Result<String, String> {
         };
         let all = set(fields, &["include-all", "include-all-proxies"]);
         let providers = set(fields, &["use", "include-all-providers"]);
+        let value = |fields: &Vec<YamlChunk>, key: &str| {
+            fields
+                .iter()
+                .find(|f| f.key.as_deref() == Some(key))
+                .map(field_value)
+        };
+        let (name, kind) = (value(fields, "name"), value(fields, "type"));
+        let filtered = value(fields, "filter").is_some_and(|f| !f.is_empty());
         let mut removed = Vec::new();
         if let Some(field) = fields
             .iter_mut()
@@ -381,6 +396,17 @@ pub fn template(raw: &str) -> Result<String, String> {
         if all {
             return Ok(());
         }
+        // A regional group would otherwise rank every country's nodes.
+        if let Some(code) = (!filtered)
+            .then(|| region(name.as_deref().unwrap_or(""), kind.as_deref(), &removed))
+            .flatten()
+        {
+            fields.retain(|f| f.key.as_deref() != Some("filter"));
+            fields.push(YamlChunk {
+                key: Some("filter".into()),
+                lines: vec![format!("filter: {}", json!(country_filter(&code)))],
+            });
+        }
         // The group now draws on every node of whichever source the scheme is
         // applied to, so no node names are kept; info pseudo-nodes stay out.
         let info = crate::compose::INFO_EXCLUDE;
@@ -404,6 +430,114 @@ pub fn template(raw: &str) -> Result<String, String> {
         Ok(())
     })?;
     chunks.retain(|c| policy_key(c.key.as_deref()));
+    for chunk in &mut chunks {
+        if chunk.key.as_deref() == Some("proxy-groups") {
+            chunk.lines = output.clone();
+        }
+    }
+    Ok(join_chunks(&chunks))
+}
+
+/// The one country shared by a group's listed nodes, when the group stands
+/// for that country. A select group must also name it, so that a source with
+/// a single country does not narrow its main dropdown.
+fn region(name: &str, kind: Option<&str>, nodes: &[String]) -> Option<String> {
+    let select = match kind {
+        Some("url-test" | "fallback" | "load-balance") => false,
+        Some("select") => true,
+        _ => return None,
+    };
+    let nodes: Vec<_> = nodes
+        .iter()
+        .filter(|n| !crate::mihomo::is_info_pseudo_node(n))
+        .collect();
+    let code = crate::best::country_hint(nodes.first()?)?;
+    if nodes
+        .iter()
+        .any(|n| crate::best::country_hint(n).as_deref() != Some(code.as_str()))
+    {
+        return None;
+    }
+    match crate::best::country_hint(name) {
+        Some(named) => (named == code).then_some(code),
+        None => (!select).then_some(code),
+    }
+}
+
+/// A Mihomo (regexp2) filter for the labels country_hint reads as `code`.
+/// ASCII aliases are whole tokens between non-letters, so `US01` matches
+/// where `\bUS\b` would not. Codes outside the alias table come from flags.
+fn country_filter(code: &str) -> String {
+    let token = |word: String| format!("(?<![a-z]){word}(?![a-z])");
+    let mut parts = vec![code
+        .bytes()
+        .filter_map(|b| char::from_u32(0x1f1e6 + u32::from(b.wrapping_sub(b'A'))))
+        .collect::<String>()];
+    if let Some((_, aliases)) = crate::best::COUNTRIES.iter().find(|(c, _)| *c == code) {
+        parts.extend(aliases.iter().map(|alias| {
+            if alias.is_ascii() {
+                token(alias.split_whitespace().collect::<Vec<_>>().join("[^a-z]+"))
+            } else if code == "IN" {
+                format!("{alias}(?!尼西)")
+            } else {
+                alias.to_string()
+            }
+        }));
+        parts.push(token(code.to_lowercase()));
+    }
+    format!("(?i)({})", parts.join("|"))
+}
+
+fn has_providers(chunks: &[YamlChunk]) -> bool {
+    chunks.iter().any(|c| {
+        c.key.as_deref() == Some("proxy-providers")
+            && c.lines.iter().skip(1).any(|l| !l.trim().is_empty())
+    })
+}
+
+/// A region filter matching no node leaves its group with only COMPATIBLE,
+/// so it is dropped and the group draws on every node again. Only filters
+/// written by template() are judged, and only against nodes in the YAML.
+fn drop_unmatched_regions(yaml: &str, proxies: &HashSet<String>) -> Result<String, String> {
+    let mut chunks = split_chunks(yaml);
+    let Some(groups) = chunks
+        .iter()
+        .find(|c| c.key.as_deref() == Some("proxy-groups"))
+    else {
+        return Ok(yaml.into());
+    };
+    let mut changed = false;
+    let output = map_groups(groups, |fields| {
+        let Some(i) = fields
+            .iter()
+            .position(|f| f.key.as_deref() == Some("filter"))
+        else {
+            return Ok(());
+        };
+        let value = field_value(&fields[i]);
+        // The flag leads every filter country_filter writes.
+        let code: String = value
+            .strip_prefix("(?i)(")
+            .unwrap_or("")
+            .chars()
+            .take(2)
+            .filter_map(|c| char::from_u32((c as u32).wrapping_sub(0x1f1e6 - u32::from(b'A'))))
+            .collect();
+        let code = (code.len() == 2 && country_filter(&code) == value).then_some(code);
+        let Some(code) = code else {
+            return Ok(());
+        };
+        if !proxies.iter().any(|n| {
+            !crate::mihomo::is_info_pseudo_node(n) && crate::best::country_hits(n).contains(&code)
+        }) {
+            fields.remove(i);
+            changed = true;
+        }
+        Ok(())
+    })?;
+    if !changed {
+        return Ok(yaml.into());
+    }
     for chunk in &mut chunks {
         if chunk.key.as_deref() == Some("proxy-groups") {
             chunk.lines = output.clone();
@@ -552,7 +686,10 @@ mod tests {
         let hk = group(&route, "香港");
         assert!(hk.contains("proxies: []"), "{hk}");
         assert!(hk.contains("include-all: true"));
-        assert!(!hk.contains("HK1") && !hk.contains("    filter:"), "{hk}");
+        assert!(!hk.contains("HK1"), "{hk}");
+        // The region is kept as a filter, never as node names.
+        let region = json!(country_filter("HK"));
+        assert!(hk.contains(&format!("    filter: {region}")), "{hk}");
         let merged = format!("(?:x#y)|(?:{})", crate::compose::INFO_EXCLUDE);
         assert!(
             hk.contains(&format!("exclude-filter: {}", json!(merged))),
@@ -572,6 +709,70 @@ mod tests {
         let kept = group(&route, "Kept");
         assert!(kept.contains("include-all: true") && !kept.contains("filter"));
         assert!(!route.contains("剩余流量"));
+    }
+
+    #[test]
+    fn region_filters_mirror_country_hint_tokens() {
+        assert_eq!(
+            country_filter("US"),
+            "(?i)(🇺🇸|美国|美國|(?<![a-z])united[^a-z]+states(?![a-z])|(?<![a-z])usa(?![a-z])|(?<![a-z])us(?![a-z]))"
+        );
+        assert!(country_filter("IN").contains("|印度(?!尼西)|"));
+        assert_eq!(country_filter("IT"), "(?i)(🇮🇹)");
+    }
+
+    #[test]
+    fn templates_keep_the_country_of_regional_groups() {
+        let doc = "proxies:\n  - {name: 剩余流量：100GB, type: ss}\n  - {name: US01, type: ss}\n  - {name: 'United States 2', type: ss}\n  - {name: HK1, type: ss}\n  - {name: Node, type: ss}\nproxy-groups:\n  - {name: 🇺🇸 美国自动, type: url-test, proxies: [剩余流量：100GB, US01, 'United States 2']}\n  - {name: Backup, type: fallback, proxies: [US01]}\n  - {name: 美国, type: select, proxies: [US01, DIRECT]}\n  - {name: Pick, type: select, proxies: [US01]}\n  - {name: Mixed, type: url-test, proxies: [US01, HK1]}\n  - {name: Unknown, type: load-balance, proxies: [US01, Node]}\n  - {name: 香港, type: url-test, proxies: [US01]}\n  - {name: Own, type: url-test, proxies: [US01], filter: 'US|JP'}\nrules:\n  - MATCH,Pick\n";
+        let route = template(doc).unwrap();
+        let us = format!("    filter: {}", json!(country_filter("US")));
+        for name in ["🇺🇸 美国自动", "Backup", "美国"] {
+            let g = group(&route, name);
+            assert!(g.contains(&us) && g.contains("include-all: true"), "{g}");
+        }
+        // A select group narrows only when its own name names the region.
+        for name in ["Pick", "Mixed", "Unknown", "香港"] {
+            let g = group(&route, name);
+            assert!(!g.contains("    filter:"), "{g}");
+        }
+        let own = group(&route, "Own");
+        assert!(
+            own.contains("filter: 'US|JP'") && !own.contains("美國"),
+            "{own}"
+        );
+        assert!(!route.contains("US01") && !route.contains("United States 2"));
+    }
+
+    #[test]
+    fn region_filters_matching_no_target_node_are_dropped() {
+        let doc = "proxies:\n  - {name: US01, type: ss}\nproxy-groups:\n  - {name: US, type: url-test, proxies: [US01]}\n  - {name: Own, type: url-test, proxies: [US01], filter: 'US'}\nrules:\n  - MATCH,US\n";
+        let route = template(doc).unwrap();
+        let region = format!("    filter: {}", json!(country_filter("US")));
+        let nodes =
+            |names: &[&str]| -> HashSet<String> { names.iter().map(|n| n.to_string()).collect() };
+        let kept = drop_unmatched_regions(&route, &nodes(&["剩余流量：1GB", "🇺🇸 洛杉矶"])).unwrap();
+        assert_eq!(kept, route);
+        let out = drop_unmatched_regions(&route, &nodes(&["剩余流量：US 1GB", "HK1"])).unwrap();
+        let us = group(&out, "US");
+        assert!(
+            !us.contains(&region) && us.contains("include-all: true"),
+            "{us}"
+        );
+        assert!(group(&out, "Own").contains("filter: 'US'"), "{out}");
+        let flag = "proxies:\n  - {name: 🇮🇹 Milan, type: ss}\nproxy-groups:\n  - {name: Italy, type: fallback, proxies: [🇮🇹 Milan]}\nrules:\n  - MATCH,Italy\n";
+        let route = template(flag).unwrap();
+        assert!(
+            route.contains(&format!("filter: {}", json!("(?i)(🇮🇹)"))),
+            "{route}"
+        );
+        let out = drop_unmatched_regions(&route, &nodes(&["US01"])).unwrap();
+        assert!(!out.contains("    filter:"), "{out}");
+        // Provider nodes are not in the YAML, so their filter is never judged.
+        let base = "proxies:\n  - {name: HK1, type: ss}\nproxy-providers:\n  P:\n    type: http\n    url: https://airport.test/sub\nproxy-groups:\n  - {name: G, type: select, proxies: [HK1]}\nrules:\n  - MATCH,G\n";
+        let mut chunks = split_chunks(base);
+        assert!(has_providers(&chunks));
+        chunks.retain(|c| c.key.as_deref() != Some("proxy-providers"));
+        assert!(!has_providers(&chunks));
     }
 
     #[test]
