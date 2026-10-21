@@ -353,7 +353,13 @@ impl Form {
                     return Err("请填写 TUIC 密码".into());
                 }
                 n["password"] = json!(self.password.text);
-                n["congestion-controller"] = json!("bbr");
+                // A stored node keeps its explicit controller on edit.
+                if n.get("congestion-controller")
+                    .and_then(Value::as_str)
+                    .is_none_or(|c| c.trim().is_empty())
+                {
+                    n["congestion-controller"] = json!("bbr");
+                }
                 n.as_object_mut().unwrap().remove("token");
             }
             if matches!(p, "http" | "socks5") {
@@ -888,6 +894,27 @@ mod tests {
         assert_eq!(f.kind, 1);
         f.original.nodes[0]["token"] = json!("stale");
         assert!(f.record().unwrap().nodes[0].get("token").is_none());
+    }
+    #[test]
+    fn edit_keeps_an_explicit_tuic_congestion_controller() {
+        let record = pasted(
+            "tuic://12345678-1234-1234-1234-123456789abc:pw@192.0.2.5:443?congestion_control=cubic#T",
+        );
+        assert_eq!(record.nodes[0]["congestion-controller"], "cubic");
+        let mut f = Form::from_record("proxy-001".into(), record);
+        assert_eq!(f.kind, 1);
+        f.name.load("T2");
+        let saved = f.record().unwrap();
+        assert_eq!(saved.nodes[0]["name"], "T2");
+        assert_eq!(saved.nodes[0]["congestion-controller"], "cubic");
+        // New or empty values get bbr.
+        assert_eq!(
+            filled(TYPES.iter().position(|p| *p == "tuic").unwrap())
+                .record()
+                .unwrap()
+                .nodes[0]["congestion-controller"],
+            "bbr"
+        );
     }
     #[test]
     fn new_nodes_enable_udp_where_mihomo_needs_it() {

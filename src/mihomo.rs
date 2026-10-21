@@ -2868,6 +2868,36 @@ pub fn regenerate_routing(
 }
 
 /// The status message and whether the core was reloaded.
+/// The config a regeneration installs: the composed source under the routing
+/// plan `route`, with the runtime state of the active file `old` and the
+/// modules, and the report checked against that result.
+fn generate(
+    cfg: &ControllerConfig,
+    input: &crate::compose::ComposeInput,
+    route: &str,
+    old: Option<&str>,
+    modules: &[crate::ops::ModuleSnippet],
+) -> Result<(String, crate::compose::ComposeReport), String> {
+    use crate::compose;
+    let (base, mut report) = compose::compose_profile(input)?;
+    // A plan replaces the rule-providers; their DNS references go too.
+    let (base, removed) = crate::routing::apply_noting(&base, route, cfg)?;
+    report.notes.extend(removed);
+    let (base, switches) = match old {
+        Some(doc) => (
+            compose::carry_runtime_state(&crate::ops::strip_marked_modules(doc), &base),
+            crate::ops::saved_switches(doc),
+        ),
+        // Normalise the first file the way the next run will (it zeroes the
+        // listener keys a source leaves out), so that run finds it unchanged.
+        None => (compose::carry_runtime_state(&base, &base), Vec::new()),
+    };
+    let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
+    // Check what the core will run: the plan's rules, the modules' DNS.
+    report.inspect(&generated, route == "subscription");
+    Ok((generated, report))
+}
+
 fn regenerate_outcome(
     cfg: &ControllerConfig,
     modules: &[crate::ops::ModuleSnippet],
@@ -2938,25 +2968,15 @@ fn regenerate_outcome(
     let manual = compose::load_manual_nodes(&dir);
     // Custom rules and AI presets are paused. The source owns routing policy.
     let rules = compose::PrivateRules::default();
-    let (base, report) = compose::compose_profile(&compose::ComposeInput {
+    let input = compose::ComposeInput {
         subscription: sub.as_ref(),
         manual: &manual,
         rules: &rules,
         controller_addr: &cfg.addr,
         secret: &cfg.secret,
         test_url: &cfg.test_url,
-    })?;
-    let base = crate::routing::apply(&base, &route, cfg)?;
-    let (base, switches) = match old.as_deref() {
-        Some(doc) => (
-            compose::carry_runtime_state(&crate::ops::strip_marked_modules(doc), &base),
-            crate::ops::saved_switches(doc),
-        ),
-        // Normalise the first file the way the next run will (it zeroes the
-        // listener keys a source leaves out), so that run finds it unchanged.
-        None => (compose::carry_runtime_state(&base, &base), Vec::new()),
     };
-    let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
+    let (generated, mut report) = generate(cfg, &input, &route, old.as_deref(), modules)?;
     // A reload re-initialises proxy providers and drops their connections, so
     // an output identical to the active file is not reloaded at all.
     let candidate = if running {
@@ -3006,6 +3026,21 @@ fn regenerate_outcome(
     if let Some(message) = unknown {
         return Err(message);
     }
+    // The core knows provider nodes and smux UDP, which the file cannot show.
+    if running {
+        if let Ok((200, body)) = http_request(
+            &cfg.addr,
+            &cfg.secret,
+            "GET",
+            "/proxies",
+            None,
+            Duration::from_millis(1500),
+        ) {
+            if let Ok(proxies) = serde_json::from_str::<Value>(&body) {
+                report.apply_runtime_udp(&proxies);
+            }
+        }
+    }
     let tail = match (reload, running, zh) {
         (false, true, true) => " — 配置未变化，未重载，现有连接不受影响",
         (false, true, false) => " — unchanged; not reloaded, existing connections kept",
@@ -3017,7 +3052,13 @@ fn regenerate_outcome(
         (true, false, false) => " — validated & saved; core stopped",
     };
     Ok((
-        format!("{}{tail}{}", report.summary(zh), report.details()),
+        // The outcome comes before the extra counts so a short toast shows it.
+        format!(
+            "{}{tail}{}{}",
+            report.headline(zh),
+            report.extras(zh),
+            report.details()
+        ),
         reload && running,
     ))
 }
@@ -4052,6 +4093,11 @@ thread_local! {
     static CORE_REFRESHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Record that this thread restarted the core (macOS TUN relaunch).
+pub fn mark_core_refreshed() {
+    CORE_REFRESHED.with(|cell| cell.set(true));
+}
+
 /// Whether this thread reloaded or started the core since the last call.
 pub fn take_core_refreshed() -> bool {
     CORE_REFRESHED.with(|cell| cell.replace(false))
@@ -4252,11 +4298,7 @@ fn prewarm_node_dns(cfg: &ControllerConfig) -> usize {
         return 0;
     };
     let hosts = prewarm_hosts(&proxies, &text, Path::new(&cfg.config_dir));
-    let qtypes: &[&str] = if parse_yaml_flags(&text).ipv6 {
-        &["A", "AAAA"]
-    } else {
-        &["A"]
-    };
+    let qtypes = prewarm_qtypes(&text);
     let quick = ControllerConfig {
         timeout_ms: 2000,
         ..cfg.clone()
@@ -4274,32 +4316,73 @@ fn prewarm_node_dns(cfg: &ControllerConfig) -> usize {
     queried
 }
 
-/// Whether the dns block names its own resolver for node hostnames.
-fn proxy_server_nameserver_set(doc: &str) -> bool {
-    let Some(chunk) = crate::ops::split_chunks(doc)
-        .into_iter()
-        .rev()
-        .find(|chunk| chunk.key.as_deref() == Some("dns"))
-    else {
-        return false;
-    };
-    let lines = &chunk.lines;
-    let Some(at) = lines
+/// Mihomo's general `ipv6` defaults to true, and then every lookup also
+/// waits (up to ipv6-timeout) for an AAAA answer, so that is warmed too.
+fn prewarm_qtypes(doc: &str) -> &'static [&'static str] {
+    let set = crate::ops::split_chunks(doc)
         .iter()
-        .position(|line| line.trim_start().starts_with("proxy-server-nameserver:"))
-    else {
-        return false;
-    };
-    let indent = crate::ops::leading_spaces(&lines[at]);
-    let inline = crate::ops::clean_scalar(lines[at].split_once(':').map_or("", |(_, v)| v));
-    if !inline.is_empty() {
-        return inline.trim_start_matches('[').trim_end_matches(']').trim() != "";
+        .any(|c| c.key.as_deref() == Some("ipv6"));
+    if !set || parse_yaml_flags(doc).ipv6 {
+        &["A", "AAAA"]
+    } else {
+        &["A"]
     }
-    lines[at + 1..]
+}
+
+/// Whether the dns block names its own resolver for node hostnames, in any
+/// list style (an indentless `- item` list included) or a flow block.
+fn proxy_server_nameserver_set(doc: &str) -> bool {
+    !crate::compose::dns_list(doc, "proxy-server-nameserver").is_empty()
+}
+
+/// Whether `hosts:` pins `host`: the dial then never asks DNS, so the warm
+/// must not send it upstream either. Keys may be `+.` (domain and every
+/// subdomain) or `*.` (one label) wildcards.
+fn pinned_by_hosts(host: &str, keys: &[String]) -> bool {
+    let host = host.to_ascii_lowercase();
+    keys.iter().any(|key| {
+        let key = key.to_ascii_lowercase();
+        if let Some(base) = key.strip_prefix("+.") {
+            host == base || host.ends_with(&format!(".{base}"))
+        } else if let Some(base) = key.strip_prefix("*.") {
+            host.strip_suffix(&format!(".{base}"))
+                .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+        } else {
+            host == key
+        }
+    })
+}
+
+/// Groups in the order the warm takes them: those the rules name, in rule
+/// order, then the rest; GLOBAL first in global mode and last otherwise.
+fn prewarm_group_order(table: &serde_json::Map<String, Value>, doc: &str) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let global = crate::ops::split_chunks(doc)
         .iter()
-        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-        .take_while(|line| crate::ops::leading_spaces(line) > indent)
-        .any(|line| line.trim_start().starts_with('-'))
+        .rev()
+        .find(|c| c.key.as_deref() == Some("mode"))
+        .and_then(|c| c.lines.first())
+        .and_then(|l| l.split_once(':'))
+        .is_some_and(|(_, v)| crate::ops::clean_scalar(v).eq_ignore_ascii_case("global"));
+    if global && table.contains_key("GLOBAL") {
+        order.push("GLOBAL".into());
+    }
+    for rule in crate::compose::rule_items(doc) {
+        for field in rule.split(',').map(str::trim) {
+            if field != "GLOBAL" && table.contains_key(field) && !order.iter().any(|g| g == field) {
+                order.push(field.to_string());
+            }
+        }
+    }
+    for name in table.keys() {
+        if name != "GLOBAL" && !order.contains(name) {
+            order.push(name.clone());
+        }
+    }
+    if !global && table.contains_key("GLOBAL") {
+        order.push("GLOBAL".into());
+    }
+    order
 }
 
 /// Distinct non-IP server hostnames of each group's selected node, its
@@ -4355,9 +4438,10 @@ fn prewarm_hosts(proxies: &Value, doc: &str, home: &Path) -> Vec<String> {
     };
     let mut entries = proxy_entries(doc);
     let providers = provider_paths(doc);
+    let pinned = crate::compose::mapping_keys(doc, "hosts");
     let mut loaded = std::collections::HashSet::new();
     let mut hosts: Vec<String> = Vec::new();
-    for group in table.keys() {
+    for group in &prewarm_group_order(table, doc) {
         if !matches!(
             kind(group).as_str(),
             "selector" | "urltest" | "fallback" | "relay"
@@ -4393,6 +4477,7 @@ fn prewarm_hosts(proxies: &Value, doc: &str, home: &Path) -> Vec<String> {
                 if host.is_empty()
                     || bare.parse::<std::net::IpAddr>().is_ok()
                     || hosts.contains(&host)
+                    || pinned_by_hosts(&host, &pinned)
                 {
                     continue;
                 }
@@ -5734,7 +5819,7 @@ mod tests {
         // No subscription, no nodes: a clear error, nothing written.
         assert!(regenerate_config(&cfg, &[], false, false, true).is_err());
         fs::write(
-            terc.join("subscription.cache"),
+            crate::compose::cache_path(&terc),
             crate::subconv::encode_base64(b"trojan://fake@192.0.2.1:443#JP-1\nssr://x\n"),
         )
         .unwrap();
@@ -5745,7 +5830,7 @@ mod tests {
         .unwrap();
         let msg = regenerate_config(&cfg, &[], false, false, true).unwrap();
         assert!(msg.contains("URI 1 节点"), "{msg}");
-        assert!(msg.contains("跳过 1"), "{msg}");
+        assert!(msg.contains("1 skipped / 跳过"), "{msg}");
         assert!(!terc.join("rules.conf").is_file());
         persist_nested_bool(&cfg, &["sniffer", "enable"], true).unwrap();
         let modules = crate::ops::builtin_modules();
@@ -5761,6 +5846,83 @@ mod tests {
 #[cfg(test)]
 mod listener_tests {
     use super::*;
+
+    /// `generate` for a Clash source, as `regenerate_outcome` runs it.
+    fn generated(
+        source: &str,
+        route: &str,
+        module_ids: &[&str],
+    ) -> (String, crate::compose::ComposeReport) {
+        let sub = crate::subconv::convert_subscription(source).unwrap();
+        let rules = crate::compose::PrivateRules::default();
+        let cfg = ControllerConfig::default();
+        let input = crate::compose::ComposeInput {
+            subscription: Some(&sub),
+            manual: &[],
+            rules: &rules,
+            controller_addr: &cfg.addr,
+            secret: &cfg.secret,
+            test_url: &cfg.test_url,
+        };
+        let modules: Vec<_> = crate::ops::builtin_modules()
+            .into_iter()
+            .filter(|m| module_ids.contains(&m.id.as_str()))
+            .collect();
+        generate(&cfg, &input, route, None, &modules).unwrap()
+    }
+
+    const REPORT_SOURCE: &str = "mixed-port: 7890\ndns:\n  enable: true\n  nameserver: [223.5.5.5]\n  fallback: [tls://8.8.8.8]\n  nameserver-policy:\n    'rule-set:cn': 223.5.5.5\nproxies:\n  - {name: HK, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake, udp: true}\nproxy-groups:\n  - {name: Airport, type: select, proxies: [HK]}\nrule-providers:\n  cn: {type: http, behavior: domain, url: https://example.org/cn.yaml}\nrules:\n  - GEOIP,CN,DIRECT\n  - MATCH,Airport\n";
+
+    #[test]
+    fn the_report_describes_the_config_after_routing_and_modules() {
+        // The source's own routing: its rule and its DNS are reported.
+        let (_, report) = generated(REPORT_SOURCE, "subscription", &[]);
+        let checks = report.checks.join("\n");
+        assert!(checks.contains("rule 1 (GEOIP,CN,DIRECT)"), "{checks}");
+        assert!(checks.contains("dns.fallback dials foreign DNS DIRECT (tls://8.8.8.8)"));
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+
+        // Global routing: the airport rules are gone, and with its
+        // rule-providers the DNS policy that named one.
+        let (yaml, report) = generated(REPORT_SOURCE, "all", &[]);
+        assert!(
+            !yaml.contains("rule-set:") && !yaml.contains("GEOIP,CN"),
+            "{yaml}"
+        );
+        assert!(!report
+            .checks
+            .iter()
+            .any(|c| c.contains("subscription rule")));
+        assert_eq!(report.notes.len(), 1, "{:?}", report.notes);
+        assert!(report.notes[0].contains("Removed rule-set:cn from dns.nameserver-policy"));
+        let message = format!("{}{}", report.summary(false), report.details());
+        // The removal and the fallback warning, which the plan keeps.
+        assert!(message.contains("2 config note(s)"), "{message}");
+        assert!(message.contains("Removed rule-set:cn"), "{message}");
+
+        // The mainland DNS module clears the fallback: no stale warning.
+        let (yaml, report) = generated(REPORT_SOURCE, "subscription", &["dns-fakeip"]);
+        assert!(yaml.contains("  fallback: []"), "{yaml}");
+        assert!(
+            !report.checks.iter().any(|c| c.contains("dns.fallback")),
+            "{:?}",
+            report.checks
+        );
+
+        // A disabled airport block that the module turns on is checked as on.
+        let off = "mixed-port: 7890\ndns:\n  enable: false\n  nameserver-policy:\n    geosite:geolocation-!cn: https://dns.google/dns-query\nproxies:\n  - {name: HK, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake, udp: true}\nproxy-groups:\n  - {name: Airport, type: select, proxies: [HK]}\nrules:\n  - MATCH,Airport\n";
+        let (_, report) = generated(off, "subscription", &[]);
+        assert!(report.checks.is_empty(), "{:?}", report.checks);
+        let (_, report) = generated(off, "subscription", &["dns-fakeip"]);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.contains("nameserver-policy geosite:geolocation-!cn dials foreign DNS")),
+            "{:?}",
+            report.checks
+        );
+    }
     #[test]
     fn duplicate_proxy_ports_are_rejected_and_disabled_ports_are_allowed() {
         let err =
@@ -6029,6 +6191,73 @@ proxy-providers:
         assert!(!proxy_server_nameserver_set(
             "proxy-server-nameserver:\n  - x\ndns:\n  enable: true\n"
         ));
+        // PyYAML writes list items at the key's indent.
+        assert!(proxy_server_nameserver_set(
+            "dns:\n  enable: true\n  proxy-server-nameserver:\n  - https://doh.pub/dns-query\n  nameserver:\n  - 8.8.8.8\n"
+        ));
+        assert!(proxy_server_nameserver_set(
+            "dns: {enable: true, proxy-server-nameserver: [https://doh.pub/dns-query]}\n"
+        ));
+        assert!(!proxy_server_nameserver_set(
+            "dns:\n  nameserver:\n  - 8.8.8.8\n  proxy-server-nameserver: []\n"
+        ));
+    }
+
+    #[test]
+    fn prewarm_asks_for_aaaa_unless_ipv6_is_off() {
+        assert_eq!(prewarm_qtypes("dns:\n  enable: true\n"), ["A", "AAAA"]);
+        assert_eq!(prewarm_qtypes("ipv6: true\n"), ["A", "AAAA"]);
+        assert_eq!(prewarm_qtypes("ipv6: false\ndns:\n  ipv6: true\n"), ["A"]);
+    }
+
+    #[test]
+    fn prewarm_skips_hosts_pins_and_fills_the_cap_in_rule_order() {
+        let mut table = serde_json::Map::new();
+        let mut doc = String::from(
+            "hosts:\n  pinned.example.com: 192.0.2.1\n  '+.wild.example': 192.0.2.2\nproxies:\n",
+        );
+        for i in 0..20 {
+            table.insert(
+                format!("G{i:02}"),
+                serde_json::json!({"type":"URLTest","all":[format!("N{i}")],"now":format!("N{i}")}),
+            );
+            doc.push_str(&format!("  - {{name: N{i}, server: n{i}.example.com}}\n"));
+        }
+        table.insert(
+            "🚀 Main".into(),
+            serde_json::json!({"type":"Selector","all":["G19"],"now":"G19"}),
+        );
+        table.insert(
+            "Pin".into(),
+            serde_json::json!({"type":"Selector","all":["P1","P2"],"now":"P1"}),
+        );
+        table.insert(
+            "GLOBAL".into(),
+            serde_json::json!({"type":"Selector","all":["Pin"],"now":"Pin"}),
+        );
+        doc.push_str(
+            "  - {name: P1, server: pinned.example.com}\n  - {name: P2, server: a.wild.example}\n",
+        );
+        doc.push_str("rules:\n  - DOMAIN-SUFFIX,example.org,Pin\n  - MATCH,🚀 Main\n");
+        let proxies = serde_json::json!({ "proxies": table });
+        let hosts = prewarm_hosts(&proxies, &doc, Path::new("/nonexistent"));
+        // The rules' groups first: Pin (pinned in hosts, skipped), then the
+        // main selector's pick, ahead of the alphabetical rest.
+        assert_eq!(hosts[0], "n19.example.com");
+        assert_eq!(hosts.len(), PREWARM_HOSTS);
+        assert!(!hosts
+            .iter()
+            .any(|h| h.contains("pinned") || h.contains("wild")));
+        assert!(pinned_by_hosts(
+            "A.Wild.Example",
+            &["+.wild.example".into()]
+        ));
+        assert!(pinned_by_hosts("x.one.example", &["*.one.example".into()]));
+        assert!(!pinned_by_hosts(
+            "x.y.one.example",
+            &["*.one.example".into()]
+        ));
+        assert!(!pinned_by_hosts("one.example", &["*.one.example".into()]));
     }
 
     #[test]
@@ -6061,11 +6290,21 @@ proxy-providers:
 
     #[test]
     fn prewarm_is_skipped_without_dns_or_with_a_node_resolver() {
-        // Nothing listens: a skipped warm never connects.
+        // A controller listens, so a warm that ran would connect to it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
         let cfg = |dir: &Path| ControllerConfig {
-            addr: "127.0.0.1:1".into(),
+            addr: addr.clone(),
             config_dir: dir.display().to_string(),
+            timeout_ms: 200,
             ..ControllerConfig::default()
+        };
+        let untouched = || {
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "the warm connected"
+            )
         };
         let dir = prewarm_dir("skip");
         fs::write(
@@ -6074,15 +6313,21 @@ proxy-providers:
         )
         .unwrap();
         assert_eq!(prewarm_node_dns(&cfg(&dir)), 0);
+        untouched();
         fs::write(
             dir.join("config.yaml"),
             PREWARM_CONFIG.replace(
                 "  nameserver:\n",
-                "  proxy-server-nameserver:\n    - https://doh.pub/dns-query\n  nameserver:\n",
+                "  proxy-server-nameserver:\n  - https://doh.pub/dns-query\n  nameserver:\n",
             ),
         )
         .unwrap();
         assert_eq!(prewarm_node_dns(&cfg(&dir)), 0);
+        untouched();
+        // The same file without the skip reasons does reach the controller.
+        fs::write(dir.join("config.yaml"), PREWARM_CONFIG).unwrap();
+        prewarm_node_dns(&cfg(&dir));
+        assert!(listener.accept().is_ok());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -6699,12 +6944,21 @@ proxy-providers:
         // core validates the PUT itself, so no install runs the check;
         // `regenerate_routing` and `install_config_with` read the mode.
         let mode = || http("200 OK", r#"{"mode":"rule"}"#);
+        // The message then counts UDP from the running core's `/proxies`.
+        let proxies = || {
+            http(
+                "200 OK",
+                r#"{"proxies":{"Own":{"type":"Shadowsocks","udp":true}}}"#,
+            )
+        };
         let server = serve(
             listener.try_clone().unwrap(),
-            vec![mode(), mode(), http("204 No Content", "")],
+            vec![mode(), mode(), http("204 No Content", ""), proxies()],
         );
         let msg = regenerate_config(&cfg, &[], true, false, false).unwrap();
-        assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
+        let requests = server.join().unwrap();
+        assert!(requests[2].starts_with("PUT /configs?force=true "));
+        assert!(requests[3].starts_with("GET /proxies "));
         assert!(msg.contains("validated & hot-reloaded"), "{msg}");
         assert_eq!(checks_run(), 0);
         let installed = read_config_text(&cfg).unwrap();
@@ -6712,13 +6966,14 @@ proxy-providers:
         fs::remove_file(&generated).unwrap();
 
         // Running: only `GET /configs` for the runtime mode, no PUT.
-        let server = serve(listener.try_clone().unwrap(), vec![mode()]);
+        let server = serve(listener.try_clone().unwrap(), vec![mode(), proxies()]);
         assert!(crate::compose::ProfileSource::load(&dir).routing.is_empty());
         let second =
             regenerate_routing(&cfg, &[], true, false, false, Some("subscription")).unwrap();
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("GET /configs "));
+        assert!(requests[1].starts_with("GET /proxies "));
         assert!(
             second.contains(" — unchanged; not reloaded, existing connections kept"),
             "{second}"
@@ -6736,7 +6991,7 @@ proxy-providers:
         RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
         let server = serve(
             listener.try_clone().unwrap(),
-            vec![mode(), mode(), http("204 No Content", "")],
+            vec![mode(), mode(), http("204 No Content", ""), proxies()],
         );
         let third = regenerate_config(&cfg, &[], true, false, true).unwrap();
         assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));

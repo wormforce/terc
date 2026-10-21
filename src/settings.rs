@@ -510,7 +510,11 @@ impl App {
                         }
                     }
                 }
-                let base = crate::ops::set_top_scalar(&base, &key, &value.to_string());
+                // The user's value replaces one terc filled in.
+                let base = crate::compose::drop_default_mark(
+                    &crate::ops::set_top_scalar(&base, &key, &value.to_string()),
+                    &key,
+                );
                 let generated = crate::ops::apply_modules_with_switches(
                     &base,
                     &modules,

@@ -43,6 +43,29 @@ Snell v4/v5 needs Mihomo v1.19.26 or newer (`Ctrl+D` fetches the latest). Mihomo
 
 Skipped, never fatal: `external`, snell v6, listen-only WireGuard sections (`listen-port` with peers lacking `endpoint`), `ssid`/`subnet` groups, `policy-path`, `USER-AGENT`, `URL-REGEX`, `RULE-SET,SYSTEM`/`LAN`, rules pointing at unknown policies, unsupported ciphers. The result toast says "N skipped"; press `!` for the list (names and types only, never secrets). Only a recognizable download replaces `~/.config/terc/subscription.cache`.
 
+## Defaults and checks in generated configs
+
+When terc generates `config.yaml` it fills in only what the subscription leaves out. A value the subscription sets, even Mihomo's default, is kept:
+
+| Added | When | Why |
+| --- | --- | --- |
+| `tcp-concurrent: true` | The subscription does not set it | When a node or direct host resolves to several IPs, all are dialed at once and the first to connect wins; otherwise they are tried in turn, and a dead first IP uses up the 5 s dial deadline. The line carries a `# terc default` comment: an explicit value the subscription adds later wins, and a value changed in Settings is kept |
+| `tun.gso: true` | Linux only; a block-style `tun:` without `gso`, including the `tun:` block the TUN switch writes; the built-in TUN snippet has it too | Batched TUN reads and writes, which cost less CPU per byte under bulk traffic. Not written on macOS, where it would only rebuild TUN for nothing |
+| `tolerance: 50` | A `url-test` group without `tolerance` that uses no anchor or merge key; routing plans and routing from other sources get it too | As for Surge above |
+| `client-fingerprint` | vmess, vless and trojan TLS nodes. Mihomo no longer reads the top-level `global-client-fingerprint`: a valid global value goes onto TLS nodes that set none, and a Reality node whose value is missing, `none` or invalid always gets one (the global value, else `chrome`). `none` on a plain TLS node is the provider's choice and stays | Reality cannot connect without a uTLS fingerprint |
+| TUIC `congestion-controller: bbr` | Surge `tuic` and `tuic://` links that set none or an empty one; editing a node in the form keeps its value | Without it quic-go uses NewReno, which backs off hard on lossy long-haul paths |
+
+Surge `port-hopping-interval` becomes Hysteria2 `hop-interval` (seconds or an `a-b` range). An invalid value in a subscription is skipped and listed under skipped; a pasted node is refused so you can fix the line. Surge `[General]` `proxy-test-url` is used for test groups without `url=` (or with an empty one); `http://…/generate_204` without a port on `www.gstatic.com`, `connectivitycheck.gstatic.com`, `www.google.com` or `cp.cloudflare.com` becomes HTTPS, any other URL is kept as written. Quoted `ws-headers` values lose their quotes.
+
+The first config generated after an upgrade reloads once because of these additions. On Linux with TUN on, the reload that adds `tun.gso` rebuilds TUN and closes every connection through it, so its reload prompt also counts TUN connections and says "TUN is rebuilt".
+
+After generating, terc checks the config the core will load (with the routing plan and snippets applied), counts the findings in the result notice, and lists them under `!`:
+
+- Foreign DNS dialed direct: a foreign server in `fallback`, a `nameserver-policy` entry pointing at one, or a `nameserver` or `proxy-server-nameserver` list with only foreign servers. From mainland China these lookups are often blocked and wait for the timeout every time. With `respect-rules` on, only `proxy-server-nameserver` is checked, because node hostnames are always resolved direct.
+- The first subscription rule that makes the core resolve locally (an IP rule without `no-resolve`, an ipcidr rule set and so on): from there on every connection no earlier rule matched pays a DNS lookup. Checked only with the subscription's own routing.
+- Nodes without `udp`: ss, vmess, vless, trojan and others do not relay UDP by default, so UDP from TUN or SOCKS5 falls through to later rules or DIRECT. While the core runs its own report is used, which covers proxy-provider nodes too; smux nodes count as UDP-capable; traffic and expiry entries are left out.
+- Removed rule-set references: when a routing plan drops the subscription's `rule-providers`, `rule-set:` references to them (any case, block style or a one-line `dns: {...}`) are removed from `dns.nameserver-policy`, `fake-ip-filter` and the sniffer's domain and address lists, because the core would refuse the config with `not found rule-set`.
+
 ## Proxy subscriptions and routing plans
 
 Press `s` → Sources & Routing to see the named proxy list directly. Tab switches between proxies and routing plans. Rows show name, type, stable ID and active state; the selected row is highlighted.
@@ -88,7 +111,9 @@ Both listen on `127.0.0.1:1053` only, so the LAN cannot use them as a resolver, 
 
 The previous Fake-IP DNS snippet used foreign DoH with a fallback and listened on `0.0.0.0:1053`. If it was on, terc says so once at the first start after the upgrade; the new body applies from the next generated config. Enable Fake-IP DNS (global) to keep foreign DoH.
 
-Every reload or core start leaves Mihomo with an empty DNS cache, so the first connection through each node would wait for its hostname lookup. After terc reloads or starts the core it resolves, in the background, the server hostnames of each group's selected node (with relay and `dialer-proxy` hops; provider nodes are read from the provider's cached file) through the controller's `/dns/query`, at most 16 names. This is skipped when `dns.enable` is off, and when the config sets `proxy-server-nameserver`, because node hostnames then use a separate cache the query cannot reach; both built-in snippets set it.
+Every reload or core start leaves Mihomo with an empty DNS cache, so the first connection through each node would wait for its hostname lookup. After terc reloads or starts the core (including the macOS restart that enables TUN) it resolves, in the background, the server hostnames of each group's selected node (with relay and `dialer-proxy` hops; provider nodes are read from the provider's cached file) through the controller's `/dns/query`, at most 16 names. Groups the rules use come first and `GLOBAL` last (first in global mode); names pinned in `hosts` are not queried; unless the config sets `ipv6: false`, AAAA is warmed along with A, because Mihomo enables IPv6 by default and a dial waits for AAAA too. This is skipped when `dns.enable` is off, and when the config sets `proxy-server-nameserver` (in any list style), because node hostnames then use a separate cache the query cannot reach; both built-in snippets set it.
+
+A subscription's one-line `dns: {...}` or `tun: {...}` now generates fine, and the switches edit that line in place; the DNS snippets still need a block-style `dns:`.
 
 ## Connections
 
@@ -102,7 +127,7 @@ Press `c`. Each row shows the connection's age, in bold once it has been open 60
 
 Mihomo reports no close reason, so terc infers it from its own actions: closed in terc, closed all, core stopped or restarted, config reload (only connections through proxy-provider nodes), TUN rebuilt (only connections that entered through TUN). A regeneration that leaves the config unchanged is not reloaded and is not blamed. Three or more unexplained closures in one refresh suggest a network change, sleep or node failure. An AI request that ends on its own within 10 s is not recorded. An unexplained AI closure shows one quiet toast, at most every 30 s.
 
-Close all, TUN off, enabling TUN where macOS must restart the core, stopping the core, and reloads (switching a profile or routing plan, Reload, updating a subscription, editing the active subscription URL, DNS and snippet toggles) first show how many long-lived and AI connections would drop; press the same key again within 6 s to go ahead. A reload counts only proxy-provider connections and may be skipped when nothing changed, so its prompt says "may drop". Settings Mihomo applies live (LAN access, ports, concurrent TCP, process matching, log level) are sent with `PATCH /configs` without a reload, so existing connections stay.
+Close all, TUN off, enabling TUN where macOS must restart the core, stopping the core, and reloads (switching a profile or routing plan, Reload, updating a subscription, editing the active subscription URL, DNS and snippet toggles) first show how many long-lived and AI connections would drop; press the same key again within 6 s to go ahead. A reload counts only proxy-provider connections, plus TUN connections on Linux when TUN is on and the reload adds `gso` to `tun`; it may be skipped when nothing changed, so its prompt says "may drop". Settings Mihomo applies live (LAN access, ports, concurrent TCP, process matching, log level) are sent with `PATCH /configs` without a reload, so existing connections stay.
 
 The core pushes the connection list over WebSocket once a second. If the push is unavailable, terc falls back to polling every 2.2 s and logs one line, and another when it recovers; a core stop or restart logs nothing. Settings → Diagnostics → Live connection stream turns the push off and shows `OFF`, `ON · WebSocket` or `ON · HTTP` (on, but polling). A changed controller address or secret applies to the push after restarting terc.
 

@@ -134,7 +134,7 @@ pub fn apply_noting(
     if id == "subscription" {
         return Ok((base.into(), Vec::new()));
     }
-    let mut chunks = split_chunks(base);
+    let chunks = split_chunks(base);
     let proxies: HashSet<String> = chunks
         .iter()
         .find(|c| c.key.as_deref() == Some("proxies"))
@@ -183,13 +183,29 @@ pub fn apply_noting(
         .map_err(|e| e.to_string())?;
         plan.yaml
     };
-    let yaml = avoid_names(&yaml, &proxies)?;
+    install_policy(chunks, &yaml, &proxies)
+}
+
+/// Replace the policy chunks of `chunks` with those of the plan `yaml`.
+fn install_policy(
+    mut chunks: Vec<YamlChunk>,
+    yaml: &str,
+    proxies: &HashSet<String>,
+) -> Result<(String, Vec<String>), String> {
+    let yaml = avoid_names(yaml, proxies)?;
     chunks.retain(|c| !policy_key(c.key.as_deref()));
     chunks.extend(
         split_chunks(&yaml)
             .into_iter()
             .filter(|c| policy_key(c.key.as_deref())),
     );
+    // Plans and templates get the same url-test default as a composed source.
+    if let Some(groups) = chunks
+        .iter_mut()
+        .find(|c| c.key.as_deref() == Some("proxy-groups"))
+    {
+        crate::compose::default_url_test_tolerance(groups);
+    }
     // The source's rule-providers are gone; its DNS block may still name them.
     let notes = crate::compose::strip_dangling_rule_sets(&mut chunks);
     Ok((join_chunks(&chunks), notes))
@@ -656,6 +672,20 @@ mod tests {
         // A routing template carries sub-rules as policy.
         let route = template(&base).unwrap();
         assert!(route.contains("SUB-RULE,(NETWORK,tcp),s1") && route.contains("sub-rules:\n  s1:"));
+    }
+
+    #[test]
+    fn plan_url_test_groups_get_the_default_tolerance() {
+        let base = split_chunks("proxies:\n  - {name: HK, type: ss}\nproxy-groups:\n  - {name: Old, type: select, proxies: [HK]}\nrules:\n  - MATCH,Old\n");
+        let plan = "proxy-groups:\n  - {name: Auto, type: url-test, include-all: true}\n  - {name: Kept, type: url-test, include-all: true, tolerance: 0}\n  - {name: Pick, type: select, proxies: [Auto, Kept]}\nrules:\n  - MATCH,Pick\n";
+        let names = HashSet::from(["HK".to_string()]);
+        let (out, notes) = install_policy(base, plan, &names).unwrap();
+        assert!(notes.is_empty());
+        assert!(
+            out.contains("{name: Auto, type: url-test, include-all: true, tolerance: 50}"),
+            "{out}"
+        );
+        assert!(out.contains("tolerance: 0}") && out.matches("tolerance").count() == 2);
     }
 
     #[test]

@@ -585,8 +585,11 @@ pub struct ComposeReport {
     pub normalized: Vec<String>,
     /// TLS nodes given the `client-fingerprint` they lacked.
     pub fingerprinted: Vec<String>,
-    /// Warnings about the final config (DNS, rule order), "zh / en".
+    /// What composing changed that the user should know, "zh / en".
     pub notes: Vec<String>,
+    /// Warnings about the config as it runs (DNS, rule order), "zh / en";
+    /// `inspect` replaces them.
+    pub checks: Vec<String>,
     /// Nodes whose type defaults `udp` to false and that do not set it.
     pub no_udp: Vec<String>,
 }
@@ -597,8 +600,13 @@ impl ComposeReport {
     }
 
     pub fn summary(&self, zh: bool) -> String {
+        format!("{}{}", self.headline(zh), self.extras(zh))
+    }
+
+    /// Source and node counts.
+    pub fn headline(&self, zh: bool) -> String {
         let fmt = self.format.map(SubFormat::label).unwrap_or("-");
-        let mut text = if zh {
+        if zh {
             format!(
                 "来源 {fmt} {} 节点  手动 {}  保留来源分流",
                 self.sub_nodes, self.manual_nodes
@@ -608,18 +616,24 @@ impl ComposeReport {
                 "{fmt} {} nodes  Manual {}  Source routing preserved",
                 self.sub_nodes, self.manual_nodes
             )
-        };
-        // Mihomo moves a UDP flow whose target lacks UDP on to later rules
-        // and finally DIRECT (tunnel.go), from TUN or SOCKS5 UDP alike.
+        }
+    }
+
+    /// Short counts of what `details` lists; kept brief for the toast.
+    pub fn extras(&self, zh: bool) -> String {
+        let mut text = String::new();
         let n = self.no_udp.len();
         if n > 0 {
-            text.push_str(&if zh {
-                format!("  {n} 个节点未开启 udp，其 UDP 流量（TUN / SOCKS5）会改走后续规则或直连")
-            } else {
-                format!("  {n} node(s) without udp: their UDP traffic (TUN / SOCKS5) falls through to later rules or DIRECT")
+            // The later counts carry the hint when there are any.
+            let hint = self.notes.len() + self.checks.len() + self.skipped_total() == 0;
+            text.push_str(&match (zh, hint) {
+                (true, true) => format!("  {n} 个节点未开 udp（! 详情）"),
+                (true, false) => format!("  {n} 个节点未开 udp"),
+                (false, true) => format!("  {n} node(s) without udp (! details)"),
+                (false, false) => format!("  {n} node(s) without udp"),
             });
         }
-        let n = self.notes.len();
+        let n = self.notes.len() + self.checks.len();
         if n > 0 {
             text.push_str(&if zh {
                 format!("  {n} 条配置提示（! 详情）")
@@ -652,17 +666,23 @@ impl ComposeReport {
         text
     }
 
-    /// Replace the compose-time UDP list with what the running core reports,
-    /// which also covers proxy-provider nodes and smux (which carries UDP).
-    pub fn apply_runtime_udp(&mut self, nodes: &[crate::ops::ProviderNode]) {
-        for node in nodes {
-            let listed = self.no_udp.iter().position(|n| *n == node.name);
-            match (node.udp, listed) {
+    /// Replace the compose-time UDP list with what the running core reports
+    /// in `GET /proxies`, which also covers proxy-provider nodes and smux
+    /// (which carries UDP).
+    pub fn apply_runtime_udp(&mut self, proxies: &Value) {
+        let Some(table) = proxies.get("proxies").and_then(Value::as_object) else {
+            return;
+        };
+        for (name, node) in table {
+            let udp = node.get("udp").and_then(Value::as_bool).unwrap_or(false);
+            let kind = runtime_type(node.get("type").and_then(Value::as_str).unwrap_or(""));
+            let listed = self.no_udp.iter().position(|n| n == name);
+            match (udp, listed) {
                 (true, Some(i)) => {
                     self.no_udp.remove(i);
                 }
-                (false, None) if udp_optional(&runtime_type(&node.kind)) => {
-                    self.no_udp.push(node.name.clone());
+                (false, None) if udp_optional(&kind) && !info_entry(name) => {
+                    self.no_udp.push(name.clone());
                 }
                 _ => {}
             }
@@ -694,11 +714,14 @@ impl ComposeReport {
             if self.no_udp.len() > 8 {
                 names.push_str(&format!(" … +{}", self.no_udp.len() - 8));
             }
-            no_udp.push(format!("未开启 udp / no udp: {names}"));
+            // Mihomo moves a UDP flow whose target lacks UDP on to later
+            // rules and finally DIRECT (tunnel.go), from TUN or SOCKS5 alike.
+            no_udp.push(format!("{NO_UDP}{names}"));
         }
         let all: Vec<&String> = self
             .notes
             .iter()
+            .chain(&self.checks)
             .chain(&no_udp)
             .chain(&self.sub_skipped)
             .chain(&self.manual_skipped)
@@ -718,6 +741,9 @@ impl ComposeReport {
 }
 
 // ------------------------------------------------------------ report checks
+
+/// Heads the `details` line that names the nodes without UDP.
+const NO_UDP: &str = "未开启 udp（TUN / SOCKS5 的 UDP 改走后续规则或直连）/ no udp (UDP from TUN / SOCKS5 falls through to later rules or DIRECT): ";
 
 /// Proxy types whose `udp` defaults to false in Mihomo (`proxy:"udp,omitempty"`).
 /// Hysteria2 and TUIC are always UDP; http never is.
@@ -905,57 +931,190 @@ fn entry_items(lines: &[String], s: usize, e: usize) -> Vec<String> {
         .collect()
 }
 
-/// The `dns` chunk when it is a block mapping (a flow `dns: {...}` is not read).
-fn dns_chunk(chunks: &[YamlChunk]) -> Option<usize> {
-    let i = chunks
-        .iter()
-        .rposition(|c| c.key.as_deref() == Some("dns"))?;
-    inline_value(&chunks[i].lines[0]).is_empty().then_some(i)
+/// A value in the `dns` block: a scalar, a list, or a map of lists.
+enum DnsValue {
+    Scalar(String),
+    List(Vec<String>),
+    Map(Vec<(String, Vec<String>)>),
 }
 
-/// Warn about DNS servers that stall lookups from the mainland: a foreign
-/// fallback, or a nameserver-policy entry, dialed DIRECT. Mihomo waits on the
-/// fallback for every non-CN answer and does not cache a failed lookup.
-fn dns_notes(chunks: &[YamlChunk]) -> Vec<String> {
-    let mut notes = Vec::new();
-    let Some(at) = dns_chunk(chunks) else {
-        return notes;
-    };
-    let lines = &chunks[at].lines;
-    let entries = block_entries(lines, 1, lines.len());
-    let value = |key: &str| entries.iter().rev().find(|e| e.0 == key);
-    let flag =
-        |key: &str| value(key).is_some_and(|e| clean_scalar(&inline_value(&lines[e.1])) == "true");
-    // With respect-rules the servers are dialed by the rules, not DIRECT.
-    if value("enable").is_some_and(|e| clean_scalar(&inline_value(&lines[e.1])) == "false")
-        || flag("respect-rules")
-    {
-        return notes;
+impl DnsValue {
+    /// A value written inline after `key:` (`[...]`, `{...}` or a scalar).
+    fn inline(text: &str) -> Self {
+        let text = text.trim();
+        if let Some(inner) = text.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+            return Self::List(flow_split(inner).into_iter().map(plain_scalar).collect());
+        }
+        if let Some(inner) = text.strip_prefix('{').and_then(|v| v.strip_suffix('}')) {
+            return Self::Map(
+                flow_split(inner)
+                    .into_iter()
+                    .filter_map(|part| {
+                        let (key, rest) = entry_key(part)?;
+                        Some((key, Self::inline(rest).items()))
+                    })
+                    .collect(),
+            );
+        }
+        Self::Scalar(plain_scalar(text))
     }
-    if let Some(&(_, s, e)) = value("fallback") {
-        let foreign: Vec<_> = entry_items(lines, s, e)
-            .into_iter()
-            .filter(|v| foreign_direct(v))
-            .collect();
-        if !foreign.is_empty() {
-            notes.push(format!(
-                "dns.fallback 直连境外 DNS（{}）：大陆网络下每个境外域名都会等它，失败时卡到 5 秒且不缓存，建议清空 fallback / dns.fallback dials foreign DNS DIRECT ({}): from the mainland every foreign lookup waits on it, up to 5 s uncached when blocked; consider clearing fallback",
-                foreign.join(", "),
-                foreign.join(", ")
-            ));
+
+    fn items(self) -> Vec<String> {
+        match self {
+            Self::Scalar(v) if v.is_empty() => Vec::new(),
+            Self::Scalar(v) => vec![v],
+            Self::List(items) => items,
+            Self::Map(_) => Vec::new(),
         }
     }
-    if let Some(&(_, s, e)) = value("nameserver-policy") {
-        for (key, ks, ke) in block_entries(lines, s + 1, e) {
-            let foreign: Vec<_> = entry_items(lines, ks, ke)
-                .into_iter()
-                .filter(|v| foreign_direct(v))
-                .collect();
-            if !foreign.is_empty() {
+}
+
+/// The last top-level `key` chunk, read as a mapping: block style, or a
+/// flow map on its first line. A multi-line flow map is not read.
+fn mapping_view(chunks: &[YamlChunk], key: &str) -> Vec<(String, DnsValue)> {
+    let Some(c) = chunks.iter().rev().find(|c| chunk_is(c, key)) else {
+        return Vec::new();
+    };
+    let lines = &c.lines;
+    let inline = inline_value(&lines[0]);
+    if !inline.is_empty() {
+        return match DnsValue::inline(&inline) {
+            DnsValue::Map(_) => {
+                let inner = &inline[1..inline.len() - 1];
+                flow_split(inner)
+                    .into_iter()
+                    .filter_map(|part| {
+                        let (k, rest) = entry_key(part)?;
+                        Some((k, DnsValue::inline(rest)))
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+    }
+    block_entries(lines, 1, lines.len())
+        .into_iter()
+        .map(|(k, s, e)| {
+            let inline = inline_value(&lines[s]);
+            let nested_list = lines[s + 1..e]
+                .iter()
+                .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                .is_some_and(|l| l.trim_start().starts_with('-'));
+            let value = if !inline.is_empty() {
+                DnsValue::inline(&inline)
+            } else if nested_list || s + 1 == e {
+                DnsValue::List(entry_items(lines, s, e))
+            } else {
+                DnsValue::Map(
+                    block_entries(lines, s + 1, e)
+                        .into_iter()
+                        .map(|(pk, ps, pe)| (pk, entry_items(lines, ps, pe)))
+                        .collect(),
+                )
+            };
+            (k, value)
+        })
+        .collect()
+}
+
+/// The servers listed under `dns.<key>` in `doc` (block or flow style, an
+/// indentless list included).
+pub(crate) fn dns_list(doc: &str, key: &str) -> Vec<String> {
+    let chunks = split_chunks(doc);
+    match mapping_view(&chunks, "dns")
+        .into_iter()
+        .rev()
+        .find(|(k, _)| k == key)
+    {
+        Some((_, value)) => value.items(),
+        None => Vec::new(),
+    }
+}
+
+/// The keys of the top-level mapping `key` of `doc` (`hosts`, say).
+pub(crate) fn mapping_keys(doc: &str, key: &str) -> Vec<String> {
+    mapping_view(&split_chunks(doc), key)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// The items of the last top-level `rules` list of `doc`.
+pub(crate) fn rule_items(doc: &str) -> Vec<String> {
+    split_chunks(doc)
+        .iter()
+        .rfind(|c| c.key.as_deref() == Some("rules"))
+        .map(clash_rule_items)
+        .unwrap_or_default()
+}
+
+/// Warn about DNS servers dialed DIRECT that stall lookups from the
+/// mainland: a foreign fallback (Mihomo waits on it for every non-CN answer
+/// and does not cache a failure), a nameserver-policy entry, or a
+/// `nameserver` / `proxy-server-nameserver` list with only foreign servers.
+fn dns_notes(chunks: &[YamlChunk]) -> Vec<String> {
+    let mut notes = Vec::new();
+    let view = mapping_view(chunks, "dns");
+    let last = |key: &str| view.iter().rev().find(|(k, _)| k == key).map(|e| &e.1);
+    let scalar = |key: &str| match last(key) {
+        Some(DnsValue::Scalar(v)) => v.to_ascii_lowercase(),
+        _ => String::new(),
+    };
+    let list = |key: &str| match last(key) {
+        Some(DnsValue::List(items)) => items.clone(),
+        Some(DnsValue::Scalar(v)) if !v.is_empty() => vec![v.clone()],
+        _ => Vec::new(),
+    };
+    let foreign = |items: &[String]| -> Vec<String> {
+        items
+            .iter()
+            .filter(|v| foreign_direct(v))
+            .cloned()
+            .collect()
+    };
+    // Every listed server foreign: nothing answers fast from the mainland.
+    let all_foreign = |items: &[String]| !items.is_empty() && foreign(items).len() == items.len();
+    if view.is_empty() || scalar("enable") == "false" {
+        return notes;
+    }
+    // Node hostnames are always resolved DIRECT, respect-rules or not.
+    let proxy_servers = list("proxy-server-nameserver");
+    if all_foreign(&proxy_servers) {
+        let servers = proxy_servers.join(", ");
+        notes.push(format!(
+            "dns.proxy-server-nameserver 只有直连境外 DNS（{servers}）：大陆网络下每次连到域名节点都要等它 / dns.proxy-server-nameserver lists only foreign DNS dialed DIRECT ({servers}): from the mainland every dial to a hostname node waits on it"
+        ));
+    }
+    // With respect-rules the other servers are dialed by the rules.
+    if scalar("respect-rules") == "true" {
+        return notes;
+    }
+    let nameservers = list("nameserver");
+    if all_foreign(&nameservers) {
+        let servers = nameservers.join(", ");
+        // Without proxy-server-nameserver node hostnames use it too.
+        let (zh, en) = if proxy_servers.is_empty() {
+            ("（包括节点域名）", ", node hostnames included,")
+        } else {
+            ("", "")
+        };
+        notes.push(format!(
+            "dns.nameserver 只有直连境外 DNS（{servers}）：大陆网络下每次解析{zh}都要等它 / dns.nameserver lists only foreign DNS dialed DIRECT ({servers}): from the mainland every lookup{en} waits on it"
+        ));
+    }
+    let fallback = foreign(&list("fallback"));
+    if !fallback.is_empty() {
+        let servers = fallback.join(", ");
+        notes.push(format!(
+            "dns.fallback 直连境外 DNS（{servers}）：大陆网络下每个境外域名都会等它，失败时卡到 5 秒且不缓存，建议清空 fallback / dns.fallback dials foreign DNS DIRECT ({servers}): from the mainland every foreign lookup waits on it, up to 5 s uncached when blocked; consider clearing fallback"
+        ));
+    }
+    if let Some(DnsValue::Map(policy)) = last("nameserver-policy") {
+        for (key, items) in policy {
+            let servers = foreign(items).join(", ");
+            if !servers.is_empty() {
                 notes.push(format!(
-                    "dns.nameserver-policy {key} 直连境外 DNS（{}），大陆网络下同样会卡顿 / dns.nameserver-policy {key} dials foreign DNS DIRECT ({}) and stalls the same way from the mainland",
-                    foreign.join(", "),
-                    foreign.join(", ")
+                    "dns.nameserver-policy {key} 直连境外 DNS（{servers}），大陆网络下同样会卡顿 / dns.nameserver-policy {key} dials foreign DNS DIRECT ({servers}) and stalls the same way from the mainland"
                 ));
             }
         }
@@ -965,30 +1124,21 @@ fn dns_notes(chunks: &[YamlChunk]) -> Vec<String> {
 
 /// Names of the entries of the `rule-providers` chunk.
 fn rule_provider_names(chunks: &[YamlChunk]) -> HashSet<String> {
-    let Some(c) = chunks
-        .iter()
-        .rfind(|c| c.key.as_deref() == Some("rule-providers"))
-    else {
-        return HashSet::new();
-    };
-    let inline = inline_value(&c.lines[0]);
-    if let Some(inner) = inline.strip_prefix('{').and_then(|v| v.strip_suffix('}')) {
-        return flow_split(inner)
-            .into_iter()
-            .filter_map(|p| entry_key(p).map(|(k, _)| k))
-            .collect();
-    }
-    block_entries(&c.lines, 1, c.lines.len())
+    mapping_view(chunks, "rule-providers")
         .into_iter()
-        .map(|e| e.0)
+        .map(|(name, _)| name)
         .collect()
 }
 
-/// Rule-set names that a DNS policy key or fake-ip-filter item references:
-/// `rule-set:a,b`, or `RULE-SET,a,…` under `fake-ip-filter-mode: rule`.
+/// Rule-set names that a DNS policy key, fake-ip-filter or sniffer item
+/// references: `rule-set:a,b` (any case, as Mihomo lowercases it), or
+/// `RULE-SET,a,…` under `fake-ip-filter-mode: rule`.
 fn referenced_rule_sets(item: &str) -> Vec<String> {
-    if let Some(names) = item.strip_prefix("rule-set:") {
-        return names.split(',').map(|n| n.trim().to_string()).collect();
+    if item
+        .get(..9)
+        .is_some_and(|p| p.eq_ignore_ascii_case("rule-set:"))
+    {
+        return item[9..].split(',').map(|n| n.trim().to_string()).collect();
     }
     let mut fields = item.splitn(3, ',');
     match (fields.next(), fields.next()) {
@@ -999,66 +1149,133 @@ fn referenced_rule_sets(item: &str) -> Vec<String> {
     }
 }
 
-/// Remove DNS references to rule-providers the config does not define: a
-/// `nameserver-policy` or `proxy-server-nameserver-policy` entry keyed by one,
-/// and `fake-ip-filter` items naming one. Mihomo refuses such a config with
-/// "not found rule-set", e.g. after the providers were dropped with the
-/// source's routing. Returns one note per removed reference.
+/// Remove references to rule-providers the config does not define: in the
+/// `dns` block a `nameserver-policy` or `proxy-server-nameserver-policy`
+/// entry keyed by one and `fake-ip-filter` items naming one, and the same
+/// items in the sniffer's domain and address lists. Mihomo refuses such a
+/// config with "not found rule-set", e.g. after the providers were dropped
+/// with the source's routing. Returns one note per removed reference.
 pub(crate) fn strip_dangling_rule_sets(chunks: &mut [YamlChunk]) -> Vec<String> {
-    let Some(at) = dns_chunk(chunks) else {
-        return Vec::new();
-    };
     let known = rule_provider_names(chunks);
     let dangling = |item: &str| {
         let names = referenced_rule_sets(item);
-        names
-            .iter()
-            .any(|n| !known.contains(n))
-            .then(|| names.join(","))
+        names.iter().any(|n| !known.contains(n))
     };
-    let lines = &mut chunks[at].lines;
+    let mut notes = Vec::new();
+    for (block, maps, lists) in [
+        (
+            "dns",
+            &["nameserver-policy", "proxy-server-nameserver-policy"][..],
+            &["fake-ip-filter"][..],
+        ),
+        (
+            "sniffer",
+            &[][..],
+            &[
+                "force-domain",
+                "skip-domain",
+                "skip-src-address",
+                "skip-dst-address",
+            ][..],
+        ),
+    ] {
+        let Some(at) = chunks.iter().rposition(|c| chunk_is(c, block)) else {
+            continue;
+        };
+        for (key, item) in strip_chunk(&mut chunks[at].lines, maps, lists, &dangling) {
+            notes.push(format!(
+                "已移除 {block}.{key} 中的 {item}：配置里没有这个规则集（否则 Mihomo 报 not found rule-set）/ Removed {item} from {block}.{key}: no such rule-provider in the config (Mihomo would fail with 'not found rule-set')"
+            ));
+        }
+    }
+    notes
+}
+
+/// The flow collection `value` (`{...}` for a map, `[...]` for a list)
+/// without the entries `gone` matches (map keys, list items), and the
+/// removed ones; None when nothing matches.
+fn strip_collection(
+    value: &str,
+    map: bool,
+    gone: &dyn Fn(&str) -> bool,
+) -> Option<(String, Vec<String>)> {
+    let (open, close) = if map { ('{', '}') } else { ('[', ']') };
+    let inner = value.strip_prefix(open)?.strip_suffix(close)?;
+    let mut removed = Vec::new();
+    let kept: Vec<&str> = flow_split(inner)
+        .into_iter()
+        .filter(|part| {
+            let item = if map {
+                entry_key(part).map(|(k, _)| k).unwrap_or_default()
+            } else {
+                clean_scalar(part)
+            };
+            let drop = gone(&item);
+            if drop {
+                removed.push(item);
+            }
+            !drop
+        })
+        .collect();
+    (!removed.is_empty()).then(|| (format!("{open}{}{close}", kept.join(", ")), removed))
+}
+
+/// Strip dangling references from the `maps` and `lists` entries of one
+/// top-level chunk, block style or a one-line flow map. Returns
+/// (entry key, removed item) for each removal.
+fn strip_chunk(
+    lines: &mut Vec<String>,
+    maps: &[&str],
+    lists: &[&str],
+    gone: &dyn Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let keys = maps
+        .iter()
+        .map(|k| (*k, true))
+        .chain(lists.iter().map(|k| (*k, false)));
+    if let Some(open) = flow_open_after_key(&lines[0]) {
+        // `dns: {..., nameserver-policy: {...}, fake-ip-filter: [...]}`
+        for (key, map) in keys {
+            let line = &mut lines[0];
+            let Some(close) = matching_close(line, open) else {
+                break;
+            };
+            let flow = &line[open..=close];
+            let Some((s, e)) = flow_key_value(flow, key) else {
+                continue;
+            };
+            if let Some((text, removed)) = strip_collection(&flow[s..e], map, gone) {
+                line.replace_range(open + s..open + e, &text);
+                out.extend(removed.into_iter().map(|item| (key.to_string(), item)));
+            }
+        }
+        return out;
+    }
+    if !inline_value(&lines[0]).is_empty() {
+        return out;
+    }
     let entries = block_entries(lines, 1, lines.len());
     // Back to front, so removed lines do not shift earlier entries.
-    let mut removed_by_entry = Vec::new();
+    let mut by_entry = Vec::new();
     for (key, s, e) in entries.into_iter().rev() {
-        let policy = matches!(
-            key.as_str(),
-            "nameserver-policy" | "proxy-server-nameserver-policy"
-        );
-        if !policy && key != "fake-ip-filter" {
+        let Some(map) = keys_kind(maps, lists, &key) else {
             continue;
-        }
+        };
         let mut removed = Vec::new();
         let inline = inline_value(&lines[s]);
         let pad = " ".repeat(leading_spaces(&lines[s]));
-        let (open, close) = if policy { ('{', '}') } else { ('[', ']') };
-        if let Some(inner) = inline
-            .strip_prefix(open)
-            .and_then(|v| v.strip_suffix(close))
-        {
-            let kept: Vec<&str> = flow_split(inner)
-                .into_iter()
-                .filter(|part| {
-                    let item = if policy {
-                        entry_key(part).map(|(k, _)| k).unwrap_or_default()
-                    } else {
-                        clean_scalar(part)
-                    };
-                    let gone = dangling(&item).is_some();
-                    if gone {
-                        removed.push(item);
-                    }
-                    !gone
-                })
-                .collect();
-            if !removed.is_empty() {
-                lines[s] = format!("{pad}{key}: {open}{}{close}", kept.join(", "));
+        let (open, close) = if map { ('{', '}') } else { ('[', ']') };
+        if inline.starts_with(open) {
+            if let Some((text, items)) = strip_collection(&inline, map, gone) {
+                lines[s] = format!("{pad}{key}: {text}");
+                removed = items;
             }
         } else if inline.is_empty() {
-            let drop: Vec<(usize, usize, String)> = if policy {
+            let drop: Vec<(usize, usize, String)> = if map {
                 block_entries(lines, s + 1, e)
                     .into_iter()
-                    .filter(|(k, _, _)| dangling(k).is_some())
+                    .filter(|(k, _, _)| gone(k))
                     .map(|(k, ks, ke)| (ks, ke, k))
                     .collect()
             } else {
@@ -1066,7 +1283,7 @@ pub(crate) fn strip_dangling_rule_sets(chunks: &mut [YamlChunk]) -> Vec<String> 
                     .filter_map(|i| {
                         let v = lines[i].trim_start().strip_prefix('-')?;
                         let item = clean_scalar(v.split(" #").next().unwrap_or(v));
-                        dangling(&item).map(|_| (i, i + 1, item))
+                        gone(&item).then_some((i, i + 1, item))
                     })
                     .collect()
             };
@@ -1084,17 +1301,53 @@ pub(crate) fn strip_dangling_rule_sets(chunks: &mut [YamlChunk]) -> Vec<String> 
                 lines[s] = format!("{pad}{key}: {open}{close}");
             }
         }
-        removed_by_entry.push((key, removed));
+        by_entry.push((key, removed));
     }
-    removed_by_entry
-        .into_iter()
-        .rev()
-        .flat_map(|(key, removed)| {
-            removed.into_iter().map(move |item| format!(
-                "已移除 dns.{key} 中的 {item}：配置里没有这个规则集（否则 Mihomo 报 not found rule-set）/ Removed {item} from dns.{key}: no such rule-provider in the config (Mihomo would fail with 'not found rule-set')"
-            ))
-        })
-        .collect()
+    for (key, removed) in by_entry.into_iter().rev() {
+        out.extend(removed.into_iter().map(|item| (key.clone(), item)));
+    }
+    out
+}
+
+/// Some(true) for a map entry, Some(false) for a list entry, None otherwise.
+fn keys_kind(maps: &[&str], lists: &[&str], key: &str) -> Option<bool> {
+    if maps.contains(&key) {
+        Some(true)
+    } else {
+        lists.contains(&key).then_some(false)
+    }
+}
+
+/// `line` (`block: {...}` on one line) with the map's `key` set to the
+/// scalar `literal`, added at the end when absent. None when the line holds
+/// no complete flow map.
+pub(crate) fn set_flow_scalar(line: &str, key: &str, literal: &str) -> Option<String> {
+    let open = flow_open_after_key(line)?;
+    let close = matching_close(line, open)?;
+    let flow = &line[open..=close];
+    let mut out = line.to_string();
+    match flow_key_value(flow, key) {
+        Some((s, e)) => out.replace_range(open + s..open + e, literal),
+        None => {
+            let body = flow[1..flow.len() - 1].trim_end();
+            let sep = if body.trim().is_empty() || body.ends_with(',') {
+                ""
+            } else {
+                ", "
+            };
+            let at = open + 1 + body.len();
+            out.replace_range(at..close, &format!("{sep}{key}: {literal}"));
+        }
+    }
+    Some(out)
+}
+
+/// Byte offset of a flow map that is the whole value of a top-level line
+/// (`dns: {...}`).
+fn flow_open_after_key(line: &str) -> Option<usize> {
+    let (_, rest) = entry_key(line)?;
+    let value = rest.trim_start();
+    value.starts_with('{').then(|| line.len() - value.len())
 }
 
 /// Behavior and inline payload of each entry of the `rule-providers` chunk.
@@ -1189,9 +1442,14 @@ fn rule_resolves(rule: &str, providers: &HashMap<String, (String, Vec<String>)>)
     }
 }
 
-/// Note the first of the source's `rules` that makes Mihomo resolve the host
+/// Note the first rule of the config that makes Mihomo resolve the host
 /// locally: every connection that reaches it unmatched pays a DNS lookup.
-fn resolving_rule_note(rules: &[String], chunks: &[YamlChunk]) -> Option<String> {
+fn resolving_rule_note(chunks: &[YamlChunk]) -> Option<String> {
+    let rules = chunks
+        .iter()
+        .rfind(|c| c.key.as_deref() == Some("rules"))
+        .map(clash_rule_items)
+        .unwrap_or_default();
     let providers = rule_provider_kinds(chunks);
     let n = rules.iter().position(|r| rule_resolves(r, &providers))?;
     let rule: String = rules[n].chars().take(60).collect();
@@ -1201,8 +1459,26 @@ fn resolving_rule_note(rules: &[String], chunks: &[YamlChunk]) -> Option<String>
     ))
 }
 
+/// Airport entries that only show traffic or expiry, not real nodes.
+fn info_entry(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    crate::mihomo::is_info_pseudo_node(name)
+        || [
+            "剩余", "到期", "流量", "过期", "官网", "套餐", "expire", "traffic",
+        ]
+        .iter()
+        .any(|k| lower.contains(k))
+}
+
+/// Whether an `smux` value turns UDP on: sing-mux carries UDP unless
+/// `only-tcp` is set (mihomo adapter/outbound/singmux.go).
+fn smux_udp(enabled: Option<String>, only_tcp: Option<String>) -> bool {
+    let on = |v: Option<String>| v.is_some_and(|v| clean_scalar(&v).eq_ignore_ascii_case("true"));
+    on(enabled) && !on(only_tcp)
+}
+
 /// Names of the `proxies` items whose type defaults `udp` to false and that
-/// set no `udp` key.
+/// set no `udp` key or smux. Traffic and expiry entries are left out.
 fn missing_udp(chunks: &[YamlChunk]) -> Vec<String> {
     let mut out = Vec::new();
     let Some(c) = chunks.iter().find(|c| c.key.as_deref() == Some("proxies")) else {
@@ -1226,17 +1502,24 @@ fn missing_udp(chunks: &[YamlChunk]) -> Vec<String> {
         let end = starts.get(k + 1).copied().unwrap_or(lines.len());
         let first = lines[start].trim_start()[1..].trim_start();
         let (name, kind, has_udp) = if let Ok(v) = serde_json::from_str::<Value>(first) {
+            let smux = |key: &str| v["smux"].get(key).map(Value::to_string);
             (
                 v["name"].as_str().unwrap_or("?").to_string(),
                 v["type"].as_str().unwrap_or("").to_string(),
-                v.get("udp").is_some(),
+                v.get("udp").is_some() || smux_udp(smux("enabled"), smux("only-tcp")),
             )
         } else if first.starts_with('{') {
             let flow = matching_close(first, 0).map_or(first, |c| &first[..=c]);
+            let smux = flow_key_value(flow, "smux").map(|(s, e)| &flow[s..e]);
+            let smux = |key: &str| {
+                smux.filter(|m| m.starts_with('{'))
+                    .and_then(|m| flow_key_value(m, key).map(|(s, e)| m[s..e].to_string()))
+            };
             (
                 flow_value(&flow[1..], "name").unwrap_or_else(|| "?".into()),
                 flow_value(&flow[1..], "type").unwrap_or_default(),
-                flow_key_value(flow, "udp").is_some(),
+                flow_key_value(flow, "udp").is_some()
+                    || smux_udp(smux("enabled"), smux("only-tcp")),
             )
         } else {
             // A block item: its first key shares the `- ` line.
@@ -1250,13 +1533,30 @@ fn missing_udp(chunks: &[YamlChunk]) -> Vec<String> {
                     .find(|f| f.0 == key)
                     .map(|f| plain_scalar(&inline_value(&item[f.1])))
             };
+            let smux_on = fields
+                .iter()
+                .find(|f| f.0 == "smux")
+                .is_some_and(|&(_, s, e)| {
+                    let inline = inline_value(&item[s]);
+                    let get = |key: &str| {
+                        if inline.starts_with('{') {
+                            flow_key_value(&inline, key).map(|(a, b)| inline[a..b].to_string())
+                        } else {
+                            block_entries(&item, s + 1, e)
+                                .into_iter()
+                                .find(|f| f.0 == key)
+                                .map(|f| inline_value(&item[f.1]))
+                        }
+                    };
+                    smux_udp(get("enabled"), get("only-tcp"))
+                });
             (
                 field("name").unwrap_or_else(|| "?".into()),
                 field("type").unwrap_or_default(),
-                field("udp").is_some(),
+                field("udp").is_some() || smux_on,
             )
         };
-        if !has_udp && udp_optional(&kind) {
+        if !has_udp && udp_optional(&kind) && !info_entry(&name) {
             out.push(name);
         }
     }
@@ -1264,13 +1564,17 @@ fn missing_udp(chunks: &[YamlChunk]) -> Vec<String> {
 }
 
 impl ComposeReport {
-    /// Checks on the final config. `sub_rules` are the source's rules when
-    /// they reach the config (subscription-rules on), else empty.
-    fn inspect(&mut self, chunks: &mut [YamlChunk], sub_rules: &[String]) {
-        self.notes.extend(strip_dangling_rule_sets(chunks));
-        self.notes.extend(dns_notes(chunks));
-        self.notes.extend(resolving_rule_note(sub_rules, chunks));
-        self.no_udp = missing_udp(chunks);
+    /// Checks on `doc`, the config as Mihomo will load it (after routing
+    /// and modules): DNS servers that stall from the mainland, the first
+    /// rule that resolves locally when the source's rules are kept
+    /// (`source_rules`), and nodes without UDP. Replaces earlier checks.
+    pub fn inspect(&mut self, doc: &str, source_rules: bool) {
+        let chunks = split_chunks(doc);
+        self.checks = dns_notes(&chunks);
+        if source_rules {
+            self.checks.extend(resolving_rule_note(&chunks));
+        }
+        self.no_udp = missing_udp(&chunks);
     }
 }
 
@@ -1621,8 +1925,7 @@ fn block_item_keys(
 /// Byte span of the value of `key:` at byte `at` of a block line, without a
 /// trailing comment. Empty for `key:` alone; a flow map spans to its `}`.
 fn block_value(line: &str, at: usize, key: &str) -> Option<(usize, usize)> {
-    let after = line[at..]
-        .strip_prefix(key)?
+    let after = strip_key(&line[at..], key)?
         .trim_start_matches(' ')
         .strip_prefix(':')?;
     if !(after.is_empty() || after.starts_with([' ', '\t'])) {
@@ -1640,15 +1943,42 @@ fn block_value(line: &str, at: usize, key: &str) -> Option<(usize, usize)> {
     Some((start, start + len))
 }
 
+/// `text` after a leading `key`, written plain or in single or double quotes.
+fn strip_key<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.strip_prefix(key).or_else(|| {
+        let q = text.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        text[1..].strip_prefix(key)?.strip_prefix(q)
+    })
+}
+
+/// Whether a top-level chunk is `key`, written plain or quoted.
+fn chunk_is(chunk: &YamlChunk, key: &str) -> bool {
+    chunk
+        .key
+        .as_deref()
+        .is_some_and(|k| strip_key(k, key) == Some(""))
+}
+
 /// Byte span of the value of a top-level `key` in a one-line YAML flow map.
 fn flow_key_value(flow: &str, key: &str) -> Option<(usize, usize)> {
     let mut depth = 0usize;
-    let mut at_key = false;
     for (i, c) in flow_unquoted(flow) {
-        if depth == 1 && at_key && !c.is_whitespace() {
-            at_key = false;
-            let value = flow[i..]
-                .strip_prefix(key)
+        let at_key = match c {
+            '[' | '{' => {
+                depth += 1;
+                depth == 1
+            }
+            ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            ',' => depth == 1,
+            _ => false,
+        };
+        // A key follows `{` or `,`; quoted keys are skipped by flow_unquoted,
+        // so the raw text after the separator is read.
+        if at_key {
+            let value = strip_key(flow[i + 1..].trim_start(), key)
                 .map(str::trim_start)
                 .and_then(|a| a.strip_prefix(':'));
             if let Some(value) = value {
@@ -1661,15 +1991,6 @@ fn flow_key_value(flow: &str, key: &str) -> Option<(usize, usize)> {
                 };
                 return Some((start, end));
             }
-        }
-        match c {
-            '[' | '{' => {
-                depth += 1;
-                at_key = depth == 1;
-            }
-            ']' | '}' => depth = depth.saturating_sub(1),
-            ',' => at_key = depth == 1,
-            _ => {}
         }
     }
     None
@@ -1724,6 +2045,42 @@ const FINGERPRINTS: &[&str] = &[
     "randomized",
 ];
 
+/// Ends a top-level line terc filled in itself. `carry_runtime_state` keeps
+/// such a value only while the source sets none, so a later explicit source
+/// value wins; a user's own switch drops the mark (`drop_default_mark`).
+const DEFAULT_MARK: &str = "# terc default";
+
+/// Whether the top-level `key` line of `doc` holds a value terc filled in.
+fn terc_default(doc: &str, key: &str) -> bool {
+    split_chunks(doc)
+        .iter()
+        .rev()
+        .find(|c| c.key.as_deref() == Some(key))
+        .and_then(|c| c.lines.first())
+        .is_some_and(|l| l.trim_end().ends_with(DEFAULT_MARK))
+}
+
+/// `doc` with the default mark removed from its top-level `key` line, for a
+/// value the user or the source set.
+pub fn drop_default_mark(doc: &str, key: &str) -> String {
+    let mut chunks = split_chunks(doc);
+    let Some(line) = chunks
+        .iter_mut()
+        .rev()
+        .find(|c| c.key.as_deref() == Some(key))
+        .and_then(|c| c.lines.first_mut())
+    else {
+        return doc.to_string();
+    };
+    match line.trim_end().strip_suffix(DEFAULT_MARK) {
+        Some(rest) => {
+            *line = rest.trim_end().to_string();
+            join_chunks(&chunks)
+        }
+        None => doc.to_string(),
+    }
+}
+
 /// `url-test` tolerance (ms) for groups that set none. Mihomo's 0 switches
 /// the exit on any single sample that is 1 ms lower.
 const URL_TEST_TOLERANCE: u64 = 50;
@@ -1734,10 +2091,7 @@ const URL_TEST_TOLERANCE: u64 = 50;
 fn inject_safe_defaults(chunks: &mut Vec<YamlChunk>) {
     // Race every resolved IP of a node or DIRECT host instead of trying them
     // in turn under one shared dial deadline.
-    if !chunks
-        .iter()
-        .any(|c| c.key.as_deref() == Some("tcp-concurrent"))
-    {
+    if !chunks.iter().any(|c| chunk_is(c, "tcp-concurrent")) {
         let pos = chunks
             .iter()
             .position(|c| c.key.as_deref() == Some("proxies"))
@@ -1746,54 +2100,72 @@ fn inject_safe_defaults(chunks: &mut Vec<YamlChunk>) {
             pos,
             YamlChunk {
                 key: Some("tcp-concurrent".into()),
-                lines: vec!["tcp-concurrent: true".into()],
+                lines: vec![format!("tcp-concurrent: true {DEFAULT_MARK}")],
             },
         );
     }
     for chunk in chunks.iter_mut() {
-        match chunk.key.as_deref() {
-            Some("tun") if cfg!(target_os = "linux") => default_tun_gso(chunk),
-            Some("proxy-groups") => default_url_test_tolerance(chunk),
-            _ => {}
+        if chunk_is(chunk, "tun") {
+            default_tun_gso(chunk);
+        } else if chunk_is(chunk, "proxy-groups") {
+            default_url_test_tolerance(chunk);
         }
     }
 }
 
 /// Linux: batch TUN reads and writes (sing-tun GSO). Darwin ignores the key,
 /// but Mihomo compares it and would rebuild TUN on a reload for nothing.
-fn default_tun_gso(chunk: &mut YamlChunk) {
+/// Only a block-style `tun:` without a `gso` key gets it.
+pub(crate) fn default_tun_gso(chunk: &mut YamlChunk) {
+    if let Some(indent) = tun_without_gso(chunk) {
+        chunk
+            .lines
+            .insert(1, format!("{}gso: true", " ".repeat(indent)));
+    }
+}
+
+/// Linux: whether the active `doc` has a `tun:` block that the next
+/// generated config adds `gso: true` to. Mihomo compares the key, so with
+/// TUN running that reload rebuilds TUN and cuts every TUN connection, AI
+/// sessions included.
+pub fn reload_adds_tun_gso(doc: &str) -> bool {
+    split_chunks(doc)
+        .iter()
+        .rev()
+        .find(|c| chunk_is(c, "tun"))
+        .is_some_and(|c| tun_without_gso(c).is_some())
+}
+
+/// The key indent of a block-style `tun:` chunk that has no `gso` key, on
+/// Linux only.
+fn tun_without_gso(chunk: &YamlChunk) -> Option<usize> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
     let inline = chunk.lines[0]
         .split_once(':')
         .map(|(_, v)| clean_scalar(v))
         .unwrap_or_default();
     let skip = |l: &String| l.trim().is_empty() || l.trim_start().starts_with('#');
-    let Some(indent) = chunk
+    let indent = chunk
         .lines
         .iter()
         .skip(1)
         .filter(|l| !skip(l))
         .map(|l| leading_spaces(l))
-        .min()
-    else {
-        return;
-    };
-    if !inline.is_empty()
-        || indent == 0
-        || chunk
-            .lines
-            .iter()
-            .any(|l| leading_spaces(l) == indent && block_value(l, indent, "gso").is_some())
-    {
-        return;
-    }
-    chunk
+        .min()?;
+    let has_gso = chunk
         .lines
-        .insert(1, format!("{}gso: true", " ".repeat(indent)));
+        .iter()
+        .any(|l| leading_spaces(l) == indent && block_value(l, indent, "gso").is_some());
+    // A merge key may bring its own gso.
+    (inline.is_empty() && indent > 0 && !has_gso && !uses_anchors(&chunk.lines[1..]))
+        .then_some(indent)
 }
 
 /// `tolerance` for `url-test` groups without one. A group that uses an
 /// anchor, alias or merge key may inherit it, so it is left alone.
-fn default_url_test_tolerance(chunk: &mut YamlChunk) {
+pub(crate) fn default_url_test_tolerance(chunk: &mut YamlChunk) {
     for (start, end) in list_items(chunk).into_iter().rev() {
         let lines = &chunk.lines;
         if uses_anchors(&lines[start..end])
@@ -1815,10 +2187,12 @@ fn default_url_test_tolerance(chunk: &mut YamlChunk) {
 
 /// Give TLS nodes of a pass-through `proxies` chunk the `client-fingerprint`
 /// that Mihomo no longer takes from the top-level `global-client-fingerprint`
-/// (mihomo config/config.go only logs it). With a known global value every
-/// vmess/vless/trojan TLS node without a valid one gets it; without one only
-/// Reality nodes, which cannot connect at all, get `chrome`. Returns the
-/// names of the repaired nodes.
+/// (mihomo config/config.go only logs it). Older cores applied the global
+/// value only where a node set none, so a plain TLS node gets it only when
+/// its own value is missing or empty; an explicit one, `none` included, is
+/// the provider's choice. A Reality node cannot connect without a valid
+/// fingerprint, so any other value is replaced there: by the known global
+/// value, else `chrome`. Returns the names of the repaired nodes.
 pub(crate) fn repair_client_fingerprints(
     chunk: &mut YamlChunk,
     global: Option<&str>,
@@ -1844,7 +2218,13 @@ pub(crate) fn repair_client_fingerprints(
         let tls = kind == "trojan"
             || reality
             || get("tls").is_some_and(|v| v.eq_ignore_ascii_case("true"));
-        if !tls || get("client-fingerprint").is_some_and(|v| FINGERPRINTS.contains(&v.as_str())) {
+        let own = get("client-fingerprint").filter(|v| !v.is_empty());
+        let keep = match &own {
+            Some(v) if reality => FINGERPRINTS.contains(&v.as_str()),
+            Some(_) => true,
+            None => false,
+        };
+        if !tls || keep {
             continue;
         }
         let value = match global {
@@ -1892,15 +2272,67 @@ fn list_items(chunk: &YamlChunk) -> Vec<(usize, usize)> {
 }
 
 /// Whether item text uses a YAML anchor, alias or merge key, whose inherited
-/// keys a line edit cannot see. Quoted text can match too; that only skips.
+/// keys a line edit cannot see. Only an unquoted `&` or `*` where a node
+/// starts counts (after `key: `, a list `- `, `[`, `{` or `,`), so names like
+/// `HK & JP` or `SG *2` do not.
 fn uses_anchors(lines: &[String]) -> bool {
-    lines.iter().any(|l| {
-        !l.trim_start().starts_with('#')
-            && (l.contains("<<")
-                || l.as_bytes().windows(2).any(|w| {
-                    matches!(w[0], b' ' | b'[' | b'{' | b',') && matches!(w[1], b'&' | b'*')
-                }))
-    })
+    lines.iter().any(|l| line_uses_anchor(l))
+}
+
+fn line_uses_anchor(line: &str) -> bool {
+    let mut quote = None;
+    // The last unquoted non-space character, and whether a space followed it.
+    let mut prev: Option<char> = None;
+    let mut spaced = false;
+    let mut list_item = true;
+    for (i, c) in line.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+                prev = Some(c);
+                spaced = false;
+            }
+            continue;
+        }
+        if c.is_whitespace() {
+            spaced = true;
+            continue;
+        }
+        match c {
+            '#' if prev.is_none() || spaced => return false,
+            '"' | '\'' if matches!(prev, None | Some(':' | '-' | '[' | '{' | ',')) => {
+                quote = Some(c);
+            }
+            '&' | '*' => {
+                let node_start = match prev {
+                    None => true,
+                    Some(':') => spaced,
+                    Some('-') => spaced && list_item,
+                    Some('[' | '{' | ',') => true,
+                    _ => false,
+                };
+                if node_start {
+                    return true;
+                }
+            }
+            // A merge key `<<:` where a key starts.
+            '<' if matches!(prev, None | Some('-' | '{' | ','))
+                && line[i..]
+                    .strip_prefix("<<")
+                    .is_some_and(|r| r.trim_start().starts_with(':')) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        // Only a run of `- ` at the start of the line is a list indicator.
+        if c != '-' {
+            list_item = false;
+        }
+        prev = Some(c);
+        spaced = false;
+    }
+    false
 }
 
 /// Byte offset of the `{` of a one-line flow item `- {...}`.
@@ -2379,10 +2811,11 @@ pub fn compose(input: &ComposeInput) -> Result<(String, ComposeReport), String> 
         key: Some("rules".into()),
         lines,
     });
-    // sub_rules is empty unless subscription-rules is on.
-    report.inspect(&mut chunks, &sub_rules);
+    report.notes.extend(strip_dangling_rule_sets(&mut chunks));
     let body = join_chunks(&chunks);
     let body = crate::mihomo::normalize_subscription(&body, input.controller_addr);
+    // sub_rules is empty unless subscription-rules is on.
+    report.inspect(&body, !sub_rules.is_empty());
     Ok((format!("{GENERATED_MARK}\n{body}"), report))
 }
 
@@ -2409,6 +2842,12 @@ pub fn carry_runtime_state(old_base: &str, new_base: &str) -> String {
                 .iter()
                 .position(|c| c.key.as_deref() == Some("proxies"))
                 .unwrap_or(chunks.len());
+            let mut old_chunk = old_chunk;
+            // A source without `tun:` keeps the block the TUN switch wrote
+            // (`tun:\n  enable: true`); it gets the same default as a source's.
+            if block == "tun" {
+                default_tun_gso(&mut old_chunk);
+            }
             chunks.insert(pos, old_chunk);
             doc = join_chunks(&chunks);
         }
@@ -2433,9 +2872,15 @@ pub fn carry_runtime_state(old_base: &str, new_base: &str) -> String {
         "tcp-concurrent",
         "mode",
     ] {
+        // A value terc filled in is not the user's: the new base's value,
+        // explicit or filled in again, stands.
+        if terc_default(old_base, key) {
+            continue;
+        }
         if let Some(chunk) = find(key) {
             if let Some((_, value)) = chunk.lines.first().and_then(|l| l.split_once(':')) {
                 doc = crate::ops::set_top_scalar(&doc, key, &clean_scalar(value));
+                doc = drop_default_mark(&doc, key);
             }
         }
     }
@@ -3022,7 +3467,9 @@ mod tests {
             .ends_with("  2 httpupgrade node(s) rewritten to ws + v2ray-http-upgrade"));
         assert_eq!(
             report.details(),
-            "\n  - 未开启 udp / no udp: Up, Ws, Own\n  - httpupgrade → ws: Up\n  - httpupgrade → ws: Own"
+            format!(
+                "\n  - {NO_UDP}Up, Ws, Own\n  - httpupgrade → ws: Up\n  - httpupgrade → ws: Own"
+            )
         );
         // Node-list subscriptions are normalised too.
         let list = Converted {
@@ -3066,7 +3513,10 @@ mod tests {
             .collect();
         assert_eq!(removed.len(), 2, "{:?}", report.notes);
         // Airport rules are dropped, so the resolution note has nothing to say.
-        assert!(!report.notes.iter().any(|n| n.contains("subscription rule")));
+        assert!(!report
+            .checks
+            .iter()
+            .any(|n| n.contains("subscription rule")));
 
         let keep = PrivateRules {
             subscription_rules: true,
@@ -3079,11 +3529,12 @@ mod tests {
             .iter()
             .any(|n| n.contains("not found rule-set")));
         let rule = report
-            .notes
+            .checks
             .iter()
             .find(|n| n.contains("subscription rule"))
             .unwrap();
-        assert!(rule.contains("rule 5 (RULE-SET,cncidr,DIRECT)"), "{rule}");
+        // Counted in the final rules, after terc's own LAN rules.
+        assert!(rule.contains("(RULE-SET,cncidr,DIRECT)"), "{rule}");
     }
 
     #[test]
@@ -3091,7 +3542,7 @@ mod tests {
         let sub = convert_subscription(DNS_DOC).unwrap();
         let (_, report) =
             compose_profile(&input(Some(&sub), &[], &PrivateRules::default())).unwrap();
-        let notes = report.notes.join("\n");
+        let notes = report.checks.join("\n");
         assert!(
             notes.contains("dns.fallback dials foreign DNS DIRECT (tls://1.1.1.1)"),
             "{notes}"
@@ -3100,13 +3551,15 @@ mod tests {
         assert!(notes.contains("geosite:geolocation-!cn dials foreign DNS DIRECT (https://dns.google/dns-query, tls://8.8.8.8#DIRECT)"));
         assert!(!notes.contains("geosite:cn ") && !notes.contains("#Airport"));
         assert!(notes.contains("From subscription rule 5 (RULE-SET,cncidr,DIRECT)"));
-        assert_eq!(report.notes.len(), 4, "{notes}");
+        assert_eq!(report.checks.len(), 4, "{notes}");
+        // The source keeps its rule-providers, so nothing was removed.
+        assert_eq!(report.notes.len(), 0, "{:?}", report.notes);
         assert_eq!(report.no_udp, ["HK", "TW"]);
-        assert!(report.summary(true).contains("2 个节点未开启 udp"));
-        assert!(report.summary(false).contains("4 config note(s)"));
         assert!(report
-            .details()
-            .contains("\n  - 未开启 udp / no udp: HK, TW"));
+            .summary(true)
+            .contains("2 个节点未开 udp  4 条配置提示"));
+        assert!(report.summary(false).contains("4 config note(s)"));
+        assert!(report.details().contains(&format!("\n  - {NO_UDP}HK, TW")));
 
         let quiet = DNS_DOC.replace(
             "  enable: true\n",
@@ -3115,7 +3568,7 @@ mod tests {
         let sub = convert_subscription(&quiet).unwrap();
         let (_, report) =
             compose_profile(&input(Some(&sub), &[], &PrivateRules::default())).unwrap();
-        assert!(!report.notes.iter().any(|n| n.contains("foreign DNS")));
+        assert!(!report.checks.iter().any(|n| n.contains("foreign DNS")));
     }
 
     #[test]
@@ -3124,19 +3577,14 @@ mod tests {
             no_udp: vec!["HK".into(), "TW".into()],
             ..ComposeReport::default()
         };
-        let node = |name: &str, kind: &str, udp| crate::ops::ProviderNode {
-            name: name.into(),
-            kind: kind.into(),
-            udp,
-            delay: None,
-            provider: "p".into(),
-        };
-        report.apply_runtime_udp(&[
-            node("HK", "Shadowsocks", true),
-            node("P1", "Vmess", false),
-            node("P2", "Hysteria2", false),
-            node("P3", "Http", false),
-        ]);
+        report.apply_runtime_udp(&json!({"proxies": {
+            "HK": {"type": "Shadowsocks", "udp": true},
+            "P1": {"type": "Vmess", "udp": false, "provider-name": "p"},
+            "P2": {"type": "Hysteria2", "udp": false},
+            "P3": {"type": "Http", "udp": false},
+            "剩余流量：1 GB": {"type": "Shadowsocks", "udp": false},
+            "PROXY": {"type": "Selector", "udp": false}
+        }}));
         assert_eq!(report.no_udp, ["TW", "P1"]);
     }
 
@@ -3178,6 +3626,58 @@ mod tests {
             "OR,((DOMAIN,a.example),(IP-CIDR,192.0.2.0/24,no-resolve)),PROXY"
         ));
         assert!(!resolves("MATCH,PROXY"));
+    }
+
+    #[test]
+    fn dangling_references_go_from_flow_dns_any_case_and_the_sniffer() {
+        let doc = "dns: {enable: true, nameserver: [223.5.5.5], nameserver-policy: {'rule-set:cn': 223.5.5.5, geosite:cn: 119.29.29.29}, fake-ip-filter: ['+.lan', 'RULE-SET:private']}\nsniffer:\n  enable: true\n  skip-domain:\n    - 'rule-set:private'\n    - '+.push.apple.com'\n  force-domain: [Rule-Set:cn]\n  skip-dst-address: ['rule-set:kept']\nrule-providers: {kept: {type: http, behavior: ipcidr}}\n";
+        let mut chunks = split_chunks(doc);
+        let notes = strip_dangling_rule_sets(&mut chunks);
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert!(notes[0].contains("Removed rule-set:cn from dns.nameserver-policy"));
+        assert!(notes[1].contains("Removed RULE-SET:private from dns.fake-ip-filter"));
+        assert!(notes[2].contains("from sniffer.skip-domain"));
+        assert!(notes[3].contains("Removed Rule-Set:cn from sniffer.force-domain"));
+        assert_eq!(
+            join_chunks(&chunks),
+            "dns: {enable: true, nameserver: [223.5.5.5], nameserver-policy: {geosite:cn: 119.29.29.29}, fake-ip-filter: ['+.lan']}\nsniffer:\n  enable: true\n  skip-domain:\n    - '+.push.apple.com'\n  force-domain: []\n  skip-dst-address: ['rule-set:kept']\nrule-providers: {kept: {type: http, behavior: ipcidr}}\n"
+        );
+    }
+
+    #[test]
+    fn dns_checks_read_flow_blocks_and_all_foreign_server_lists() {
+        let notes = |dns: &str| dns_notes(&split_chunks(dns));
+        let flow = notes("dns: {enable: true, nameserver: [223.5.5.5], fallback: [\"https://8.8.8.8/dns-query\"]}\n");
+        assert_eq!(flow.len(), 1, "{flow:?}");
+        assert!(
+            flow[0].contains("dns.fallback dials foreign DNS DIRECT (https://8.8.8.8/dns-query)")
+        );
+        let foreign = notes("dns:\n  enable: true\n  nameserver:\n    - https://dns.google/dns-query\n    - tls://1.1.1.1\n  proxy-server-nameserver: [tls://8.8.8.8]\n");
+        assert_eq!(foreign.len(), 2, "{foreign:?}");
+        assert!(foreign[0].contains(
+            "dns.proxy-server-nameserver lists only foreign DNS dialed DIRECT (tls://8.8.8.8)"
+        ));
+        assert!(foreign[1].contains("dns.nameserver lists only foreign DNS dialed DIRECT (https://dns.google/dns-query, tls://1.1.1.1): from the mainland every lookup waits"));
+        // Without proxy-server-nameserver node hostnames use it as well.
+        let alone = notes("dns:\n  enable: true\n  nameserver: [https://dns.google/dns-query]\n");
+        assert!(
+            alone[0].contains("every lookup, node hostnames included, waits"),
+            "{alone:?}"
+        );
+        // One mainland server answers fast; through a proxy is not DIRECT.
+        assert!(notes("dns:\n  nameserver: [tls://1.1.1.1, 223.5.5.5]\n").is_empty());
+        assert!(notes("dns:\n  nameserver: ['tls://1.1.1.1#Airport']\n").is_empty());
+        // respect-rules routes the rest, but node hostnames still go DIRECT.
+        let rules = notes("dns:\n  respect-rules: true\n  nameserver: [https://dns.google/dns-query]\n  proxy-server-nameserver: [https://dns.google/dns-query]\n");
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert!(rules[0].starts_with("dns.proxy-server-nameserver"));
+        assert!(notes("dns: {enable: false, nameserver: [tls://1.1.1.1]}\n").is_empty());
+    }
+
+    #[test]
+    fn smux_nodes_and_info_entries_are_not_reported_without_udp() {
+        let doc = "proxies:\n  - {name: SM, type: vmess, server: a, port: 1, smux: {enabled: true}}\n  - {name: TCP, type: vmess, server: a, port: 1, smux: {enabled: true, only-tcp: true}}\n  - {\"name\":\"J\",\"type\":\"vless\",\"smux\":{\"enabled\":true}}\n  - name: B\n    type: trojan\n    smux:\n      enabled: true\n      protocol: h2mux\n  - name: Off\n    type: trojan\n    smux:\n      enabled: false\n  - {name: 剩余流量：100 GB, type: ss, server: a, port: 1}\n  - {name: Expire Date 2026-12-01, type: ss, server: a, port: 1}\n";
+        assert_eq!(missing_udp(&split_chunks(doc)), ["TCP", "Off"]);
     }
 
     #[test]
@@ -3224,7 +3724,7 @@ pub fn compose_profile_reserving(
         let global = chunks
             .iter()
             .rev()
-            .find(|c| c.key.as_deref() == Some("global-client-fingerprint"))
+            .find(|c| chunk_is(c, "global-client-fingerprint"))
             .and_then(|c| c.lines[0].split_once(':').map(|(_, v)| clean_scalar(v)));
         if let Some(c) = chunks
             .iter_mut()
@@ -3387,13 +3887,7 @@ pub fn compose_profile_reserving(
             ],
         });
     }
-    // The source's routing is kept here, as with subscription-rules on.
-    let sub_rules = chunks
-        .iter()
-        .rfind(|c| c.key.as_deref() == Some("rules"))
-        .map(clash_rule_items)
-        .unwrap_or_default();
-    report.inspect(&mut chunks, &sub_rules);
+    report.notes.extend(strip_dangling_rule_sets(&mut chunks));
     // A source's own geox-url, even a partial one, is left as it is.
     if !chunks.iter().any(|c| c.key.as_deref() == Some("geox-url")) {
         let pos = chunks
@@ -3405,6 +3899,9 @@ pub fn compose_profile_reserving(
     inject_safe_defaults(&mut chunks);
     let body = crate::mihomo::normalize_subscription(&join_chunks(&chunks), input.controller_addr);
     let body = crate::ops::set_top_scalar(&body, "secret", &json!(input.secret).to_string());
+    // The source's routing is kept here, as with subscription-rules on. A
+    // caller that changes routing or adds modules inspects its result again.
+    report.inspect(&body, true);
     Ok((format!("{GENERATED_MARK}\n{body}"), report))
 }
 
@@ -3926,7 +4423,14 @@ mod profile_tests {
     fn tcp_concurrent_is_added_once_and_never_overrides_the_source() {
         let yaml = build(Some(&convert_subscription(CLASH).unwrap()), &[]);
         assert_eq!(yaml.matches("tcp-concurrent:").count(), 1, "{yaml}");
-        assert!(yaml.contains("tcp-concurrent: true\n"));
+        assert!(yaml.contains("tcp-concurrent: true # terc default\n"));
+        // A JSON-style quoted key is the same key.
+        let quoted = CLASH.replace(
+            "mixed-port: 7897\n",
+            "mixed-port: 7897\n\"tcp-concurrent\": false\n",
+        );
+        let out = build(Some(&convert_subscription(&quoted).unwrap()), &[]);
+        assert_eq!(out.matches("tcp-concurrent").count(), 1, "{out}");
         let off = CLASH.replace(
             "mixed-port: 7897\n",
             "mixed-port: 7897\ntcp-concurrent: false\n",
@@ -3937,6 +4441,36 @@ mod profile_tests {
         // The template sets it itself.
         let yaml = build(None, &manual());
         assert_eq!(yaml.matches("tcp-concurrent: true").count(), 1, "{yaml}");
+        assert!(!yaml.contains("terc default"));
+    }
+
+    #[test]
+    fn a_filled_in_tcp_concurrent_yields_to_a_later_source_value() {
+        let filled = build(Some(&convert_subscription(CLASH).unwrap()), &[]);
+        let off = CLASH.replace(
+            "mixed-port: 7897\n",
+            "mixed-port: 7897\ntcp-concurrent: false\n",
+        );
+        let explicit = build(Some(&convert_subscription(&off).unwrap()), &[]);
+        // The airport adds `false` later: it wins over terc's own `true`.
+        let next = carry_runtime_state(&filled, &explicit);
+        assert!(next.contains("tcp-concurrent: false\n"), "{next}");
+        // Still nothing in the source: the filled-in value stays marked.
+        let again = carry_runtime_state(&filled, &filled);
+        assert!(again.contains("tcp-concurrent: true # terc default\n"));
+        // A user's switch is no default any more and is carried forward.
+        let user = drop_default_mark(
+            &crate::ops::set_top_scalar(&filled, "tcp-concurrent", "false"),
+            "tcp-concurrent",
+        );
+        assert!(user.contains("tcp-concurrent: false\n"), "{user}");
+        let next = carry_runtime_state(&user, &filled);
+        assert!(next.contains("tcp-concurrent: false\n"), "{next}");
+        let next = carry_runtime_state(
+            &user.replace("tcp-concurrent: false", "tcp-concurrent: true"),
+            &explicit,
+        );
+        assert!(next.contains("tcp-concurrent: true\n"), "{next}");
     }
 
     #[test]
@@ -4041,19 +4575,22 @@ mod profile_tests {
         // The fixture nodes set no udp, so that report line comes first.
         assert_eq!(
             report.details(),
-            "\n  - 未开启 udp / no udp: Reality, Tls, Trojan, Plain, Own, SS, Json\
-             \n  - client-fingerprint: Reality\n  - client-fingerprint: Json"
+            format!(
+                "\n  - {NO_UDP}Reality, Tls, Trojan, Plain, Own, SS, Json\
+                 \n  - client-fingerprint: Reality\n  - client-fingerprint: Json"
+            )
         );
 
-        // A known global value goes onto every TLS node without a valid one.
+        // A known global value goes onto every TLS node that sets none; an
+        // explicit `none` on a plain TLS node is the provider's choice.
         let global = src.replace(
             "proxies:\n",
             "global-client-fingerprint: random # old key\nproxies:\n",
         );
         let (yaml, report) = compose(&global);
-        assert_eq!(report.fingerprinted, ["Reality", "Tls", "Trojan", "Json"]);
+        assert_eq!(report.fingerprinted, ["Reality", "Trojan", "Json"]);
         assert!(
-            yaml.contains("    tls: true\n    client-fingerprint: \"random\"\n"),
+            yaml.contains("    tls: true\n    client-fingerprint: none\n"),
             "{yaml}"
         );
         assert!(yaml.contains(
@@ -4063,6 +4600,20 @@ mod profile_tests {
         assert!(yaml.contains("client-fingerprint: safari}"));
         assert!(yaml.contains("\"client-fingerprint\":\"random\""));
         assert_eq!(yaml.matches("client-fingerprint: ").count(), 5, "{yaml}");
+        // Reality cannot use `none` or an unknown value, whatever the source says.
+        let bad = src
+            .replace(
+                "    reality-opts:\n      public-key: fake\n",
+                "    reality-opts:\n      public-key: fake\n    client-fingerprint: none\n",
+            )
+            .replace(
+                "\"client-fingerprint\":\"\"",
+                "\"client-fingerprint\":\"chrome_auto\"",
+            );
+        let (yaml, report) = compose(&bad);
+        assert_eq!(report.fingerprinted, ["Reality", "Json"]);
+        assert!(yaml.contains("      public-key: fake\n    client-fingerprint: \"chrome\"\n"));
+        assert!(yaml.contains("    tls: true\n    client-fingerprint: none\n"));
 
         // An unknown global value is ignored like a missing one.
         let bogus = src.replace(
@@ -4073,6 +4624,93 @@ mod profile_tests {
         // The raw source is not rewritten.
         let sub = convert_subscription(&src).unwrap();
         assert!(!sub.clash_doc.unwrap().contains("\"chrome\""));
+    }
+
+    #[test]
+    fn the_tun_block_the_switch_wrote_gets_gso_too() {
+        // A source without `tun:` keeps the bare block `set_tun` persisted.
+        let old = "mixed-port: 7890\ntun:\n  enable: true\nproxies: []\n";
+        let out = carry_runtime_state(old, "mixed-port: 7890\nproxies: []\n");
+        let want = if cfg!(target_os = "linux") {
+            "tun:\n  gso: true\n  enable: true\n"
+        } else {
+            "tun:\n  enable: true\n"
+        };
+        assert!(out.contains(want), "{out}");
+        // The built-in TUN module carries it as well, Linux only.
+        let module = crate::ops::builtin_modules()
+            .into_iter()
+            .find(|m| m.id == "tun")
+            .unwrap();
+        assert_eq!(
+            module.body.contains("\n  gso: true\n"),
+            cfg!(target_os = "linux")
+        );
+        // The module merges into the base's tun block key by key.
+        let merged = crate::ops::apply_modules_with_switches(
+            "tun:\n  enable: false\n  stack: system\n",
+            &[module],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            merged.contains("  gso: true"),
+            cfg!(target_os = "linux"),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn anchor_check_ignores_names_with_ampersands_and_stars() {
+        for plain in [
+            "  - {name: HK & JP, type: vless, server: a.example}",
+            "  - {name: SG *2, type: vless}",
+            "    password: \"*abc &def\"",
+            "    password: a&b*c",
+            "    name: HK - *2",
+            "    path: /x # see &ref",
+        ] {
+            assert!(!line_uses_anchor(plain), "{plain}");
+        }
+        for anchored in [
+            "  - &node {name: A, type: vless}",
+            "    <<: *reality",
+            "  - {<<: *base, name: A}",
+            "  - {name: A, opts: *o}",
+            "    reality-opts: &r",
+            "  - *alias",
+        ] {
+            assert!(line_uses_anchor(anchored), "{anchored}");
+        }
+        let src = CLASH.replace(
+            "proxies:\n",
+            "proxies:\n  - {name: HK & JP, type: vless, server: 192.0.2.9, port: 443, uuid: 12345678-1234-1234-1234-123456789abc, tls: true, reality-opts: {public-key: k}}\n",
+        );
+        let sub = convert_subscription(&src).unwrap();
+        let (yaml, report) = compose_profile(&ComposeInput {
+            subscription: Some(&sub),
+            manual: &[],
+            rules: &PrivateRules::default(),
+            controller_addr: "127.0.0.1:9090",
+            secret: "",
+            test_url: "https://example.org",
+        })
+        .unwrap();
+        assert_eq!(report.fingerprinted, ["HK & JP"]);
+        assert!(yaml.contains("reality-opts: {public-key: k}, client-fingerprint: \"chrome\"}"));
+    }
+
+    #[test]
+    fn quoted_keys_are_seen_before_a_default_is_added() {
+        let src = CLASH.replace(
+            "proxy-groups:\n",
+            "proxy-groups:\n  - {name: Q, type: url-test, \"tolerance\": 10, proxies: [HK]}\n  - name: B\n    type: url-test\n    'tolerance': 20\n    proxies: [HK]\n",
+        );
+        let yaml = build(Some(&convert_subscription(&src).unwrap()), &[]);
+        assert!(!yaml.contains("tolerance: 50"), "{yaml}");
+        let tun = tun_source("tun:\n  enable: true\n  \"gso\": false\n");
+        let yaml = build(Some(&convert_subscription(&tun).unwrap()), &[]);
+        assert!(!yaml.contains("gso: true"), "{yaml}");
     }
 
     #[test]
@@ -4126,14 +4764,45 @@ mod profile_tests {
                 "proxy-groups:\n",
                 "proxy-groups:\n  - {name: Auto, type: url-test, proxies: [HK, R], url: https://example.org, interval: 300}\n",
             );
-        for source in [None, Some(CLASH), Some(surge), Some(defaults.as_str())] {
+        // A flow-style dns block, carried over a previous file as every
+        // regeneration does, and stripped of a dangling rule-set name.
+        let flow_dns = CLASH.replace(
+            "proxies:\n",
+            "dns: {enable: true, enhanced-mode: fake-ip, nameserver: [223.5.5.5], nameserver-policy: {'rule-set:gone': 223.5.5.5}}\nsniffer: {enable: true, skip-domain: ['rule-set:gone']}\nproxies:\n",
+        );
+        // JSON-style quoted keys must not get a second, duplicate key.
+        let quoted = CLASH
+            .replace(
+                "mixed-port: 7897\n",
+                "mixed-port: 7897\n\"tcp-concurrent\": false\n",
+            )
+            .replace(
+                "proxy-groups:\n",
+                "proxy-groups:\n  - {name: Q, type: url-test, \"tolerance\": 10, proxies: [HK], url: https://example.org}\n",
+            );
+        for source in [
+            None,
+            Some(CLASH),
+            Some(surge),
+            Some(defaults.as_str()),
+            Some(flow_dns.as_str()),
+            Some(quoted.as_str()),
+        ] {
             let converted = source.map(|s| convert_subscription(s).unwrap());
-            let yaml = build(converted.as_ref(), &manual());
+            let mut yaml = build(converted.as_ref(), &manual());
             if source == Some(defaults.as_str()) {
                 assert!(
                     yaml.contains("client-fingerprint: \"chrome\"}")
                         && yaml.contains("tolerance: 50}")
                 );
+            }
+            if source == Some(flow_dns.as_str()) {
+                yaml = carry_runtime_state(&yaml.replace("enable: true", "enable: false"), &yaml);
+                assert!(
+                    yaml.contains("dns: {enable: false, enhanced-mode"),
+                    "{yaml}"
+                );
+                assert!(!yaml.contains("rule-set:"), "{yaml}");
             }
             crate::mihomo::validate_listener_ports(&yaml).unwrap();
             let path = dir.join("config.yaml");

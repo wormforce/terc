@@ -181,8 +181,24 @@ pub fn convert_subscription(raw: &str) -> Result<Converted, String> {
     }
 }
 
-/// Parse one user-pasted node: a Surge `Name = type, ...` line or a URI.
+/// Parse one user-pasted node: a Surge `Name = type, ...` line or a URI. A
+/// value the conversion would drop (a subscription only notes it) is an
+/// error here, so the user can correct the line they just typed.
 pub fn parse_node_line(line: &str) -> Result<Value, String> {
+    let mut dropped = Vec::new();
+    let node = parse_node_line_noting(line, &mut dropped)?;
+    match dropped.first() {
+        Some(what) => Err(format!(
+            "{what} 无效：需要秒数 N 或范围 N-M / invalid {}: use seconds N or a range N-M",
+            what.rsplit(": ").next().unwrap_or(what)
+        )),
+        None => Ok(node),
+    }
+}
+
+/// `parse_node_line`, keeping the node and adding a note for each value
+/// dropped from it.
+pub fn parse_node_line_noting(line: &str, dropped: &mut Vec<String>) -> Result<Value, String> {
     let line = line.trim().trim_start_matches('\u{feff}');
     if line.starts_with('{') {
         let mut value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
@@ -216,13 +232,7 @@ pub fn parse_node_line(line: &str) -> Result<Value, String> {
         return Err("需要 Surge 节点行或节点链接 / expected a Surge line or URI".into());
     };
     let mut alias = HashMap::new();
-    match parse_surge_proxy(
-        name.trim(),
-        rest,
-        &mut alias,
-        &SurgeCtx::default(),
-        &mut Vec::new(),
-    )? {
+    match parse_surge_proxy(name.trim(), rest, &mut alias, &SurgeCtx::default(), dropped)? {
         Some(node) => Ok(node),
         None => Err("DIRECT / REJECT 不是节点 / not a node".into()),
     }
@@ -443,7 +453,9 @@ fn convert_surge(text: &str) -> Converted {
             obj.insert("proxies".into(), json!(members));
         }
         if group.kind != "select" {
-            if let Some(url) = group.params.get("url").or(proxy_test_url.as_ref()) {
+            // An empty `url=` is no URL, so the [General] fallback applies.
+            let own = group.params.get("url").filter(|u| !u.trim().is_empty());
+            if let Some(url) = own.or(proxy_test_url.as_ref()) {
                 obj.insert("url".into(), json!(url));
             }
             if let Some(v) = group
@@ -486,15 +498,25 @@ fn convert_surge(text: &str) -> Converted {
     out
 }
 
-/// `http://<host>/generate_204` becomes HTTPS: every common generate_204 host
-/// serves it, and providers cannot intercept the test there. Other URLs are
-/// returned unchanged.
+/// Public generate_204 endpoints known to serve the same check over HTTPS.
+const HTTPS_204_HOSTS: &[&str] = &[
+    "www.gstatic.com",
+    "connectivitycheck.gstatic.com",
+    "www.google.com",
+    "cp.cloudflare.com",
+];
+
+/// `http://<host>/generate_204` becomes HTTPS for the public hosts in
+/// `HTTPS_204_HOSTS`, where providers cannot intercept the test. Any other
+/// host, or an explicit port, may serve HTTP only, so it is kept as written.
 fn https_generate_204(url: &str) -> String {
     match url.get(..7) {
         Some(scheme) if scheme.eq_ignore_ascii_case("http://") => {
             let rest = &url[7..];
             match rest.split_once('/') {
-                Some((host, "generate_204")) if !host.is_empty() => {
+                Some((host, "generate_204"))
+                    if HTTPS_204_HOSTS.iter().any(|h| h.eq_ignore_ascii_case(host)) =>
+                {
                     format!("https://{host}/generate_204")
                 }
                 _ => url.to_string(),
@@ -924,7 +946,8 @@ fn parse_surge_proxy(
                 let mut headers = Map::new();
                 for pair in h.split('|') {
                     if let Some((k, v)) = pair.split_once(':') {
-                        headers.insert(k.trim().to_string(), json!(v.trim()));
+                        // Surge allows `Host:"a.example"`; the quotes are not part of it.
+                        headers.insert(unquote(k), json!(unquote(v)));
                     }
                 }
                 if !headers.is_empty() {
@@ -1133,6 +1156,7 @@ fn parse_surge_proxy(
             // Surge has no key for it; an empty value leaves quic-go on NewReno.
             let cc = kv
                 .get("congestion-controller")
+                .filter(|v| !v.trim().is_empty())
                 .cloned()
                 .unwrap_or_else(|| TUIC_CONGESTION.into());
             node.insert("congestion-controller".into(), json!(cc));
@@ -2825,9 +2849,15 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
         );
         let surge = convert_subscription(
             "[Proxy]\nT4 = tuic, 192.0.2.5, 443, token=fake\n\
-             TC = tuic-v5, 192.0.2.5, 443, uuid=u, password=fake, congestion-controller=cubic\n",
+             TC = tuic-v5, 192.0.2.5, 443, uuid=u, password=fake, congestion-controller=cubic\n\
+             TE = tuic-v5, 192.0.2.5, 443, uuid=u, password=fake, congestion-controller=\n",
         )
         .unwrap();
+        // An empty value is no choice; Mihomo would keep NewReno for it.
+        assert_eq!(
+            by_name(&surge.proxies, "TE")["congestion-controller"],
+            "bbr"
+        );
         assert_eq!(
             by_name(&surge.proxies, "T4")["congestion-controller"],
             "bbr"
@@ -2890,12 +2920,27 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
             assert!(b.get("hop-interval").is_none(), "{value}");
             assert_eq!(out.skipped, ["Proxy B: port-hopping-interval"], "{value}");
         }
-        // The single-node paste path drops it too.
-        let node = parse_node_line(
-            "B = hysteria2, 192.0.2.4, 8443, password=fake, port-hopping=5000-6000, port-hopping-interval=30s",
+        // A pasted node says so instead of dropping it silently; migration of
+        // stored lines keeps the node and notes the value.
+        let line = "B = hysteria2, 192.0.2.4, 8443, password=fake, port-hopping=5000-6000, port-hopping-interval=30s";
+        let err = parse_node_line(line).unwrap_err();
+        assert!(err.contains("invalid port-hopping-interval"), "{err}");
+        let mut dropped = Vec::new();
+        let node = parse_node_line_noting(line, &mut dropped).unwrap();
+        assert!(node.get("hop-interval").is_none());
+        assert_eq!(dropped, ["Proxy B: port-hopping-interval"]);
+    }
+
+    #[test]
+    fn surge_ws_header_values_lose_their_quotes() {
+        let out = convert_subscription(
+            "[Proxy]\nW = vmess, 192.0.2.6, 443, username=12345678-1234-1234-1234-123456789abc, ws=true, ws-path=/ws, ws-headers=Host:\"sg.example.com\"|User-Agent:\"Mozilla/5.0\"|X:plain\n",
         )
         .unwrap();
-        assert!(node.get("hop-interval").is_none());
+        let headers = &by_name(&out.proxies, "W")["ws-opts"]["headers"];
+        assert_eq!(headers["Host"], "sg.example.com");
+        assert_eq!(headers["User-Agent"], "Mozilla/5.0");
+        assert_eq!(headers["X"], "plain");
     }
 
     #[test]
@@ -2926,6 +2971,30 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
         );
         let none = profile("internet-test-url = http://direct.example/");
         assert!(by_name(&none.groups, "Auto").get("url").is_none());
+        // An HTTP-only probe or an explicit port keeps its scheme: TLS there
+        // would time out every health check.
+        for kept in [
+            "http://probe.airport.example/generate_204",
+            "http://www.gstatic.com:80/generate_204",
+        ] {
+            let out = profile(&format!("proxy-test-url = {kept}"));
+            assert_eq!(by_name(&out.groups, "Auto")["url"], kept);
+        }
+        let cf = profile("proxy-test-url = http://CP.cloudflare.com/generate_204");
+        assert_eq!(
+            by_name(&cf.groups, "Auto")["url"],
+            "https://CP.cloudflare.com/generate_204"
+        );
+        // An empty url= falls back to proxy-test-url like a missing one.
+        let empty = convert_subscription(
+            "[General]\nproxy-test-url = http://cp.cloudflare.com/generate_204\n\
+             [Proxy]\nA = socks5, 192.0.2.1, 1080\n[Proxy Group]\nAuto = url-test, A, url=\n",
+        )
+        .unwrap();
+        assert_eq!(
+            by_name(&empty.groups, "Auto")["url"],
+            "https://cp.cloudflare.com/generate_204"
+        );
         // The shared fixture sets a per-group url and no proxy-test-url.
         let fixture = convert_subscription(SURGE).unwrap();
         assert!(by_name(&fixture.groups, "Fail").get("url").is_none());
