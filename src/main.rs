@@ -52,6 +52,8 @@ use ui::{draw, theme, Theme, ThemeId, WaveRenderer, THEMES};
 const REFRESH_RATES: &[u16] = &[15, 30, 60, 120];
 const ROUTING_MODES: &[&str] = &["Rule", "Global", "Direct"];
 const HISTORY_LEN: usize = 256;
+/// `Config::seen_notices` entry for the mainland `dns-fakeip` module body.
+const DNS_MODULE_NOTICE: &str = "dns-fakeip-mainland";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -177,6 +179,9 @@ pub struct Config {
     pub controller: ControllerConfig,
     #[serde(default)]
     pub enabled_modules: Vec<String>,
+    /// One-time notices already shown, such as `DNS_MODULE_NOTICE`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen_notices: Vec<String>,
     #[serde(default, skip_serializing)]
     pub active_profile: String,
     #[serde(default, skip_serializing)]
@@ -711,6 +716,33 @@ impl App {
         self.update_subscription();
     }
 
+    /// The built-in `dns-fakeip` module switched from foreign DoH with a
+    /// fallback on 0.0.0.0 to mainland DoH on loopback. Users who had it on
+    /// are told once; the new body lands with the next generated config.
+    /// True when the preferences need saving.
+    fn note_dns_module_change(&mut self) -> bool {
+        if self
+            .config
+            .seen_notices
+            .iter()
+            .any(|n| n == DNS_MODULE_NOTICE)
+        {
+            return false;
+        }
+        self.config.seen_notices.push(DNS_MODULE_NOTICE.into());
+        if self
+            .config
+            .enabled_modules
+            .iter()
+            .any(|id| id == "dns-fakeip")
+        {
+            let text = self.t("dns_module_notice");
+            self.logs.push(("warning".into(), text.into()));
+            self.set_status(text, false);
+        }
+        true
+    }
+
     pub fn set_status(&mut self, text: &str, is_error: bool) {
         self.toast_started = Some(Instant::now());
         self.status_message = text.to_string();
@@ -742,7 +774,7 @@ impl App {
         }
         self.clear_status();
         self.core_downloading = true;
-        download_managed_core_async(self.tx.clone());
+        download_managed_core_async(self.tx.clone(), mihomo::core_download_proxy(&self.snapshot));
     }
 
     fn finish_setup_fetch(&mut self, ok: bool) {
@@ -1891,9 +1923,30 @@ impl App {
             (Lang::Zh, "mod_dns_fakeip") => "Fake-IP DNS",
             (Lang::En, "mod_dns_fakeip") => "Fake-IP DNS",
             (Lang::Ja, "mod_dns_fakeip") => "Fake-IP DNS",
-            (Lang::Zh, "mod_dns_fakeip_desc") => "开启 DNS，使用 Fake-IP 与 DoH",
-            (Lang::En, "mod_dns_fakeip_desc") => "Enable DNS with Fake-IP and DoH",
-            (Lang::Ja, "mod_dns_fakeip_desc") => "Fake-IP と DoH で DNS を有効化",
+            (Lang::Zh, "mod_dns_fakeip_desc") => "开启 DNS，Fake-IP 与国内 DoH",
+            (Lang::En, "mod_dns_fakeip_desc") => "Enable DNS with Fake-IP and mainland DoH",
+            (Lang::Ja, "mod_dns_fakeip_desc") => "Fake-IP と国内 DoH で DNS を有効化",
+            (Lang::Zh, "mod_dns_fakeip_global") => "Fake-IP DNS（境外）",
+            (Lang::En, "mod_dns_fakeip_global") => "Fake-IP DNS (global)",
+            (Lang::Ja, "mod_dns_fakeip_global") => "Fake-IP DNS（海外）",
+            (Lang::Zh, "mod_dns_fakeip_global_desc") => {
+                "Google / Cloudflare DoH 按规则连接，节点域名用国内 DoH"
+            }
+            (Lang::En, "mod_dns_fakeip_global_desc") => {
+                "Google / Cloudflare DoH via the rules; nodes resolved by mainland DoH"
+            }
+            (Lang::Ja, "mod_dns_fakeip_global_desc") => {
+                "Google / Cloudflare DoH をルール経由で使用、ノード名は国内 DoH"
+            }
+            (Lang::Zh, "dns_module_notice") => {
+                "「Fake-IP DNS」片段已改用国内 DoH（doh.pub / alidns），只监听 127.0.0.1:1053，不再带 fallback，下次生成配置时生效。需要境外 DoH 请改开「Fake-IP DNS（境外）」"
+            }
+            (Lang::En, "dns_module_notice") => {
+                "The Fake-IP DNS snippet now uses mainland DoH (doh.pub / alidns), listens on 127.0.0.1:1053 only and has no fallback, from the next generated config. For foreign DoH, enable Fake-IP DNS (global) instead"
+            }
+            (Lang::Ja, "dns_module_notice") => {
+                "Fake-IP DNS スニペットは国内 DoH（doh.pub / alidns）に変わり、127.0.0.1:1053 のみで待ち受け、fallback もなくなりました。次の設定生成から有効です。海外 DoH は Fake-IP DNS（海外）を有効にしてください"
+            }
             (Lang::Zh, "mod_find_process") => "进程名",
             (Lang::En, "mod_find_process") => "Process name",
             (Lang::Ja, "mod_find_process") => "プロセス名",
@@ -2002,6 +2055,9 @@ fn main() -> io::Result<()> {
     // Migration problems are shown in the UI; legacy files stay untouched.
     let migration = storage::migrate(&mut config);
     let mut app = App::new(config);
+    if app.note_dns_module_change() {
+        app.save_preferences();
+    }
     match migration {
         Ok(notes) if !notes.is_empty() => app.set_status(
             &format!(
@@ -2952,6 +3008,34 @@ mod tests {
 
     fn press(app: &mut App, key: KeyCode) -> bool {
         handle_key(app, KeyEvent::new(key, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn dns_module_change_is_announced_once_to_users_who_had_it_on() {
+        let mut app = offline_app();
+        app.config.enabled_modules = vec!["tun".into(), "dns-fakeip".into()];
+        assert!(app.note_dns_module_change());
+        assert_eq!(app.status_message, app.t("dns_module_notice"));
+        assert!(app.status_message.contains("127.0.0.1:1053"));
+        assert!(app.logs.iter().any(|(_, line)| line.contains("doh.pub")));
+        // Saved, so the next start stays quiet.
+        let saved: Config =
+            serde_json::from_str(&serde_json::to_string(&app.config).unwrap()).unwrap();
+        let mut again = App::from_snapshot(saved, CoreSnapshot::default());
+        assert!(!again.note_dns_module_change());
+        assert!(again.status_message.is_empty());
+
+        // Without the module: marked seen, nothing shown, so enabling the new
+        // body later never triggers it.
+        let mut fresh = offline_app();
+        assert!(fresh.note_dns_module_change());
+        assert!(fresh.status_message.is_empty());
+        fresh.config.enabled_modules = vec!["dns-fakeip".into()];
+        assert!(!fresh.note_dns_module_change());
+        assert!(serde_json::to_string(&Config::default())
+            .unwrap()
+            .find("seen_notices")
+            .is_none());
     }
 
     fn render_text(app: &mut App, width: u16, height: u16) -> String {

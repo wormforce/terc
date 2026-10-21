@@ -251,8 +251,8 @@ impl App {
             "内核日志级别",
             "Core log level",
             self.core_setting("log-level", "info"),
-            "默认 info。遇到问题可临时切换 debug。",
-            "Use info normally; switch to debug while investigating issues.",
+            "内核自己写出的日志（terc 启动时为 terc-core.log）。新生成的配置默认 warning；日志页始终按 info 订阅，不受影响。排查时可临时切换 debug。",
+            "What the core writes itself (terc-core.log when terc starts it). New configs use warning; the Logs view always subscribes at info. Switch to debug while investigating.",
         );
         add(
             TestUrl,

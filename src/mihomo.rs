@@ -2132,23 +2132,38 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     Ok("Stopped managed Mihomo core".into())
 }
 
+/// Airport CDNs often gzip and now and then answer 5xx or 429, which curl
+/// retries. Each attempt is capped at 30 s and no retry starts after 40 s,
+/// so the worst case stays near the former single 60 s attempt; a link that
+/// stalls below 1 KB/s for 15 s fails instead of running the full time.
+const SUBSCRIPTION_CURL: &[&str] = &[
+    "-fsSL",
+    "--compressed",
+    "--connect-timeout",
+    "10",
+    "--max-time",
+    "30",
+    "--retry",
+    "2",
+    "--retry-delay",
+    "1",
+    "--retry-max-time",
+    "40",
+    "--speed-limit",
+    "1024",
+    "--speed-time",
+    "15",
+    "-A",
+    "clash.meta/1.19.32",
+];
+
 pub fn download_subscription(cfg: &ControllerConfig) -> Result<String, String> {
     if cfg.subscription_url.trim().is_empty() {
         return Err("Subscription URL is empty".into());
     }
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "60",
-            "-A",
-            "clash.meta/1.19.32",
-            "--url",
-            cfg.subscription_url.trim(),
-        ])
-        .stdin(Stdio::null())
+    let output = curl()
+        .args(SUBSCRIPTION_CURL)
+        .args(["--url", cfg.subscription_url.trim()])
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -2719,12 +2734,15 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     written
 }
 
+/// The plain `-amd64` asset is the GOAMD64=v3 build, which will not run on
+/// CPUs or VMs without AVX2; `-amd64-v1` is the baseline build under the
+/// name upstream keeps (`-compatible` is marked for removal in build.yml).
 pub fn mihomo_asset_id_for(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Some("darwin-arm64"),
-        ("macos", "x86_64") => Some("darwin-amd64"),
+        ("macos", "x86_64") => Some("darwin-amd64-v1"),
         ("linux", "aarch64") => Some("linux-arm64"),
-        ("linux", "x86_64") => Some("linux-amd64"),
+        ("linux", "x86_64") => Some("linux-amd64-v1"),
         _ => None,
     }
 }
@@ -2740,64 +2758,252 @@ pub fn mihomo_asset_label() -> String {
     }
 }
 
-pub fn mihomo_release_grep(asset: &str) -> String {
-    format!(r#"https://[^"]*mihomo-{asset}-v[^"]*\.gz"#)
+const MIHOMO_RELEASES: &str = "https://github.com/MetaCubeX/mihomo/releases";
+
+/// The system curl. Tests talk to loopback mock servers, which a proxy from
+/// the environment must not capture.
+fn curl() -> Command {
+    let mut cmd = Command::new("curl");
+    cmd.stdin(Stdio::null());
+    if cfg!(test) {
+        for key in [
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+        ] {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
 }
 
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r#"'\''"#))
+fn curl_error(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+    match last {
+        Some(line) => brief(line),
+        None => format!("curl exited with {}", output.status),
+    }
 }
 
-pub fn managed_core_script(asset: &str, gz: &str, bin: &str) -> String {
-    let pattern = mihomo_release_grep(asset);
-    format!(
-        r#"URL=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep -o '{pattern}' | head -n 1); if [ -n "$URL" ]; then curl -fsSL "$URL" -o {gz} && gunzip -f {gz} && chmod +x {bin}; else exit 1; fi"#,
-        pattern = pattern,
-        gz = shell_quote(gz),
-        bin = shell_quote(bin),
-    )
+/// The running core's own listener, for fetching a core update through the
+/// user's node. Not with TUN on: curl is captured by it already. Only this
+/// curl uses it; the system proxy is never touched.
+pub fn core_download_proxy(snapshot: &CoreSnapshot) -> Option<u16> {
+    if !snapshot.running || snapshot.tun_enabled {
+        return None;
+    }
+    [snapshot.mixed_port, snapshot.http_port]
+        .into_iter()
+        .find(|port| *port > 0)
 }
 
-fn install_managed_core(tx: &Sender<BackendEvent>) -> Result<String, String> {
+/// Arguments for one attempt at the release asset. No throughput floor: a
+/// 10-15 KB/s link must still finish. A stall of 60 s below 1 KB/s ends the
+/// attempt, and `-C -` lets the next one resume the partial file.
+pub fn core_curl_args(url: &str, out: &Path, proxy: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-fsSL",
+        "--connect-timeout",
+        "10",
+        "--speed-limit",
+        "1024",
+        "--speed-time",
+        "60",
+        "-C",
+        "-",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if let Some(proxy) = proxy {
+        args.extend(proxy_args(proxy).map(str::to_string));
+    }
+    args.extend(["-o".to_string(), out.display().to_string(), url.to_string()]);
+    args
+}
+
+/// An empty `--noproxy` keeps a NO_PROXY from the environment from quietly
+/// turning the explicit route into a direct one.
+fn proxy_args(proxy: &str) -> [&str; 4] {
+    ["-x", proxy, "--noproxy", ""]
+}
+
+/// Routes to try in order: the core's local listener when given, then direct.
+fn core_routes(proxy_port: Option<u16>) -> Vec<Option<String>> {
+    proxy_port
+        .map(|port| Some(format!("http://127.0.0.1:{port}")))
+        .into_iter()
+        .chain([None])
+        .collect()
+}
+
+/// The latest tag from version.txt, which every release carries, so the
+/// asset name is exact and the 60-per-hour api.github.com limit is avoided.
+/// Also returns the routes left from the first one that worked.
+fn latest_core_version(
+    base: &str,
+    routes: Vec<Option<String>>,
+) -> Result<(String, Vec<Option<String>>), String> {
+    let url = format!("{base}/latest/download/version.txt");
+    let mut last = String::new();
+    for (i, route) in routes.iter().enumerate() {
+        let mut cmd = curl();
+        cmd.args(["-fsSL", "--connect-timeout", "10", "--max-time", "30"]);
+        if let Some(proxy) = route {
+            cmd.args(proxy_args(proxy));
+        }
+        let output = cmd.arg(&url).output().map_err(|e| format!("curl: {e}"))?;
+        if !output.status.success() {
+            last = curl_error(&output);
+            continue;
+        }
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let valid = version.starts_with('v')
+            && version.len() <= 32
+            && version[1..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+        if !valid {
+            last = format!("unexpected version.txt: {}", brief(&version));
+            continue;
+        }
+        return Ok((version, routes[i..].to_vec()));
+    }
+    Err(last)
+}
+
+/// Download `url` to `part`, resuming across attempts: two through the core,
+/// then three direct.
+fn fetch_core_asset(
+    url: &str,
+    part: &Path,
+    routes: &[Option<String>],
+    tx: &Sender<BackendEvent>,
+) -> Result<(), String> {
+    let pause = Duration::from_secs(if cfg!(test) { 0 } else { 2 });
+    let mut last = String::new();
+    for (n, route) in routes.iter().enumerate() {
+        if n > 0 {
+            let _ = tx.send(BackendEvent::StatusMessage {
+                text: format!("Core proxy failed ({last}); downloading directly..."),
+                is_error: false,
+            });
+        }
+        for attempt in 0..if route.is_some() { 2 } else { 3 } {
+            if attempt > 0 {
+                thread::sleep(pause);
+            }
+            let output = curl()
+                .args(core_curl_args(url, part, route.as_deref()))
+                .output()
+                .map_err(|e| format!("curl: {e}"))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            last = curl_error(&output);
+            // 416: the part is already whole (an earlier run stopped before
+            // unpacking it); 33: the server cannot resume. Start over.
+            let code = output.status.code();
+            if (code == Some(22) && last.contains("error: 416")) || code == Some(33) {
+                let _ = fs::remove_file(part);
+            }
+        }
+    }
+    Err(last)
+}
+
+fn install_core_from(
+    base: &str,
+    asset: &str,
+    core_dir: &Path,
+    proxy_port: Option<u16>,
+    tx: &Sender<BackendEvent>,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(core_dir)
+        .map_err(|err| format!("Cannot create {}: {err}", core_dir.display()))?;
+    let _ = tx.send(BackendEvent::StatusMessage {
+        text: format!("Checking latest mihomo-{asset} release..."),
+        is_error: false,
+    });
+    let (version, routes) = latest_core_version(base, core_routes(proxy_port))
+        .map_err(|err| format!("Cannot read the latest mihomo version: {err}"))?;
+    let name = format!("mihomo-{asset}-{version}.gz");
+    let part = core_dir.join(format!("{name}.part"));
+    // Partial files of other versions, and the old script's mihomo.gz.
+    if let Ok(entries) = fs::read_dir(core_dir) {
+        for entry in entries.flatten() {
+            let file = entry.file_name().to_string_lossy().to_string();
+            let stale = file.ends_with(".gz.part") || file == "mihomo.gz";
+            if stale && entry.path() != part {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let via = match routes.first() {
+        Some(Some(proxy)) => format!(" via {}", proxy.trim_start_matches("http://")),
+        _ => String::new(),
+    };
+    let _ = tx.send(BackendEvent::StatusMessage {
+        text: format!("Downloading {name}{via}..."),
+        is_error: false,
+    });
+    let url = format!("{base}/download/{version}/{name}");
+    fetch_core_asset(&url, &part, &routes, tx)
+        .map_err(|err| format!("Failed to download {name}: {err}"))?;
+    let bin = core_dir.join("mihomo");
+    let fresh = core_dir.join("mihomo.new");
+    let unpacked = fs::File::create(&fresh)
+        .and_then(|file| {
+            Command::new("gunzip")
+                .arg("-c")
+                .arg(&part)
+                .stdin(Stdio::null())
+                .stdout(file)
+                .stderr(Stdio::piped())
+                .output()
+        })
+        .map_err(|err| format!("gunzip: {err}"))?;
+    if !unpacked.status.success() {
+        let _ = fs::remove_file(&fresh);
+        let _ = fs::remove_file(&part);
+        return Err(format!(
+            "Downloaded {name} is damaged ({}); press Ctrl+D to fetch it again",
+            brief(&String::from_utf8_lossy(&unpacked.stderr))
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fresh, fs::Permissions::from_mode(0o755))
+            .map_err(|err| format!("chmod {}: {err}", fresh.display()))?;
+    }
+    fs::rename(&fresh, &bin).map_err(|err| format!("Cannot replace {}: {err}", bin.display()))?;
+    let _ = fs::remove_file(&part);
+    Ok(bin)
+}
+
+fn install_managed_core(
+    tx: &Sender<BackendEvent>,
+    proxy_port: Option<u16>,
+) -> Result<String, String> {
     let asset = mihomo_asset_id().ok_or_else(|| {
         "No mihomo build for this OS/CPU (darwin-arm64, darwin-amd64, linux-arm64, linux-amd64)"
             .to_string()
     })?;
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
     let core_dir = PathBuf::from(home).join(".config/terc/core");
-    fs::create_dir_all(&core_dir)
-        .map_err(|err| format!("Cannot create {}: {err}", core_dir.display()))?;
-    let bin_path = core_dir.join("mihomo");
-    let gz_path = core_dir.join("mihomo.gz");
-    let _ = tx.send(BackendEvent::StatusMessage {
-        text: format!("Checking latest mihomo-{asset} release..."),
-        is_error: false,
-    });
-    let script = managed_core_script(
-        asset,
-        &gz_path.display().to_string(),
-        &bin_path.display().to_string(),
-    );
-    let ok = matches!(
-        Command::new("sh")
-            .arg("-c")
-            .arg(&script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status(),
-        Ok(status) if status.success()
-    );
-    if ok {
-        Ok(bin_path.display().to_string())
-    } else {
-        Err(format!("Failed to download mihomo-{asset} from GitHub"))
-    }
+    install_core_from(MIHOMO_RELEASES, asset, &core_dir, proxy_port, tx)
+        .map(|bin| bin.display().to_string())
 }
 
-pub fn download_managed_core_async(tx: Sender<BackendEvent>) {
+/// `proxy_port` comes from `core_download_proxy`.
+pub fn download_managed_core_async(tx: Sender<BackendEvent>, proxy_port: Option<u16>) {
     thread::spawn(move || {
-        let (text, ok) = match install_managed_core(&tx) {
+        let (text, ok) = match install_managed_core(&tx, proxy_port) {
             Ok(path) => (format!("Managed core installed to {path}"), true),
             Err(err) => (err, false),
         };
@@ -4431,20 +4637,68 @@ mod tests {
             mihomo_asset_id_for("macos", "aarch64"),
             Some("darwin-arm64")
         );
-        assert_eq!(mihomo_asset_id_for("macos", "x86_64"), Some("darwin-amd64"));
+        // The baseline amd64 build, never the AVX2-only plain `-amd64`.
+        assert_eq!(
+            mihomo_asset_id_for("macos", "x86_64"),
+            Some("darwin-amd64-v1")
+        );
         assert_eq!(mihomo_asset_id_for("linux", "aarch64"), Some("linux-arm64"));
-        assert_eq!(mihomo_asset_id_for("linux", "x86_64"), Some("linux-amd64"));
+        assert_eq!(
+            mihomo_asset_id_for("linux", "x86_64"),
+            Some("linux-amd64-v1")
+        );
         assert_eq!(mihomo_asset_id_for("windows", "x86_64"), None);
         assert_eq!(mihomo_asset_id_for("linux", "arm"), None);
     }
 
     #[test]
-    fn managed_core_script_selects_matching_asset() {
-        let script = managed_core_script("linux-amd64", "/tmp/terc/mihomo.gz", "/tmp/terc/mihomo");
-        assert!(script.contains(r#"mihomo-linux-amd64-v[^"]*\.gz"#));
-        assert!(!script.contains("darwin-arm64"));
-        assert!(!script.contains("networksetup"));
-        assert!(script.contains("'/tmp/terc/mihomo'"));
+    fn core_download_resumes_stalls_and_never_caps_total_time() {
+        let out = Path::new("/tmp/terc/mihomo.gz.part");
+        let direct = core_curl_args("https://example.org/m.gz", out, None);
+        let joined = direct.join(" ");
+        assert!(joined.contains("--speed-limit 1024 --speed-time 60"));
+        assert!(joined.contains("-C -"));
+        assert!(joined.ends_with("-o /tmp/terc/mihomo.gz.part https://example.org/m.gz"));
+        // A slow link must be able to finish; curl's own --retry restarts at 0.
+        assert!(!joined.contains("--max-time") && !joined.contains("--retry"));
+        assert!(!direct.iter().any(|a| a == "-x"));
+        let proxied = core_curl_args(
+            "https://example.org/m.gz",
+            out,
+            Some("http://127.0.0.1:7890"),
+        );
+        assert!(proxied
+            .join(" ")
+            .contains("-x http://127.0.0.1:7890 --noproxy  -o"));
+        for arg in direct.iter().chain(&proxied) {
+            assert!(!arg.contains("networksetup") && !arg.contains("gsettings"));
+        }
+    }
+
+    #[test]
+    fn core_download_uses_the_core_listener_only_without_tun() {
+        let mut snapshot = CoreSnapshot {
+            running: true,
+            mixed_port: 7890,
+            http_port: 7891,
+            ..CoreSnapshot::default()
+        };
+        assert_eq!(core_download_proxy(&snapshot), Some(7890));
+        snapshot.mixed_port = 0;
+        assert_eq!(core_download_proxy(&snapshot), Some(7891));
+        snapshot.tun_enabled = true;
+        assert_eq!(core_download_proxy(&snapshot), None);
+        snapshot.tun_enabled = false;
+        snapshot.running = false;
+        assert_eq!(core_download_proxy(&snapshot), None);
+        snapshot.running = true;
+        snapshot.http_port = 0;
+        assert_eq!(core_download_proxy(&snapshot), None);
+        assert_eq!(core_routes(None), vec![None]);
+        assert_eq!(
+            core_routes(Some(7890)),
+            vec![Some("http://127.0.0.1:7890".to_string()), None]
+        );
     }
 
     #[test]
@@ -5251,5 +5505,252 @@ mod listener_tests {
         crate::compose::terc_dir()
             .join("generated")
             .join(format!("{}.yaml", cfg.profile_id))
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    /// Answer `count` connections with `respond(request head)`; returns the heads.
+    fn serve_heads(
+        listener: TcpListener,
+        count: usize,
+        respond: impl Fn(&str) -> Vec<u8> + Send + 'static,
+    ) -> thread::JoinHandle<Vec<String>> {
+        thread::spawn(move || {
+            let mut heads = Vec::new();
+            for _ in 0..count {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let _ = reader.get_mut().write_all(&respond(&head));
+                heads.push(head);
+            }
+            heads
+        })
+    }
+
+    fn reply(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut child = Command::new("gzip")
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(data).unwrap();
+        child.wait_with_output().unwrap().stdout
+    }
+
+    fn dead_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("terc-core-dl-{tag}-{}-{nanos}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    const BINARY: &[u8] = b"#!/bin/sh\necho mihomo\n";
+    const ASSET: &str = "/download/v1.2.3/mihomo-linux-amd64-v1-v1.2.3.gz";
+
+    fn release(head: &str, gz: &[u8]) -> Vec<u8> {
+        if head.contains("/latest/download/version.txt ") {
+            reply("200 OK", "", b"v1.2.3\n")
+        } else if head.contains(ASSET) {
+            reply("200 OK", "", gz)
+        } else {
+            reply("404 Not Found", "", b"")
+        }
+    }
+
+    fn notes(rx: &mpsc::Receiver<BackendEvent>) -> Vec<String> {
+        rx.try_iter()
+            .filter_map(|e| match e {
+                BackendEvent::StatusMessage { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn core_install_reads_version_txt_and_falls_back_from_a_dead_core_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let gz = gzip(BINARY);
+        let server = serve_heads(listener, 2, move |head| release(head, &gz));
+        let dir = scratch("direct");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("mihomo-linux-amd64-v1-v1.0.0.gz.part"), b"old").unwrap();
+        fs::write(dir.join("mihomo.gz"), b"old").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let bin = install_core_from(&base, "linux-amd64-v1", &dir, Some(dead_port()), &tx).unwrap();
+        let heads = server.join().unwrap();
+        assert!(heads[0].starts_with("GET /latest/download/version.txt "));
+        assert!(heads[1].starts_with(&format!("GET {ASSET} ")), "{heads:?}");
+        assert_eq!(fs::read(&bin).unwrap(), BINARY);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&bin).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        let mut left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["mihomo"]);
+        assert!(notes(&rx)
+            .iter()
+            .any(|n| n == "Downloading mihomo-linux-amd64-v1-v1.2.3.gz..."));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn core_install_goes_through_the_core_listener_when_it_works() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = listener.local_addr().unwrap().port();
+        // Unreachable directly: only the proxy route can succeed.
+        let base = format!("http://127.0.0.1:{}", dead_port());
+        let gz = gzip(BINARY);
+        let server = serve_heads(listener, 2, move |head| release(head, &gz));
+        let dir = scratch("proxy");
+        let (tx, rx) = mpsc::channel();
+        let bin = install_core_from(&base, "linux-amd64-v1", &dir, Some(proxy), &tx).unwrap();
+        let heads = server.join().unwrap();
+        // Absolute-form request lines: curl spoke to the core as a proxy.
+        assert!(
+            heads.iter().all(|h| h.starts_with(&format!("GET {base}/"))),
+            "{heads:?}"
+        );
+        assert_eq!(fs::read(&bin).unwrap(), BINARY);
+        let via = format!(" via 127.0.0.1:{proxy}...");
+        assert!(notes(&rx).iter().any(|n| n.ends_with(&via)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn core_install_resumes_a_cut_transfer_and_reports_curl_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let gz = gzip(BINARY);
+        let cut = gz.len() / 2;
+        let served = Arc::new(Mutex::new(0));
+        let server = serve_heads(listener, 3, move |head| {
+            if head.contains("version.txt") {
+                return reply("200 OK", "", b"v1.2.3");
+            }
+            let mut n = served.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                // Promise the whole file, send half, hang up.
+                let mut out = reply("200 OK", "", &gz);
+                out.truncate(out.len() - (gz.len() - cut));
+                return out;
+            }
+            let range = format!(
+                "Content-Range: bytes {cut}-{}/{}\r\n",
+                gz.len() - 1,
+                gz.len()
+            );
+            reply("206 Partial Content", &range, &gz[cut..])
+        });
+        let dir = scratch("resume");
+        let (tx, _rx) = mpsc::channel();
+        let bin = install_core_from(&base, "linux-amd64-v1", &dir, None, &tx).unwrap();
+        let heads = server.join().unwrap();
+        assert!(
+            heads[2].contains(&format!("Range: bytes={cut}-")),
+            "{heads:?}"
+        );
+        assert_eq!(fs::read(&bin).unwrap(), BINARY);
+        fs::remove_dir_all(&dir).unwrap();
+
+        // A missing asset: three direct attempts, curl's reason in the error.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = serve_heads(listener, 4, |head| release(head, b""));
+        let err = install_core_from(&base, "darwin-arm64", &dir, None, &tx).unwrap_err();
+        assert_eq!(server.join().unwrap().len(), 4);
+        assert!(
+            err.starts_with("Failed to download mihomo-darwin-arm64-v1.2.3.gz: "),
+            "{err}"
+        );
+        assert!(err.contains("404"), "{err}");
+        assert!(!dir.join("mihomo").exists());
+
+        // Not gzip: refused, and the part is dropped so Ctrl+D starts clean.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = serve_heads(listener, 2, |head| release(head, b"<html>portal</html>"));
+        let err = install_core_from(&base, "linux-amd64-v1", &dir, None, &tx).unwrap_err();
+        server.join().unwrap();
+        assert!(err.contains("damaged"), "{err}");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn subscription_download_asks_for_gzip_and_retries_a_503() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/sub?token=x", listener.local_addr().unwrap());
+        let body = "proxies:\n  - {name: a, type: ss}\n".repeat(20);
+        let packed = gzip(body.as_bytes());
+        let first = Arc::new(Mutex::new(true));
+        let server = serve_heads(listener, 2, move |_| {
+            if std::mem::replace(&mut *first.lock().unwrap(), false) {
+                return reply("503 Service Unavailable", "", b"");
+            }
+            reply("200 OK", "Content-Encoding: gzip\r\n", &packed)
+        });
+        let cfg = ControllerConfig {
+            subscription_url: url,
+            ..ControllerConfig::default()
+        };
+        assert_eq!(download_subscription(&cfg).unwrap(), body);
+        let heads = server.join().unwrap();
+        assert!(heads[1].starts_with("GET /sub?token=x "));
+        let lower = heads[1].to_ascii_lowercase();
+        assert!(
+            lower.contains("accept-encoding: ") && lower.contains("gzip"),
+            "{lower}"
+        );
+        assert!(heads[1].contains("User-Agent: clash.meta/1.19.32"));
     }
 }
