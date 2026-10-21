@@ -583,6 +583,8 @@ pub struct ComposeReport {
     pub ai_group: String,
     /// Nodes rewritten from `network: httpupgrade` to Mihomo's ws form.
     pub normalized: Vec<String>,
+    /// TLS nodes given the `client-fingerprint` they lacked.
+    pub fingerprinted: Vec<String>,
 }
 
 impl ComposeReport {
@@ -617,6 +619,14 @@ impl ComposeReport {
                 format!("  {n} httpupgrade node(s) rewritten to ws + v2ray-http-upgrade")
             });
         }
+        let n = self.fingerprinted.len();
+        if n > 0 {
+            text.push_str(&if zh {
+                format!("  {n} 个 TLS 节点已补 client-fingerprint")
+            } else {
+                format!("  {n} TLS node(s) given a client-fingerprint")
+            });
+        }
         text
     }
 
@@ -627,6 +637,11 @@ impl ComposeReport {
             .normalized
             .iter()
             .map(|name| format!("httpupgrade → ws: {name}"))
+            .chain(
+                self.fingerprinted
+                    .iter()
+                    .map(|name| format!("client-fingerprint: {name}")),
+            )
             .collect();
         let all: Vec<&String> = self
             .sub_skipped
@@ -679,7 +694,13 @@ external-controller: {addr}\n"
     text.push_str(
         "profile:\n  store-selected: true\n\
 sniffer:\n  enable: false\n  sniff:\n    HTTP:\n      ports: [80, 8080-8880]\n      override-destination: true\n    TLS:\n      ports: [443, 8443]\n    QUIC:\n      ports: [443, 8443]\n\
-tun:\n  enable: false\n  stack: mixed\n  auto-route: true\n  auto-detect-interface: true\n  dns-hijack: [\"any:53\"]\n\
+tun:\n  enable: false\n  stack: mixed\n",
+    );
+    if cfg!(target_os = "linux") {
+        text.push_str("  gso: true\n");
+    }
+    text.push_str(
+        "  auto-route: true\n  auto-detect-interface: true\n  dns-hijack: [\"any:53\"]\n\
 dns:\n  enable: true\n  ipv6: false\n  listen: 127.0.0.1:1053\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n  fake-ip-filter: [\"*.lan\", \"+.local\", \"localhost\"]\n  default-nameserver: [223.5.5.5, 119.29.29.29]\n  nameserver: [\"https://doh.pub/dns-query\", \"https://dns.alidns.com/dns-query\"]\n",
     );
     text
@@ -894,23 +915,7 @@ fn normalize_flow_item(line: &mut String) -> Option<String> {
 /// A block item in `lines[start..end]`.
 fn normalize_block_item(lines: &mut Vec<String>, start: usize, end: usize) -> Option<String> {
     let skip = |l: &String| l.trim().is_empty() || l.trim_start().starts_with('#');
-    let first = &lines[start];
-    let first_key = first.len() - first.trim_start()[1..].trim_start().len();
-    let inline_key = first_key < first.len() && !first[first_key..].starts_with('#');
-    let key_indent = if inline_key {
-        first_key
-    } else {
-        leading_spaces(lines[start + 1..end].iter().find(|l| !skip(l))?)
-    };
-    // (line, byte offset of the key) for each of the item's own keys.
-    let keys: Vec<(usize, usize)> = std::iter::once((start, first_key))
-        .filter(|_| inline_key)
-        .chain(
-            (start + 1..end)
-                .filter(|&i| !skip(&lines[i]) && leading_spaces(&lines[i]) == key_indent)
-                .map(|i| (i, key_indent)),
-        )
-        .collect();
+    let (key_indent, keys) = block_item_keys(lines, start, end)?;
     let find = |lines: &[String], key: &str| {
         keys.iter()
             .find_map(|&(i, at)| Some((i, block_value(&lines[i], at, key)?)))
@@ -972,6 +977,33 @@ fn normalize_block_item(lines: &mut Vec<String>, start: usize, end: usize) -> Op
         lines.splice(at..at, new);
     }
     Some(name)
+}
+
+/// The key indent of the block item in `lines[start..end]` and (line, byte
+/// offset of the key) for each of its own keys.
+fn block_item_keys(
+    lines: &[String],
+    start: usize,
+    end: usize,
+) -> Option<(usize, Vec<(usize, usize)>)> {
+    let skip = |l: &String| l.trim().is_empty() || l.trim_start().starts_with('#');
+    let first = &lines[start];
+    let first_key = first.len() - first.trim_start()[1..].trim_start().len();
+    let inline_key = first_key < first.len() && !first[first_key..].starts_with('#');
+    let key_indent = if inline_key {
+        first_key
+    } else {
+        leading_spaces(lines[start + 1..end].iter().find(|l| !skip(l))?)
+    };
+    let keys = std::iter::once((start, first_key))
+        .filter(|_| inline_key)
+        .chain(
+            (start + 1..end)
+                .filter(|&i| !skip(&lines[i]) && leading_spaces(&lines[i]) == key_indent)
+                .map(|i| (i, key_indent)),
+        )
+        .collect();
+    Some((key_indent, keys))
 }
 
 /// Byte span of the value of `key:` at byte `at` of a block line, without a
@@ -1052,6 +1084,307 @@ fn flow_value(inner: &str, key: &str) -> Option<String> {
         }
         rest = &rest[pos + key.len()..];
     }
+}
+
+// ------------------------------------------------------------ safe defaults
+
+/// Values `client-fingerprint` accepts (mihomo component/tls/utls.go). Any
+/// other value, `none` or nothing leaves the node on Go's stock ClientHello,
+/// and a Reality node fails every dial.
+const FINGERPRINTS: &[&str] = &[
+    "chrome",
+    "firefox",
+    "safari",
+    "ios",
+    "android",
+    "edge",
+    "360",
+    "qq",
+    "random",
+    "chrome120",
+    "firefox120",
+    "safari16",
+    "chrome_psk",
+    "chrome_psk_shuffle",
+    "chrome_padding_psk_shuffle",
+    "chrome_pq",
+    "chrome_pq_psk",
+    "randomized",
+];
+
+/// `url-test` tolerance (ms) for groups that set none. Mihomo's 0 switches
+/// the exit on any single sample that is 1 ms lower.
+const URL_TEST_TOLERANCE: u64 = 50;
+
+/// Fill safe defaults a source left out. They go in once, in the same
+/// composition, so the first build after an upgrade costs one reload. A value
+/// the source sets, even Mihomo's default, is never changed.
+fn inject_safe_defaults(chunks: &mut Vec<YamlChunk>) {
+    // Race every resolved IP of a node or DIRECT host instead of trying them
+    // in turn under one shared dial deadline.
+    if !chunks
+        .iter()
+        .any(|c| c.key.as_deref() == Some("tcp-concurrent"))
+    {
+        let pos = chunks
+            .iter()
+            .position(|c| c.key.as_deref() == Some("proxies"))
+            .unwrap_or(chunks.len());
+        chunks.insert(
+            pos,
+            YamlChunk {
+                key: Some("tcp-concurrent".into()),
+                lines: vec!["tcp-concurrent: true".into()],
+            },
+        );
+    }
+    for chunk in chunks.iter_mut() {
+        match chunk.key.as_deref() {
+            Some("tun") if cfg!(target_os = "linux") => default_tun_gso(chunk),
+            Some("proxy-groups") => default_url_test_tolerance(chunk),
+            _ => {}
+        }
+    }
+}
+
+/// Linux: batch TUN reads and writes (sing-tun GSO). Darwin ignores the key,
+/// but Mihomo compares it and would rebuild TUN on a reload for nothing.
+fn default_tun_gso(chunk: &mut YamlChunk) {
+    let inline = chunk.lines[0]
+        .split_once(':')
+        .map(|(_, v)| clean_scalar(v))
+        .unwrap_or_default();
+    let skip = |l: &String| l.trim().is_empty() || l.trim_start().starts_with('#');
+    let Some(indent) = chunk
+        .lines
+        .iter()
+        .skip(1)
+        .filter(|l| !skip(l))
+        .map(|l| leading_spaces(l))
+        .min()
+    else {
+        return;
+    };
+    if !inline.is_empty()
+        || indent == 0
+        || chunk
+            .lines
+            .iter()
+            .any(|l| leading_spaces(l) == indent && block_value(l, indent, "gso").is_some())
+    {
+        return;
+    }
+    chunk
+        .lines
+        .insert(1, format!("{}gso: true", " ".repeat(indent)));
+}
+
+/// `tolerance` for `url-test` groups without one. A group that uses an
+/// anchor, alias or merge key may inherit it, so it is left alone.
+fn default_url_test_tolerance(chunk: &mut YamlChunk) {
+    for (start, end) in list_items(chunk).into_iter().rev() {
+        let lines = &chunk.lines;
+        if uses_anchors(&lines[start..end])
+            || item_value(lines, start, end, "type").map(|v| clean_scalar(&v))
+                != Some("url-test".into())
+            || item_value(lines, start, end, "tolerance").is_some()
+        {
+            continue;
+        }
+        set_item_value(
+            &mut chunk.lines,
+            start,
+            end,
+            "tolerance",
+            &json!(URL_TEST_TOLERANCE),
+        );
+    }
+}
+
+/// Give TLS nodes of a pass-through `proxies` chunk the `client-fingerprint`
+/// that Mihomo no longer takes from the top-level `global-client-fingerprint`
+/// (mihomo config/config.go only logs it). With a known global value every
+/// vmess/vless/trojan TLS node without a valid one gets it; without one only
+/// Reality nodes, which cannot connect at all, get `chrome`. Returns the
+/// names of the repaired nodes.
+pub(crate) fn repair_client_fingerprints(
+    chunk: &mut YamlChunk,
+    global: Option<&str>,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    if chunk.key.as_deref() != Some("proxies") {
+        return names;
+    }
+    let global = global.filter(|g| FINGERPRINTS.contains(g));
+    for (start, end) in list_items(chunk).into_iter().rev() {
+        let lines = &chunk.lines;
+        if uses_anchors(&lines[start..end]) {
+            continue;
+        }
+        let get = |key: &str| item_value(lines, start, end, key).map(|v| clean_scalar(&v));
+        let kind = get("type").unwrap_or_default().to_ascii_lowercase();
+        if !matches!(kind.as_str(), "vmess" | "vless" | "trojan") {
+            continue;
+        }
+        // An empty value is a block map on the lines below.
+        let reality = item_value(lines, start, end, "reality-opts")
+            .is_some_and(|v| v.trim().is_empty() || !is_null(&v));
+        let tls = kind == "trojan"
+            || reality
+            || get("tls").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        if !tls || get("client-fingerprint").is_some_and(|v| FINGERPRINTS.contains(&v.as_str())) {
+            continue;
+        }
+        let value = match global {
+            Some(value) => value,
+            None if reality => "chrome",
+            None => continue,
+        };
+        let name = get("name").unwrap_or_else(|| "?".into());
+        if set_item_value(
+            &mut chunk.lines,
+            start,
+            end,
+            "client-fingerprint",
+            &json!(value),
+        ) {
+            names.push(name);
+        }
+    }
+    names.reverse();
+    names
+}
+
+/// Line ranges of the items of a YAML list chunk.
+fn list_items(chunk: &YamlChunk) -> Vec<(usize, usize)> {
+    let Some(indent) = chunk
+        .lines
+        .iter()
+        .skip(1)
+        .find(|l| l.trim_start().starts_with('-'))
+        .map(|l| leading_spaces(l))
+    else {
+        return Vec::new();
+    };
+    let starts: Vec<usize> = (1..chunk.lines.len())
+        .filter(|&i| {
+            leading_spaces(&chunk.lines[i]) == indent
+                && chunk.lines[i].trim_start().starts_with('-')
+        })
+        .collect();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(k, &s)| (s, starts.get(k + 1).copied().unwrap_or(chunk.lines.len())))
+        .collect()
+}
+
+/// Whether item text uses a YAML anchor, alias or merge key, whose inherited
+/// keys a line edit cannot see. Quoted text can match too; that only skips.
+fn uses_anchors(lines: &[String]) -> bool {
+    lines.iter().any(|l| {
+        !l.trim_start().starts_with('#')
+            && (l.contains("<<")
+                || l.as_bytes().windows(2).any(|w| {
+                    matches!(w[0], b' ' | b'[' | b'{' | b',') && matches!(w[1], b'&' | b'*')
+                }))
+    })
+}
+
+/// Byte offset of the `{` of a one-line flow item `- {...}`.
+fn flow_open(line: &str) -> Option<usize> {
+    let rest = line.trim_start().strip_prefix('-')?.trim_start();
+    rest.starts_with('{').then(|| line.len() - rest.len())
+}
+
+/// The value text of the own `key` of the item in `lines[start..end]`; empty
+/// for a block key whose value is nested below it, `~` for a JSON null.
+fn item_value(lines: &[String], start: usize, end: usize, key: &str) -> Option<String> {
+    let line = &lines[start];
+    if let Some(open) = flow_open(line) {
+        if let Ok(node) = serde_json::from_str::<Value>(&line[open..]) {
+            return node.get(key).map(|v| match v {
+                Value::String(s) => yaml_str(s),
+                Value::Null => "~".into(),
+                v => v.to_string(),
+            });
+        }
+        let flow = &line[open..=matching_close(line, open)?];
+        let (s, e) = flow_key_value(flow, key)?;
+        return Some(flow[s..e].to_string());
+    }
+    let (_, keys) = block_item_keys(lines, start, end)?;
+    keys.iter().find_map(|&(i, at)| {
+        let (s, e) = block_value(&lines[i], at, key)?;
+        Some(lines[i][s..e].to_string())
+    })
+}
+
+/// Set the own `key` of the item in `lines[start..end]` to `value` (a JSON
+/// scalar), replacing its value or adding the key. False when the item cannot
+/// be edited.
+fn set_item_value(
+    lines: &mut Vec<String>,
+    start: usize,
+    end: usize,
+    key: &str,
+    value: &Value,
+) -> bool {
+    let text = match value {
+        Value::String(s) => yaml_str(s),
+        v => v.to_string(),
+    };
+    if let Some(open) = flow_open(&lines[start]) {
+        let line = &mut lines[start];
+        if let Ok(mut node) = serde_json::from_str::<Value>(&line[open..]) {
+            node[key] = value.clone();
+            *line = format!("{}{node}", &line[..open]);
+            return true;
+        }
+        let Some(close) = matching_close(line, open) else {
+            return false;
+        };
+        let flow = &line[open..=close];
+        let (s, e, text) = match flow_key_value(flow, key) {
+            Some((s, e)) => (s, e, text),
+            None => {
+                let body = flow[..flow.len() - 1].trim_end();
+                let sep = if body.ends_with(',') || body.ends_with('{') {
+                    ""
+                } else {
+                    ","
+                };
+                let pad = if body.ends_with('{') { "" } else { " " };
+                (body.len(), body.len(), format!("{sep}{pad}{key}: {text}"))
+            }
+        };
+        line.replace_range(open + s..open + e, &text);
+        return true;
+    }
+    let Some((indent, keys)) = block_item_keys(lines, start, end) else {
+        return false;
+    };
+    if let Some((i, (s, e))) = keys
+        .iter()
+        .find_map(|&(i, at)| Some((i, block_value(&lines[i], at, key)?)))
+    {
+        // An empty span sits after the colon, or on a trailing comment.
+        let text = match (s == e, s == lines[i].len()) {
+            (true, true) => format!(" {text}"),
+            (true, false) => format!("{text} "),
+            _ => text,
+        };
+        lines[i].replace_range(s..e, &text);
+        return true;
+    }
+    let skip = |l: &String| l.trim().is_empty() || l.trim_start().starts_with('#');
+    let at = (start..end)
+        .rev()
+        .find(|&i| !skip(&lines[i]))
+        .unwrap_or(start)
+        + 1;
+    lines.insert(at, format!("{}{key}: {text}", " ".repeat(indent)));
+    true
 }
 
 fn clash_rule_items(chunk: &YamlChunk) -> Vec<String> {
@@ -2102,6 +2435,17 @@ pub fn compose_profile_reserving(
         {
             report.normalized = normalize_httpupgrade_items(c);
         }
+        let global = chunks
+            .iter()
+            .rev()
+            .find(|c| c.key.as_deref() == Some("global-client-fingerprint"))
+            .and_then(|c| c.lines[0].split_once(':').map(|(_, v)| clean_scalar(v)));
+        if let Some(c) = chunks
+            .iter_mut()
+            .find(|c| c.key.as_deref() == Some("proxies"))
+        {
+            report.fingerprinted = repair_client_fingerprints(c, global.as_deref());
+        }
     }
     // Source sub-rules stay: its SUB-RULE rules reference them.
     let mut names = HashSet::new();
@@ -2265,6 +2609,7 @@ pub fn compose_profile_reserving(
             .unwrap_or(chunks.len());
         chunks.insert(pos, geox_url_chunk());
     }
+    inject_safe_defaults(&mut chunks);
     let body = crate::mihomo::normalize_subscription(&join_chunks(&chunks), input.controller_addr);
     let body = crate::ops::set_top_scalar(&body, "secret", &json!(input.secret).to_string());
     Ok((format!("{GENERATED_MARK}\n{body}"), report))
@@ -2780,6 +3125,161 @@ mod profile_tests {
         crate::mihomo::validate_listener_ports(&copied).unwrap();
     }
 
+    fn tun_source(tun: &str) -> String {
+        CLASH.replace("proxies:\n", &format!("{tun}proxies:\n"))
+    }
+
+    #[test]
+    fn tcp_concurrent_is_added_once_and_never_overrides_the_source() {
+        let yaml = build(Some(&convert_subscription(CLASH).unwrap()), &[]);
+        assert_eq!(yaml.matches("tcp-concurrent:").count(), 1, "{yaml}");
+        assert!(yaml.contains("tcp-concurrent: true\n"));
+        let off = CLASH.replace(
+            "mixed-port: 7897\n",
+            "mixed-port: 7897\ntcp-concurrent: false\n",
+        );
+        let yaml = build(Some(&convert_subscription(&off).unwrap()), &[]);
+        assert_eq!(yaml.matches("tcp-concurrent:").count(), 1, "{yaml}");
+        assert!(yaml.contains("tcp-concurrent: false\n"));
+        // The template sets it itself.
+        let yaml = build(None, &manual());
+        assert_eq!(yaml.matches("tcp-concurrent: true").count(), 1, "{yaml}");
+    }
+
+    #[test]
+    fn tun_gso_is_linux_only_and_kept_when_set() {
+        let linux = cfg!(target_os = "linux");
+        let yaml = build(None, &manual());
+        assert_eq!(
+            yaml.contains("  stack: mixed\n  gso: true\n"),
+            linux,
+            "{yaml}"
+        );
+        assert_eq!(yaml.matches("gso:").count(), usize::from(linux));
+        let src = tun_source("tun:\n  enable: true\n  # system or gvisor\n  stack: system\n");
+        let yaml = build(Some(&convert_subscription(&src).unwrap()), &[]);
+        let want = if linux {
+            "tun:\n  gso: true\n  enable: true\n  # system or gvisor\n  stack: system\n"
+        } else {
+            "tun:\n  enable: true\n  # system or gvisor\n  stack: system\n"
+        };
+        assert!(yaml.contains(want), "{yaml}");
+        for kept in [
+            "tun:\n    enable: true\n    gso: false\n",
+            "tun: {enable: true, stack: system}\n",
+            "tun:\n",
+        ] {
+            let yaml = build(Some(&convert_subscription(&tun_source(kept)).unwrap()), &[]);
+            assert!(yaml.contains(kept), "{yaml}");
+            assert!(!yaml.contains("gso: true"), "{yaml}");
+        }
+        // A source without a tun block gets none.
+        let yaml = build(Some(&convert_subscription(CLASH).unwrap()), &[]);
+        assert!(!yaml.contains("tun:") && !yaml.contains("gso"), "{yaml}");
+    }
+
+    #[test]
+    fn url_test_groups_get_a_tolerance_only_when_they_set_none() {
+        let groups = "proxy-groups:\n  - name: Auto\n    type: url-test\n    proxies: [HK]\n    url: https://example.org\n    interval: 300\n  # trailing comment\n  - name: Kept\n    type: url-test\n    tolerance: 0\n    proxies: [HK]\n  - {name: Flow, type: url-test, proxies: [HK]}\n  - {name: Comma, type: url-test, proxies: [HK],}\n  - {\"name\":\"Json\",\"type\":\"url-test\",\"proxies\":[\"HK\"]}\n  - name: Pick\n    type: select\n    proxies: [Auto, Kept, Flow, Comma, Json, Merged, Fallback]\n  - name: Merged\n    <<: *auto\n    proxies: [HK]\n  - name: Fallback\n    type: fallback\n    proxies: [HK]\n";
+        let src = CLASH
+            .replace(
+                "proxy-groups:\n  - name: Airport\n    type: select\n    proxies: [HK]\n",
+                groups,
+            )
+            .replace("MATCH,Airport", "MATCH,Pick");
+        let sub = convert_subscription(&src).unwrap();
+        let yaml = build(Some(&sub), &[]);
+        assert!(
+            yaml.contains("    interval: 300\n    tolerance: 50\n  # trailing comment\n"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("    tolerance: 0\n    proxies: [HK]\n"));
+        assert!(yaml.contains("  - {name: Flow, type: url-test, proxies: [HK], tolerance: 50}\n"));
+        assert!(yaml.contains("  - {name: Comma, type: url-test, proxies: [HK], tolerance: 50}\n"));
+        assert!(yaml.contains(
+            "  - {\"name\":\"Json\",\"proxies\":[\"HK\"],\"tolerance\":50,\"type\":\"url-test\"}\n"
+        ));
+        assert!(yaml.contains("    <<: *auto\n    proxies: [HK]\n  - name: Fallback"));
+        assert_eq!(yaml.matches("tolerance: 50").count(), 3, "{yaml}");
+        // A second composition of the same source changes nothing more.
+        assert_eq!(build(Some(&sub), &[]), yaml);
+    }
+
+    #[test]
+    fn tls_nodes_get_the_removed_global_fingerprint() {
+        let proxies = "proxies:\n  - name: Reality\n    type: vless\n    server: 192.0.2.10\n    port: 443\n    uuid: 12345678-1234-1234-1234-123456789abc\n    reality-opts:\n      public-key: fake\n  - name: Tls\n    type: vmess\n    server: 192.0.2.11\n    port: 443\n    uuid: 12345678-1234-1234-1234-123456789abc\n    cipher: auto\n    tls: true\n    client-fingerprint: none\n  - {name: Trojan, type: trojan, server: 192.0.2.12, port: 443, password: fake}\n  - {name: Plain, type: vmess, server: 192.0.2.13, port: 80, uuid: 12345678-1234-1234-1234-123456789abc, cipher: auto}\n  - {name: Own, type: trojan, server: 192.0.2.14, port: 443, password: fake, client-fingerprint: safari}\n  - {name: SS, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake}\n  - {\"name\":\"Json\",\"type\":\"vless\",\"server\":\"192.0.2.15\",\"port\":443,\"uuid\":\"12345678-1234-1234-1234-123456789abc\",\"tls\":true,\"reality-opts\":{\"public-key\":\"fake\"},\"client-fingerprint\":\"\"}\n  - name: Merged\n    <<: *reality\n    server: 192.0.2.16\n";
+        let src = CLASH
+            .replace(
+                "proxies:\n  - {name: HK, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake}\n",
+                proxies,
+            )
+            .replace("proxies: [HK]", "proxies: [SS]");
+        let rules = PrivateRules::default();
+        let compose = |src: &str| {
+            let sub = convert_subscription(src).unwrap();
+            compose_profile(&ComposeInput {
+                subscription: Some(&sub),
+                manual: &[],
+                rules: &rules,
+                controller_addr: "127.0.0.1:9090",
+                secret: "",
+                test_url: "https://example.org",
+            })
+            .unwrap()
+        };
+
+        // No global value: only Reality nodes, which cannot connect at all.
+        let (yaml, report) = compose(&src);
+        assert_eq!(report.fingerprinted, ["Reality", "Json"]);
+        assert!(
+            yaml.contains("    reality-opts:\n      public-key: fake\n    client-fingerprint: \"chrome\"\n  - name: Tls\n"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("    client-fingerprint: none\n"));
+        assert!(yaml.contains("password: fake}\n  - {name: Plain"));
+        assert!(yaml.contains("\"client-fingerprint\":\"chrome\""));
+        assert!(yaml.contains("    <<: *reality\n    server: 192.0.2.16\n"));
+        assert!(report
+            .summary(true)
+            .ends_with("  2 个 TLS 节点已补 client-fingerprint"));
+        assert!(report
+            .summary(false)
+            .ends_with("  2 TLS node(s) given a client-fingerprint"));
+        assert_eq!(
+            report.details(),
+            "\n  - client-fingerprint: Reality\n  - client-fingerprint: Json"
+        );
+
+        // A known global value goes onto every TLS node without a valid one.
+        let global = src.replace(
+            "proxies:\n",
+            "global-client-fingerprint: random # old key\nproxies:\n",
+        );
+        let (yaml, report) = compose(&global);
+        assert_eq!(report.fingerprinted, ["Reality", "Tls", "Trojan", "Json"]);
+        assert!(
+            yaml.contains("    tls: true\n    client-fingerprint: \"random\"\n"),
+            "{yaml}"
+        );
+        assert!(yaml.contains(
+            "  - {name: Trojan, type: trojan, server: 192.0.2.12, port: 443, password: fake, client-fingerprint: \"random\"}\n"
+        ));
+        assert!(yaml.contains("cipher: auto}\n"), "Plain stays: {yaml}");
+        assert!(yaml.contains("client-fingerprint: safari}"));
+        assert!(yaml.contains("\"client-fingerprint\":\"random\""));
+        assert_eq!(yaml.matches("client-fingerprint: ").count(), 5, "{yaml}");
+
+        // An unknown global value is ignored like a missing one.
+        let bogus = src.replace(
+            "proxies:\n",
+            "global-client-fingerprint: netscape\nproxies:\n",
+        );
+        assert_eq!(compose(&bogus).1.fingerprinted, ["Reality", "Json"]);
+        // The raw source is not rewritten.
+        let sub = convert_subscription(&src).unwrap();
+        assert!(!sub.clash_doc.unwrap().contains("\"chrome\""));
+    }
+
     #[test]
     #[ignore = "requires an installed Mihomo; validates temporary configs only"]
     fn real_core_accepts_profile_sources() {
@@ -2788,9 +3288,26 @@ mod profile_tests {
             std::env::temp_dir().join(format!("terc-profile-validation-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let surge="[Proxy]\nJP = trojan, 192.0.2.3, 443, password=fake\n[Proxy Group]\nAirport = select, JP\n[Rule]\nDOMAIN-SUFFIX,example.org,DIRECT\nFINAL,Airport\n";
-        for source in [None, Some(CLASH), Some(surge)] {
+        // Every safe default lands: tcp-concurrent, tun.gso, a url-test
+        // tolerance and a Reality client-fingerprint.
+        let defaults = CLASH
+            .replace(
+                "proxies:\n",
+                "tun:\n  enable: false\n  stack: mixed\nproxies:\n  - {name: R, type: vless, server: 192.0.2.9, port: 443, uuid: 12345678-1234-1234-1234-123456789abc, network: tcp, tls: true, servername: example.org, reality-opts: {public-key: Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw, short-id: 0123abcd}}\n",
+            )
+            .replace(
+                "proxy-groups:\n",
+                "proxy-groups:\n  - {name: Auto, type: url-test, proxies: [HK, R], url: https://example.org, interval: 300}\n",
+            );
+        for source in [None, Some(CLASH), Some(surge), Some(defaults.as_str())] {
             let converted = source.map(|s| convert_subscription(s).unwrap());
             let yaml = build(converted.as_ref(), &manual());
+            if source == Some(defaults.as_str()) {
+                assert!(
+                    yaml.contains("client-fingerprint: \"chrome\"}")
+                        && yaml.contains("tolerance: 50}")
+                );
+            }
             crate::mihomo::validate_listener_ports(&yaml).unwrap();
             let path = dir.join("config.yaml");
             fs::write(&path, &yaml).unwrap();
