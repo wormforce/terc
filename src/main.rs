@@ -1330,6 +1330,9 @@ impl App {
                 },
             );
             let result = action(cfg.clone());
+            if mihomo::take_core_refreshed() {
+                mihomo::prewarm_node_dns_async(cfg.clone());
+            }
             done.set(BackendEvent::ActionDone {
                 result,
                 modules,

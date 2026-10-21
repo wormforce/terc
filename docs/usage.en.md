@@ -88,6 +88,8 @@ Both listen on `127.0.0.1:1053` only, so the LAN cannot use them as a resolver, 
 
 The previous Fake-IP DNS snippet used foreign DoH with a fallback and listened on `0.0.0.0:1053`. If it was on, terc says so once at the first start after the upgrade; the new body applies from the next generated config. Enable Fake-IP DNS (global) to keep foreign DoH.
 
+Every reload or core start leaves Mihomo with an empty DNS cache, so the first connection through each node would wait for its hostname lookup. After terc reloads or starts the core it resolves, in the background, the server hostnames of each group's selected node (with relay and `dialer-proxy` hops; provider nodes are read from the provider's cached file) through the controller's `/dns/query`, at most 16 names. This is skipped when `dns.enable` is off, and when the config sets `proxy-server-nameserver`, because node hostnames then use a separate cache the query cannot reach; both built-in snippets set it.
+
 ## Connections
 
 Press `c`. Each row shows the connection's age, in bold once it has been open 60 s (long-lived). Connections to AI services are tagged `AI`: the destination or sniffed host matches the AI preset rules, or the chain passes through the `AI` group. When the pane is narrow, columns appear in this order: the current sort value (total bytes or total rate), process, rule, separate up/down, inbound. The host gets the rest.
