@@ -2161,7 +2161,8 @@ pub fn download_subscription(cfg: &ControllerConfig) -> Result<String, String> {
 }
 
 /// Download (when `refresh`) and compose subscription + own nodes + private
-/// rules into `config.yaml`, validate it with `mihomo -t`, and hot-reload.
+/// rules into `config.yaml`, validate it (the running core checks it on reload,
+/// `mihomo -t` otherwise), and hot-reload.
 pub fn regenerate_config(
     cfg: &ControllerConfig,
     modules: &[crate::ops::ModuleSnippet],
@@ -2384,61 +2385,110 @@ fn install_config_with(
     } else {
         text.to_string()
     };
-    let candidate = Path::new(&cfg.config_dir).join(".terc-candidate.yaml");
-    write_private(&candidate, text.as_bytes()).map_err(|e| e.to_string())?;
-    let result = (|| {
-        let bin =
-            find_bin().ok_or("Install the managed Mihomo core before saving a configuration")?;
-        check_candidate(&bin, cfg, &candidate, limits)?;
-        let path = config_yaml_path(cfg);
-        let previous = match fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.to_string().into()),
-        };
-        fs::rename(&candidate, &path).map_err(|e| e.to_string())?;
+    let path = config_yaml_path(cfg);
+    // A running core parses the payload with the same code as `mihomo -t` and
+    // answers 400 before applying anything, so it validates for free. A
+    // stopped core cannot, and missing geodata would be downloaded inside the
+    // PUT handler, past the reload timeout; the check fetches it first with
+    // its own budget.
+    if !running || needs_missing_geodata(&text, Path::new(&cfg.config_dir)) {
+        let candidate = Path::new(&cfg.config_dir).join(".terc-candidate.yaml");
+        write_private(&candidate, text.as_bytes()).map_err(|e| e.to_string())?;
+        let checked = (|| {
+            let bin = find_bin()
+                .ok_or("Install the managed Mihomo core before saving a configuration")?;
+            check_candidate(&bin, cfg, &candidate, limits)?;
+            if running {
+                Ok(())
+            } else {
+                fs::rename(&candidate, &path).map_err(|e| e.to_string())
+            }
+        })();
+        let _ = fs::remove_file(candidate);
+        checked?;
         if !running {
             return Ok(());
         }
-        match reload_config(cfg) {
-            Ok(()) => {
-                RELOAD_UNCERTAIN.store(false, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(ReloadError::Rejected(err)) => {
-                let restored = match previous {
-                    Some(bytes) => write_private(&path, &bytes),
-                    None => fs::remove_file(&path),
-                };
-                Err(match restored {
-                    Ok(()) => format!("{err}; previous configuration restored"),
-                    Err(restore) => {
-                        format!("{err}; could not restore previous configuration: {restore}")
-                    }
-                }
-                .into())
-            }
-            // Mihomo finishes applying a PUT after the client gives up, so the
-            // new file may already be live. Never roll back on a lost reply.
-            // Either way the running config may differ from the file, so the
-            // next regeneration reloads even when its output is unchanged.
-            Err(ReloadError::Unknown(_)) if controller_answers(cfg, limits.settle) => {
-                RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(ReloadError::Unknown(err)) => {
-                RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
-                Err(InstallFailure {
-                    message: format!(
-                        "热重载结果未知，新配置已保留在磁盘上 / Reload outcome unknown ({err}); the new configuration was kept on disk"
-                    ),
-                    kept: true,
-                })
-            }
+    }
+    let save = || write_private(&path, text.as_bytes()).map_err(|e| e.to_string());
+    match reload_config_text(cfg, &text) {
+        Ok(()) => {
+            // The core runs the new config; until the file matches, the next
+            // regeneration must reload even when its output is unchanged.
+            let saved = save();
+            RELOAD_UNCERTAIN.store(saved.is_err(), Ordering::SeqCst);
+            saved.map_err(|err| {
+                format!("新配置已生效，但保存失败 / Applied, but could not save config.yaml: {err}")
+                    .into()
+            })
         }
-    })();
-    let _ = fs::remove_file(candidate);
-    result
+        // The core kept its configuration and the file was never touched.
+        Err(ReloadError::Rejected(err)) => {
+            Err(format!("{err}; previous configuration kept").into())
+        }
+        // Mihomo finishes applying a PUT after the client gives up, so the new
+        // config may already be live; keep it on disk too. Either way the
+        // running config may differ from the file, so the next regeneration
+        // reloads even when its output is unchanged.
+        Err(ReloadError::Unknown(err)) => {
+            RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+            save()?;
+            if controller_answers(cfg, limits.settle) {
+                return Ok(());
+            }
+            Err(InstallFailure {
+                message: format!(
+                    "热重载结果未知，新配置已保留在磁盘上 / Reload outcome unknown ({err}); the new configuration was kept on disk"
+                ),
+                kept: true,
+            })
+        }
+    }
+}
+
+/// Whether `text` uses geodata that `dir` lacks. Mihomo looks the files up in
+/// its home directory, case-insensitively; a false positive only costs a
+/// `mihomo -t`.
+fn needs_missing_geodata(text: &str, dir: &Path) -> bool {
+    let (mut geoip, mut geosite, mut asn, mut geodata_mode) = (false, false, false, false);
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if raw.len() == line.len() {
+            section = lower.split(':').next().unwrap_or("").to_string();
+        }
+        // Download URLs and loader settings name the files without using them.
+        if section == "geox-url" || section.starts_with("geodata-") {
+            geodata_mode |= lower.starts_with("geodata-mode:") && lower.contains("true");
+            continue;
+        }
+        // A DNS `fallback` list filters with GEOIP,CN unless told otherwise.
+        geoip |= lower.contains("geoip") || lower.starts_with("fallback:");
+        geosite |= lower.contains("geosite");
+        asn |= lower.contains("ip-asn");
+    }
+    if !(geoip || geosite || asn) {
+        return false;
+    }
+    let names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let has = |wanted: &[&str]| wanted.iter().any(|w| names.iter().any(|n| n == w));
+    let ip_files: &[&str] = if geodata_mode {
+        &["geoip.dat"]
+    } else {
+        &["country.mmdb", "geoip.db", "geoip.metadb"]
+    };
+    (geoip && !has(ip_files)) || (geosite && !has(&["geosite.dat"])) || (asn && !has(&["asn.mmdb"]))
 }
 
 /// Run `mihomo -t` on the candidate, stopping a check that hangs.
@@ -3022,16 +3072,30 @@ impl std::fmt::Display for ReloadError {
     }
 }
 
+/// Reload the core from `config.yaml`.
 pub fn reload_config(cfg: &ControllerConfig) -> Result<(), ReloadError> {
     let path = config_yaml_path(cfg);
-    let body = serde_json::json!({
-        "path": path.display().to_string(),
-        "payload": ""
-    })
-    .to_string();
+    put_config(
+        cfg,
+        &serde_json::json!({
+            "path": path.display().to_string(),
+            "payload": ""
+        })
+        .to_string(),
+    )
+}
+
+/// Reload the core from `text` before it is written. Sending the content also
+/// spares Mihomo's safe-path check on a core whose home is elsewhere.
+fn reload_config_text(cfg: &ControllerConfig, text: &str) -> Result<(), ReloadError> {
+    put_config(cfg, &serde_json::json!({ "payload": text }).to_string())
+}
+
+fn put_config(cfg: &ControllerConfig, body: &str) -> Result<(), ReloadError> {
+    use crate::conns::{Cause, Scope};
     // Mihomo re-initialises every proxy provider on reload (§2.2 of
     // docs/websocket-plan.md); top-level `proxies:` connections stay.
-    announce_disruption(crate::conns::Cause::Reload, crate::conns::Scope::Providers);
+    announce_disruption(Cause::Reload, Scope::Providers);
     // The first fetch of new providers runs inside the request, so allow well
     // beyond Mihomo's own provider download timeout.
     match http_request(
@@ -3039,14 +3103,19 @@ pub fn reload_config(cfg: &ControllerConfig) -> Result<(), ReloadError> {
         &cfg.secret,
         "PUT",
         "/configs?force=true",
-        Some(&body),
+        Some(body),
         Duration::from_millis(cfg.timeout_ms.max(90_000)),
     ) {
         Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-        Ok((status, text)) => Err(ReloadError::Rejected(format!(
-            "reload HTTP {status} {}",
-            brief(&text)
-        ))),
+        Ok((status, text)) => {
+            // Mihomo answers 400 before applying anything, so nothing was cut:
+            // replace the announcement with one that covers no connection.
+            announce_disruption(Cause::Reload, Scope::Id(String::new()));
+            Err(ReloadError::Rejected(format!(
+                "reload HTTP {status} {}",
+                brief(&text)
+            )))
+        }
         Err(err) => Err(ReloadError::Unknown(err.to_string())),
     }
 }
@@ -4087,7 +4156,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an installed Mihomo binary; only validates temporary configs and calls a mock controller"]
-    fn real_core_validates_overlays_and_config_updates_restore_on_failure() {
+    fn real_core_validates_overlays_and_config_updates_keep_the_file_on_failure() {
         use std::net::TcpListener;
         let directory = std::env::temp_dir().join(format!(
             "terc-config-test-{}-{}",
@@ -4162,9 +4231,7 @@ mod tests {
             let result = install_config(&cfg, next, true);
             server.join().unwrap();
             if status == 400 {
-                assert!(result
-                    .unwrap_err()
-                    .contains("previous configuration restored"));
+                assert!(result.unwrap_err().contains("previous configuration kept"));
                 assert_eq!(read_config_text(&cfg).unwrap(), provider_only);
             } else {
                 result.unwrap();
@@ -4517,8 +4584,9 @@ mod listener_tests {
 
     #[test]
     #[cfg(unix)]
-    fn rejected_reload_restores_previous_file_privately() {
-        let (dir, bin) = install_fixture("rejected", "exit 0");
+    fn rejected_reload_leaves_the_file_and_withdraws_the_disruption() {
+        use crate::conns::{Cause, Scope};
+        let (dir, _) = install_fixture("rejected", "exit 0");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let cfg = ControllerConfig {
             addr: listener.local_addr().unwrap().to_string(),
@@ -4531,22 +4599,119 @@ mod listener_tests {
             listener,
             vec![http("200 OK", "{}"), http("400 Bad Request", "bad")],
         );
+        let (tx, rx) = std::sync::mpsc::channel();
+        report_disruptions(tx);
+        // The running core validates; no `mihomo -t` is needed.
         let failure = install_config_with(
             &cfg,
             "mode: rule\nipv6: true\n",
             true,
-            || Some(bin),
+            || panic!("no check while the core runs"),
             &TEST_LIMITS,
         )
         .err()
         .unwrap();
         let requests = server.join().unwrap();
         assert!(requests[1].starts_with("PUT /configs?force=true "));
+        assert!(requests[1].ends_with(r#"{"payload":"mode: rule\nipv6: true\n"}"#));
         assert!(!failure.kept);
-        assert!(failure.message.contains("previous configuration restored"));
+        assert!(failure.message.contains("previous configuration kept"));
         assert_eq!(read_config_text(&cfg).unwrap(), previous);
-        assert_eq!(mode_of(&config_yaml_path(&cfg)) & 0o077, 0);
         assert!(!dir.join(".terc-candidate.yaml").exists());
+        // Nothing was applied, so no closure may be blamed on this reload.
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(
+            &events[..],
+            [
+                BackendEvent::Disrupting {
+                    cause: Cause::Reload,
+                    scope: Scope::Providers
+                },
+                BackendEvent::Disrupting {
+                    cause: Cause::Reload,
+                    scope: Scope::Id(id)
+                }
+            ] if id.is_empty()
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn running_core_validates_the_payload_and_the_file_follows() {
+        let (dir, bin) = install_fixture(
+            "payload",
+            "echo run >> \"$(dirname \"$0\")/checks\"; exit 0",
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        let checks = dir.join("checks");
+        let next = "mode: rule\nrules:\n  - GEOSITE,cn,DIRECT\n";
+        let ok = || {
+            vec![
+                http("200 OK", r#"{"mode":"rule"}"#),
+                http("204 No Content", ""),
+            ]
+        };
+        // GeoSite.dat is missing: `mihomo -t` fetches it before the PUT.
+        let server = serve(listener.try_clone().unwrap(), ok());
+        install_config_with(&cfg, next, true, || Some(bin.clone()), &TEST_LIMITS)
+            .ok()
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[1].contains(r#"{"payload":"mode: \"rule\"\nrules:"#));
+        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 1);
+        assert!(read_config_text(&cfg)
+            .unwrap()
+            .contains("GEOSITE,cn,DIRECT"));
+        assert_eq!(mode_of(&config_yaml_path(&cfg)) & 0o077, 0);
+        // With the file present the PUT alone validates and applies.
+        fs::write(dir.join("GeoSite.dat"), "").unwrap();
+        let server = serve(listener, ok());
+        let other = "mode: rule\nipv6: true\nrules:\n  - GEOSITE,cn,DIRECT\n";
+        install_config_with(&cfg, other, true, || None, &TEST_LIMITS)
+            .ok()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 1);
+        assert!(read_config_text(&cfg).unwrap().contains("ipv6: true"));
+        assert!(!dir.join(".terc-candidate.yaml").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn geodata_need_follows_the_rules_dns_and_files_present() {
+        let dir = std::env::temp_dir().join(format!("terc-geo-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let need = |text: &str| needs_missing_geodata(text, &dir);
+        assert!(!need(
+            "rules:\n  - DOMAIN-SUFFIX,example.com,DIRECT\n  - MATCH,DIRECT\n"
+        ));
+        assert!(!need("# GEOSITE,cn,DIRECT only in a comment\nrules: []\n"));
+        assert!(!need(
+            "geodata-mode: false\ngeox-url:\n  geoip: \"https://x/geoip.dat\"\n  geosite: \"https://x/geosite.dat\"\n  asn: \"https://x/GeoLite2-ASN.mmdb\"\nrules: []\n"
+        ));
+        assert!(need("rules:\n  - GEOIP,CN,DIRECT\n"));
+        assert!(need(
+            "rules:\n  - AND,((GEOSITE,cn),(NETWORK,UDP)),REJECT\n"
+        ));
+        assert!(need("rules:\n  - IP-ASN,13335,DIRECT\n"));
+        assert!(need(
+            "dns:\n  nameserver-policy:\n    'geosite:cn': 223.5.5.5\n"
+        ));
+        assert!(need("dns:\n  fallback:\n    - tls://1.1.1.1\n"));
+        fs::write(dir.join("Country.mmdb"), "").unwrap();
+        fs::write(dir.join("geosite.dat"), "").unwrap();
+        assert!(!need(
+            "rules:\n  - GEOIP,CN,DIRECT\n  - GEOSITE,cn,DIRECT\n"
+        ));
+        // geodata-mode reads GeoIP.dat instead of the mmdb.
+        assert!(need("geodata-mode: true\nrules:\n  - GEOIP,CN,DIRECT\n"));
+        assert!(need("rules:\n  - SRC-IP-ASN,13335,DIRECT\n"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4835,6 +5000,7 @@ mod listener_tests {
         fs::create_dir_all(&core).unwrap();
         fs::rename(&bin, core.join("mihomo")).unwrap();
         let checks = core.join("checks");
+        let checks_run = || fs::read_to_string(&checks).map_or(0, |t| t.lines().count());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let cfg = ControllerConfig {
             addr: listener.local_addr().unwrap().to_string(),
@@ -4849,9 +5015,9 @@ mod listener_tests {
         )
         .unwrap();
         // The first file is already a fixed point: the next pass carries the
-        // listener keys over from it and finds nothing to change. The install
-        // runs the check and reloads; `regenerate_routing` and
-        // `install_config_with` read the mode.
+        // listener keys over from it and finds nothing to change. The running
+        // core validates the PUT itself, so no install runs the check;
+        // `regenerate_routing` and `install_config_with` read the mode.
         let mode = || http("200 OK", r#"{"mode":"rule"}"#);
         let server = serve(
             listener.try_clone().unwrap(),
@@ -4860,7 +5026,7 @@ mod listener_tests {
         let msg = regenerate_config(&cfg, &[], true, false, false).unwrap();
         assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
         assert!(msg.contains("validated & hot-reloaded"), "{msg}");
-        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 1);
+        assert_eq!(checks_run(), 0);
         let installed = read_config_text(&cfg).unwrap();
         let generated = compose_generated(&cfg);
         fs::remove_file(&generated).unwrap();
@@ -4877,7 +5043,7 @@ mod listener_tests {
             second.contains(" — unchanged; not reloaded, existing connections kept"),
             "{second}"
         );
-        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 1);
+        assert_eq!(checks_run(), 0);
         assert_eq!(read_config_text(&cfg).unwrap(), installed);
         // The routing choice and the generated copy are still written.
         assert_eq!(
@@ -4896,7 +5062,7 @@ mod listener_tests {
         assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
         assert!(third.contains("已校验并热重载"), "{third}");
         assert!(!RELOAD_UNCERTAIN.load(Ordering::SeqCst));
-        assert_eq!(fs::read_to_string(&checks).unwrap().lines().count(), 2);
+        assert_eq!(checks_run(), 0);
         fs::remove_dir_all(home).unwrap();
     }
 
