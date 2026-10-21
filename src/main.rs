@@ -30,10 +30,10 @@ mod ws;
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event as CEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event as CEvent,
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
-    execute,
+    execute, queue,
     terminal::{
         disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
         EnterAlternateScreen, LeaveAlternateScreen,
@@ -466,7 +466,8 @@ pub struct App {
     pub graph_samples: (f64, f64, u64),
     pub up_history: Vec<f32>,
     pub down_history: Vec<f32>,
-    pub pulse_phase: f32,
+    /// Bumped on every graph shift, so `run_app` sees one that repeats a value.
+    pub graph_gen: u64,
     pub logs: Vec<(String, String)>,
     pub toast_started: Option<Instant>,
     pub toast_area: Option<ratatui::layout::Rect>,
@@ -597,7 +598,7 @@ impl App {
             graph_samples: (0.0, 0.0, 0),
             up_history: vec![0.0; HISTORY_LEN],
             down_history: vec![0.0; HISTORY_LEN],
-            pulse_phase: 0.0,
+            graph_gen: 0,
             logs: Vec::new(),
             toast_started: None,
             toast_area: None,
@@ -804,8 +805,16 @@ impl App {
         Duration::from_micros(1_000_000 / hz)
     }
 
-    pub fn drain_events(&mut self) {
+    /// Applies queued backend events. Returns whether any of them can change
+    /// the screen: `/logs` sends a line per new connection, but only the live
+    /// Logs tab shows them (a TUN failure still raises a toast).
+    pub fn drain_events(&mut self) -> bool {
+        let mut visible = false;
         while let Ok(ev) = self.rx.try_recv() {
+            visible |= !matches!(ev, BackendEvent::Log { .. })
+                || (self.screen == Screen::Dashboard
+                    && self.main_tab == MainTab::Logs
+                    && !self.logs_paused);
             match ev {
                 BackendEvent::Traffic { up, down } => {
                     self.up_rate = up;
@@ -838,6 +847,8 @@ impl App {
                     profile,
                 } => {
                     self.action_busy = false;
+                    // The action thread fetches a snapshot next; skip the poll.
+                    self.last_snapshot_poll = Instant::now();
                     self.conns.action_finished(Instant::now());
                     let ok = result.is_ok();
                     match &result {
@@ -977,6 +988,7 @@ impl App {
                 }
             }
         }
+        visible
     }
 
     pub fn advance_graph(&mut self, elapsed: Duration) {
@@ -992,13 +1004,12 @@ impl App {
             self.down_history.remove(0);
             self.down_history.push((down / count as f64) as f32);
             self.graph_samples = (0.0, 0.0, 0);
+            self.graph_gen = self.graph_gen.wrapping_add(1);
         }
     }
 
     pub fn tick(&mut self, elapsed: Duration) {
         self.advance_graph(elapsed);
-        let dt = elapsed.as_secs_f32();
-        self.pulse_phase = (self.pulse_phase + dt * 0.9) % 1.0;
 
         if self.screen == Screen::Setup
             && self.setup_phase == SetupPhase::Starting
@@ -1612,9 +1623,15 @@ impl App {
             (Lang::Zh, "set_refresh") => "界面刷新率",
             (Lang::En, "set_refresh") => "Refresh Rate",
             (Lang::Ja, "set_refresh") => "リフレッシュレート",
-            (Lang::Zh, "desc_refresh") => "控制界面刷新率（15 / 30 / 60 / 120 Hz）。",
-            (Lang::En, "desc_refresh") => "Target UI refresh rate (15 / 30 / 60 / 120 Hz).",
-            (Lang::Ja, "desc_refresh") => "フレームレートを設定します。",
+            (Lang::Zh, "desc_refresh") => {
+                "界面最高重绘频率（15 / 30 / 60 / 120 Hz）。画面无变化时不重绘。"
+            }
+            (Lang::En, "desc_refresh") => {
+                "Maximum UI redraw rate (15 / 30 / 60 / 120 Hz). Nothing redraws while the screen is unchanged."
+            }
+            (Lang::Ja, "desc_refresh") => {
+                "画面の最大再描画レート（15 / 30 / 60 / 120 Hz）。変化がないときは再描画しません。"
+            }
             (Lang::Zh, "set_lang") => "界面语言",
             (Lang::En, "set_lang") => "Language",
             (Lang::Ja, "set_lang") => "言語",
@@ -2001,6 +2018,18 @@ fn main() -> io::Result<()> {
     run(&mut app)
 }
 
+/// Click and wheel reports only (1000, in SGR 1006 encoding). crossterm's
+/// `EnableMouseCapture` also asks for drag (1002) and any-motion (1003)
+/// reports, which terc never handles and which woke the loop on every mouse
+/// move. `DisableMouseCapture` on exit still clears all of them.
+struct ClickMouse;
+
+impl crossterm::Command for ClickMouse {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1006h")
+    }
+}
+
 fn run(app: &mut App) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2008,7 +2037,7 @@ fn run(app: &mut App) -> io::Result<()> {
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture
+        ClickMouse
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -2025,91 +2054,219 @@ fn run(app: &mut App) -> io::Result<()> {
     result
 }
 
+/// Longest the loop blocks on input before it drains backend events again.
+const IDLE_WAKE: Duration = Duration::from_millis(50);
+/// Data repaints (pushes, polls, toasts) run at most this often; Mihomo
+/// pushes once a second anyway.
+const DATA_FRAME: Duration = Duration::from_millis(100);
+/// Ages, "ago" columns and the Setup screen's config check change with time
+/// alone.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+/// Key repeats and pastes applied before one repaint.
+const INPUT_BURST: usize = 64;
+
+/// When `run_app` repaints: input at once (capped by `refresh_hz`), data at
+/// most every `DATA_FRAME`, and nothing while the screen cannot have changed.
+struct Redraw {
+    input: bool,
+    data: bool,
+    last: Instant,
+    toast: (bool, Option<Instant>),
+    graph: u64,
+}
+
+impl Redraw {
+    fn new(now: Instant) -> Self {
+        Self {
+            input: true,
+            data: false,
+            // Long enough ago that the first frame draws at once.
+            last: now.checked_sub(HEARTBEAT).unwrap_or(now),
+            toast: (false, None),
+            graph: 0,
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.input || self.data
+    }
+
+    fn toast_of(app: &App) -> (bool, Option<Instant>) {
+        (app.toast_visible(), app.toast_started)
+    }
+
+    /// Notes changes no event reports: a toast shown, replaced or expired, a
+    /// graph shift, and the heartbeat.
+    fn observe(&mut self, app: &App, now: Instant) {
+        self.data |= Self::toast_of(app) != self.toast
+            || app.graph_gen != self.graph
+            || now.saturating_duration_since(self.last) >= HEARTBEAT;
+    }
+
+    /// Time since the last frame the pending change has to wait for.
+    fn gap(&self, frame: Duration) -> Option<Duration> {
+        if self.input {
+            Some(frame)
+        } else if self.data {
+            Some(frame.max(DATA_FRAME))
+        } else {
+            None
+        }
+    }
+
+    fn due(&self, now: Instant, frame: Duration) -> bool {
+        self.gap(frame)
+            .is_some_and(|gap| now.saturating_duration_since(self.last) >= gap)
+    }
+
+    /// How long the loop may wait for input before it has to look again.
+    fn wait(&self, now: Instant, frame: Duration) -> Duration {
+        let since = now.saturating_duration_since(self.last);
+        self.gap(frame)
+            .unwrap_or(HEARTBEAT)
+            .saturating_sub(since)
+            .min(IDLE_WAKE)
+    }
+
+    fn drawn(&mut self, app: &App, now: Instant) {
+        self.input = false;
+        self.data = false;
+        self.last = now;
+        self.toast = Self::toast_of(app);
+        self.graph = app.graph_gen;
+    }
+}
+
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     let mut last_tick = Instant::now();
+    let mut redraw = Redraw::new(last_tick);
+    // A mouse event read behind undrawn changes waits for the next frame: its
+    // hit areas (proxy_hits, list scroll) come from the last draw.
+    let mut held: Option<CEvent> = None;
 
     loop {
-        app.drain_events();
-        execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let draw_res = terminal.draw(|frame| draw(frame, app)).map(|_| ());
-        let sync_res = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
-        draw_res?;
-        sync_res?;
+        redraw.data |= app.drain_events();
+        let now = Instant::now();
+        redraw.observe(app, now);
+        let frame = app.frame_duration();
+        if redraw.due(now, frame) || (held.is_some() && redraw.pending()) {
+            // Queued, so Begin and End ride along with the frame's own flushes.
+            queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+            let draw_res = terminal.draw(|frame| draw(frame, app)).map(|_| ());
+            let sync_res = queue!(terminal.backend_mut(), EndSynchronizedUpdate)
+                .and_then(|()| io::Write::flush(terminal.backend_mut()));
+            draw_res?;
+            sync_res?;
+            redraw.drawn(app, Instant::now());
+        }
 
-        let tick_rate = app.frame_duration();
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_millis(0));
-
-        if event::poll(timeout)? {
-            match event::read()? {
-                CEvent::Key(key) => {
-                    if handle_key(app, key) {
-                        return Ok(());
-                    }
-                }
-                CEvent::Mouse(mouse) => {
-                    if proxy_mouse_action(app, mouse) {
-                        app.activate_selected_node();
-                    }
-                }
-                CEvent::Paste(text) => {
-                    if let Some(form) = app.proxy_form.as_mut() {
-                        form.paste(&text);
-                    } else if app.screen == Screen::Settings && app.setting_input.is_some() {
-                        let text = text.trim();
-                        let id = app.settings_rows()[app.setting_index].id;
-                        if id == crate::settings::SettingId::TestUrl
-                            || (text.len() <= 8 && text.chars().all(|c| c.is_ascii_digit()))
-                        {
-                            app.setting_input = Some(text.trim().to_string());
-                        }
-                    } else if app.screen == Screen::Setup && app.setup_phase == SetupPhase::Editing
-                    {
-                        if text.trim().lines().count() > 1 {
-                            app.setup_editor.load(text.trim());
-                        } else {
-                            app.setup_editor.insert_text(text.trim());
-                        }
-                    } else if matches!(app.screen, Screen::Dashboard | Screen::Settings)
-                        && (app.settings_management
-                            || matches!(app.overlay, Overlay::OwnNodes | Overlay::PrivateRules))
-                    {
-                        crate::manage::handle_manage_paste(app, &text);
-                    } else if app.screen == Screen::Dashboard && app.overlay == Overlay::Probe {
-                        app.probe_editor.insert(&text);
-                    } else if app.screen == Screen::Dashboard
-                        && app.main_tab == MainTab::Dns
-                        && app.dns_editing
-                    {
-                        app.dns_editor.insert(&text);
-                    } else if app.screen == Screen::Dashboard
-                        && app.main_tab == MainTab::Rules
-                        && app.rule_editing
-                    {
-                        if app.rule_explaining {
-                            app.rule_target_editor.insert_text(&text);
-                        } else {
-                            app.rule_query.insert_text(&text);
-                            app.rule_index = 0;
-                        }
-                    } else if app.screen == Screen::Dashboard
-                        && app.main_tab == MainTab::Logs
-                        && app.log_editing
-                    {
-                        app.log_query.insert_text(&text);
-                        app.log_index = 0;
-                    }
-                }
-                _ => {}
+        let mut next = match held.take() {
+            Some(ev) => Some(ev),
+            None if event::poll(redraw.wait(Instant::now(), frame))? => Some(event::read()?),
+            None => None,
+        };
+        let mut applied = 0;
+        while let Some(ev) = next.take() {
+            if matches!(&ev, CEvent::Mouse(m) if mouse_acts(m.kind)) && redraw.pending() {
+                held = Some(ev);
+                break;
+            }
+            let burst = matches!(ev, CEvent::Key(_) | CEvent::Paste(_));
+            match handle_event(app, ev) {
+                Handled::Quit => return Ok(()),
+                Handled::Changed => redraw.input = true,
+                Handled::Unchanged => {}
+            }
+            applied += 1;
+            // Key repeat and pastes coalesce into one frame; mouse events do
+            // not, since each hit-tests against the frame before it.
+            if burst && applied < INPUT_BURST && event::poll(Duration::ZERO)? {
+                next = Some(event::read()?);
             }
         }
 
-        let elapsed = last_tick.elapsed();
-        if elapsed >= tick_rate {
-            app.tick(elapsed);
-            last_tick = Instant::now();
+        let shown = (app.screen, app.setup_phase);
+        app.tick(last_tick.elapsed());
+        last_tick = Instant::now();
+        redraw.data |= shown != (app.screen, app.setup_phase);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Handled {
+    Quit,
+    Changed,
+    Unchanged,
+}
+
+/// Mouse events terc acts on; release, drag and motion change nothing.
+fn mouse_acts(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    )
+}
+
+fn handle_event(app: &mut App, ev: CEvent) -> Handled {
+    match ev {
+        CEvent::Key(key) => {
+            if handle_key(app, key) {
+                return Handled::Quit;
+            }
         }
+        CEvent::Mouse(mouse) => {
+            if !mouse_acts(mouse.kind) {
+                return Handled::Unchanged;
+            }
+            if proxy_mouse_action(app, mouse) {
+                app.activate_selected_node();
+            }
+        }
+        CEvent::Paste(text) => handle_paste(app, &text),
+        // The next draw picks up the new size.
+        CEvent::Resize(..) => {}
+        CEvent::FocusGained | CEvent::FocusLost => return Handled::Unchanged,
+    }
+    Handled::Changed
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    if let Some(form) = app.proxy_form.as_mut() {
+        form.paste(text);
+    } else if app.screen == Screen::Settings && app.setting_input.is_some() {
+        let text = text.trim();
+        let id = app.settings_rows()[app.setting_index].id;
+        if id == crate::settings::SettingId::TestUrl
+            || (text.len() <= 8 && text.chars().all(|c| c.is_ascii_digit()))
+        {
+            app.setting_input = Some(text.trim().to_string());
+        }
+    } else if app.screen == Screen::Setup && app.setup_phase == SetupPhase::Editing {
+        if text.trim().lines().count() > 1 {
+            app.setup_editor.load(text.trim());
+        } else {
+            app.setup_editor.insert_text(text.trim());
+        }
+    } else if matches!(app.screen, Screen::Dashboard | Screen::Settings)
+        && (app.settings_management
+            || matches!(app.overlay, Overlay::OwnNodes | Overlay::PrivateRules))
+    {
+        crate::manage::handle_manage_paste(app, text);
+    } else if app.screen == Screen::Dashboard && app.overlay == Overlay::Probe {
+        app.probe_editor.insert(text);
+    } else if app.screen == Screen::Dashboard && app.main_tab == MainTab::Dns && app.dns_editing {
+        app.dns_editor.insert(text);
+    } else if app.screen == Screen::Dashboard && app.main_tab == MainTab::Rules && app.rule_editing
+    {
+        if app.rule_explaining {
+            app.rule_target_editor.insert_text(text);
+        } else {
+            app.rule_query.insert_text(text);
+            app.rule_index = 0;
+        }
+    } else if app.screen == Screen::Dashboard && app.main_tab == MainTab::Logs && app.log_editing {
+        app.log_query.insert_text(text);
+        app.log_index = 0;
     }
 }
 
@@ -4123,5 +4280,182 @@ mod tests {
                 "{lang:?}"
             );
         }
+    }
+
+    #[test]
+    fn action_done_restarts_the_poll_timer() {
+        let mut app = offline_app();
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        app.action_busy = true;
+        app.last_snapshot_poll = Instant::now() - Duration::from_secs(10);
+        app.tx
+            .send(BackendEvent::ActionDone {
+                result: Ok("done".into()),
+                modules: None,
+                profile: None,
+            })
+            .unwrap();
+        assert!(app.drain_events());
+        assert!(!app.action_busy);
+        // The action thread's own snapshot is on its way; no second poll now.
+        app.tick(Duration::from_millis(10));
+        assert!(!app.snapshot_pending);
+    }
+
+    fn log(level: &str, payload: &str) -> BackendEvent {
+        BackendEvent::Log {
+            level: level.into(),
+            payload: payload.into(),
+        }
+    }
+
+    #[test]
+    fn drain_reports_only_changes_the_screen_shows() {
+        let mut app = offline_app();
+        assert!(!app.drain_events());
+        // /logs carries a line per new connection; off the Logs tab it is kept, not drawn.
+        app.tx.send(log("info", "[TCP] a --> b match x")).unwrap();
+        assert!(!app.drain_events());
+        assert_eq!(app.logs.len(), 1);
+        app.main_tab = MainTab::Logs;
+        app.tx.send(log("info", "[TCP] c --> d match x")).unwrap();
+        assert!(app.drain_events());
+        app.pause_logs();
+        app.tx.send(log("info", "[TCP] e --> f match x")).unwrap();
+        assert!(!app.drain_events());
+        // A TUN failure still reaches the screen through the toast.
+        app.main_tab = MainTab::Proxies;
+        app.tx
+            .send(log("error", "Start TUN listening error: denied"))
+            .unwrap();
+        assert!(!app.drain_events());
+        assert!(app.toast_visible());
+        app.tx
+            .send(BackendEvent::Traffic { up: 1, down: 2 })
+            .unwrap();
+        app.tx.send(log("info", "[TCP] g --> h match x")).unwrap();
+        assert!(app.drain_events());
+        assert_eq!(app.logs.len(), 5);
+    }
+
+    #[test]
+    fn graph_generation_counts_shifts_even_of_equal_samples() {
+        let mut app = offline_app();
+        let gen = app.graph_gen;
+        app.advance_graph(Duration::from_secs(1));
+        assert_eq!(app.graph_gen, gen, "no samples, no shift");
+        for round in 1..=2 {
+            app.graph_samples = (100.0, 100.0, 1);
+            app.advance_graph(Duration::from_secs(1));
+            assert_eq!(app.graph_gen, gen + round);
+        }
+        assert_eq!(app.up_history[HISTORY_LEN - 2..], [100.0, 100.0]);
+    }
+
+    #[test]
+    fn redraw_draws_input_at_once_and_caps_data_and_heartbeat() {
+        let app = offline_app();
+        let frame = Duration::from_millis(16);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut redraw = Redraw::new(t0);
+        assert!(redraw.due(t0, frame), "first frame at once");
+        redraw.drawn(&app, t0);
+        redraw.observe(&app, at(10));
+        assert!(!redraw.pending());
+        assert_eq!(redraw.wait(at(10), frame), IDLE_WAKE);
+        // Data waits for the 100 ms frame, input only for refresh_hz.
+        redraw.data = true;
+        assert!(!redraw.due(at(40), frame));
+        assert_eq!(redraw.wait(at(70), frame), Duration::from_millis(30));
+        assert!(redraw.due(at(100), frame));
+        redraw.input = true;
+        assert!(redraw.due(at(16), frame));
+        assert!(!redraw.due(at(16), Duration::from_millis(66)), "15 Hz cap");
+        redraw.drawn(&app, at(100));
+        // Nothing changed: one heartbeat a second for ages and "ago" columns.
+        redraw.observe(&app, at(1099));
+        assert!(!redraw.pending());
+        redraw.observe(&app, at(1100));
+        assert!(redraw.due(at(1100), frame));
+    }
+
+    #[test]
+    fn redraw_sees_toast_edges_and_graph_shifts() {
+        let mut app = offline_app();
+        let frame = Duration::from_millis(16);
+        let t0 = Instant::now();
+        let mut redraw = Redraw::new(t0);
+        redraw.drawn(&app, t0);
+        app.set_status("first", false);
+        redraw.observe(&app, t0);
+        assert!(redraw.pending(), "toast shown");
+        redraw.drawn(&app, t0);
+        // A new message while one is still up replaces it.
+        app.toast_started = Some(Instant::now() + Duration::from_millis(1));
+        redraw.observe(&app, t0);
+        assert!(redraw.pending(), "toast replaced");
+        redraw.drawn(&app, t0);
+        app.toast_started = Some(Instant::now() - Duration::from_secs(5));
+        redraw.observe(&app, t0);
+        assert!(redraw.pending(), "toast expired");
+        redraw.drawn(&app, t0);
+        app.graph_gen += 1;
+        redraw.observe(&app, t0);
+        assert!(redraw.pending(), "graph shifted");
+        redraw.drawn(&app, t0);
+        redraw.observe(&app, t0);
+        assert!(!redraw.due(t0 + Duration::from_millis(500), frame));
+    }
+
+    #[test]
+    fn terminal_events_mark_only_what_can_change_the_screen() {
+        let mut app = offline_app();
+        let mouse = |kind| {
+            CEvent::Mouse(MouseEvent {
+                kind,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let key = |code| CEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(handle_event(&mut app, key(KeyCode::Down)), Handled::Changed);
+        assert_eq!(
+            handle_event(&mut app, CEvent::Resize(80, 24)),
+            Handled::Changed
+        );
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        ] {
+            assert!(!mouse_acts(kind));
+            assert_eq!(handle_event(&mut app, mouse(kind)), Handled::Unchanged);
+        }
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            assert!(mouse_acts(kind));
+            assert_eq!(handle_event(&mut app, mouse(kind)), Handled::Changed);
+        }
+        assert_eq!(
+            handle_event(&mut app, CEvent::FocusGained),
+            Handled::Unchanged
+        );
+        assert_eq!(
+            handle_event(&mut app, key(KeyCode::Char('q'))),
+            Handled::Quit
+        );
+    }
+
+    #[test]
+    fn mouse_mode_asks_for_clicks_and_wheel_only() {
+        let mut out = String::new();
+        crossterm::Command::write_ansi(&ClickMouse, &mut out).unwrap();
+        // 1000 click/wheel + 1006 SGR; never 1002 (drag) or 1003 (any motion).
+        assert_eq!(out, "\x1b[?1000h\x1b[?1006h");
     }
 }
