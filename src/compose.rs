@@ -661,7 +661,7 @@ fn template_base(addr: &str, secret: &str) -> String {
         "mixed-port: 7890\n\
 allow-lan: false\n\
 mode: rule\n\
-log-level: info\n\
+log-level: warning\n\
 ipv6: false\n\
 unified-delay: true\n\
 tcp-concurrent: true\n\
@@ -2639,9 +2639,14 @@ mod profile_tests {
             vec!["geox-url:\n  geosite: \"https://example.org/gs.dat\"".to_string()]
         );
         assert!(!kept.contains(GEOX_MIRROR));
-        // The template carries all four keys.
+        // The template carries all four keys and a quiet core log.
         let template = build(None, &manual());
         assert_eq!(geox(&template), found);
+        assert!(template.contains("\nlog-level: warning\n"));
+        let source_level = format!("log-level: debug\n{CLASH}");
+        let source_level = build(Some(&convert_subscription(&source_level).unwrap()), &[]);
+        assert!(source_level.contains("log-level: debug\n"));
+        assert!(!source_level.contains("log-level: warning"));
     }
 
     #[test]

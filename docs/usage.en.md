@@ -57,7 +57,7 @@ Proxy settings include mixed / HTTP / SOCKS ports, LAN access, TUN, DNS, IPv6, s
 
 Appearance includes theme, graph style, UI refresh rate, graph interval, language, top panels and the shortcut footer. The graph interval stays in Settings rather than cluttering the traffic graph.
 
-Diagnostics contains the log level, core download, snippets, probe, runtime details, rules, providers and Live connection stream. Startup errors include a core-log excerpt. The Logs view also reads `terc-core.log`; the preceding startup log is kept as `terc-core.previous.log`. An occupied controller or an unresponsive managed process blocks another launch. A startup timeout cleans up the newly launched process.
+Diagnostics contains the log level, core download, snippets, probe, runtime details, rules, providers and Live connection stream. Startup errors include a core-log excerpt. The Logs view also reads `terc-core.log`; the preceding startup log is kept as `terc-core.previous.log`. New configs set `log-level: warning`, so `terc-core.log` no longer gets a line per new connection; the Logs view always subscribes at info and shows the same lines as before. A subscription's own `log-level` is kept. An occupied controller or an unresponsive managed process blocks another launch. A startup timeout cleans up the newly launched process.
 
 ## Geodata
 
