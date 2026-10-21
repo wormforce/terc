@@ -838,6 +838,8 @@ impl App {
                     profile,
                 } => {
                     self.action_busy = false;
+                    // The action thread fetches a snapshot next; skip the poll.
+                    self.last_snapshot_poll = Instant::now();
                     self.conns.action_finished(Instant::now());
                     let ok = result.is_ok();
                     match &result {
@@ -4123,5 +4125,25 @@ mod tests {
                 "{lang:?}"
             );
         }
+    }
+
+    #[test]
+    fn action_done_restarts_the_poll_timer() {
+        let mut app = offline_app();
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        app.action_busy = true;
+        app.last_snapshot_poll = Instant::now() - Duration::from_secs(10);
+        app.tx
+            .send(BackendEvent::ActionDone {
+                result: Ok("done".into()),
+                modules: None,
+                profile: None,
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(!app.action_busy);
+        // The action thread's own snapshot is on its way; no second poll now.
+        app.tick(Duration::from_millis(10));
+        assert!(!app.snapshot_pending);
     }
 }
