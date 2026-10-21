@@ -660,11 +660,7 @@ fn stream_session(
         match client.read_message() {
             Ok(Message::Text(text)) => {
                 idle = 0;
-                let snapshot = serde_json::from_str::<Value>(&text).ok().filter(|v| {
-                    v.get("connections")
-                        .is_some_and(|c| c.is_null() || c.is_array())
-                });
-                let Some(v) = snapshot else {
+                let Some((items, upload_total, download_total)) = parse_connections(&text) else {
                     garbled += 1;
                     if garbled >= 3 {
                         return ended("3 unreadable snapshots in a row".into(), delivered);
@@ -672,7 +668,6 @@ fn stream_session(
                     continue;
                 };
                 garbled = 0;
-                let (items, upload_total, download_total) = connections_from_snapshot_json(&v);
                 let event = BackendEvent::Connections {
                     items,
                     upload_total,
@@ -729,52 +724,188 @@ fn stream_session(
 }
 
 /// A `/connections` body, polled or pushed: items sorted by total bytes, then
-/// the upload and download totals. `connections: null` means none.
-pub fn connections_from_snapshot_json(v: &Value) -> (Vec<ConnectionItem>, u64, u64) {
-    let upload_total = v.get("uploadTotal").and_then(Value::as_u64).unwrap_or(0);
-    let download_total = v.get("downloadTotal").and_then(Value::as_u64).unwrap_or(0);
-    let mut connections = Vec::new();
-    for c in v
-        .get("connections")
-        .and_then(Value::as_array)
+/// the upload and download totals. `connections: null` means none; a body
+/// without the key is not a snapshot and gives `None`.
+pub fn parse_connections(text: &str) -> Option<(Vec<ConnectionItem>, u64, u64)> {
+    let snap: conn_json::Snap = serde_json::from_str(text).ok()?;
+    let mut connections: Vec<ConnectionItem> = snap
+        .connections
         .into_iter()
-        .flatten()
-    {
-        // Id, rule, byte counters and the rest come from connection_from_value.
-        let Some(mut item) = connection_from_value(c) else {
-            continue;
-        };
-        let meta = c.get("metadata");
-        let field = |key: &str| {
-            meta.and_then(|m| m.get(key))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-        };
-        let host = match field("host") {
-            "" => field("destinationIP"),
-            host => host,
-        };
-        item.host = format!("{host}:{}", field("destinationPort"));
-        item.network = meta
-            .and_then(|m| m.get("network"))
-            .and_then(Value::as_str)
-            .unwrap_or("tcp")
-            .to_uppercase();
-        item.chains = c
-            .get("chains")
-            .and_then(Value::as_array)
-            .map(|ch| {
-                ch.iter()
-                    .rev()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" › ")
-            })
-            .unwrap_or_default();
-        connections.push(item);
-    }
+        .map(conn_json::Conn::into_item)
+        .collect();
     connections.sort_by_key(|c| std::cmp::Reverse(c.download + c.upload));
-    (connections, upload_total, download_total)
+    Some((connections, snap.upload_total, snap.download_total))
+}
+
+/// Typed `/connections` JSON. Only the fields `ConnectionItem` shows are
+/// declared; serde skips the rest without building a tree, and each string
+/// moves into the item. Fields read as leniently as the old `Value` lookups
+/// did: null, a missing key or an odd type gives the default.
+mod conn_json {
+    use super::ConnectionItem;
+    use serde::{Deserialize, Deserializer};
+    use serde_json::Value;
+
+    fn text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::String(s) => s,
+            _ => String::new(),
+        })
+    }
+
+    fn opt_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::String(s) => Some(s),
+            _ => None,
+        })
+    }
+
+    fn count<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        Ok(Value::deserialize(d)?.as_u64().unwrap_or(0))
+    }
+
+    /// String array entries; anything else is skipped.
+    fn texts<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::Array(items) => items
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+    }
+
+    fn nul<'de, D, T>(d: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Default + Deserialize<'de>,
+    {
+        Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Snap {
+        #[serde(rename = "uploadTotal", default, deserialize_with = "count")]
+        pub upload_total: u64,
+        #[serde(rename = "downloadTotal", default, deserialize_with = "count")]
+        pub download_total: u64,
+        // No `default`: the key must be present, as Mihomo always writes it.
+        #[serde(deserialize_with = "nul")]
+        pub connections: Vec<Conn>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    pub(super) struct Conn {
+        #[serde(deserialize_with = "text")]
+        id: String,
+        #[serde(deserialize_with = "nul")]
+        metadata: Meta,
+        #[serde(deserialize_with = "count")]
+        upload: u64,
+        #[serde(deserialize_with = "count")]
+        download: u64,
+        #[serde(deserialize_with = "text")]
+        start: String,
+        #[serde(deserialize_with = "texts")]
+        chains: Vec<String>,
+        #[serde(rename = "providerChains", deserialize_with = "texts")]
+        provider_chains: Vec<String>,
+        #[serde(deserialize_with = "text")]
+        rule: String,
+        #[serde(rename = "rulePayload", deserialize_with = "text")]
+        rule_payload: String,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Meta {
+        #[serde(deserialize_with = "opt_text")]
+        network: Option<String>,
+        #[serde(rename = "type", deserialize_with = "text")]
+        inbound: String,
+        #[serde(rename = "inboundName", deserialize_with = "text")]
+        inbound_name: String,
+        #[serde(rename = "sourceIP", deserialize_with = "text")]
+        source_ip: String,
+        #[serde(rename = "sourcePort", deserialize_with = "text")]
+        source_port: String,
+        #[serde(rename = "destinationIP", deserialize_with = "text")]
+        destination_ip: String,
+        #[serde(rename = "destinationPort", deserialize_with = "text")]
+        destination_port: String,
+        #[serde(deserialize_with = "text")]
+        host: String,
+        #[serde(rename = "sniffHost", deserialize_with = "text")]
+        sniff_host: String,
+        #[serde(rename = "dnsMode", deserialize_with = "text")]
+        dns_mode: String,
+        #[serde(deserialize_with = "text")]
+        process: String,
+        #[serde(rename = "processPath", deserialize_with = "text")]
+        process_path: String,
+        #[serde(rename = "destinationGeoIP", deserialize_with = "texts")]
+        destination_geo_ip: Vec<String>,
+        #[serde(rename = "destinationIPASN", deserialize_with = "text")]
+        destination_ip_asn: String,
+    }
+
+    impl Conn {
+        pub(super) fn into_item(self) -> ConnectionItem {
+            let m = self.metadata;
+            let host = if m.host.is_empty() {
+                &m.destination_ip
+            } else {
+                &m.host
+            };
+            let source = if m.source_ip.is_empty() {
+                String::new()
+            } else {
+                format!("{}:{}", m.source_ip, m.source_port)
+            };
+            let provider: Vec<&str> = self
+                .provider_chains
+                .iter()
+                .rev()
+                .map(String::as_str)
+                .filter(|name| !name.is_empty())
+                .collect();
+            ConnectionItem {
+                host: format!("{host}:{}", m.destination_port),
+                network: m.network.as_deref().unwrap_or("tcp").to_uppercase(),
+                chains: self
+                    .chains
+                    .iter()
+                    .rev()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" › "),
+                upload: self.upload,
+                download: self.download,
+                process: m.process,
+                process_path: m.process_path,
+                inbound: m.inbound,
+                inbound_name: m.inbound_name,
+                source,
+                sniff_host: m.sniff_host,
+                start_ms: crate::conns::parse_rfc3339_ms(&self.start),
+                start: self.start,
+                provider: provider.join(" › "),
+                dns_mode: m.dns_mode,
+                dest_geo: m.destination_geo_ip.join(","),
+                dest_asn: m.destination_ip_asn,
+                id: self.id,
+                rule: self.rule,
+                rule_payload: self.rule_payload,
+                up_rate: 0,
+                down_rate: 0,
+                ai: false,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1178,8 +1309,7 @@ mod stream_tests {
     #[test]
     fn snapshot_parser_matches_the_polled_list() {
         // The shape Mihomo 88dcbf7 writes: ports as strings, chains leaf first.
-        let v: Value = serde_json::from_str(
-            r#"{"downloadTotal":5000,"uploadTotal":700,"memory":1,"connections":[
+        let text = r#"{"downloadTotal":5000,"uploadTotal":700,"memory":1,"connections":[
               {"id":"small","metadata":{"network":"udp","type":"Tun","sourceIP":"198.18.0.1",
                "destinationIP":"1.1.1.1","sourcePort":"53000","destinationPort":"53","host":"",
                "dnsMode":"normal","process":"mDNSResponder"},
@@ -1193,10 +1323,8 @@ mod stream_tests {
                "rule":"DomainSuffix","rulePayload":"openai.com"},
               {"id":"bare","metadata":{"destinationIP":"203.0.113.7","destinationPort":"8443"},
                "upload":10,"download":10}
-            ]}"#,
-        )
-        .unwrap();
-        let (items, up, down) = connections_from_snapshot_json(&v);
+            ]}"#;
+        let (items, up, down) = parse_connections(text).unwrap();
         assert_eq!((up, down), (700, 5000));
         fn row(c: &ConnectionItem) -> (&str, &str, &str, &str, &str, u64, u64) {
             (
@@ -1231,9 +1359,126 @@ mod stream_tests {
         assert!(items[0].start_ms.is_some());
         assert!(items[2].start_ms.is_some());
 
-        let empty = json!({"downloadTotal": 1, "uploadTotal": 2, "connections": null});
-        assert_eq!(connections_from_snapshot_json(&empty).0.len(), 0);
-        assert_eq!(connections_from_snapshot_json(&empty).1, 2);
+        let empty = r#"{"downloadTotal": 1, "uploadTotal": 2, "connections": null}"#;
+        let (items, up, down) = parse_connections(empty).unwrap();
+        assert!(items.is_empty());
+        assert_eq!((up, down), (2, 1));
+    }
+
+    #[test]
+    fn snapshot_parser_reads_nulls_and_odd_types_as_defaults() {
+        let text = r#"{"uploadTotal":null,"downloadTotal":-1,"connections":[
+            {"id":"n","metadata":{"network":null,"type":"Tun","host":null,
+             "destinationIP":"198.51.100.4","destinationPort":"80","sourceIP":"",
+             "destinationGeoIP":null,"destinationIPASN":null,"process":7},
+             "upload":1.5,"download":null,"chains":null,"providerChains":null,
+             "rule":null,"rulePayload":null,"start":null},
+            {"id":"m","metadata":null,"chains":["A",null,"B"],"providerChains":"x",
+             "destinationGeoIP":["CN"],"upload":3,"download":4,"extra":{"deep":[1,2]}}
+        ]}"#;
+        let (items, up, down) = parse_connections(text).unwrap();
+        assert_eq!((up, down), (0, 0));
+        let m = &items[0];
+        assert_eq!((m.id.as_str(), m.host.as_str()), ("m", ":"));
+        assert_eq!((m.network.as_str(), m.chains.as_str()), ("TCP", "B › A"));
+        assert_eq!((m.upload, m.download, m.provider.as_str()), (3, 4, ""));
+        let n = &items[1];
+        assert_eq!(n.host, "198.51.100.4:80");
+        assert_eq!((n.network.as_str(), n.inbound.as_str()), ("TCP", "Tun"));
+        assert_eq!((n.upload, n.download), (0, 0));
+        assert_eq!((n.chains.as_str(), n.provider.as_str()), ("", ""));
+        assert_eq!((n.dest_geo.as_str(), n.dest_asn.as_str()), ("", ""));
+        assert_eq!((n.process.as_str(), n.source.as_str()), ("", ""));
+        assert_eq!((n.rule.as_str(), n.start.as_str()), ("", ""));
+        assert_eq!(n.start_ms, None);
+    }
+
+    #[test]
+    fn snapshot_parser_rejects_bodies_without_a_connection_list() {
+        for text in [
+            "",
+            "not json",
+            "{}",
+            r#"{"uploadTotal":1,"downloadTotal":2}"#,
+            r#"{"connections":{}}"#,
+            r#"{"connections":"none"}"#,
+            r#"[{"connections":[]}]"#,
+        ] {
+            assert!(parse_connections(text).is_none(), "{text}");
+        }
+        assert!(parse_connections(r#"{"connections":[]}"#).is_some());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    /// A controller that answers each path from `routes` (404 otherwise) and
+    /// records the paths it was asked for.
+    fn controller(
+        routes: Vec<(&'static str, String)>,
+    ) -> (ControllerConfig, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                if reader.read_line(&mut first).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, body) = match routes.iter().find(|(p, _)| *p == path) {
+                    Some((_, body)) => (200, body.as_str()),
+                    None => (404, r#"{"message":"resource not found"}"#),
+                };
+                log.lock().unwrap().push(path);
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let cfg = ControllerConfig {
+            addr,
+            config_dir: "/nonexistent/terc-snapshot-test".into(),
+            ..ControllerConfig::default()
+        };
+        (cfg, seen)
+    }
+
+    #[test]
+    fn polled_body_without_a_connection_list_is_not_an_empty_list() {
+        let conns = r#"{"uploadTotal":5,"downloadTotal":6,"connections":[{"id":"a","metadata":{"host":"a.test","destinationPort":"443"},"upload":1,"download":2}]}"#;
+        let (cfg, _) = controller(vec![
+            ("/version", r#"{"version":"v1.19.28"}"#.into()),
+            ("/connections", conns.into()),
+        ]);
+        let snap = fetch_snapshot(&cfg);
+        assert!(snap.running && snap.connections_ok);
+        assert_eq!(snap.connections[0].host, "a.test:443");
+        assert_eq!((snap.upload_total, snap.download_total), (5, 6));
+
+        for body in [r#"{"uploadTotal":5,"downloadTotal":6}"#, "{}", "oops"] {
+            let (cfg, _) = controller(vec![
+                ("/version", r#"{"version":"v1.19.28"}"#.into()),
+                ("/connections", body.into()),
+            ]);
+            let snap = fetch_snapshot(&cfg);
+            assert!(snap.running, "{body}");
+            // App::accept_snapshot then keeps the previous list and totals.
+            assert!(!snap.connections_ok, "{body}");
+        }
     }
 }
 
@@ -1458,8 +1703,10 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, include_connections: bool) -> Cor
         if let Ok((200, conn_body)) =
             http_request(&cfg.addr, &cfg.secret, "GET", "/connections", None, timeout)
         {
-            if let Ok(v) = serde_json::from_str::<Value>(&conn_body) {
-                (connections, upload_total, download_total) = connections_from_snapshot_json(&v);
+            // A body without a connection list keeps the last one (`connections_ok`
+            // stays false) instead of reporting every session as closed.
+            if let Some(parsed) = parse_connections(&conn_body) {
+                (connections, upload_total, download_total) = parsed;
                 connections_ok = true;
             }
         }
@@ -1559,6 +1806,9 @@ fn snapshot_from_flags(
     }
 }
 
+/// Test helper: one connection's columns except `host` and `chains`, which
+/// `parse_connections` fills.
+#[cfg(test)]
 pub fn connection_from_value(value: &Value) -> Option<ConnectionItem> {
     let meta = value.get("metadata");
     let text = |key: &str| {
