@@ -661,7 +661,7 @@ fn template_base(addr: &str, secret: &str) -> String {
         "mixed-port: 7890\n\
 allow-lan: false\n\
 mode: rule\n\
-log-level: info\n\
+log-level: warning\n\
 ipv6: false\n\
 unified-delay: true\n\
 tcp-concurrent: true\n\
@@ -671,15 +671,41 @@ external-controller: {addr}\n"
     if !secret.is_empty() {
         text.push_str(&format!("secret: {}\n", json!(secret)));
     }
+    text.push_str("geodata-mode: false\n");
+    for line in geox_url_chunk().lines {
+        text.push_str(&line);
+        text.push('\n');
+    }
     text.push_str(
-        "geodata-mode: false\n\
-geox-url:\n  mmdb: \"https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb\"\n\
-profile:\n  store-selected: true\n\
+        "profile:\n  store-selected: true\n\
 sniffer:\n  enable: false\n  sniff:\n    HTTP:\n      ports: [80, 8080-8880]\n      override-destination: true\n    TLS:\n      ports: [443, 8443]\n    QUIC:\n      ports: [443, 8443]\n\
 tun:\n  enable: false\n  stack: mixed\n  auto-route: true\n  auto-detect-interface: true\n  dns-hijack: [\"any:53\"]\n\
 dns:\n  enable: true\n  ipv6: false\n  listen: 127.0.0.1:1053\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n  fake-ip-filter: [\"*.lan\", \"+.local\", \"localhost\"]\n  default-nameserver: [223.5.5.5, 119.29.29.29]\n  nameserver: [\"https://doh.pub/dns-query\", \"https://dns.alidns.com/dns-query\"]\n",
     );
     text
+}
+
+/// jsDelivr mirror of the meta-rules-dat `release` branch. Mihomo's defaults
+/// are GitHub release downloads with 90 s per file, and a failed download
+/// fails `mihomo -t`, so a first run on a slow link would not start.
+const GEOX_MIRROR: &str = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/";
+
+/// All four keys: one left out falls back to Mihomo's GitHub default.
+fn geox_url_chunk() -> YamlChunk {
+    let files = [
+        ("geoip", "geoip.dat"),
+        ("geosite", "geosite.dat"),
+        ("mmdb", "country.mmdb"),
+        ("asn", "GeoLite2-ASN.mmdb"),
+    ];
+    YamlChunk {
+        key: Some("geox-url".into()),
+        lines: std::iter::once("geox-url:".to_string())
+            .chain(files.iter().map(|(key, file)| {
+                format!("  {key}: {}", yaml_str(&format!("{GEOX_MIRROR}{file}")))
+            }))
+            .collect(),
+    }
 }
 
 fn yaml_str(s: &str) -> String {
@@ -2231,6 +2257,14 @@ pub fn compose_profile_reserving(
             ],
         });
     }
+    // A source's own geox-url, even a partial one, is left as it is.
+    if !chunks.iter().any(|c| c.key.as_deref() == Some("geox-url")) {
+        let pos = chunks
+            .iter()
+            .position(|c| c.key.as_deref() == Some("proxies"))
+            .unwrap_or(chunks.len());
+        chunks.insert(pos, geox_url_chunk());
+    }
     let body = crate::mihomo::normalize_subscription(&join_chunks(&chunks), input.controller_addr);
     let body = crate::ops::set_top_scalar(&body, "secret", &json!(input.secret).to_string());
     Ok((format!("{GENERATED_MARK}\n{body}"), report))
@@ -2567,6 +2601,52 @@ mod profile_tests {
         );
         let yaml = build(Some(&convert_subscription(&flow).unwrap()), &manual());
         assert!(yaml.contains("proxies: [HK, \"Own\"]"));
+    }
+
+    #[test]
+    fn geodata_mirror_fills_only_an_absent_geox_url() {
+        let geox = |yaml: &str| {
+            split_chunks(yaml)
+                .into_iter()
+                .filter(|c| c.key.as_deref() == Some("geox-url"))
+                .map(|c| c.lines.join("\n"))
+                .collect::<Vec<_>>()
+        };
+        let mirror = |file: &str| format!("\"{GEOX_MIRROR}{file}\"");
+        let clash = build(Some(&convert_subscription(CLASH).unwrap()), &manual());
+        let found = geox(&clash);
+        assert_eq!(found.len(), 1, "{clash}");
+        for (key, file) in [
+            ("geoip", "geoip.dat"),
+            ("geosite", "geosite.dat"),
+            ("mmdb", "country.mmdb"),
+            ("asn", "GeoLite2-ASN.mmdb"),
+        ] {
+            assert!(
+                found[0].contains(&format!("  {key}: {}", mirror(file))),
+                "{clash}"
+            );
+        }
+        // Placed ahead of the node list, and recomposing keeps one copy.
+        assert!(clash.find("geox-url:").unwrap() < clash.find("proxies:").unwrap());
+        let again = build(Some(&convert_subscription(&clash).unwrap()), &manual());
+        assert_eq!(geox(&again), found);
+        // A source's own geox-url, even with one key, is left alone.
+        let own = format!("geox-url:\n  geosite: \"https://example.org/gs.dat\"\n{CLASH}");
+        let kept = build(Some(&convert_subscription(&own).unwrap()), &manual());
+        assert_eq!(
+            geox(&kept),
+            vec!["geox-url:\n  geosite: \"https://example.org/gs.dat\"".to_string()]
+        );
+        assert!(!kept.contains(GEOX_MIRROR));
+        // The template carries all four keys and a quiet core log.
+        let template = build(None, &manual());
+        assert_eq!(geox(&template), found);
+        assert!(template.contains("\nlog-level: warning\n"));
+        let source_level = format!("log-level: debug\n{CLASH}");
+        let source_level = build(Some(&convert_subscription(&source_level).unwrap()), &[]);
+        assert!(source_level.contains("log-level: debug\n"));
+        assert!(!source_level.contains("log-level: warning"));
     }
 
     #[test]

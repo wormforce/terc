@@ -306,7 +306,7 @@ ws-opts:
 - `spawn_stream_workers`（`src/mihomo.rs:335`）多启动一个线程 `stream_connections`（`:555`）：
   - 用 `ws::connect` 连 `ws://{控制器}/connections?interval=1000`，secret 非空时带 `Authorization: Bearer …`。
     连接超时 1.5 秒，读超时 2 秒。
-  - 每个 text 帧用 serde_json 解析，交给 `connections_from_snapshot_json`（`:726`，轮询也用它），
+  - 每个 text 帧交给 `parse_connections`（轮询也用它，正文直接反序列化为 `conn_json` 里的类型化结构），
     以 `BackendEvent::Connections` 发给界面。界面和轮询走同一个 `install_connections`，
     所以连接时长、单连接速率、长连接与关闭记录都不变，只是采样变成每秒一次、间隔更稳。
   - 会话在这些情况下结束，结束时直接丢掉 socket，**不发 close、不等 pong 或 close**：
@@ -336,7 +336,7 @@ ws-opts:
 - 测试（`src/mihomo.rs` 的 `mod stream_tests`，只连 `127.0.0.1:0` 上的模拟控制器，时间按毫秒缩放）：
   两份快照（含 `connections: null` 和字符串端口）、404 握手只警告一次并按退避重试、
   超大帧触发长暂停、静默 3 次读超时后重连并记录恢复、退出标志和开关能及时结束线程、
-  退避序列、内核停止再重启不写日志，以及 `connections_from_snapshot_json` 与原轮询解析结果一致。
+  退避序列、内核停止再重启不写日志，以及 `parse_connections` 对推送帧与轮询正文的解析结果一致。
   `src/main.rs` 的 `polls_skip_the_connections_get_only_while_pushes_arrive` 用一个记录请求路径的模拟控制器驱动 `tick()`，
   确认推送正常时轮询不请求 `/connections`，推送中断后会请求。
 

@@ -291,14 +291,20 @@ mod tests {
         })
         .join()
         .unwrap();
+        // The refused PUT cut nothing, so its announcement is withdrawn.
         let events: Vec<_> = rx.try_iter().collect();
-        assert_eq!(events.len(), 1);
         assert!(matches!(
-            &events[0],
-            BackendEvent::Disrupting {
-                cause: Cause::Reload,
-                scope: Scope::Providers
-            }
+            &events[..],
+            [
+                BackendEvent::Disrupting {
+                    cause: Cause::Reload,
+                    scope: Scope::Providers
+                },
+                BackendEvent::Disrupting {
+                    cause: Cause::Reload,
+                    scope: Scope::Id(id)
+                }
+            ] if id.is_empty()
         ));
     }
 

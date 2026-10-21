@@ -1405,6 +1405,8 @@ fn translated(app: &App, id: &str, desc: bool) -> Option<String> {
         ("sniffer", true) => "mod_sniffer_desc",
         ("dns-fakeip", false) => "mod_dns_fakeip",
         ("dns-fakeip", true) => "mod_dns_fakeip_desc",
+        ("dns-fakeip-global", false) => "mod_dns_fakeip_global",
+        ("dns-fakeip-global", true) => "mod_dns_fakeip_global_desc",
         ("find-process", false) => "mod_find_process",
         ("find-process", true) => "mod_find_process_desc",
         ("tcp-concurrent", false) => "mod_tcp_concurrent",

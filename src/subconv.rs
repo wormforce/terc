@@ -94,6 +94,11 @@ const URI_SCHEMES: &[&str] = &[
     "ssh://",
 ];
 
+/// For Surge url-test / smart groups that set none. Mihomo's default is 0,
+/// which moves new connections (and the exit IP) to whichever node won the
+/// last health check by any margin.
+const URL_TEST_TOLERANCE: u64 = 50;
+
 const SURGE_PROXY_TYPES: &[&str] = &[
     "ss",
     "shadowsocks",
@@ -427,11 +432,12 @@ fn convert_surge(text: &str) -> Converted {
             {
                 obj.insert("interval".into(), json!(v));
             }
-            if let Some(v) = group
+            let tolerance = group
                 .params
                 .get("tolerance")
                 .and_then(|v| v.parse::<u64>().ok())
-            {
+                .or((group.kind == "url-test").then_some(URL_TEST_TOLERANCE));
+            if let Some(v) = tolerance {
                 obj.insert("tolerance".into(), json!(v));
             }
             if let Some(v) = group
@@ -446,7 +452,7 @@ fn convert_surge(text: &str) -> Converted {
     }
 
     for line in &rule_lines {
-        match convert_surge_rule(line, &resolve, out.rule_providers.len()) {
+        match convert_surge_rule(line, &resolve, &out.rule_providers) {
             Ok((rule, provider)) => {
                 if let Some(p) = provider {
                     out.rule_providers.push(p);
@@ -1148,10 +1154,11 @@ const RULE_PASS: &[&str] = &[
     "SRC-IP-CIDR",
 ];
 
+/// A provider is returned only for a list that `providers` does not hold yet.
 fn convert_surge_rule(
     line: &str,
     resolve: &dyn Fn(&str) -> Option<String>,
-    provider_index: usize,
+    providers: &[(String, Value)],
 ) -> Result<(String, Option<(String, Value)>), String> {
     let parts = split_params(line);
     let kind = parts
@@ -1194,20 +1201,32 @@ fn convert_surge_rule(
                 return Err(format!("Rule {kind},{url}"));
             }
             let policy = policy_at(2)?;
-            let name = format!("surge-{}", provider_index + 1);
             let behavior = if kind == "DOMAIN-SET" {
                 "domain"
             } else {
                 "classical"
             };
-            let provider = json!({
-                "type": "http",
-                "behavior": behavior,
-                "format": "text",
-                "url": url,
-                "path": format!("./rules/{name}.list"),
-                "interval": 86400,
-            });
+            // No `path`: Mihomo then caches the list under a hash of its URL.
+            // A path from the running index let a reordered rule list reuse
+            // another list's cached file for up to `interval`. A repeated URL
+            // shares one provider rather than two racing on the same file.
+            let seen = providers
+                .iter()
+                .find(|(_, p)| p["url"] == url.as_str() && p["behavior"] == behavior);
+            let (name, provider) = match seen {
+                Some((name, _)) => (name.clone(), None),
+                None => {
+                    let name = format!("surge-{}", providers.len() + 1);
+                    let provider = json!({
+                        "type": "http",
+                        "behavior": behavior,
+                        "format": "text",
+                        "url": url,
+                        "interval": 86400,
+                    });
+                    (name.clone(), Some((name, provider)))
+                }
+            };
             let mut rule = format!("RULE-SET,{name},{policy}");
             if parts
                 .iter()
@@ -1216,7 +1235,7 @@ fn convert_surge_rule(
             {
                 rule.push_str(",no-resolve");
             }
-            Ok((rule, Some((name, provider))))
+            Ok((rule, provider))
         }
         _ => {
             let mapped = match kind.as_str() {
@@ -2282,6 +2301,11 @@ FINAL,Proxy,dns-failed
         let auto = by_name(&out.groups, "Auto");
         assert_eq!(auto["interval"], 600);
         assert_eq!(auto["timeout"], 5000);
+        assert_eq!(auto["tolerance"], 80);
+        // url-test and smart without one get a tolerance; other kinds never do.
+        assert_eq!(by_name(&out.groups, "Smart")["tolerance"], 50);
+        assert!(by_name(&out.groups, "Fail").get("tolerance").is_none());
+        assert!(by_name(&out.groups, "LB").get("tolerance").is_none());
         assert_eq!(by_name(&out.groups, "Fail")["type"], "fallback");
         assert_eq!(by_name(&out.groups, "LB")["type"], "load-balance");
         let smart = by_name(&out.groups, "Smart");
@@ -2318,6 +2342,54 @@ FINAL,Proxy,dns-failed
                 out.skipped
             );
         }
+    }
+
+    #[test]
+    fn surge_rule_sets_cache_by_url_and_share_repeated_lists() {
+        let surge = |rules: &str| {
+            convert_subscription(&format!(
+                "[Proxy]\nA = ss, 192.0.2.1, 8388, encrypt-method=aes-128-gcm, password=fake\n\n[Proxy Group]\nP = select, A\n\n[Rule]\n{rules}FINAL,P\n"
+            ))
+            .unwrap()
+        };
+        let out = surge(
+            "RULE-SET,https://example.com/ai.list,P\n\
+             DOMAIN-SET,https://example.com/ads.txt,REJECT\n\
+             RULE-SET,https://example.com/ai.list,DIRECT,no-resolve\n\
+             DOMAIN-SET,https://example.com/ai.list,REJECT\n",
+        );
+        assert_eq!(
+            out.rules,
+            [
+                "RULE-SET,surge-1,P",
+                "RULE-SET,surge-2,REJECT",
+                "RULE-SET,surge-1,DIRECT,no-resolve",
+                "RULE-SET,surge-3,REJECT",
+                "MATCH,P",
+            ]
+        );
+        let names: Vec<_> = out.rule_providers.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["surge-1", "surge-2", "surge-3"]);
+        assert_eq!(out.rule_providers[2].1["behavior"], "domain");
+        assert_eq!(
+            out.rule_providers[2].1["url"],
+            "https://example.com/ai.list"
+        );
+        // Mihomo keys the cache file on the URL, so a reorder cannot hand one
+        // policy another list's cached rules.
+        assert!(out
+            .rule_providers
+            .iter()
+            .all(|(_, p)| p.get("path").is_none()));
+        let swapped = surge(
+            "DOMAIN-SET,https://example.com/ads.txt,REJECT\n\
+             RULE-SET,https://example.com/ai.list,P\n",
+        );
+        assert_eq!(
+            swapped.rule_providers[0].1["url"],
+            "https://example.com/ads.txt"
+        );
+        assert_eq!(swapped.rules[0], "RULE-SET,surge-1,REJECT");
     }
 
     #[test]
