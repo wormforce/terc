@@ -1,7 +1,45 @@
 //! Country hints from subscription node labels, not IP geolocation.
 use crate::mihomo::{is_info_pseudo_node, CoreSnapshot};
 
+/// Country codes with the label aliases that name them.
+pub const COUNTRIES: [(&str, &[&str]); 24] = [
+    ("US", &["美国", "美國", "united states", "usa"]),
+    ("JP", &["日本", "japan"]),
+    ("SG", &["新加坡", "singapore"]),
+    ("HK", &["香港", "hong kong"]),
+    ("TW", &["台湾", "台灣", "taiwan"]),
+    ("KR", &["韩国", "韓國", "south korea", "korea"]),
+    ("GB", &["英国", "英國", "united kingdom", "uk"]),
+    ("DE", &["德国", "德國", "germany"]),
+    ("FR", &["法国", "法國", "france"]),
+    ("CA", &["加拿大", "canada"]),
+    ("AU", &["澳大利亚", "澳大利亞", "australia"]),
+    ("NL", &["荷兰", "荷蘭", "netherlands"]),
+    ("IN", &["印度", "india"]),
+    ("RU", &["俄罗斯", "俄羅斯", "russia"]),
+    ("TR", &["土耳其", "turkey"]),
+    ("MY", &["马来西亚", "馬來西亞", "malaysia"]),
+    ("TH", &["泰国", "泰國", "thailand"]),
+    ("VN", &["越南", "vietnam"]),
+    ("PH", &["菲律宾", "菲律賓", "philippines"]),
+    ("ID", &["印度尼西亚", "印度尼西亞", "indonesia"]),
+    ("BR", &["巴西", "brazil"]),
+    ("CH", &["瑞士", "switzerland"]),
+    ("SE", &["瑞典", "sweden"]),
+    ("FI", &["芬兰", "芬蘭", "finland"]),
+];
+
 pub fn country_hint(name: &str) -> Option<String> {
+    let mut found = country_hits(name);
+    if found.len() == 1 {
+        found.pop()
+    } else {
+        None
+    }
+}
+
+/// Every country a label names, sorted and deduplicated.
+pub fn country_hits(name: &str) -> Vec<String> {
     let chars: Vec<char> = name.chars().collect();
     let mut found = Vec::new();
     for pair in chars.windows(2) {
@@ -18,32 +56,7 @@ pub fn country_hint(name: &str) -> Option<String> {
         .split(|c: char| !c.is_ascii_alphabetic())
         .filter(|s| !s.is_empty())
         .collect();
-    for (code, aliases) in [
-        ("US", &["美国", "美國", "united states", "usa"][..]),
-        ("JP", &["日本", "japan"][..]),
-        ("SG", &["新加坡", "singapore"][..]),
-        ("HK", &["香港", "hong kong"][..]),
-        ("TW", &["台湾", "台灣", "taiwan"][..]),
-        ("KR", &["韩国", "韓國", "south korea", "korea"][..]),
-        ("GB", &["英国", "英國", "united kingdom", "uk"][..]),
-        ("DE", &["德国", "德國", "germany"][..]),
-        ("FR", &["法国", "法國", "france"][..]),
-        ("CA", &["加拿大", "canada"][..]),
-        ("AU", &["澳大利亚", "澳大利亞", "australia"][..]),
-        ("NL", &["荷兰", "荷蘭", "netherlands"][..]),
-        ("IN", &["印度", "india"][..]),
-        ("RU", &["俄罗斯", "俄羅斯", "russia"][..]),
-        ("TR", &["土耳其", "turkey"][..]),
-        ("MY", &["马来西亚", "馬來西亞", "malaysia"][..]),
-        ("TH", &["泰国", "泰國", "thailand"][..]),
-        ("VN", &["越南", "vietnam"][..]),
-        ("PH", &["菲律宾", "菲律賓", "philippines"][..]),
-        ("ID", &["印度尼西亚", "印度尼西亞", "indonesia"][..]),
-        ("BR", &["巴西", "brazil"][..]),
-        ("CH", &["瑞士", "switzerland"][..]),
-        ("SE", &["瑞典", "sweden"][..]),
-        ("FI", &["芬兰", "芬蘭", "finland"][..]),
-    ] {
+    for (code, aliases) in COUNTRIES {
         let token_code = code.to_lowercase();
         let matches_alias = aliases.iter().any(|alias| {
             if alias.is_ascii() {
@@ -60,11 +73,7 @@ pub fn country_hint(name: &str) -> Option<String> {
     }
     found.sort();
     found.dedup();
-    if found.len() == 1 {
-        found.pop()
-    } else {
-        None
-    }
+    found
 }
 
 pub fn active_country(snapshot: &CoreSnapshot, group_index: usize) -> Option<String> {
