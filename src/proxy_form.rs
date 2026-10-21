@@ -353,7 +353,13 @@ impl Form {
                     return Err("请填写 TUIC 密码".into());
                 }
                 n["password"] = json!(self.password.text);
-                n["congestion-controller"] = json!("bbr");
+                // A stored node keeps its explicit controller on edit.
+                if n.get("congestion-controller")
+                    .and_then(Value::as_str)
+                    .is_none_or(|c| c.trim().is_empty())
+                {
+                    n["congestion-controller"] = json!("bbr");
+                }
                 n.as_object_mut().unwrap().remove("token");
             }
             if matches!(p, "http" | "socks5") {
@@ -511,7 +517,12 @@ pub fn handle(app: &mut App, key: KeyEvent) {
                     return;
                 }
                 form.submitting = true;
-                app.save_source_record(record, id);
+                // Not started (a reload prompt, or busy): keep the form editable.
+                if !app.save_source_record(record, id) {
+                    if let Some(form) = app.proxy_form.as_mut() {
+                        form.submitting = false;
+                    }
+                }
             }
             Err(e) => app.set_status(&e, true),
         };
@@ -890,6 +901,27 @@ mod tests {
         assert!(f.record().unwrap().nodes[0].get("token").is_none());
     }
     #[test]
+    fn edit_keeps_an_explicit_tuic_congestion_controller() {
+        let record = pasted(
+            "tuic://12345678-1234-1234-1234-123456789abc:pw@192.0.2.5:443?congestion_control=cubic#T",
+        );
+        assert_eq!(record.nodes[0]["congestion-controller"], "cubic");
+        let mut f = Form::from_record("proxy-001".into(), record);
+        assert_eq!(f.kind, 1);
+        f.name.load("T2");
+        let saved = f.record().unwrap();
+        assert_eq!(saved.nodes[0]["name"], "T2");
+        assert_eq!(saved.nodes[0]["congestion-controller"], "cubic");
+        // New or empty values get bbr.
+        assert_eq!(
+            filled(TYPES.iter().position(|p| *p == "tuic").unwrap())
+                .record()
+                .unwrap()
+                .nodes[0]["congestion-controller"],
+            "bbr"
+        );
+    }
+    #[test]
     fn new_nodes_enable_udp_where_mihomo_needs_it() {
         for (i, p) in TYPES.iter().enumerate() {
             let node = &filled(i).record().unwrap().nodes[0];
@@ -1198,6 +1230,35 @@ mod tests {
                 assert!(f.ws && !f.upgrade);
             }
         }
+    }
+    #[test]
+    fn saving_a_source_asks_before_a_reload_that_drops_sessions() {
+        let mut app = crate::App::from_snapshot(Default::default(), Default::default());
+        app.screen = crate::Screen::Settings;
+        app.snapshot.running = true;
+        app.snapshot.connections_ok = true;
+        let mut conn =
+            crate::mihomo::connection_from_value(&json!({"id": "long"})).expect("connection");
+        conn.host = "api.test:443".into();
+        conn.provider = "airport".into();
+        conn.start_ms = Some(crate::conns::now_ms() - 120_000);
+        app.snapshot.connections = vec![conn];
+        app.proxy_form = Some(Form::from_record(
+            "proxy-001".into(),
+            ws_record(json!({"path": "/p"})),
+        ));
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        handle(&mut app, ctrl_s);
+        // The prompt, no action, and the form can be saved again.
+        assert!(!app.action_busy);
+        assert!(app.pending_confirm.is_some());
+        assert!(
+            app.status_message.contains("再按一次确认"),
+            "{}",
+            app.status_message
+        );
+        let form = app.proxy_form.as_ref().expect("form stays open");
+        assert!(!form.submitting);
     }
     #[test]
     fn trojan_host_hint_asks_for_sni() {

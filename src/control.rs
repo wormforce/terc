@@ -561,7 +561,12 @@ impl App {
             return;
         };
         self.set_status(&format!("{} {}", self.t("st_probe_busy"), peer.name), false);
-        test_node_async(self.config.controller.clone(), peer.name, self.tx.clone());
+        test_node_async(
+            self.config.controller.clone(),
+            peer.name,
+            self.snapshot.groups.clone(),
+            self.tx.clone(),
+        );
     }
 
     pub fn test_all_tunnels(&mut self) {
@@ -579,6 +584,7 @@ impl App {
             self.config.controller.clone(),
             "WireGuard".into(),
             names,
+            self.snapshot.groups.clone(),
             self.tx.clone(),
         );
     }
@@ -764,20 +770,24 @@ impl App {
         self.save_source_record(record, None);
     }
 
+    /// Saves `record` (a new source, or `edit_id`), makes it active and
+    /// reloads. Like every other reload it asks first when sessions would
+    /// drop; the form or input stays open, so the same key confirms. `false`
+    /// when nothing was started.
     pub fn save_source_record(
         &mut self,
         record: crate::compose::ProfileSource,
         edit_id: Option<String>,
-    ) {
-        if self.action_busy {
-            return;
+    ) -> bool {
+        if self.action_busy || !self.confirm_disruption(crate::guard::Disrupt::Reload) {
+            return false;
         }
         if self.config.controller.profile_id.is_empty()
             && crate::mihomo::config_file_exists(&self.config.controller)
         {
             self.save_profile_copy();
             if self.config.controller.profile_id.is_empty() {
-                return;
+                return false;
             }
         }
         let id = edit_id.unwrap_or_else(crate::storage::next_id);
@@ -814,6 +824,7 @@ impl App {
                 result
             },
         );
+        true
     }
 
     pub fn load_core_log(&mut self) {
@@ -1052,6 +1063,78 @@ mod profile_integration_tests {
             read_config_text(&app.config.controller).unwrap(),
             previous_config
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    #[ignore = "changes HOME; run alone with temporary data; never starts a core"]
+    fn setup_on_a_fresh_install_creates_a_listed_source() {
+        let settle = |app: &mut App| {
+            let start = Instant::now();
+            while app.action_busy && start.elapsed() < Duration::from_secs(15) {
+                thread::sleep(Duration::from_millis(10));
+                app.drain_events();
+            }
+        };
+        let home = std::env::temp_dir().join(format!("terc-setup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        let cfg = crate::mihomo::ControllerConfig {
+            config_dir: home.join("core").display().to_string(),
+            addr: "127.0.0.1:1".into(),
+            ..Default::default()
+        };
+        let snapshot = crate::mihomo::CoreSnapshot {
+            core_bin_path: "/nonexistent/mihomo".into(),
+            ..Default::default()
+        };
+        let mut app = App::from_snapshot(
+            crate::Config {
+                controller: cfg.clone(),
+                ..Default::default()
+            },
+            snapshot.clone(),
+        );
+        app.setup_editor
+            .load("SetupNode = ss, 192.0.2.2, 8388, encrypt-method=aes-128-gcm, password=fake");
+        app.submit_setup();
+        // Generating fails without a Mihomo on PATH, and with one the start
+        // is refused under test; either way the source is written first.
+        settle(&mut app);
+        assert_eq!(app.config.controller.profile_id, "proxy-001");
+        let dir = crate::storage::root().join("proxy-001");
+        let source = crate::compose::ProfileSource::load(&dir);
+        assert_eq!(source.name, "SetupNode");
+        assert_eq!(source.kind, "proxy");
+        assert_eq!(source.nodes.len(), 1);
+        let terc = crate::compose::terc_dir();
+        assert!(!terc.join("source.json").exists(), "not the pre-0.2 spot");
+        let saved: crate::Config =
+            serde_json::from_str(&fs::read_to_string(terc.join("config.json")).unwrap()).unwrap();
+        assert_eq!(saved.controller.profile_id, "proxy-001");
+
+        // A subscription link goes to its own new source the same way.
+        let mut app = App::from_snapshot(
+            crate::Config {
+                controller: cfg,
+                ..Default::default()
+            },
+            snapshot,
+        );
+        app.setup_editor
+            .load("https://airport.example.test/sub?token=x");
+        app.submit_setup();
+        settle(&mut app);
+        assert_eq!(app.config.controller.profile_id, "proxy-002");
+        let source = crate::compose::ProfileSource::load(&crate::storage::root().join("proxy-002"));
+        assert_eq!(
+            source.subscription_url,
+            "https://airport.example.test/sub?token=x"
+        );
+        assert_eq!(source.name, "airport.example.test");
+        assert_eq!(source.kind, "subscription");
+        assert!(!terc.join("source.json").exists());
         fs::remove_dir_all(home).unwrap();
     }
 }

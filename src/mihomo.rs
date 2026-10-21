@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -191,12 +191,57 @@ pub struct SubscriptionSummary {
     pub expire: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ProxyGroup {
     pub name: String,
     pub kind: String,
     pub now: String,
+    /// Node pinned on a url-test/fallback group; Mihomo keeps using it while
+    /// it is alive for the group's own test URL, so `now` can differ.
+    pub fixed: String,
     pub all: Vec<String>,
+    /// `testUrl`; Selectors omit it when it is Mihomo's default.
+    pub test_url: String,
+    /// `expectedStatus`, such as `204` or `200-299/302`; empty accepts any.
+    pub expected_status: String,
+    /// The group's `timeout:` from the config file, which the group JSON
+    /// leaves out; 0 when unset.
+    pub timeout_ms: u64,
+}
+
+impl ProxyGroup {
+    /// The URL whose `extra` state the group ranks on. Only URLTest and
+    /// Fallback rank, and only those tests run with the group's own URL.
+    pub fn ranking_url(&self) -> Option<&str> {
+        let ranks = ["urltest", "fallback"].contains(&self.kind.to_ascii_lowercase().as_str());
+        Some(self.test_url.as_str()).filter(|url| ranks && !url.is_empty())
+    }
+
+    /// The delay the group ranks `node` on: its `extra` state for the
+    /// group's URL, or the global history for every other group.
+    pub fn member_delay(&self, node: &ProxyNode) -> Option<u16> {
+        match self.ranking_url() {
+            Some(url) => node.url_delays.get(url).copied().flatten(),
+            None => node.delay,
+        }
+    }
+}
+
+impl ProxyGroup {
+    /// Groups where a PUT pins a node instead of selecting it.
+    pub fn pinnable(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("urltest") || self.kind.eq_ignore_ascii_case("fallback")
+    }
+
+    /// The timeout of the group's own health checks: Mihomo uses 5000 ms
+    /// when `timeout:` is unset.
+    pub fn check_timeout_ms(&self) -> u64 {
+        if self.timeout_ms == 0 {
+            GROUP_DELAY_TIMEOUT_MS
+        } else {
+            self.timeout_ms
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +252,9 @@ pub struct ProxyNode {
     pub delay: Option<u16>,
     /// Owning proxy provider, used for the provider healthcheck delay route.
     pub provider: Option<String>,
+    /// Per test URL, the last delay of `extra` while alive. Unlike `delay`,
+    /// a test that missed the expected status leaves no number here.
+    pub url_delays: HashMap<String, Option<u16>>,
 }
 
 #[derive(Clone, Debug)]
@@ -258,12 +306,23 @@ impl Default for ControllerConfig {
             secret: String::new(),
             config_dir: default_config_dir(),
             subscription_url: String::new(),
-            test_url: "http://www.gstatic.com/generate_204".to_string(),
+            test_url: DEFAULT_TEST_URL.to_string(),
             timeout_ms: 4000,
             profile_id: String::new(),
         }
     }
 }
+
+/// Mihomo's own `DefaultTestURL`. Over plain HTTP a provider can answer
+/// generate_204 at the entry relay and report a fake-low delay.
+pub const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
+/// terc's default before it followed Mihomo; migrated on config load.
+pub const OLD_DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
+/// The delay routes parse `timeout` as int16, so larger values get HTTP 400.
+pub const MAX_DELAY_TIMEOUT_MS: u64 = 32_767;
+/// Mihomo's default group healthcheck timeout. A shorter terc test would
+/// mark nodes dead in `extra` that the group itself keeps.
+const GROUP_DELAY_TIMEOUT_MS: u64 = 5000;
 
 const HOMEBREW_CONFIG_DIR: &str = "/opt/homebrew/etc/mihomo";
 
@@ -303,14 +362,34 @@ pub fn percent_encode(input: &str) -> String {
     out
 }
 
-fn parse_socket_addr(addr: &str) -> SocketAddr {
+/// Where terc connects for the controller `addr`, the same string the core
+/// gets as `-ext-ctl`. A host name resolves IPv4 first, as Go's listener
+/// does, and an empty host means loopback. An address that does not resolve
+/// is an error: guessing 127.0.0.1:9090 would reach, and send the secret to,
+/// whatever else listens there.
+pub fn controller_socket_addr(addr: &str) -> io::Result<SocketAddr> {
     let clean = addr
+        .trim()
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .trim_end_matches('/');
-    clean
-        .parse()
-        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9090)))
+    let invalid = |why: &dyn std::fmt::Display| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid controller address {addr:?} in config.json: {why}"),
+        )
+    };
+    let clean = match clean.strip_prefix(':') {
+        Some(port) => format!("127.0.0.1:{port}"),
+        None => clean.to_string(),
+    };
+    let found: Vec<SocketAddr> = clean.to_socket_addrs().map_err(|e| invalid(&e))?.collect();
+    found
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or(found.first())
+        .copied()
+        .ok_or_else(|| invalid(&"no address"))
 }
 
 pub fn http_request(
@@ -321,7 +400,7 @@ pub fn http_request(
     body: Option<&str>,
     timeout: Duration,
 ) -> io::Result<(u16, String)> {
-    let sock_addr = parse_socket_addr(addr);
+    let sock_addr = controller_socket_addr(addr)?;
     let mut stream = TcpStream::connect_timeout(&sock_addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -485,7 +564,10 @@ fn stream_json_lines<F>(
 ) where
     F: FnMut(Value),
 {
-    let sock_addr = parse_socket_addr(addr);
+    // A bad address is reported once at startup and by every request.
+    let Ok(sock_addr) = controller_socket_addr(addr) else {
+        return;
+    };
     while !stop.load(Ordering::Relaxed) {
         if let Ok(mut stream) = TcpStream::connect_timeout(&sock_addr, Duration::from_millis(800)) {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
@@ -644,7 +726,9 @@ fn stream_connections_with(
     conn_stream: &ConnStream,
     t: &StreamTiming,
 ) {
-    let sock_addr = parse_socket_addr(addr);
+    let Ok(sock_addr) = controller_socket_addr(addr) else {
+        return;
+    };
     // A header keeps the secret out of the URL; Mihomo accepts Bearer for WS.
     let auth = format!("Bearer {secret}");
     let headers: Vec<(&str, &str)> = if secret.is_empty() {
@@ -1633,6 +1717,62 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn url_test_and_fallback_groups_carry_their_pin() {
+        let proxies = r#"{"proxies":{
+            "PROXY":{"type":"Selector","all":["Auto","JP 01"],"now":"Auto"},
+            "Auto":{"type":"URLTest","all":["JP 01","US 01"],"now":"US 01","fixed":"JP 01"},
+            "Safe":{"type":"Fallback","all":["JP 01","US 01"],"now":"JP 01","fixed":""}}}"#;
+        let (cfg, _) = controller(vec![
+            ("/version", r#"{"version":"v1.19.28"}"#.into()),
+            ("/proxies", proxies.into()),
+        ]);
+        let snap = fetch_snapshot(&cfg);
+        let group = |name: &str| snap.groups.iter().find(|g| g.name == name).unwrap();
+        let auto = group("Auto");
+        assert_eq!((auto.fixed.as_str(), auto.now.as_str()), ("JP 01", "US 01"));
+        assert!(auto.pinnable());
+        assert!(group("Safe").fixed.is_empty() && group("Safe").pinnable());
+        assert!(group("PROXY").fixed.is_empty() && !group("PROXY").pinnable());
+    }
+
+    #[test]
+    fn unpin_deletes_the_group_pin() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            ..ControllerConfig::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for status in [204, 400] {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                tx.send(first.trim_end().to_string()).unwrap();
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        unpin_group(&cfg, "Auto 自动").unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            "DELETE /proxies/Auto%20%E8%87%AA%E5%8A%A8 HTTP/1.1"
+        );
+        // A Selector answers 400: the error reaches the status line.
+        assert!(unpin_group(&cfg, "PROXY").is_err());
+        assert_eq!(rx.recv().unwrap(), "DELETE /proxies/PROXY HTTP/1.1");
+    }
+
+    #[test]
     fn skipped_parts_carry_over_with_provider_nodes_and_their_delays() {
         let (cfg, _) = controller(routes());
         let mut old = fetch_snapshot(&cfg);
@@ -1665,6 +1805,7 @@ mod snapshot_tests {
                 udp: false,
                 delay: Some(70),
                 provider: None,
+                url_delays: HashMap::new(),
             },
         );
         lean.carry_skipped(&mut old);
@@ -1806,6 +1947,15 @@ pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot
     // One read serves both the runtime flags and the configured values.
     let raw = read_config_text(cfg).ok();
     let mut snapshot = fetch_core_snapshot(cfg, fetch, raw.as_deref());
+    if let Some(raw) = raw
+        .as_deref()
+        .filter(|_| snapshot.groups.iter().any(ProxyGroup::pinnable))
+    {
+        let timeouts = crate::routing::group_timeouts(raw);
+        for group in &mut snapshot.groups {
+            group.timeout_ms = timeouts.get(&group.name).copied().unwrap_or(0);
+        }
+    }
     if let Some(raw) = raw {
         for chunk in crate::ops::split_chunks(&raw) {
             if let Some(key) = chunk.key {
@@ -1955,11 +2105,20 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
+                        let fixed = item
+                            .get("fixed")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         groups.push(ProxyGroup {
                             name: name.clone(),
                             kind: kind.clone(),
                             now,
+                            fixed,
                             all,
+                            test_url: json_str(item, "testUrl"),
+                            expected_status: json_str(item, "expectedStatus"),
+                            timeout_ms: 0,
                         });
                     }
 
@@ -1971,6 +2130,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
                             udp,
                             delay,
                             provider: None,
+                            url_delays: url_delays(item),
                         },
                     );
                 }
@@ -2035,13 +2195,16 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
         // One parse feeds both the provider list and the provider nodes.
         if let Some(v) = get("/providers/proxies") {
             providers.extend(crate::ops::providers_from_value(&v, "proxy"));
+            let mut extras = provider_url_delays(&v);
             for found in crate::ops::provider_nodes_from_value(&v) {
+                let url_delays = extras.remove(&found.name).unwrap_or_default();
                 let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
                     name: found.name,
                     kind: found.kind,
                     udp: found.udp,
                     delay: found.delay,
                     provider: None,
+                    url_delays,
                 });
                 node.provider.get_or_insert(found.provider);
             }
@@ -2231,15 +2394,46 @@ fn extract_subscription_summary(nodes: &[String]) -> Option<SubscriptionSummary>
     }
 }
 
-pub fn select_group_node(cfg: &ControllerConfig, group: &str, node: &str) -> io::Result<()> {
+/// Selects `node`, or pins it when `pin` (url-test/fallback). A Fallback
+/// re-tests a dead node for up to 5 s before it answers, and has stored the
+/// pin by then, so a pin waits that long instead of reporting a failure.
+pub fn select_group_node(
+    cfg: &ControllerConfig,
+    group: &str,
+    node: &str,
+    pin: bool,
+) -> io::Result<()> {
     let path = format!("/proxies/{}", percent_encode(group));
     let body = serde_json::json!({ "name": node }).to_string();
+    let wait = if pin {
+        GROUP_DELAY_TIMEOUT_MS + 1500
+    } else {
+        1200
+    };
     let (status, _) = http_request(
         &cfg.addr,
         &cfg.secret,
         "PUT",
         &path,
         Some(&body),
+        Duration::from_millis(wait),
+    )?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("HTTP {status}")))
+    }
+}
+
+/// Clears the pin a PUT left on a url-test/fallback group.
+pub fn unpin_group(cfg: &ControllerConfig, group: &str) -> io::Result<()> {
+    let path = format!("/proxies/{}", percent_encode(group));
+    let (status, _) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "DELETE",
+        &path,
+        None,
         Duration::from_millis(1200),
     )?;
     if (200..300).contains(&status) {
@@ -2286,22 +2480,26 @@ pub fn close_connection(cfg: &ControllerConfig, id: Option<&str>) -> io::Result<
     }
 }
 
+/// `groups` are the snapshot's: they stand in for a group the core does
+/// not describe in time, and say which groups check the configured URL.
 pub fn test_group_delays_async(
     cfg: ControllerConfig,
     group_name: String,
     nodes: Vec<String>,
+    groups: Vec<ProxyGroup>,
     tx: Sender<BackendEvent>,
 ) {
-    test_delays_async(cfg, group_name, nodes, tx, false);
+    test_delays_async(cfg, group_name, nodes, groups, tx, false);
 }
 
 pub fn test_best_delays_async(
     cfg: ControllerConfig,
     group_name: String,
     nodes: Vec<String>,
+    groups: Vec<ProxyGroup>,
     tx: Sender<BackendEvent>,
 ) {
-    test_delays_async(cfg, group_name, nodes, tx, true);
+    test_delays_async(cfg, group_name, nodes, groups, tx, true);
 }
 
 /// Concurrent delay probes per test run. Workers pull the next node as soon
@@ -2312,6 +2510,7 @@ fn test_delays_async(
     cfg: ControllerConfig,
     group_name: String,
     nodes: Vec<String>,
+    groups: Vec<ProxyGroup>,
     tx: Sender<BackendEvent>,
     best: bool,
 ) {
@@ -2320,14 +2519,29 @@ fn test_delays_async(
             .into_iter()
             .filter(|node| !is_info_pseudo_node(node))
             .collect();
+        // The core's answer is current; the snapshot keeps the configured
+        // timeout, and stands in when the core does not answer in time.
+        let known = groups.iter().find(|g| g.name == group_name);
+        let group = match (fetch_group(&cfg, &group_name), known) {
+            (Some(fresh), Some(known)) => Some(ProxyGroup {
+                timeout_ms: known.timeout_ms,
+                ..fresh
+            }),
+            (fresh, known) => fresh.or_else(|| known.cloned()),
+        };
+        let ranking_url = group.as_ref().and_then(ProxyGroup::ranking_url);
+        let probe = match (&group, ranking_url) {
+            (Some(group), Some(url)) => DelayProbe::checking(group, url),
+            _ => DelayProbe::for_url(&cfg, &cfg.test_url, &groups),
+        };
         let next = std::sync::atomic::AtomicUsize::new(0);
         let providers = std::sync::OnceLock::new();
         let mut indexed: Vec<(usize, Option<u16>)> = thread::scope(|scope| {
             let workers: Vec<_> = (0..DELAY_WORKERS.min(queue.len()))
                 .map(|_| {
                     let tx = tx.clone();
-                    let (cfg, group_name, queue, next, providers) =
-                        (&cfg, &group_name, &queue, &next, &providers);
+                    let (cfg, group_name, queue, next, providers, probe) =
+                        (&cfg, &group_name, &queue, &next, &providers, &probe);
                     scope.spawn(move || {
                         let mut done = Vec::new();
                         loop {
@@ -2335,9 +2549,7 @@ fn test_delays_async(
                             let Some(node) = queue.get(index) else {
                                 break;
                             };
-                            let delay = node_delay_with(cfg, node, &cfg.test_url, providers)
-                                .ok()
-                                .flatten();
+                            let delay = node_delay_with(cfg, node, probe, providers).ok().flatten();
                             let _ = tx.send(BackendEvent::DelayResult {
                                 group: group_name.clone(),
                                 node: node.clone(),
@@ -2357,10 +2569,24 @@ fn test_delays_async(
         });
         // BestTestDone keeps the group order, as the batched version did.
         indexed.sort_by_key(|(index, _)| *index);
-        let results = indexed
+        let mut results: Vec<(String, Option<u16>)> = indexed
             .into_iter()
             .map(|(index, delay)| (queue[index].clone(), delay))
             .collect();
+        // The route answers 200 with a delay even when the status missed the
+        // expected range; only `extra` records whether the group can use it.
+        if let Some(url) = ranking_url {
+            let fresh = fetch_snapshot(&cfg);
+            for (node, delay) in &mut results {
+                *delay = fresh
+                    .nodes
+                    .get(node)
+                    .and_then(|n| n.url_delays.get(url).copied().flatten());
+            }
+            if fresh.running {
+                let _ = tx.send(BackendEvent::Snapshot(Box::new(fresh)));
+            }
+        }
         let _ = tx.send(if best {
             BackendEvent::BestTestDone {
                 group: group_name,
@@ -2370,6 +2596,48 @@ fn test_delays_async(
             BackendEvent::GroupTestDone { group: group_name }
         });
     });
+}
+
+fn json_str(item: &Value, key: &str) -> String {
+    item.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A proxy's `extra`: per test URL, the last delay while the state is alive.
+/// The global history records a delay even when the expected status missed.
+fn url_delays(item: &Value) -> HashMap<String, Option<u16>> {
+    item.get("extra")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(url, state)| {
+            let alive = state.get("alive").and_then(Value::as_bool) == Some(true);
+            let delay = state
+                .get("history")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.last())
+                .and_then(|h| h.get("delay"))
+                .and_then(Value::as_u64)
+                .and_then(|d| if alive && d > 0 { Some(d as u16) } else { None });
+            (url.clone(), delay)
+        })
+        .collect()
+}
+
+/// `url_delays` of every node in a `/providers/proxies` body, by node name.
+fn provider_url_delays(value: &Value) -> HashMap<String, HashMap<String, Option<u16>>> {
+    value
+        .get("providers")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|obj| obj.values())
+        .filter_map(|item| item.get("proxies").and_then(Value::as_array))
+        .flatten()
+        .map(|proxy| (json_str(proxy, "name"), url_delays(proxy)))
+        .filter(|(name, extra)| !name.is_empty() && !extra.is_empty())
+        .collect()
 }
 
 pub fn is_info_pseudo_node(name: &str) -> bool {
@@ -2540,12 +2808,19 @@ pub fn core_log_excerpt(cfg: &ControllerConfig) -> String {
 }
 
 pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
+    // Key-path tests reach this through Setup and the core toggle. A Mihomo
+    // on PATH would then really start, with listeners and possibly TUN, so
+    // tests stop here, as the system proxy setters do.
+    if cfg!(test) {
+        return Err("the core is never started under test".into());
+    }
     let bin = discover_mihomo_binary()
         .ok_or("mihomo binary not found  download the managed core first")?;
     let config_file = config_yaml_path(cfg);
     if !config_file.is_file() {
         return Err(format!("config not found: {}", config_file.display()));
     }
+    let address = controller_socket_addr(&cfg.addr).map_err(|e| e.to_string())?;
     if matches!(
         http_request(
             &cfg.addr,
@@ -2562,16 +2837,16 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     if let Ok((pid, _)) = crate::privilege::managed_core(cfg) {
         return Err(format!("Mihomo (PID {pid}) is still running but its controller is not responding. Stop the existing core before restarting.\n{}", core_log_excerpt(cfg)));
     }
-    if let Ok(address) = cfg.addr.parse::<SocketAddr>() {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(400)).is_ok() {
-            return Err(format!("Controller {} is occupied but did not accept this client. Check the controller secret or existing Mihomo service. No additional core was started.", cfg.addr));
-        }
+    if TcpStream::connect_timeout(&address, Duration::from_millis(400)).is_ok() {
+        return Err(format!("Controller {} is occupied but did not accept this client. Check the controller secret or existing Mihomo service. No additional core was started.", cfg.addr));
     }
     let raw = read_config_text(cfg)?;
     validate_listener_ports(&raw)?;
     check_startup_ports(&raw)?;
     if cfg!(target_os = "macos") && local_flags(cfg).tun_enabled {
-        return crate::privilege::start_core(cfg, None);
+        let started = crate::privilege::start_core(cfg, None);
+        CORE_REFRESHED.with(|cell| cell.set(started.is_ok()));
+        return started;
     }
     let log_path = Path::new(&cfg.config_dir).join("terc-core.log");
     if log_path.is_file() {
@@ -2637,6 +2912,7 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
                     let _ = child.wait();
                 });
                 if step == StartupStep::Ready {
+                    CORE_REFRESHED.with(|cell| cell.set(true));
                     return Ok(format!("Started mihomo ({})", bin.display()));
                 }
                 // The PID record stays, so the managed-core guard blocks a second launch.
@@ -2744,9 +3020,113 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     let _ = fs::remove_file(Path::new(&cfg.config_dir).join("terc-core.pid"));
     let (_, enabled) = detect_sysproxy();
     if enabled {
-        set_sysproxy(false, 0, 0)?;
+        let ports = read_config_text(cfg)
+            .map(|raw| yaml_listener_ports(&raw))
+            .unwrap_or_default();
+        release_sysproxy(&ports)?;
     }
     Ok("Stopped managed Mihomo core".into())
+}
+
+/// The `port`, `socks-port` and `mixed-port` values a config listens on.
+fn yaml_listener_ports(text: &str) -> Vec<u16> {
+    crate::ops::split_chunks(text)
+        .into_iter()
+        .filter(|c| matches!(c.key.as_deref(), Some("port" | "socks-port" | "mixed-port")))
+        .filter_map(|c| {
+            let (_, value) = c.lines.first()?.split_once(':')?;
+            crate::ops::clean_scalar(value).parse::<u16>().ok()
+        })
+        .filter(|&port| port > 0)
+        .collect()
+}
+
+/// Whether a system proxy entry is terc's: on loopback at one of `ports`.
+/// Anything else, such as a corporate proxy, is left on when the core stops.
+fn proxy_is_ours(host: &str, port: &str, ports: &[u16]) -> bool {
+    let host = host.trim().trim_matches('\'');
+    let port = port.trim().parse::<u16>().unwrap_or(0);
+    matches!(host, "127.0.0.1" | "localhost" | "::1") && port > 0 && ports.contains(&port)
+}
+
+/// `networksetup -getwebproxy` (and the secure and SOCKS variants) output.
+fn macos_proxy_is_ours(text: &str, ports: &[u16]) -> bool {
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(name))
+            .unwrap_or("")
+            .to_string()
+    };
+    field("Enabled:").trim() == "Yes" && proxy_is_ours(&field("Server:"), &field("Port:"), ports)
+}
+
+/// Changing the system proxy is refused under `cargo test` (AGENTS.md); the
+/// readers are kept out by `detect_sysproxy`.
+fn refuse_sysproxy_in_tests() -> Result<(), String> {
+    if cfg!(test) {
+        Err("system proxy is never changed under test".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Turn off the system proxy entries that still point at this core.
+fn release_sysproxy(ports: &[u16]) -> Result<Option<String>, String> {
+    refuse_sysproxy_in_tests()?;
+    match std::env::consts::OS {
+        "macos" => release_macos_sysproxy(ports),
+        "linux" => release_gnome_sysproxy(ports),
+        _ => Ok(None),
+    }
+}
+
+fn release_macos_sysproxy(ports: &[u16]) -> Result<Option<String>, String> {
+    let service =
+        active_macos_network_service().ok_or("Cannot identify the active macOS network service")?;
+    let mut ours = Vec::new();
+    for (get, set) in [
+        ("-getwebproxy", "-setwebproxystate"),
+        ("-getsecurewebproxy", "-setsecurewebproxystate"),
+        ("-getsocksfirewallproxy", "-setsocksfirewallproxystate"),
+    ] {
+        let out = Command::new("networksetup")
+            .args([get, &service])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if macos_proxy_is_ours(&String::from_utf8_lossy(&out.stdout), ports) {
+            ours.push(set);
+        }
+    }
+    if ours.is_empty() {
+        return Ok(None);
+    }
+    for set in ours {
+        run_networksetup(&[set, &service, "off"])?;
+    }
+    Ok(Some(format!("System Proxy OFF ({service})")))
+}
+
+fn release_gnome_sysproxy(ports: &[u16]) -> Result<Option<String>, String> {
+    let get = |schema: &str, key: &str| {
+        Command::new("gsettings")
+            .args(["get", schema, key])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    if get("org.gnome.system.proxy", "mode") != "'manual'" {
+        return Ok(None);
+    }
+    let host = get("org.gnome.system.proxy.http", "host");
+    let port = get("org.gnome.system.proxy.http", "port");
+    if !proxy_is_ours(&host, &port, ports) {
+        return Ok(None);
+    }
+    set_gnome_sysproxy(false, 0, 0).map(Some)
 }
 
 /// Airport CDNs often gzip and now and then answer 5xx or 429, which curl
@@ -2865,6 +3245,37 @@ pub fn regenerate_routing(
 }
 
 /// The status message and whether the core was reloaded.
+/// The config a regeneration installs: the composed source under the routing
+/// plan `route`, with the runtime state of the active file `old` and the
+/// modules, and the report checked against that result.
+fn generate(
+    cfg: &ControllerConfig,
+    input: &crate::compose::ComposeInput,
+    route: &str,
+    old: Option<&str>,
+    modules: &[crate::ops::ModuleSnippet],
+) -> Result<(String, crate::compose::ComposeReport), String> {
+    use crate::compose;
+    let (base, mut report) = compose::compose_profile(input)?;
+    // A plan replaces the rule-providers; their DNS references go too.
+    let (base, removed) = crate::routing::apply_noting(&base, route, cfg)?;
+    report.notes.extend(removed);
+    report.plan = route != "subscription";
+    let (base, switches) = match old {
+        Some(doc) => (
+            compose::carry_runtime_state(&crate::ops::strip_marked_modules(doc), &base),
+            crate::ops::saved_switches(doc),
+        ),
+        // Normalise the first file the way the next run will (it zeroes the
+        // listener keys a source leaves out), so that run finds it unchanged.
+        None => (compose::carry_runtime_state(&base, &base), Vec::new()),
+    };
+    let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
+    // Check what the core will run: the plan's rules, the modules' DNS.
+    report.inspect(&generated, route == "subscription");
+    Ok((generated, report))
+}
+
 fn regenerate_outcome(
     cfg: &ControllerConfig,
     modules: &[crate::ops::ModuleSnippet],
@@ -2935,25 +3346,15 @@ fn regenerate_outcome(
     let manual = compose::load_manual_nodes(&dir);
     // Custom rules and AI presets are paused. The source owns routing policy.
     let rules = compose::PrivateRules::default();
-    let (base, report) = compose::compose_profile(&compose::ComposeInput {
+    let input = compose::ComposeInput {
         subscription: sub.as_ref(),
         manual: &manual,
         rules: &rules,
         controller_addr: &cfg.addr,
         secret: &cfg.secret,
         test_url: &cfg.test_url,
-    })?;
-    let base = crate::routing::apply(&base, &route, cfg)?;
-    let (base, switches) = match old.as_deref() {
-        Some(doc) => (
-            compose::carry_runtime_state(&crate::ops::strip_marked_modules(doc), &base),
-            crate::ops::saved_switches(doc),
-        ),
-        // Normalise the first file the way the next run will (it zeroes the
-        // listener keys a source leaves out), so that run finds it unchanged.
-        None => (compose::carry_runtime_state(&base, &base), Vec::new()),
     };
-    let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
+    let (generated, mut report) = generate(cfg, &input, &route, old.as_deref(), modules)?;
     // A reload re-initialises proxy providers and drops their connections, so
     // an output identical to the active file is not reloaded at all.
     let candidate = if running {
@@ -3003,6 +3404,21 @@ fn regenerate_outcome(
     if let Some(message) = unknown {
         return Err(message);
     }
+    // The core knows provider nodes and smux UDP, which the file cannot show.
+    if running {
+        if let Ok((200, body)) = http_request(
+            &cfg.addr,
+            &cfg.secret,
+            "GET",
+            "/proxies",
+            None,
+            Duration::from_millis(1500),
+        ) {
+            if let Ok(proxies) = serde_json::from_str::<Value>(&body) {
+                report.apply_runtime_udp(&proxies);
+            }
+        }
+    }
     let tail = match (reload, running, zh) {
         (false, true, true) => " — 配置未变化，未重载，现有连接不受影响",
         (false, true, false) => " — unchanged; not reloaded, existing connections kept",
@@ -3014,7 +3430,13 @@ fn regenerate_outcome(
         (true, false, false) => " — validated & saved; core stopped",
     };
     Ok((
-        format!("{}{tail}{}", report.summary(zh), report.details()),
+        // The outcome comes before the extra counts so a short toast shows it.
+        format!(
+            "{}{tail}{}{}",
+            report.headline(zh),
+            report.extras(zh),
+            report.details()
+        ),
         reload && running,
     ))
 }
@@ -3605,7 +4027,7 @@ fn install_core_from(
         let _ = fs::remove_file(&fresh);
         let _ = fs::remove_file(&part);
         return Err(format!(
-            "Downloaded {name} is damaged ({}); press Ctrl+D to fetch it again",
+            "Downloaded {name} is damaged ({}); download it again: Settings → Diagnostics → Download / update core, or Ctrl+D in Setup",
             brief(&String::from_utf8_lossy(&unpacked.stderr))
         ));
     }
@@ -3625,7 +4047,7 @@ fn install_managed_core(
     proxy_port: Option<u16>,
 ) -> Result<String, String> {
     let asset = mihomo_asset_id().ok_or_else(|| {
-        "No mihomo build for this OS/CPU (darwin-arm64, darwin-amd64, linux-arm64, linux-amd64)"
+        "No mihomo build for this OS/CPU (darwin-arm64, darwin-amd64-v1, linux-arm64, linux-amd64-v1)"
             .to_string()
     })?;
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
@@ -4011,7 +4433,10 @@ fn put_config(cfg: &ControllerConfig, body: &str) -> Result<(), ReloadError> {
         Some(body),
         Duration::from_millis(cfg.timeout_ms.max(90_000)),
     ) {
-        Ok((status, _)) if (200..300).contains(&status) => Ok(()),
+        Ok((status, _)) if (200..300).contains(&status) => {
+            CORE_REFRESHED.with(|cell| cell.set(true));
+            Ok(())
+        }
         Ok((status, text)) => {
             // Mihomo answers 400 before applying anything, so nothing was cut:
             // replace the announcement with one that covers no connection.
@@ -4038,6 +4463,22 @@ thread_local! {
     /// so a thread-local reaches the reload and TUN paths deep inside it.
     static DISRUPTION_TX: std::cell::RefCell<Option<Sender<BackendEvent>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// Set when this thread's reload or core start left the core on a fresh
+    /// resolver, whose cache is empty; `take_core_refreshed` consumes it.
+    static CORE_REFRESHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record that this thread restarted the core (macOS TUN relaunch).
+pub fn mark_core_refreshed() {
+    CORE_REFRESHED.with(|cell| cell.set(true));
+}
+
+/// Whether this thread reloaded or started the core since the last call.
+pub fn take_core_refreshed() -> bool {
+    CORE_REFRESHED.with(|cell| cell.replace(false))
 }
 
 /// Lets this thread's reloads and TUN rebuilds report themselves to the UI.
@@ -4192,6 +4633,372 @@ pub fn dns_query_async(
         };
         let _ = tx.send(BackendEvent::DnsLookup { lines, is_error });
     });
+}
+
+/// At most this many node hostnames are warmed after a reload or start.
+const PREWARM_HOSTS: usize = 16;
+/// Wall-clock budget of one warm, so a broken resolver cannot keep it alive.
+const PREWARM_BUDGET: Duration = Duration::from_secs(10);
+
+/// Resolve the selected nodes' hostnames through `/dns/query` in the
+/// background. Every config apply rebuilds Mihomo's resolver with an empty
+/// cache, and the first dial through each node would otherwise pay that
+/// lookup and the DoH handshake. Without `proxy-server-nameserver` the dial
+/// and `/dns/query` share one resolver cache. Errors are ignored.
+pub fn prewarm_node_dns_async(cfg: ControllerConfig) {
+    thread::spawn(move || {
+        prewarm_node_dns(&cfg);
+    });
+}
+
+/// The number of hostnames queried.
+fn prewarm_node_dns(cfg: &ControllerConfig) -> usize {
+    let Ok(text) = read_config_text(cfg) else {
+        return 0;
+    };
+    // With the dns block disabled `/dns/query` has no resolver, and a
+    // dedicated node resolver keeps its own cache the warm cannot reach.
+    if !crate::ops::parse_dns_block(&text).enable || proxy_server_nameserver_set(&text) {
+        return 0;
+    }
+    let started = Instant::now();
+    let Ok((200, body)) = http_request(
+        &cfg.addr,
+        &cfg.secret,
+        "GET",
+        "/proxies",
+        None,
+        Duration::from_millis(1500),
+    ) else {
+        return 0;
+    };
+    let Ok(proxies) = serde_json::from_str::<Value>(&body) else {
+        return 0;
+    };
+    let hosts = prewarm_hosts(&proxies, &text, Path::new(&cfg.config_dir));
+    let qtypes = prewarm_qtypes(&text);
+    let quick = ControllerConfig {
+        timeout_ms: 2000,
+        ..cfg.clone()
+    };
+    let mut queried = 0;
+    for host in &hosts {
+        if started.elapsed() > PREWARM_BUDGET {
+            break;
+        }
+        for qtype in qtypes {
+            let _ = query_dns(&quick, host, qtype);
+        }
+        queried += 1;
+    }
+    queried
+}
+
+/// Mihomo's general `ipv6` defaults to true, and then every lookup also
+/// waits (up to ipv6-timeout) for an AAAA answer, so that is warmed too.
+fn prewarm_qtypes(doc: &str) -> &'static [&'static str] {
+    let set = crate::ops::split_chunks(doc)
+        .iter()
+        .any(|c| c.key.as_deref() == Some("ipv6"));
+    if !set || parse_yaml_flags(doc).ipv6 {
+        &["A", "AAAA"]
+    } else {
+        &["A"]
+    }
+}
+
+/// Whether the dns block names its own resolver for node hostnames, in any
+/// list style (an indentless `- item` list included) or a flow block.
+fn proxy_server_nameserver_set(doc: &str) -> bool {
+    !crate::compose::dns_list(doc, "proxy-server-nameserver").is_empty()
+}
+
+/// Whether `hosts:` pins `host`: the dial then never asks DNS, so the warm
+/// must not send it upstream either. Keys may be `+.` (domain and every
+/// subdomain) or `*.` (one label) wildcards.
+fn pinned_by_hosts(host: &str, keys: &[String]) -> bool {
+    let host = host.to_ascii_lowercase();
+    keys.iter().any(|key| {
+        let key = key.to_ascii_lowercase();
+        if let Some(base) = key.strip_prefix("+.") {
+            host == base || host.ends_with(&format!(".{base}"))
+        } else if let Some(base) = key.strip_prefix("*.") {
+            host.strip_suffix(&format!(".{base}"))
+                .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+        } else {
+            host == key
+        }
+    })
+}
+
+/// Groups in the order the warm takes them: those the rules name, in rule
+/// order, then the rest; GLOBAL first in global mode and last otherwise.
+fn prewarm_group_order(table: &serde_json::Map<String, Value>, doc: &str) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let global = crate::ops::split_chunks(doc)
+        .iter()
+        .rev()
+        .find(|c| c.key.as_deref() == Some("mode"))
+        .and_then(|c| c.lines.first())
+        .and_then(|l| l.split_once(':'))
+        .is_some_and(|(_, v)| crate::ops::clean_scalar(v).eq_ignore_ascii_case("global"));
+    if global && table.contains_key("GLOBAL") {
+        order.push("GLOBAL".into());
+    }
+    for rule in crate::compose::rule_items(doc) {
+        for field in rule.split(',').map(str::trim) {
+            if field != "GLOBAL" && table.contains_key(field) && !order.iter().any(|g| g == field) {
+                order.push(field.to_string());
+            }
+        }
+    }
+    for name in table.keys() {
+        if name != "GLOBAL" && !order.contains(name) {
+            order.push(name.clone());
+        }
+    }
+    if !global && table.contains_key("GLOBAL") {
+        order.push("GLOBAL".into());
+    }
+    order
+}
+
+/// Distinct non-IP server hostnames of each group's selected node, its
+/// relay hops and `dialer-proxy`, capped at `PREWARM_HOSTS`. `/proxies`
+/// names the selection but not the servers, so those come from the composed
+/// `proxies:` list or, for provider nodes, the provider's cache file.
+fn prewarm_hosts(proxies: &Value, doc: &str, home: &Path) -> Vec<String> {
+    let Some(table) = proxies.get("proxies").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let kind = |name: &str| {
+        table
+            .get(name)
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    let members = |name: &str| -> Vec<String> {
+        table
+            .get(name)
+            .and_then(|item| item.get("all"))
+            .and_then(Value::as_array)
+            .map(|all| {
+                all.iter()
+                    .filter_map(|m| m.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let now = |name: &str| {
+        table
+            .get(name)
+            .and_then(|item| item.get("now"))
+            .and_then(Value::as_str)
+            .filter(|now| !now.is_empty())
+            .map(String::from)
+    };
+    // A group's selection, one level of nesting deep; a relay is its chain.
+    let leaves = |name: &str| -> Vec<String> {
+        let pick = |name: &str| match kind(name).as_str() {
+            "relay" => members(name),
+            "selector" | "urltest" | "fallback" => now(name).into_iter().collect(),
+            _ => vec![name.to_string()],
+        };
+        pick(name)
+            .into_iter()
+            .flat_map(|first| match kind(&first).as_str() {
+                "relay" | "selector" | "urltest" | "fallback" => pick(&first),
+                _ => vec![first],
+            })
+            .collect()
+    };
+    let mut entries = proxy_entries(doc);
+    let providers = provider_paths(doc);
+    let pinned = crate::compose::mapping_keys(doc, "hosts");
+    let mut loaded = std::collections::HashSet::new();
+    let mut hosts: Vec<String> = Vec::new();
+    for group in &prewarm_group_order(table, doc) {
+        if !matches!(
+            kind(group).as_str(),
+            "selector" | "urltest" | "fallback" | "relay"
+        ) {
+            continue;
+        }
+        for leaf in leaves(group) {
+            if !entries.contains_key(&leaf) {
+                let provider = table
+                    .get(&leaf)
+                    .and_then(|node| node.get("provider-name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if let Some(path) = providers.get(provider) {
+                    if loaded.insert(provider.to_string()) {
+                        let file = home.join(path);
+                        let cached = fs::read_to_string(file).unwrap_or_default();
+                        for (name, entry) in proxy_entries(&cached) {
+                            entries.entry(name).or_insert(entry);
+                        }
+                    }
+                }
+            }
+            let Some((server, dialer)) = entries.get(&leaf).cloned() else {
+                continue;
+            };
+            let hop = dialer
+                .iter()
+                .flat_map(|name| leaves(name))
+                .filter_map(|name| entries.get(&name).map(|(server, _)| server.clone()));
+            for host in std::iter::once(server).chain(hop) {
+                let bare = host.trim_start_matches('[').trim_end_matches(']');
+                if host.is_empty()
+                    || bare.parse::<std::net::IpAddr>().is_ok()
+                    || hosts.contains(&host)
+                    || pinned_by_hosts(&host, &pinned)
+                {
+                    continue;
+                }
+                hosts.push(host);
+                if hosts.len() >= PREWARM_HOSTS {
+                    return hosts;
+                }
+            }
+        }
+    }
+    hosts
+}
+
+/// `name` → (`server`, `dialer-proxy`) of each item in a `proxies:` list,
+/// written as flow maps (`- {name: a, server: b}`) or block maps.
+fn proxy_entries(doc: &str) -> HashMap<String, (String, Option<String>)> {
+    let mut entries = HashMap::new();
+    let Some(chunk) = crate::ops::split_chunks(doc)
+        .into_iter()
+        .rev()
+        .find(|chunk| chunk.key.as_deref() == Some("proxies"))
+    else {
+        return entries;
+    };
+    let mut items: Vec<HashMap<String, String>> = Vec::new();
+    let mut item_indent = None;
+    for line in chunk.lines.iter().skip(1) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = crate::ops::leading_spaces(line);
+        let item_indent = *item_indent.get_or_insert(indent);
+        let body = if indent == item_indent {
+            let Some(rest) = trimmed.strip_prefix('-') else {
+                continue;
+            };
+            items.push(HashMap::new());
+            rest.trim_start()
+        } else {
+            trimmed
+        };
+        let Some(item) = items.last_mut() else {
+            continue;
+        };
+        if body.starts_with('{') {
+            item.extend(flow_pairs(body));
+        } else if indent == item_indent || indent == item_indent + 2 {
+            // Keys of nested maps (`ws-opts:` children) sit deeper.
+            if let Some((key, value)) = body.split_once(':') {
+                let value = value.split(" #").next().unwrap_or(value);
+                item.insert(key.trim().to_string(), crate::ops::clean_scalar(value));
+            }
+        }
+    }
+    for mut item in items {
+        let (Some(name), Some(server)) = (item.remove("name"), item.remove("server")) else {
+            continue;
+        };
+        let dialer = item.remove("dialer-proxy").filter(|d| !d.is_empty());
+        entries.insert(name, (server, dialer));
+    }
+    entries
+}
+
+/// Top-level scalar pairs of a one-line flow map; nested values are skipped.
+fn flow_pairs(flow: &str) -> Vec<(String, String)> {
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(flow) {
+        return map
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_string())))
+            .collect();
+    }
+    let inner = flow.trim().trim_start_matches('{');
+    let inner = inner.strip_suffix('}').unwrap_or(inner);
+    let mut parts = Vec::new();
+    let (mut depth, mut quote, mut start) = (0usize, None, 0usize);
+    for (i, c) in inner.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '{' | '[') => depth += 1,
+            (None, '}' | ']') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    parts
+        .into_iter()
+        .filter_map(|part| {
+            let (key, value) = part.split_once(':')?;
+            let value = value.trim();
+            if value.starts_with(['{', '[']) {
+                return None;
+            }
+            Some((
+                crate::ops::clean_scalar(key),
+                value.trim_matches('"').trim_matches('\'').to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// `name` → `path` of each entry in `proxy-providers:`.
+fn provider_paths(doc: &str) -> HashMap<String, String> {
+    let mut paths = HashMap::new();
+    let Some(chunk) = crate::ops::split_chunks(doc)
+        .into_iter()
+        .rev()
+        .find(|chunk| chunk.key.as_deref() == Some("proxy-providers"))
+    else {
+        return paths;
+    };
+    let (mut name_indent, mut key_indent) = (None, None);
+    let mut current = None;
+    for line in chunk.lines.iter().skip(1) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = crate::ops::leading_spaces(line);
+        let name_indent = *name_indent.get_or_insert(indent);
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if indent == name_indent {
+            current = Some(crate::ops::clean_scalar(key));
+            key_indent = None;
+            continue;
+        }
+        // `health-check:` and `override:` children sit deeper.
+        if indent == *key_indent.get_or_insert(indent) && key.trim() == "path" {
+            if let Some(name) = current.clone() {
+                paths.insert(name, crate::ops::clean_scalar(value));
+            }
+        }
+    }
+    paths
 }
 
 fn format_dns_lines(name: &str, qtype: &str, msg: &DnsMessage) -> Vec<String> {
@@ -4426,7 +5233,89 @@ pub fn test_node_delay(
     node: &str,
     url: &str,
 ) -> Result<Option<u16>, String> {
-    node_delay_with(cfg, node, url, &std::sync::OnceLock::new())
+    node_delay_with(
+        cfg,
+        node,
+        &DelayProbe::plain(cfg, url),
+        &std::sync::OnceLock::new(),
+    )
+}
+
+/// The query of one delay test.
+struct DelayProbe<'a> {
+    url: &'a str,
+    /// Mihomo's `expected=`; empty sends none and accepts any status.
+    expected: &'a str,
+    timeout_ms: u64,
+}
+
+impl<'a> DelayProbe<'a> {
+    fn plain(cfg: &ControllerConfig, url: &'a str) -> Self {
+        Self {
+            url,
+            expected: "",
+            timeout_ms: cfg.timeout_ms,
+        }
+    }
+
+    /// A test the way `group` checks `url` itself, so the `extra` state it
+    /// writes is the one the group would write.
+    fn checking(group: &'a ProxyGroup, url: &'a str) -> Self {
+        Self {
+            url,
+            expected: &group.expected_status,
+            timeout_ms: group.check_timeout_ms(),
+        }
+    }
+
+    /// A test of `url`. Mihomo keeps one `extra` state per URL, so when a
+    /// URLTest/Fallback group checks the same URL (with no `url:`, every
+    /// such group checks the default), the test takes that group's expected
+    /// status and timeout rather than mark nodes dead that it keeps.
+    fn for_url(cfg: &ControllerConfig, url: &'a str, groups: &'a [ProxyGroup]) -> Self {
+        match groups.iter().find(|g| g.ranking_url() == Some(url)) {
+            Some(group) => Self::checking(group, url),
+            None => Self::plain(cfg, url),
+        }
+    }
+
+    /// Capped for saved settings from before the cap, too.
+    fn timeout_ms(&self) -> u64 {
+        self.timeout_ms.min(MAX_DELAY_TIMEOUT_MS)
+    }
+
+    fn query(&self) -> String {
+        let mut query = format!(
+            "url={}&timeout={}",
+            percent_encode(self.url),
+            self.timeout_ms()
+        );
+        if !self.expected.is_empty() {
+            query.push_str(&format!("&expected={}", percent_encode(self.expected)));
+        }
+        query
+    }
+}
+
+/// GET /proxies/{group}: its type, `testUrl` and `expectedStatus`, read at
+/// the start of each test so the round uses what the core ranks on now.
+fn fetch_group(cfg: &ControllerConfig, name: &str) -> Option<ProxyGroup> {
+    let path = format!("/proxies/{}", percent_encode(name));
+    let timeout = Duration::from_millis(cfg.timeout_ms.max(1500));
+    let Ok((200, body)) = http_request(&cfg.addr, &cfg.secret, "GET", &path, None, timeout) else {
+        return None;
+    };
+    let item = serde_json::from_str::<Value>(&body).ok()?;
+    Some(ProxyGroup {
+        name: name.to_string(),
+        kind: json_str(&item, "type"),
+        now: json_str(&item, "now"),
+        fixed: json_str(&item, "fixed"),
+        all: Vec::new(),
+        test_url: json_str(&item, "testUrl"),
+        expected_status: json_str(&item, "expectedStatus"),
+        timeout_ms: 0,
+    })
 }
 
 /// GET /proxies/{name}/delay, falling back to the provider healthcheck route
@@ -4435,10 +5324,10 @@ pub fn test_node_delay(
 fn node_delay_with(
     cfg: &ControllerConfig,
     node: &str,
-    url: &str,
+    probe: &DelayProbe,
     providers: &std::sync::OnceLock<HashMap<String, String>>,
 ) -> Result<Option<u16>, String> {
-    let query = format!("url={}&timeout={}", percent_encode(url), cfg.timeout_ms);
+    let query = probe.query();
     let get = |path: &str| {
         http_request(
             &cfg.addr,
@@ -4446,7 +5335,7 @@ fn node_delay_with(
             "GET",
             path,
             None,
-            Duration::from_millis(cfg.timeout_ms + 500),
+            Duration::from_millis(probe.timeout_ms() + 500),
         )
     };
     let mut response = get(&format!("/proxies/{}/delay?{query}", percent_encode(node)));
@@ -4478,9 +5367,17 @@ fn node_delay_with(
     }
 }
 
-pub fn test_node_async(cfg: ControllerConfig, node: String, tx: Sender<BackendEvent>) {
+pub fn test_node_async(
+    cfg: ControllerConfig,
+    node: String,
+    groups: Vec<ProxyGroup>,
+    tx: Sender<BackendEvent>,
+) {
     thread::spawn(move || {
-        let delay = test_node_delay(&cfg, &node, &cfg.test_url).ok().flatten();
+        let probe = DelayProbe::for_url(&cfg, &cfg.test_url, &groups);
+        let delay = node_delay_with(&cfg, &node, &probe, &std::sync::OnceLock::new())
+            .ok()
+            .flatten();
         let _ = tx.send(BackendEvent::DelayResult {
             group: String::new(),
             node,
@@ -4572,6 +5469,7 @@ fn run_gsettings(schema: &str, key: &str, value: &str) -> Result<(), String> {
 }
 
 fn set_gnome_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
+    refuse_sysproxy_in_tests()?;
     if !gnome_proxy_ready() {
         return Err("sysproxy_unavailable".to_string());
     }
@@ -4588,6 +5486,7 @@ fn set_gnome_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<S
 }
 
 pub fn set_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
+    refuse_sysproxy_in_tests()?;
     match std::env::consts::OS {
         "macos" => set_macos_sysproxy(enable, http_port, socks_port),
         "linux" => set_gnome_sysproxy(enable, http_port, socks_port),
@@ -4612,25 +5511,28 @@ pub fn proxy_ports(snapshot: &CoreSnapshot) -> Result<(u16, u16), String> {
     Ok((http, socks))
 }
 
+fn run_networksetup(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("networksetup")
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    // networksetup may print an error while returning status 0.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || stdout.contains("Error") || stdout.contains("error") {
+        return Err(format!(
+            "networksetup: {} {}",
+            stdout.trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
+    refuse_sysproxy_in_tests()?;
     let service =
         active_macos_network_service().ok_or("Cannot identify the active macOS network service")?;
-    let run = |args: &[&str]| -> Result<(), String> {
-        let output = Command::new("networksetup")
-            .args(args)
-            .output()
-            .map_err(|e| e.to_string())?;
-        // networksetup may print an error while returning status 0.
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() || stdout.contains("Error") || stdout.contains("error") {
-            return Err(format!(
-                "networksetup: {} {}",
-                stdout.trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        Ok(())
-    };
+    let run = run_networksetup;
     if enable {
         if http_port == 0 {
             return Err("No HTTP proxy listener is enabled".into());
@@ -4755,6 +5657,7 @@ mod provider_tests {
             cfg,
             "Main".into(),
             nodes.iter().map(|s| s.to_string()).collect(),
+            Vec::new(),
             tx,
         );
         let mut streamed = Vec::new();
@@ -4787,6 +5690,202 @@ mod provider_tests {
         sorted.sort();
         assert_eq!(streamed, sorted);
         assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn delay_timeout_is_capped_to_what_mihomo_parses() {
+        let mut mock = recorder(Duration::ZERO, |_| (200, r#"{"delay":9}"#));
+        mock.cfg.timeout_ms = 60_000;
+        let url = DEFAULT_TEST_URL;
+        assert_eq!(test_node_delay(&mock.cfg, "A", url), Ok(Some(9)));
+        let lines = mock.lines.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            ["GET /proxies/A/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=32767 HTTP/1.1"]
+        );
+    }
+
+    /// `Auto` ranks on its own URL and status; `Main` is a Selector whose
+    /// non-default `testUrl` terc does not use. The delay route answers 200
+    /// for both nodes, but `B` missed the expected status.
+    fn group_reply(path: &str) -> (u16, &'static str) {
+        match path {
+            "/version" => (200, r#"{"version":"v1.19.28"}"#),
+            "/configs" => (200, r#"{"mode":"rule"}"#),
+            "/proxies/Auto" => (
+                200,
+                r#"{"name":"Auto","type":"URLTest","all":["A","B","P"],"testUrl":"https://ai.test/x","expectedStatus":"200/204"}"#,
+            ),
+            "/proxies/Main" => (
+                200,
+                r#"{"name":"Main","type":"Selector","all":["A","B"],"testUrl":"https://ai.test/x"}"#,
+            ),
+            "/proxies" => (
+                200,
+                r#"{"proxies":{
+                "Auto":{"type":"URLTest","all":["A","B","P"],"now":"A","testUrl":"https://ai.test/x","expectedStatus":"200/204"},
+                "Main":{"type":"Selector","all":["A","B"],"now":"A"},
+                "A":{"type":"Vmess","history":[{"delay":35}],"extra":{"https://ai.test/x":{"alive":true,"history":[{"delay":40}]}}},
+                "B":{"type":"Vmess","history":[{"delay":30}],"extra":{"https://ai.test/x":{"alive":false,"history":[{"delay":30}]}}}}}"#,
+            ),
+            "/providers/proxies" => (
+                200,
+                r#"{"providers":{"air":{"name":"air","vehicleType":"HTTP","proxies":[{"name":"P","type":"Trojan","history":[{"delay":12}],"extra":{"https://ai.test/x":{"alive":true,"history":[{"delay":50}]}}}]}}}"#,
+            ),
+            p if p.starts_with("/proxies/P/delay?") => (404, ""),
+            p if p.starts_with("/proxies/") && p.contains("/delay?") => (200, r#"{"delay":30}"#),
+            p if p.starts_with("/providers/proxies/air/P/healthcheck?") => (200, r#"{"delay":50}"#),
+            _ => (404, r#"{"message":"resource not found"}"#),
+        }
+    }
+
+    fn run_best(
+        cfg: &ControllerConfig,
+        group: &str,
+        nodes: &[&str],
+        groups: Vec<ProxyGroup>,
+    ) -> (Vec<(String, Option<u16>)>, Option<CoreSnapshot>) {
+        let (tx, rx) = mpsc::channel();
+        test_best_delays_async(
+            cfg.clone(),
+            group.into(),
+            nodes.iter().map(|s| s.to_string()).collect(),
+            groups,
+            tx,
+        );
+        let mut snapshot = None;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                BackendEvent::DelayResult { .. } => {}
+                BackendEvent::Snapshot(snap) => snapshot = Some(*snap),
+                BackendEvent::BestTestDone { results, .. } => break (results, snapshot),
+                _ => panic!("unexpected event"),
+            }
+        }
+    }
+
+    #[test]
+    fn urltest_rounds_use_the_group_url_and_rank_on_extra() {
+        let mock = recorder(Duration::ZERO, group_reply);
+        let (results, snapshot) = run_best(&mock.cfg, "Auto", &["A", "B", "P"], Vec::new());
+        // B answered 200 with a delay, yet the group counts it as dead.
+        let expected: Vec<(String, Option<u16>)> = vec![
+            ("A".into(), Some(40)),
+            ("B".into(), None),
+            ("P".into(), Some(50)),
+        ];
+        assert_eq!(results, expected);
+        let lines = mock.lines.lock().unwrap().clone();
+        let query = "url=https%3A%2F%2Fai.test%2Fx&timeout=5000&expected=200%2F204 HTTP/1.1";
+        for line in [
+            format!("GET /proxies/A/delay?{query}"),
+            format!("GET /proxies/B/delay?{query}"),
+            format!("GET /providers/proxies/air/P/healthcheck?{query}"),
+        ] {
+            assert!(lines.contains(&line), "{line} not in {lines:?}");
+        }
+        // The fresh state goes to the UI, which shows what the group ranks on.
+        let snap = snapshot.expect("a snapshot after the round");
+        let auto = snap.groups.iter().find(|g| g.name == "Auto").unwrap();
+        assert_eq!(auto.ranking_url(), Some("https://ai.test/x"));
+        assert_eq!(auto.expected_status, "200/204");
+        let delays: Vec<_> = ["A", "B", "P"]
+            .iter()
+            .map(|n| auto.member_delay(&snap.nodes[*n]))
+            .collect();
+        assert_eq!(delays, [Some(40), None, Some(50)]);
+        let main = snap.groups.iter().find(|g| g.name == "Main").unwrap();
+        assert_eq!(main.ranking_url(), None);
+        assert_eq!(main.member_delay(&snap.nodes["B"]), Some(30));
+    }
+
+    #[test]
+    fn selector_rounds_keep_the_configured_url_and_history() {
+        let mock = recorder(Duration::ZERO, group_reply);
+        let (results, snapshot) = run_best(&mock.cfg, "Main", &["A", "B"], Vec::new());
+        assert_eq!(results, [("A".into(), Some(30)), ("B".into(), Some(30))]);
+        assert!(snapshot.is_none());
+        let lines = mock.lines.lock().unwrap().clone();
+        assert!(lines.contains(
+            &"GET /proxies/A/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=500 HTTP/1.1"
+                .to_string()
+        ));
+        assert!(lines
+            .iter()
+            .all(|l| !l.contains("expected=") && l != "GET /proxies HTTP/1.1"));
+    }
+
+    fn snapshot_group(name: &str, kind: &str, url: &str, expected: &str, ms: u64) -> ProxyGroup {
+        ProxyGroup {
+            name: name.into(),
+            kind: kind.into(),
+            test_url: url.into(),
+            expected_status: expected.into(),
+            timeout_ms: ms,
+            ..ProxyGroup::default()
+        }
+    }
+
+    #[test]
+    fn rounds_on_a_url_a_group_checks_take_that_groups_status_and_timeout() {
+        let mock = recorder(Duration::ZERO, group_reply);
+        // A url-test with no `url:` checks Mihomo's default, terc's URL too.
+        let groups = vec![
+            snapshot_group("Main", "Selector", "", "", 0),
+            snapshot_group("Fast", "URLTest", DEFAULT_TEST_URL, "204", 0),
+        ];
+        run_best(&mock.cfg, "Main", &["A"], groups.clone());
+        let (tx, rx) = mpsc::channel();
+        test_node_async(mock.cfg.clone(), "B".into(), groups, tx);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            BackendEvent::DelayResult {
+                delay: Some(30),
+                ..
+            }
+        ));
+        let lines = mock.lines.lock().unwrap().clone();
+        let query = "url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=5000&expected=204";
+        for node in ["A", "B"] {
+            let line = format!("GET /proxies/{node}/delay?{query} HTTP/1.1");
+            assert!(lines.contains(&line), "{line} not in {lines:?}");
+        }
+    }
+
+    #[test]
+    fn urltest_rounds_use_the_configured_group_timeout() {
+        let mock = recorder(Duration::ZERO, group_reply);
+        let groups = vec![snapshot_group(
+            "Auto",
+            "URLTest",
+            "https://ai.test/x",
+            "200/204",
+            10_000,
+        )];
+        run_best(&mock.cfg, "Auto", &["A"], groups);
+        let lines = mock.lines.lock().unwrap().clone();
+        let line = "GET /proxies/A/delay?url=https%3A%2F%2Fai.test%2Fx&timeout=10000&expected=200%2F204 HTTP/1.1";
+        assert!(lines.contains(&line.to_string()), "{lines:?}");
+    }
+
+    #[test]
+    fn urltest_rounds_fall_back_to_the_snapshot_group() {
+        let mock = recorder(Duration::ZERO, group_reply);
+        // GET /proxies/Gone answers 404, as when it times out: the snapshot
+        // still says it ranks on its own URL, so the round does too.
+        let groups = vec![snapshot_group(
+            "Gone",
+            "URLTest",
+            "https://ai.test/x",
+            "200/204",
+            0,
+        )];
+        let (results, snapshot) = run_best(&mock.cfg, "Gone", &["A", "B"], groups);
+        assert_eq!(results, [("A".into(), Some(40)), ("B".into(), None)]);
+        assert!(snapshot.is_some());
+        let lines = mock.lines.lock().unwrap().clone();
+        let line = "GET /proxies/B/delay?url=https%3A%2F%2Fai.test%2Fx&timeout=5000&expected=200%2F204 HTTP/1.1";
+        assert!(lines.contains(&line.to_string()), "{lines:?}");
     }
 
     /// Mock controller that records each request line, answers `PUT`s after
@@ -4979,6 +6078,40 @@ mod provider_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_address_resolves_or_fails_loudly() {
+        let v4 = |s: &str| controller_socket_addr(s).unwrap();
+        assert_eq!(
+            v4("127.0.0.1:9097"),
+            SocketAddr::from(([127, 0, 0, 1], 9097))
+        );
+        assert_eq!(
+            v4("http://127.0.0.1:9097/"),
+            SocketAddr::from(([127, 0, 0, 1], 9097))
+        );
+        assert_eq!(v4(":9091"), SocketAddr::from(([127, 0, 0, 1], 9091)));
+        assert_eq!(v4("[::1]:9092").port(), 9092);
+        // The core listens on the port it is given; terc must probe the same one.
+        let local = v4("localhost:9097");
+        assert_eq!(local.port(), 9097);
+        assert!(local.ip().is_loopback());
+        for bad in ["127.0.0.1", "127.0.0.1:port", "", "127.0.0.1:99999"] {
+            let err = controller_socket_addr(bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad}");
+            assert!(err.to_string().contains("invalid controller address"));
+        }
+        let err = http_request(
+            "localhost",
+            "",
+            "GET",
+            "/version",
+            None,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn vpn_primary_interface_uses_connected_hardware_service() {
@@ -5372,6 +6505,57 @@ mod tests {
     }
 
     #[test]
+    fn system_proxy_is_never_changed_under_test() {
+        for enable in [true, false] {
+            let err = set_sysproxy(enable, 7890, 7891).unwrap_err();
+            assert!(err.contains("under test"), "{err}");
+            assert!(set_gnome_sysproxy(enable, 7890, 7891).is_err());
+            assert!(set_macos_sysproxy(enable, 7890, 7891).is_err());
+        }
+        assert!(release_sysproxy(&[7890]).is_err());
+    }
+
+    #[test]
+    fn stopping_the_core_only_releases_its_own_system_proxy() {
+        let ports = yaml_listener_ports(
+            "mixed-port: 7890\nsocks-port: \"7891\"\nport: 0\nallow-lan: false\n",
+        );
+        assert_eq!(ports, [7890, 7891]);
+
+        let mac = |enabled: &str, server: &str, port: &str| {
+            format!("Enabled: {enabled}\nServer: {server}\nPort: {port}\nAuthenticated Proxy Enabled: 0\n")
+        };
+        assert!(macos_proxy_is_ours(
+            &mac("Yes", "127.0.0.1", "7890"),
+            &ports
+        ));
+        assert!(macos_proxy_is_ours(
+            &mac("Yes", "localhost", "7891"),
+            &ports
+        ));
+        // A corporate proxy, another app on loopback, or an entry already off.
+        assert!(!macos_proxy_is_ours(
+            &mac("Yes", "proxy.corp.example", "7890"),
+            &ports
+        ));
+        assert!(!macos_proxy_is_ours(
+            &mac("Yes", "127.0.0.1", "8080"),
+            &ports
+        ));
+        assert!(!macos_proxy_is_ours(
+            &mac("No", "127.0.0.1", "7890"),
+            &ports
+        ));
+        assert!(!macos_proxy_is_ours("", &ports));
+
+        // gsettings get prints strings quoted and ints bare.
+        assert!(proxy_is_ours("'127.0.0.1'", "7890", &ports));
+        assert!(!proxy_is_ours("'10.0.0.8'", "7890", &ports));
+        assert!(!proxy_is_ours("'127.0.0.1'", "3128", &ports));
+        assert!(!proxy_is_ours("'127.0.0.1'", "0", &[]));
+    }
+
+    #[test]
     #[ignore = "requires an installed Mihomo binary; run alone, it points HOME at a temp dir"]
     fn regenerate_pipeline_composes_validates_and_keeps_switches() {
         let bin = discover_mihomo_binary().expect("mihomo binary");
@@ -5390,7 +6574,7 @@ mod tests {
         // No subscription, no nodes: a clear error, nothing written.
         assert!(regenerate_config(&cfg, &[], false, false, true).is_err());
         fs::write(
-            terc.join("subscription.cache"),
+            crate::compose::cache_path(&terc),
             crate::subconv::encode_base64(b"trojan://fake@192.0.2.1:443#JP-1\nssr://x\n"),
         )
         .unwrap();
@@ -5401,7 +6585,7 @@ mod tests {
         .unwrap();
         let msg = regenerate_config(&cfg, &[], false, false, true).unwrap();
         assert!(msg.contains("URI 1 节点"), "{msg}");
-        assert!(msg.contains("跳过 1"), "{msg}");
+        assert!(msg.contains("1 skipped / 跳过"), "{msg}");
         assert!(!terc.join("rules.conf").is_file());
         persist_nested_bool(&cfg, &["sniffer", "enable"], true).unwrap();
         let modules = crate::ops::builtin_modules();
@@ -5417,6 +6601,83 @@ mod tests {
 #[cfg(test)]
 mod listener_tests {
     use super::*;
+
+    /// `generate` for a Clash source, as `regenerate_outcome` runs it.
+    fn generated(
+        source: &str,
+        route: &str,
+        module_ids: &[&str],
+    ) -> (String, crate::compose::ComposeReport) {
+        let sub = crate::subconv::convert_subscription(source).unwrap();
+        let rules = crate::compose::PrivateRules::default();
+        let cfg = ControllerConfig::default();
+        let input = crate::compose::ComposeInput {
+            subscription: Some(&sub),
+            manual: &[],
+            rules: &rules,
+            controller_addr: &cfg.addr,
+            secret: &cfg.secret,
+            test_url: &cfg.test_url,
+        };
+        let modules: Vec<_> = crate::ops::builtin_modules()
+            .into_iter()
+            .filter(|m| module_ids.contains(&m.id.as_str()))
+            .collect();
+        generate(&cfg, &input, route, None, &modules).unwrap()
+    }
+
+    const REPORT_SOURCE: &str = "mixed-port: 7890\ndns:\n  enable: true\n  nameserver: [223.5.5.5]\n  fallback: [tls://8.8.8.8]\n  nameserver-policy:\n    'rule-set:cn': 223.5.5.5\nproxies:\n  - {name: HK, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake, udp: true}\nproxy-groups:\n  - {name: Airport, type: select, proxies: [HK]}\nrule-providers:\n  cn: {type: http, behavior: domain, url: https://example.org/cn.yaml}\nrules:\n  - GEOIP,CN,DIRECT\n  - MATCH,Airport\n";
+
+    #[test]
+    fn the_report_describes_the_config_after_routing_and_modules() {
+        // The source's own routing: its rule and its DNS are reported.
+        let (_, report) = generated(REPORT_SOURCE, "subscription", &[]);
+        let checks = report.checks.join("\n");
+        assert!(checks.contains("rule 1 (GEOIP,CN,DIRECT)"), "{checks}");
+        assert!(checks.contains("dns.fallback dials foreign DNS DIRECT (tls://8.8.8.8)"));
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+
+        // Global routing: the airport rules are gone, and with its
+        // rule-providers the DNS policy that named one.
+        let (yaml, report) = generated(REPORT_SOURCE, "all", &[]);
+        assert!(
+            !yaml.contains("rule-set:") && !yaml.contains("GEOIP,CN"),
+            "{yaml}"
+        );
+        assert!(!report
+            .checks
+            .iter()
+            .any(|c| c.contains("subscription rule")));
+        assert_eq!(report.notes.len(), 1, "{:?}", report.notes);
+        assert!(report.notes[0].contains("Removed rule-set:cn from dns.nameserver-policy"));
+        let message = format!("{}{}", report.summary(false), report.details());
+        // The removal and the fallback warning, which the plan keeps.
+        assert!(message.contains("2 config note(s)"), "{message}");
+        assert!(message.contains("Removed rule-set:cn"), "{message}");
+
+        // The mainland DNS module clears the fallback: no stale warning.
+        let (yaml, report) = generated(REPORT_SOURCE, "subscription", &["dns-fakeip"]);
+        assert!(yaml.contains("  fallback: []"), "{yaml}");
+        assert!(
+            !report.checks.iter().any(|c| c.contains("dns.fallback")),
+            "{:?}",
+            report.checks
+        );
+
+        // A disabled airport block that the module turns on is checked as on.
+        let off = "mixed-port: 7890\ndns:\n  enable: false\n  nameserver-policy:\n    geosite:geolocation-!cn: https://dns.google/dns-query\nproxies:\n  - {name: HK, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake, udp: true}\nproxy-groups:\n  - {name: Airport, type: select, proxies: [HK]}\nrules:\n  - MATCH,Airport\n";
+        let (_, report) = generated(off, "subscription", &[]);
+        assert!(report.checks.is_empty(), "{:?}", report.checks);
+        let (_, report) = generated(off, "subscription", &["dns-fakeip"]);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.contains("nameserver-policy geosite:geolocation-!cn dials foreign DNS")),
+            "{:?}",
+            report.checks
+        );
+    }
     #[test]
     fn duplicate_proxy_ports_are_rejected_and_disabled_ports_are_allowed() {
         let err =
@@ -5571,6 +6832,279 @@ mod listener_tests {
             body.len()
         )
         .into_bytes()
+    }
+
+    fn prewarm_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "terc-prewarm-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("proxies")).unwrap();
+        dir
+    }
+
+    const PREWARM_PROXIES: &str = r#"{"proxies":{
+        "GLOBAL":{"type":"Selector","all":["PROXY"],"now":"PROXY"},
+        "PROXY":{"type":"Selector","all":["Auto","Chain","IP","Pool 1"],"now":"Auto"},
+        "Auto":{"type":"URLTest","all":["JP 01","US 01"],"now":"JP 01"},
+        "Chain":{"type":"Relay","all":["US 01","IP"]},
+        "Pool":{"type":"Selector","all":["Pool 1"],"now":"Pool 1"},
+        "Balance":{"type":"LoadBalance","all":["HK 01"]},
+        "JP 01":{"type":"Trojan"},
+        "US 01":{"type":"Vmess"},
+        "HK 01":{"type":"Vmess"},
+        "IP":{"type":"Shadowsocks"},
+        "Pool 1":{"type":"Shadowsocks","provider-name":"sub"},
+        "DIRECT":{"type":"Direct"}
+    }}"#;
+
+    const PREWARM_CONFIG: &str = "\
+dns:
+  enable: true
+  nameserver:
+    - https://doh.pub/dns-query
+proxies:
+  - {name: \"JP 01\", type: trojan, server: jp.example.com, port: 443, dialer-proxy: Hop}
+  - name: US 01
+    type: vmess
+    server: us.example.com # edge
+    port: 443
+    ws-opts:
+      headers:
+        server: nested.example.com
+  - {\"name\":\"IP\",\"type\":\"ss\",\"server\":\"203.0.113.9\",\"port\":8388}
+  - {name: HK 01, type: vmess, server: hk.example.com, port: 443}
+  - {name: Hop, type: ss, server: hop.example.com, port: 8388}
+proxy-providers:
+  sub:
+    type: http
+    url: https://example.com/sub
+    path: ./proxies/sub.yaml
+    health-check:
+      path: ignored.yaml
+";
+
+    #[test]
+    fn prewarm_takes_selected_servers_relay_hops_and_provider_nodes() {
+        let dir = prewarm_dir("hosts");
+        fs::write(
+            dir.join("proxies/sub.yaml"),
+            "proxies:\n  - {name: Pool 1, type: ss, server: pool.example.net, port: 1}\n",
+        )
+        .unwrap();
+        let proxies: Value = serde_json::from_str(PREWARM_PROXIES).unwrap();
+        let hosts = prewarm_hosts(&proxies, PREWARM_CONFIG, &dir);
+        // Load-balance groups have no selection, IP literals need no lookup,
+        // and a nested map's `server` is not the node's.
+        assert_eq!(
+            hosts,
+            [
+                "jp.example.com",
+                "hop.example.com",
+                "us.example.com",
+                "pool.example.net"
+            ]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prewarm_caps_the_number_of_hostnames() {
+        let mut table = serde_json::Map::new();
+        let mut doc = String::from("proxies:\n");
+        for i in 0..40 {
+            table.insert(
+                format!("G{i}"),
+                serde_json::json!({"type":"Selector","all":[format!("N{i}")],"now":format!("N{i}")}),
+            );
+            doc.push_str(&format!("  - {{name: N{i}, server: n{i}.example.com}}\n"));
+        }
+        let proxies = serde_json::json!({ "proxies": table });
+        let hosts = prewarm_hosts(&proxies, &doc, Path::new("/nonexistent"));
+        assert_eq!(hosts.len(), PREWARM_HOSTS);
+    }
+
+    #[test]
+    fn only_a_listed_proxy_server_nameserver_counts_as_set() {
+        assert!(!proxy_server_nameserver_set("dns:\n  enable: true\n"));
+        assert!(!proxy_server_nameserver_set(
+            "dns:\n  proxy-server-nameserver: []\n  nameserver:\n    - 1.1.1.1\n"
+        ));
+        assert!(!proxy_server_nameserver_set(
+            "dns:\n  proxy-server-nameserver:\n  nameserver:\n    - 1.1.1.1\n"
+        ));
+        assert!(proxy_server_nameserver_set(
+            "dns:\n  proxy-server-nameserver: [https://doh.pub/dns-query]\n"
+        ));
+        assert!(proxy_server_nameserver_set(
+            "dns:\n  proxy-server-nameserver:\n    # mainland\n    - https://doh.pub/dns-query\n"
+        ));
+        assert!(!proxy_server_nameserver_set(
+            "proxy-server-nameserver:\n  - x\ndns:\n  enable: true\n"
+        ));
+        // PyYAML writes list items at the key's indent.
+        assert!(proxy_server_nameserver_set(
+            "dns:\n  enable: true\n  proxy-server-nameserver:\n  - https://doh.pub/dns-query\n  nameserver:\n  - 8.8.8.8\n"
+        ));
+        assert!(proxy_server_nameserver_set(
+            "dns: {enable: true, proxy-server-nameserver: [https://doh.pub/dns-query]}\n"
+        ));
+        assert!(!proxy_server_nameserver_set(
+            "dns:\n  nameserver:\n  - 8.8.8.8\n  proxy-server-nameserver: []\n"
+        ));
+    }
+
+    #[test]
+    fn prewarm_asks_for_aaaa_unless_ipv6_is_off() {
+        assert_eq!(prewarm_qtypes("dns:\n  enable: true\n"), ["A", "AAAA"]);
+        assert_eq!(prewarm_qtypes("ipv6: true\n"), ["A", "AAAA"]);
+        assert_eq!(prewarm_qtypes("ipv6: false\ndns:\n  ipv6: true\n"), ["A"]);
+    }
+
+    #[test]
+    fn prewarm_skips_hosts_pins_and_fills_the_cap_in_rule_order() {
+        let mut table = serde_json::Map::new();
+        let mut doc = String::from(
+            "hosts:\n  pinned.example.com: 192.0.2.1\n  '+.wild.example': 192.0.2.2\nproxies:\n",
+        );
+        for i in 0..20 {
+            table.insert(
+                format!("G{i:02}"),
+                serde_json::json!({"type":"URLTest","all":[format!("N{i}")],"now":format!("N{i}")}),
+            );
+            doc.push_str(&format!("  - {{name: N{i}, server: n{i}.example.com}}\n"));
+        }
+        table.insert(
+            "🚀 Main".into(),
+            serde_json::json!({"type":"Selector","all":["G19"],"now":"G19"}),
+        );
+        table.insert(
+            "Pin".into(),
+            serde_json::json!({"type":"Selector","all":["P1","P2"],"now":"P1"}),
+        );
+        table.insert(
+            "GLOBAL".into(),
+            serde_json::json!({"type":"Selector","all":["Pin"],"now":"Pin"}),
+        );
+        doc.push_str(
+            "  - {name: P1, server: pinned.example.com}\n  - {name: P2, server: a.wild.example}\n",
+        );
+        doc.push_str("rules:\n  - DOMAIN-SUFFIX,example.org,Pin\n  - MATCH,🚀 Main\n");
+        let proxies = serde_json::json!({ "proxies": table });
+        let hosts = prewarm_hosts(&proxies, &doc, Path::new("/nonexistent"));
+        // The rules' groups first: Pin (pinned in hosts, skipped), then the
+        // main selector's pick, ahead of the alphabetical rest.
+        assert_eq!(hosts[0], "n19.example.com");
+        assert_eq!(hosts.len(), PREWARM_HOSTS);
+        assert!(!hosts
+            .iter()
+            .any(|h| h.contains("pinned") || h.contains("wild")));
+        assert!(pinned_by_hosts(
+            "A.Wild.Example",
+            &["+.wild.example".into()]
+        ));
+        assert!(pinned_by_hosts("x.one.example", &["*.one.example".into()]));
+        assert!(!pinned_by_hosts(
+            "x.y.one.example",
+            &["*.one.example".into()]
+        ));
+        assert!(!pinned_by_hosts("one.example", &["*.one.example".into()]));
+    }
+
+    #[test]
+    fn prewarm_queries_each_host_through_the_controller() {
+        let dir = prewarm_dir("query");
+        fs::write(
+            dir.join("config.yaml"),
+            format!("ipv6: true\n{PREWARM_CONFIG}"),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut responses = vec![http("200 OK", PREWARM_PROXIES)];
+        // Three hosts (the provider file is missing), A and AAAA each.
+        responses.extend((0..6).map(|_| http("200 OK", r#"{"Status":0}"#)));
+        let server = serve(listener, responses);
+        let cfg = ControllerConfig {
+            addr,
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        assert_eq!(prewarm_node_dns(&cfg), 3);
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /proxies "));
+        assert!(requests[1].starts_with("GET /dns/query?name=jp.example.com&type=A "));
+        assert!(requests[2].starts_with("GET /dns/query?name=jp.example.com&type=AAAA "));
+        assert!(requests[6].starts_with("GET /dns/query?name=us.example.com&type=AAAA "));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prewarm_is_skipped_without_dns_or_with_a_node_resolver() {
+        // A controller listens, so a warm that ran would connect to it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let cfg = |dir: &Path| ControllerConfig {
+            addr: addr.clone(),
+            config_dir: dir.display().to_string(),
+            timeout_ms: 200,
+            ..ControllerConfig::default()
+        };
+        let untouched = || {
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "the warm connected"
+            )
+        };
+        let dir = prewarm_dir("skip");
+        fs::write(
+            dir.join("config.yaml"),
+            PREWARM_CONFIG.replace("enable: true", "enable: false"),
+        )
+        .unwrap();
+        assert_eq!(prewarm_node_dns(&cfg(&dir)), 0);
+        untouched();
+        fs::write(
+            dir.join("config.yaml"),
+            PREWARM_CONFIG.replace(
+                "  nameserver:\n",
+                "  proxy-server-nameserver:\n  - https://doh.pub/dns-query\n  nameserver:\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(prewarm_node_dns(&cfg(&dir)), 0);
+        untouched();
+        // The same file without the skip reasons does reach the controller.
+        fs::write(dir.join("config.yaml"), PREWARM_CONFIG).unwrap();
+        prewarm_node_dns(&cfg(&dir));
+        assert!(listener.accept().is_ok());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_accepted_reload_marks_the_core_refreshed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = serve(
+            listener,
+            vec![http("400 Bad Request", "bad"), http("204 No Content", "")],
+        );
+        let cfg = ControllerConfig {
+            addr,
+            ..ControllerConfig::default()
+        };
+        assert!(!take_core_refreshed());
+        assert!(reload_config_text(&cfg, "mode: rule\n").is_err());
+        assert!(!take_core_refreshed());
+        reload_config_text(&cfg, "mode: rule\n").unwrap();
+        assert!(take_core_refreshed());
+        assert!(!take_core_refreshed());
+        server.join().unwrap();
     }
 
     /// A temporary config dir with a stand-in for `mihomo -t` (never a real core).
@@ -6165,12 +7699,21 @@ mod listener_tests {
         // core validates the PUT itself, so no install runs the check;
         // `regenerate_routing` and `install_config_with` read the mode.
         let mode = || http("200 OK", r#"{"mode":"rule"}"#);
+        // The message then counts UDP from the running core's `/proxies`.
+        let proxies = || {
+            http(
+                "200 OK",
+                r#"{"proxies":{"Own":{"type":"Shadowsocks","udp":true}}}"#,
+            )
+        };
         let server = serve(
             listener.try_clone().unwrap(),
-            vec![mode(), mode(), http("204 No Content", "")],
+            vec![mode(), mode(), http("204 No Content", ""), proxies()],
         );
         let msg = regenerate_config(&cfg, &[], true, false, false).unwrap();
-        assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
+        let requests = server.join().unwrap();
+        assert!(requests[2].starts_with("PUT /configs?force=true "));
+        assert!(requests[3].starts_with("GET /proxies "));
         assert!(msg.contains("validated & hot-reloaded"), "{msg}");
         assert_eq!(checks_run(), 0);
         let installed = read_config_text(&cfg).unwrap();
@@ -6178,13 +7721,14 @@ mod listener_tests {
         fs::remove_file(&generated).unwrap();
 
         // Running: only `GET /configs` for the runtime mode, no PUT.
-        let server = serve(listener.try_clone().unwrap(), vec![mode()]);
+        let server = serve(listener.try_clone().unwrap(), vec![mode(), proxies()]);
         assert!(crate::compose::ProfileSource::load(&dir).routing.is_empty());
         let second =
             regenerate_routing(&cfg, &[], true, false, false, Some("subscription")).unwrap();
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("GET /configs "));
+        assert!(requests[1].starts_with("GET /proxies "));
         assert!(
             second.contains(" — unchanged; not reloaded, existing connections kept"),
             "{second}"
@@ -6202,7 +7746,7 @@ mod listener_tests {
         RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
         let server = serve(
             listener.try_clone().unwrap(),
-            vec![mode(), mode(), http("204 No Content", "")],
+            vec![mode(), mode(), http("204 No Content", ""), proxies()],
         );
         let third = regenerate_config(&cfg, &[], true, false, true).unwrap();
         assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));

@@ -46,6 +46,21 @@ pub fn l3(app: &App, zh: &'static str, en: &'static str, ja: &'static str) -> &'
     }
 }
 
+/// `storage::list`'s source kind in the UI language.
+pub fn source_kind_text(app: &App, kind: &str) -> String {
+    if kind == "subscription" {
+        return l3(app, "订阅", "Subscription", "サブスク").into();
+    }
+    match kind.strip_prefix("nodes:") {
+        Some(n) => match app.lang() {
+            Lang::Zh => format!("{n} 个节点"),
+            Lang::En => format!("{n} nodes"),
+            Lang::Ja => format!("{n} ノード"),
+        },
+        None => kind.into(),
+    }
+}
+
 const BUILTIN_POLICIES: &[&str] = &[
     "DIRECT",
     "REJECT",
@@ -78,6 +93,11 @@ impl App {
 
     /// Regenerate config.yaml from the cached subscription + manual nodes + rules.
     pub fn apply_composed(&mut self) {
+        self.apply_composed_noting(None);
+    }
+
+    /// `note` follows the result, so it outlasts the progress line.
+    fn apply_composed_noting(&mut self, note: Option<&'static str>) {
         if self.action_busy {
             self.pending_regen = true;
             return;
@@ -95,7 +115,11 @@ impl App {
             "設定を生成・検証中…",
         );
         self.run_action(label, None, None, move |cfg| {
-            crate::mihomo::regenerate_config(&cfg, &modules, running, false, zh)
+            let done = crate::mihomo::regenerate_config(&cfg, &modules, running, false, zh)?;
+            Ok(match note {
+                Some(note) => format!("{done}  {note}"),
+                None => done,
+            })
         });
     }
 
@@ -195,10 +219,27 @@ impl App {
                     } else {
                         (self.private_rule_index + 1).min(self.private_rules.rules.len())
                     };
+                    // Private rules run first, so every connection they do
+                    // not match earlier pays for the process lookup.
+                    let note = rule.starts_with("PROCESS-").then(|| {
+                        l3(
+                            self,
+                            "进程规则较慢：私有规则最先匹配，之前未命中的每个连接都要查进程（Linux 约 1–15 ms），能用域名规则时更省",
+                            "Process rules are slower: private rules match first, so every connection not matched before looks up its process (about 1–15 ms on Linux); a domain rule is cheaper where it fits",
+                            "プロセス規則は低速：プライベート規則が最初に評価され、それまでに一致しない接続ごとにプロセスを検索します（Linux で約 1–15 ms）。ドメイン規則の方が軽量です",
+                        )
+                    });
                     self.private_rules.rules.insert(at, rule);
                     self.private_rule_index = at;
                     self.manage_input = None;
-                    self.save_rules_and_apply();
+                    if let Err(err) = self
+                        .private_rules
+                        .save(&crate::compose::profile_dir(&self.config.controller))
+                    {
+                        self.set_status(&err, true);
+                    } else {
+                        self.apply_composed_noting(note);
+                    }
                 }
                 Err(err) => self.set_status(&err, true),
             },
@@ -301,7 +342,12 @@ impl App {
                 .unwrap_or_default()
         };
         for name in names {
-            test_node_async(self.config.controller.clone(), name, self.tx.clone());
+            test_node_async(
+                self.config.controller.clone(),
+                name,
+                self.snapshot.groups.clone(),
+                self.tx.clone(),
+            );
         }
         self.set_status(l3(self, "测速中…", "Testing latency…", "測定中…"), false);
     }
@@ -939,8 +985,8 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
                 list_inner,
                 l3(
                     app,
-                    "还没有私有规则。按 a 添加，例如 example.com,AI　或　DOMAIN-KEYWORD,steam,DIRECT　或　PROCESS-NAME,Cursor,AI",
-                    "No private rules. Press a, e.g. example.com,AI  or  DOMAIN-KEYWORD,steam,DIRECT  or  PROCESS-NAME,Cursor,AI",
+                    "还没有私有规则。按 a 添加，例如 example.com,AI　或　DOMAIN-KEYWORD,steam,DIRECT　或　PROCESS-NAME,Cursor,AI（较慢：每个连接都要查进程）",
+                    "No private rules. Press a, e.g. example.com,AI  or  DOMAIN-KEYWORD,steam,DIRECT  or  PROCESS-NAME,Cursor,AI (slower: looks up the process per connection)",
                     "a で追加。例：example.com,AI",
                 ),
             );
@@ -1204,7 +1250,10 @@ pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             app.profiles
                 .iter()
-                .map(|p| (format!("{}   {}   [{}]", p.label, p.kind, p.name), p.active))
+                .map(|p| {
+                    let kind = source_kind_text(app, &p.kind);
+                    (format!("{}   {kind}   [{}]", p.label, p.name), p.active)
+                })
                 .collect()
         };
         let selected = if routing {
@@ -1274,7 +1323,7 @@ pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
             let desc = if routing {
                 l3(app,"Enter 为当前订阅应用所选方案。c 将当前规则与策略组保存为可复用方案。保存后节点成员统一跟随订阅，保留组间引用与过滤条件。","Enter assigns the plan to the active subscription. c saves current routing for reuse. Saved groups use current-source nodes, preserving group links and filters.","Enter 適用 c 保存")
             } else {
-                l3(app,"Enter 切换订阅并加载它记住的分流。a 添加代理  e 编辑选中项  n 改名。u 更新当前订阅  v 管理当前节点。Tab 切换分流。","Enter switches source with its assigned routing. a Add  c Copy  n Rename. u Update active  e Edit active URL  v Active nodes.","Enter 切替 a 追加 c 保存 n 名前 u 更新 v ノード")
+                l3(app,"Enter 切换订阅并加载它记住的分流。a 添加代理  e 编辑选中项  n 改名。u 更新当前订阅  v 管理当前节点。Tab 切换分流。","Enter switches source with its assigned routing. a Add  e Edit selected  c Copy  n Rename. u Update active  v Active nodes. Tab switches to routing.","Enter 切替 a 追加 e 編集 c 保存 n 名前 u 更新 v ノード")
             };
             frame.render_widget(
                 Paragraph::new(desc)

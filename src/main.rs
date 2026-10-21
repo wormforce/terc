@@ -4,7 +4,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -196,18 +196,106 @@ impl Config {
         base.join(".config").join("terc").join("config.json")
     }
 
-    pub fn load() -> Self {
-        let path = Self::path();
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(cfg) = serde_json::from_str::<Self>(&raw) {
-                return cfg;
+    /// The config plus a notice for the UI when the file could not be used.
+    pub fn load() -> (Self, Option<LoadIssue>) {
+        Self::load_from(&Self::path(), unix_now())
+    }
+
+    /// A missing file starts fresh with a random controller secret. A file
+    /// that will not parse is renamed to `config.json.broken-<now>` and never
+    /// overwritten, so a typo cannot wipe the secret, sources or modules.
+    fn load_from(path: &std::path::Path, now: u64) -> (Self, Option<LoadIssue>) {
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let mut cfg = Self::default();
+                cfg.controller.secret = random_secret().unwrap_or_default();
+                let notice = cfg.save_to(path).err().map(|err| {
+                    LoadIssue::Unsaved(format!(
+                        "无法保存偏好 / Could not save preferences / 設定を保存できません: {err}"
+                    ))
+                });
+                return (cfg, notice);
+            }
+            Err(err) => {
+                return (
+                    Self::unusable_defaults(""),
+                    Some(LoadIssue::Unusable(format!(
+                        "无法读取 / Cannot read / 読み込めません {}: {err}",
+                        path.display()
+                    ))),
+                )
+            }
+        };
+        match serde_json::from_str::<Self>(&raw) {
+            Ok(mut cfg) => {
+                // Only a file that parsed is rewritten, and only when a
+                // stored default actually moved.
+                let notice = if cfg.migrate() {
+                    cfg.save_to(path).err().map(|err| {
+                        LoadIssue::Unsaved(format!(
+                            "无法保存偏好 / Could not save preferences / 設定を保存できません: {err}"
+                        ))
+                    })
+                } else {
+                    None
+                };
+                (cfg, notice)
+            }
+            Err(err) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "config.json".into());
+                let backup = path.with_file_name(format!("{name}.broken-{now}"));
+                let kept = match fs::rename(path, &backup) {
+                    Ok(()) => backup.display().to_string(),
+                    Err(rename) => format!("{} ({rename})", path.display()),
+                };
+                (
+                    Self::unusable_defaults(&raw),
+                    Some(LoadIssue::Unusable(format!(
+                        "config.json 无法解析，已备份 / could not be parsed, kept as / を解析できず退避: {kept}: {err}"
+                    ))),
+                )
             }
         }
-        let cfg = Self::default();
-        if let Err(err) = cfg.save() {
-            eprintln!("Cannot save preferences: {err}");
-        }
+    }
+
+    /// Defaults for a run after `raw` could not be used. They still carry a
+    /// controller secret: the core is started with `-secret`, and an empty
+    /// one would leave the controller open to any web page. The broken
+    /// file's own secret is kept when it can be read, so a core it started
+    /// (and the config.yaml written with it) still accepts terc.
+    fn unusable_defaults(raw: &str) -> Self {
+        let mut cfg = Self::default();
+        cfg.controller.secret = salvage_secret(raw)
+            .or_else(random_secret)
+            .unwrap_or_default();
         cfg
+    }
+
+    /// Moves the old http default test URL to the https one, never a URL the
+    /// user set, and caps a timeout saved before the delay route's limit. An
+    /// empty controller secret, the v0.1.0 default, gets a random one.
+    /// Returns whether anything changed.
+    fn migrate(&mut self) -> bool {
+        let controller = &mut self.controller;
+        let mut changed = false;
+        if controller.secret.is_empty() {
+            if let Some(secret) = random_secret() {
+                controller.secret = secret;
+                changed = true;
+            }
+        }
+        let before = (controller.test_url.clone(), controller.timeout_ms);
+        if controller.test_url == crate::mihomo::OLD_DEFAULT_TEST_URL {
+            controller.test_url = crate::mihomo::DEFAULT_TEST_URL.to_string();
+        }
+        controller.timeout_ms = controller
+            .timeout_ms
+            .min(crate::mihomo::MAX_DELAY_TIMEOUT_MS);
+        changed || before != (controller.test_url.clone(), controller.timeout_ms)
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -225,12 +313,166 @@ impl Config {
     }
 }
 
+/// Why `Config::load` fell back to defaults.
+#[derive(Debug)]
+pub enum LoadIssue {
+    /// A fresh config could not be written; it still works for this run.
+    Unsaved(String),
+    /// The file exists but could not be read or parsed. Migration is skipped
+    /// so the defaults never import or save over the user's data.
+    Unusable(String),
+}
+
+impl LoadIssue {
+    fn text(&self) -> &str {
+        match self {
+            Self::Unsaved(text) | Self::Unusable(text) => text,
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The non-empty `controller.secret` of a config.json that did not load,
+/// read even when the JSON itself is broken (a trailing comma, say).
+fn salvage_secret(raw: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+        return value["controller"]["secret"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+    let key = "\"secret\"";
+    let at = raw.find(key)? + key.len();
+    let rest = raw[at..].trim_start().strip_prefix(':')?.trim_start();
+    serde_json::Deserializer::from_str(rest)
+        .into_iter::<String>()
+        .next()?
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// 32 hex characters from `/dev/urandom`. Mihomo installs no auth at all for
+/// an empty secret, and its default CORS lets any web page reach the
+/// controller, so a fresh config never starts without one.
+fn random_secret() -> Option<String> {
+    use std::io::Read as _;
+    let mut bytes = [0u8; 16];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Deliver a worker's completion event even when the worker panics, so
 /// `snapshot_pending` and `action_busy` are always cleared.
 /// Space asks for the opposite of what the panel shows. A fresh lookup may
 /// disagree (the proxy changed outside terc since a cached poll, up to 15 s
 /// ago), and flipping that would undo what the user asked for; setting the
 /// shown opposite is harmless when the system already has it.
+/// The result of an action whose worker panicked.
+const ACTION_PANICKED: &str = "Operation failed unexpectedly";
+
+/// The oldest Mihomo that reads every key terc writes: `empty-fallback` on
+/// region groups (v1.19.27; older cores ignore it, and a group with no
+/// matching node then dials DIRECT) and `hop-interval` ranges (v1.19.24).
+pub const MIN_CORE: (u32, u32, u32) = (1, 19, 27);
+
+/// `v1.19.26` or `1.19.26` as numbers; alpha builds (`alpha-88dcbf7`) and
+/// anything else unreadable give `None`.
+fn core_version(version: &str) -> Option<(u32, u32, u32)> {
+    let v = version.trim();
+    let v = v.strip_prefix('v').unwrap_or(v);
+    let end = v
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(v.len());
+    let mut parts = v[..end].split('.').map(|p| p.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+/// Whether a readable core version predates `MIN_CORE`.
+pub fn core_too_old(version: &str) -> bool {
+    core_version(version).is_some_and(|v| v < MIN_CORE)
+}
+
+/// A warning for a running core older than `MIN_CORE`.
+fn old_core_notice(version: &str, lang: Lang) -> Option<String> {
+    if !core_too_old(version) {
+        return None;
+    }
+    let (a, b, c) = MIN_CORE;
+    Some(match lang {
+        Lang::Zh => format!("Mihomo {version} 低于 v{a}.{b}.{c}：地区组的 empty-fallback 不生效，没有匹配节点时会直连；hop-interval 范围需要 v1.19.24。请在 设置 → 排查工具 → 下载 / 更新内核 更新，或 brew upgrade mihomo"),
+        Lang::En => format!("Mihomo {version} is older than v{a}.{b}.{c}: region groups ignore empty-fallback and go DIRECT when no node matches; hop-interval ranges need v1.19.24. Update in Settings → Diagnostics → Download / update core, or brew upgrade mihomo"),
+        Lang::Ja => format!("Mihomo {version} は v{a}.{b}.{c} より古い：地域グループの empty-fallback が効かず、一致ノードがないと直接接続になります。hop-interval の範囲指定は v1.19.24 以降。設定 → 診断 → コアのダウンロード / 更新、または brew upgrade mihomo で更新してください"),
+    })
+}
+
+/// A hint for a core error caused by a key the core is too old to read.
+fn old_core_hint(err: &str, lang: Lang) -> Option<&'static str> {
+    if !(err.contains("hop-interval") && err.contains("parse")) {
+        return None;
+    }
+    Some(match lang {
+        Lang::Zh => "（hop-interval 范围写法需要 Mihomo v1.19.24 或更新的内核）",
+        Lang::En => "(hop-interval ranges need Mihomo v1.19.24 or newer)",
+        Lang::Ja => "（hop-interval の範囲指定には Mihomo v1.19.24 以降が必要）",
+    })
+}
+
+/// Whether the TUI owns the terminal (raw mode, alternate screen).
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Worker panics held back while the TUI was up; printed once it closes.
+static WORKER_PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A worker panic printed while the TUI is up would land in the alternate
+/// screen in raw mode, cut through the panels, and vanish on exit.
+fn holds_panic(on_main: bool, tui_active: bool) -> bool {
+    !on_main && tui_active
+}
+
+fn hold_worker_panic(text: String) {
+    if let Ok(mut held) = WORKER_PANICS.lock() {
+        if held.len() >= 8 {
+            held.remove(0);
+        }
+        held.push(text.replace('\n', " "));
+    }
+}
+
+fn last_worker_panic() -> Option<String> {
+    WORKER_PANICS.lock().ok()?.last().cloned()
+}
+
+/// Print the held worker panics on the normal screen.
+fn flush_worker_panics() {
+    let held = WORKER_PANICS
+        .lock()
+        .map(|mut held| std::mem::take(&mut *held))
+        .unwrap_or_default();
+    for text in held {
+        eprintln!("{text}");
+    }
+}
+
+/// Setup's message for a first line that is no subscription link and did not
+/// parse as a node. A line that looks like a node (`Name = type, …` or a
+/// `scheme://` link) gets the parser's reason, such as a bad
+/// `port-hopping-interval`; anything else gets the generic hint.
+fn setup_node_error(hint: &str, line: &str, err: &str) -> String {
+    let line = line.trim();
+    if line.contains("://") || line.contains('=') {
+        format!("{err}  ({hint})")
+    } else {
+        hint.into()
+    }
+}
+
 fn sysproxy_toggle(
     shown: bool,
     ports: Result<(u16, u16), String>,
@@ -288,6 +530,197 @@ mod io_tests {
         assert!(fs::read_to_string(&path).unwrap().contains("s3cret"));
         assert!(!dir.join("config.json.tmp").exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn broken_preferences_are_kept_aside_not_overwritten() {
+        let dir = env::temp_dir().join(format!("terc-broken-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        let mut good = Config::default();
+        good.controller.secret = "keep-me".into();
+        good.enabled_modules = vec!["dns-fakeip".into()];
+        let raw = serde_json::to_string(&good)
+            .unwrap()
+            .replace("\"spring\"", "\"dracula\"");
+        assert!(raw.contains("dracula"));
+        fs::write(&path, &raw).unwrap();
+
+        let (cfg, issue) = Config::load_from(&path, 1_700_000_000);
+        assert!(
+            matches!(&issue, Some(LoadIssue::Unusable(text)) if text.contains("broken-1700000000"))
+        );
+        assert_eq!(cfg.controller.secret, "keep-me", "the broken file's secret");
+        assert!(!path.exists(), "nothing is written back in its place");
+        let backup = dir.join("config.json.broken-1700000000");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), raw);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unusable_preferences_never_leave_the_controller_without_a_secret() {
+        // Broken JSON: the secret is still read from the text.
+        let raw = r#"{"controller":{"addr":"127.0.0.1:9090","secret": "f12e",},}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(raw).is_err());
+        assert_eq!(salvage_secret(raw).as_deref(), Some("f12e"));
+        assert_eq!(Config::unusable_defaults(raw).controller.secret, "f12e");
+        // No secret, an empty one, or a file that could not be read at all.
+        for raw in [
+            r#"{"settings":{"theme":"dracula"}}"#,
+            r#"{"controller":{"secret":""},"settings":{"theme":"dracula"}}"#,
+            r#"{"controller":{"secret":"",}"#,
+            "",
+        ] {
+            let secret = Config::unusable_defaults(raw).controller.secret;
+            assert_eq!(secret.len(), 32, "{raw}");
+            assert!(secret.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        // Through load_from, with a read error (a directory in its place).
+        let dir = env::temp_dir().join(format!("terc-unreadable-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&path).unwrap();
+        let (cfg, issue) = Config::load_from(&path, 0);
+        assert!(matches!(issue, Some(LoadIssue::Unusable(_))));
+        assert_eq!(cfg.controller.secret.len(), 32);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_preferences_get_a_random_secret() {
+        let dir = env::temp_dir().join(format!("terc-fresh-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+        let (cfg, issue) = Config::load_from(&path, 0);
+        assert!(issue.is_none());
+        let secret = &cfg.controller.secret;
+        assert_eq!(secret.len(), 32);
+        assert!(secret.bytes().all(|b| b.is_ascii_hexdigit()));
+        let (again, issue) = Config::load_from(&path, 0);
+        assert!(issue.is_none());
+        assert_eq!(&again.controller.secret, secret, "loaded, not regenerated");
+        assert_ne!(
+            Config::load_from(&dir.join("other.json"), 0)
+                .0
+                .controller
+                .secret,
+            *secret
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v010_preferences_still_load() {
+        let dir = env::temp_dir().join(format!("terc-v010-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        let raw = r#"{"settings":{"lang":"en","theme":"vintage","renderer":"braille","refresh_hz":30,"graph_interval_secs":1,"show_traffic":true,"show_toolbar":true},"controller":{"addr":"127.0.0.1:9090","secret":"old","config_dir":"/tmp/x","subscription_url":"","test_url":"http://www.gstatic.com/generate_204","timeout_ms":4000},"enabled_modules":["sniffer"],"active_profile":"work"}"#;
+        fs::write(&path, raw).unwrap();
+        let (cfg, issue) = Config::load_from(&path, 0);
+        assert!(issue.is_none());
+        assert_eq!(cfg.controller.secret, "old");
+        assert_eq!(cfg.settings.lang, Lang::En);
+        assert_eq!(cfg.enabled_modules, ["sniffer"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v010_preferences_with_the_empty_default_secret_get_a_random_one() {
+        let dir = env::temp_dir().join(format!("terc-v010-open-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        let raw = r#"{"settings":{"lang":"zh","theme":"spring","renderer":"braille","refresh_hz":60,"graph_interval_secs":1,"show_traffic":true,"show_toolbar":true},"controller":{"addr":"127.0.0.1:9090","secret":"","config_dir":"/tmp/x","subscription_url":"","test_url":"https://www.gstatic.com/generate_204","timeout_ms":4000}}"#;
+        fs::write(&path, raw).unwrap();
+        let (cfg, issue) = Config::load_from(&path, 0);
+        assert!(issue.is_none());
+        let secret = cfg.controller.secret.clone();
+        assert_eq!(secret.len(), 32);
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["controller"]["secret"], secret.as_str(), "saved once");
+        let (again, _) = Config::load_from(&path, 0);
+        assert_eq!(again.controller.secret, secret, "not regenerated");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn setup_names_the_reason_a_pasted_node_line_was_refused() {
+        let mut app = App::from_snapshot(Config::default(), CoreSnapshot::default());
+        app.snapshot.core_bin_path = "/usr/bin/mihomo".into();
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            app.setup_editor
+                .load("HY = hysteria2, 192.0.2.1, 443, password=x, port-hopping-interval=30s");
+            app.submit_setup();
+            assert!(app.status_is_error);
+            assert!(
+                app.status_message.contains("port-hopping-interval"),
+                "{lang:?}: {}",
+                app.status_message
+            );
+            assert_eq!(app.setup_phase, SetupPhase::Editing);
+            app.setup_editor.load("hello");
+            app.submit_setup();
+            assert_eq!(app.status_message, app.t("setup_err_scheme"));
+        }
+        assert!(app.config.controller.profile_id.is_empty(), "nothing saved");
+        // Japanese names node lines too.
+        app.config.settings.lang = Lang::Ja;
+        assert!(app.t("setup_err_scheme").contains("ss://"));
+    }
+
+    #[test]
+    fn action_errors_read_in_the_ui_language() {
+        let mut app = App::from_snapshot(Config::default(), CoreSnapshot::default());
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            let text = app.explain_action_error("sysproxy_unavailable");
+            assert_eq!(text, app.t("sysproxy_unavailable"));
+            assert!(text.contains("gsettings"));
+            let parse = "proxy 0: cannot parse 'hop-interval' as int: strconv.ParseInt: parsing \"10-30\": invalid syntax";
+            assert!(app.explain_action_error(parse).contains("v1.19.24"));
+        }
+        assert_eq!(app.explain_action_error("other"), "other");
+        assert!(holds_panic(false, true));
+        assert!(!holds_panic(true, true) && !holds_panic(false, false));
+        hold_worker_panic("thread 'w' panicked at src/x.rs:1:1:\nboom".into());
+        let text = app.explain_action_error(ACTION_PANICKED);
+        assert!(
+            text.starts_with(ACTION_PANICKED) && text.contains("boom"),
+            "{text}"
+        );
+        assert!(!text.contains('\n'));
+    }
+
+    #[test]
+    fn cores_older_than_the_newest_keys_terc_writes_are_flagged() {
+        assert_eq!(core_version("v1.19.26"), Some((1, 19, 26)));
+        assert_eq!(core_version("1.19.32"), Some((1, 19, 32)));
+        assert_eq!(core_version("v1.19.27-alpha"), Some((1, 19, 27)));
+        assert_eq!(core_version("alpha-88dcbf7"), None);
+        assert_eq!(core_version("unknown"), None);
+        assert!(core_too_old("v1.19.26") && core_too_old("v1.18.10"));
+        assert!(!core_too_old("v1.19.27") && !core_too_old("v1.20.0"));
+        assert!(!core_too_old("alpha-88dcbf7"));
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            let text = old_core_notice("v1.19.23", lang).unwrap();
+            assert!(text.contains("v1.19.27") && text.contains("empty-fallback"));
+        }
+        let mut app = App::from_snapshot(Config::default(), CoreSnapshot::default());
+        app.snapshot.running = true;
+        app.snapshot.version = "v1.19.26".into();
+        // Another toast is up: the notice waits for it.
+        app.set_status("reloaded", false);
+        app.note_old_core();
+        assert_eq!(app.status_message, "reloaded");
+        app.clear_status();
+        app.note_old_core();
+        assert!(app.status_message.contains("v1.19.26"));
+        app.clear_status();
+        app.note_old_core();
+        assert!(app.status_message.is_empty(), "once per version");
+        app.snapshot.version = "v1.19.32".into();
+        app.note_old_core();
+        assert!(app.status_message.is_empty());
     }
 
     #[test]
@@ -443,7 +876,16 @@ pub struct App {
     pub log_editing: bool,
     pub log_detail: bool,
     pub log_index: usize,
+    /// The core version the old-core notice last looked at.
+    pub core_version_noted: String,
     pub pending_best_group: Option<(String, Option<String>)>,
+    /// Results of the rounds so far while the leaders are re-tested.
+    pub best_rounds: Vec<Vec<(String, Option<u16>)>>,
+    /// The leaders every re-test round measures.
+    pub best_retest: Vec<String>,
+    /// The group's selection (its pin on url-test/fallback) when the best
+    /// pick started; a different one later means the user chose meanwhile.
+    pub best_choice: String,
     pub best_scope_index: usize,
     pub action_busy: bool,
     pub snapshot_pending: bool,
@@ -586,7 +1028,11 @@ impl App {
             log_editing: false,
             log_detail: false,
             log_index: 0,
+            core_version_noted: String::new(),
             pending_best_group: None,
+            best_rounds: Vec::new(),
+            best_retest: Vec::new(),
+            best_choice: String::new(),
             best_scope_index: 0,
             action_busy: false,
             snapshot_pending: false,
@@ -715,11 +1161,26 @@ impl App {
         let lower = url.to_ascii_lowercase();
         if !lower.starts_with("https://") && !lower.starts_with("http://") {
             // Not a subscription link: accept a pasted node (Surge line or URI).
-            if crate::subconv::parse_node_line(url.lines().next().unwrap_or("")).is_err() {
-                self.set_status(self.t("setup_err_scheme"), true);
-                return;
-            }
-            let dir = crate::compose::profile_dir(&self.config.controller);
+            let first = url.lines().next().unwrap_or("");
+            let node = match crate::subconv::parse_node_line(first) {
+                Ok(node) => node,
+                Err(err) => {
+                    let text = setup_node_error(self.t("setup_err_scheme"), first, &err);
+                    self.set_status(&text, true);
+                    return;
+                }
+            };
+            let name = node["name"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| "导入代理".into());
+            let dir = match self.setup_source_dir(name, "proxy", "") {
+                Ok(dir) => dir,
+                Err(err) => {
+                    self.set_status(&err, true);
+                    return;
+                }
+            };
             let mut added = 0;
             let mut last_err = String::new();
             for line in url.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -738,11 +1199,39 @@ impl App {
             return;
         }
         let url = url.split_whitespace().next().unwrap_or("").to_string();
+        let name = storage::label("", &url, "new");
+        if let Err(err) = self.setup_source_dir(name, "subscription", &url) {
+            self.set_status(&err, true);
+            return;
+        }
         self.config.controller.subscription_url = url;
         self.save_profile_source();
         self.save_preferences();
         self.setup_phase = SetupPhase::Fetching;
         self.update_subscription();
+    }
+
+    /// Where Setup stores what it was given. A fresh install has no source
+    /// yet, and `profile_dir` would then be the pre-0.2 `~/.config/terc`,
+    /// which Sources & Routing does not list; so a new source is created
+    /// under `sources/` and made active first.
+    fn setup_source_dir(&mut self, name: String, kind: &str, url: &str) -> Result<PathBuf, String> {
+        if self.config.controller.profile_id.is_empty() {
+            let id = storage::next_id();
+            let record = crate::compose::ProfileSource {
+                name,
+                subscription_url: url.into(),
+                kind: kind.into(),
+                routing: "subscription".into(),
+                ..Default::default()
+            };
+            record.save(&storage::root().join(&id))?;
+            self.config.controller.profile_id = id.clone();
+            self.config.active_profile_label = record.name;
+            self.config.active_profile = id;
+            self.save_preferences();
+        }
+        Ok(crate::compose::profile_dir(&self.config.controller))
     }
 
     /// The built-in `dns-fakeip` module switched from foreign DoH with a
@@ -772,6 +1261,25 @@ impl App {
         true
     }
 
+    /// An action's error as the user should read it: a worker's error key in
+    /// the UI language, a hint when an old core rejected a newer key, and
+    /// the panic message behind a worker that died.
+    fn explain_action_error(&self, err: &str) -> String {
+        if err == "sysproxy_unavailable" {
+            return self.t("sysproxy_unavailable").into();
+        }
+        if err == ACTION_PANICKED {
+            return match last_worker_panic() {
+                Some(panic) => format!("{err}: {panic}"),
+                None => err.into(),
+            };
+        }
+        match old_core_hint(err, self.lang()) {
+            Some(hint) => format!("{err}  {hint}"),
+            None => err.into(),
+        }
+    }
+
     pub fn set_status(&mut self, text: &str, is_error: bool) {
         self.toast_started = Some(Instant::now());
         self.status_message = text.to_string();
@@ -781,6 +1289,23 @@ impl App {
     pub fn save_preferences(&mut self) {
         if let Err(err) = self.config.save() {
             self.set_status(&format!("Could not save preferences: {err}"), true);
+        }
+    }
+
+    /// Once per core version: warn when the running core predates keys terc
+    /// writes. It waits while another toast is up, so an action's result is
+    /// never replaced; the log keeps it too.
+    fn note_old_core(&mut self) {
+        if !self.snapshot.running || self.core_version_noted == self.snapshot.version {
+            return;
+        }
+        if self.toast_visible() {
+            return;
+        }
+        self.core_version_noted = self.snapshot.version.clone();
+        if let Some(text) = old_core_notice(&self.snapshot.version, self.lang()) {
+            self.logs.push(("warning".into(), text.clone()));
+            self.set_status(&text, true);
         }
     }
 
@@ -919,8 +1444,9 @@ impl App {
                     match &result {
                         Ok(text) => self.set_status(text, false),
                         Err(err) => {
-                            self.set_status(err, true);
-                            self.logs.push(("error".into(), err.clone()));
+                            let err = self.explain_action_error(err);
+                            self.set_status(&err, true);
+                            self.logs.push(("error".into(), err));
                             self.load_core_log();
                         }
                     }
@@ -992,6 +1518,7 @@ impl App {
                     self.snapshot_pending = false;
                     if !self.action_busy {
                         self.accept_snapshot(*snap);
+                        self.note_old_core();
                     }
                     if std::mem::take(&mut self.refresh_queued) {
                         self.refresh_snapshot_now();
@@ -999,6 +1526,7 @@ impl App {
                 }
                 BackendEvent::Snapshot(snap) => {
                     self.accept_snapshot(*snap);
+                    self.note_old_core();
                     if self.group_index >= self.snapshot.groups.len() {
                         self.group_index = self.snapshot.groups.len().saturating_sub(1);
                     }
@@ -1037,7 +1565,7 @@ impl App {
                             let previous_group = self.group_index;
                             let previous_node = self.node_index;
                             self.group_index = index;
-                            self.select_best_node_in_group_after_test(country.as_deref(), &results);
+                            self.select_best_node_in_group_after_test(country, results);
                             if previous_group != index {
                                 self.group_index = previous_group;
                                 self.node_index = previous_node;
@@ -1323,13 +1851,16 @@ impl App {
             let mut done = SendOnDrop::new(
                 tx.clone(),
                 BackendEvent::ActionDone {
-                    result: Err("Operation failed unexpectedly".into()),
+                    result: Err(ACTION_PANICKED.into()),
                     modules: None,
                     profile: None,
                     snapshot_follows: false,
                 },
             );
             let result = action(cfg.clone());
+            if mihomo::take_core_refreshed() {
+                mihomo::prewarm_node_dns_async(cfg.clone());
+            }
             done.set(BackendEvent::ActionDone {
                 result,
                 modules,
@@ -1393,9 +1924,35 @@ impl App {
         }
         let group_name = group.name.clone();
         let node_name = node.clone();
-        self.run_action("Switching node…", None, None, move |cfg| {
-            select_group_node(&cfg, &group_name, &node_name).map_err(|e| e.to_string())?;
-            Ok(format!("{group_name} › {node_name}"))
+        // On url-test/fallback the same PUT pins the node, so say so.
+        let pin = group.pinnable();
+        let (label, note) = if pin {
+            (self.t("pin_setting"), format!("  {}", self.t("pin_note")))
+        } else {
+            ("Switching node…", String::new())
+        };
+        self.run_action(label, None, None, move |cfg| {
+            select_group_node(&cfg, &group_name, &node_name, pin).map_err(|e| e.to_string())?;
+            Ok(format!("{group_name} › {node_name}{note}"))
+        });
+    }
+
+    pub fn unpin_selected_group(&mut self) {
+        let Some(group) = self.snapshot.groups.get(self.group_index) else {
+            return;
+        };
+        if !group.pinnable() {
+            self.set_status(self.t("pin_unpinnable"), true);
+            return;
+        }
+        // Sent even with no pin shown: a Fallback forgets a dead pin only in
+        // memory, and the saved one comes back at the next reload. DELETE
+        // clears both and is harmless when there is none.
+        let group_name = group.name.clone();
+        let done = self.t("pin_cleared");
+        self.run_action(self.t("pin_clearing"), None, None, move |cfg| {
+            mihomo::unpin_group(&cfg, &group_name).map_err(|e| e.to_string())?;
+            Ok(format!("{group_name}  {done}"))
         });
     }
 
@@ -1415,6 +1972,7 @@ impl App {
             self.config.controller.clone(),
             group.name.clone(),
             group.all.clone(),
+            self.snapshot.groups.clone(),
             self.tx.clone(),
         );
     }
@@ -1431,11 +1989,14 @@ impl App {
         let Some(group) = self.snapshot.groups.get(self.group_index) else {
             return;
         };
-        if !group.kind.eq_ignore_ascii_case("selector") {
-            self.set_status(
-                "请选择可手动切换的策略组 / Select a manual Selector group",
-                true,
-            );
+        // url-test/fallback take the pick as a pin with automatic failover.
+        if !group.kind.eq_ignore_ascii_case("selector") && !group.pinnable() {
+            let text = match self.lang() {
+                Lang::Zh => "请选择 Selector / url-test / fallback 策略组",
+                Lang::En => "Select a Selector, url-test or fallback group",
+                Lang::Ja => "Selector / url-test / fallback グループを選んでください",
+            };
+            self.set_status(text, true);
             return;
         }
         let country = if self.best_scope_index == 1 {
@@ -1458,29 +2019,114 @@ impl App {
             return;
         }
         let group_name = group.name.clone();
+        self.best_choice = best_choice(group).to_string();
         self.pending_best_group = Some((group_name.clone(), country));
+        self.best_rounds.clear();
+        self.best_retest.clear();
         self.overlay = Overlay::None;
         self.set_status("正在测速并优选 / Testing candidates…", false);
         mihomo::test_best_delays_async(
             self.config.controller.clone(),
             group_name,
             candidates.into_iter().map(|(_, name)| name).collect(),
+            self.snapshot.groups.clone(),
             self.tx.clone(),
         );
     }
 
     fn select_best_node_in_group_after_test(
         &mut self,
-        country: Option<&str>,
-        results: &[(String, Option<u16>)],
+        country: Option<String>,
+        results: Vec<(String, Option<u16>)>,
     ) {
-        let candidates = best::candidates(&self.snapshot, self.group_index, country);
-        let selected = best::fastest(&candidates, results);
-        if let Some(index) = selected {
-            self.node_index = index;
-            self.activate_selected_node();
-        } else {
-            self.set_status("范围内没有可达节点 / No reachable node in this scope", true);
+        let Some(group) = self.snapshot.groups.get(self.group_index) else {
+            return;
+        };
+        let (group_name, current) = (group.name.clone(), group.now.clone());
+        let pinnable = group.pinnable();
+        let pinned_current = group.fixed == current;
+        // A node chosen by hand during the test is not overridden. A
+        // Fallback clearing a dead pin by itself is not a choice.
+        let choice = best_choice(group);
+        if choice != self.best_choice && !(pinnable && choice.is_empty()) {
+            self.best_rounds.clear();
+            self.best_retest.clear();
+            self.set_status(self.t("best_choice_changed"), false);
+            return;
+        }
+        let candidates = best::candidates(&self.snapshot, self.group_index, country.as_deref());
+        self.best_rounds.push(results);
+        // One sample favours whichever node got lucky, so the leaders run
+        // again until each has best::ROUNDS samples for a median.
+        if self.best_rounds.len() == 1 {
+            self.best_retest = best::retest(&candidates, &self.best_rounds[0], &current);
+        }
+        if self.best_retest.len() > 1 && self.best_rounds.len() < best::ROUNDS {
+            let (n, round) = (self.best_retest.len(), self.best_rounds.len());
+            let of = best::ROUNDS - 1;
+            let text = match self.lang() {
+                Lang::Zh => format!("正在复测领先的 {n} 个节点（{round}/{of}）…"),
+                Lang::En => format!("Re-testing {n} leading nodes ({round}/{of})…"),
+                Lang::Ja => format!("上位 {n} ノードを再測定中（{round}/{of}）…"),
+            };
+            self.set_status(&text, false);
+            self.pending_best_group = Some((group_name.clone(), country));
+            mihomo::test_best_delays_async(
+                self.config.controller.clone(),
+                group_name,
+                self.best_retest.clone(),
+                self.snapshot.groups.clone(),
+                self.tx.clone(),
+            );
+            return;
+        }
+        let rounds = std::mem::take(&mut self.best_rounds);
+        self.best_retest.clear();
+        let rounds: Vec<&[(String, Option<u16>)]> = rounds.iter().map(Vec::as_slice).collect();
+        match best::pick(&candidates, &rounds, &current) {
+            best::Pick::Switch(index) => {
+                self.node_index = index;
+                self.activate_selected_node();
+            }
+            best::Pick::Keep {
+                best,
+                current_ms,
+                best_ms,
+            } => {
+                let fastest = candidates
+                    .iter()
+                    .find(|(index, _)| *index == best)
+                    .map_or("", |(_, name)| name.as_str());
+                let text = match (self.lang(), fastest == current) {
+                    (Lang::Zh, true) => format!("当前节点 {current} 已是最快（{best_ms} ms）"),
+                    (Lang::En, true) => format!("{current} is already the fastest ({best_ms} ms)"),
+                    (Lang::Ja, true) => format!("現在の {current} が最速です（{best_ms} ms）"),
+                    (Lang::Zh, false) => format!(
+                        "保留当前节点 {current}（{current_ms} ms），与最快的 {fastest}（{best_ms} ms）差距在 30 ms / 15% 内"
+                    ),
+                    (Lang::En, false) => format!(
+                        "Kept {current} ({current_ms} ms): within 30 ms / 15% of the fastest, {fastest} ({best_ms} ms)"
+                    ),
+                    (Lang::Ja, false) => format!(
+                        "現在の {current}（{current_ms} ms）を維持：最速の {fastest}（{best_ms} ms）との差が 30 ms / 15% 以内"
+                    ),
+                };
+                // On url-test/fallback the kept node is only Mihomo's choice
+                // of the moment until it is pinned; 'a' always ends pinned.
+                if pinnable && !pinned_current {
+                    let note = format!("{text}  {}", self.t("pin_note"));
+                    self.run_action(self.t("pin_setting"), None, None, move |cfg| {
+                        select_group_node(&cfg, &group_name, &current, true)
+                            .map_err(|e| e.to_string())?;
+                        Ok(note)
+                    });
+                } else {
+                    self.set_status(&text, false);
+                }
+            }
+            best::Pick::None => {
+                self.set_status("范围内没有可达节点 / No reachable node in this scope", true)
+            }
         }
     }
 
@@ -1549,6 +2195,7 @@ impl App {
     pub fn t(&self, key: &str) -> &'static str {
         match (self.config.settings.lang, key) {
             (Lang::Zh, "cat_diagnostics") => "排查工具",
+            (Lang::Ja, "cat_diagnostics") => "診断ツール",
             (_, "cat_diagnostics") => "Diagnostics",
             (_, "too_small") => "Terminal window too small",
             (Lang::Zh, "traffic") => "实时速率",
@@ -1811,7 +2458,7 @@ impl App {
             (Lang::Ja, "setup_err_empty") => "まずリンクを入力してください",
             (Lang::Zh, "setup_err_scheme") => "需要 http(s) 订阅链接，或一条 Surge 节点行 / ss:// 等节点链接",
             (Lang::En, "setup_err_scheme") => "Enter an http(s) subscription link, or a Surge proxy line / ss:// style node link",
-            (Lang::Ja, "setup_err_scheme") => "リンクは http:// または https:// で始めてください",
+            (Lang::Ja, "setup_err_scheme") => "http(s) のサブスクリプションリンク、または Surge のノード行 / ss:// などのノードリンクを入力してください",
             (Lang::Zh, "setup_msg_saved") => "订阅已保存  内核未安装：按 Ctrl+D 下载，再按 Esc 返回，在 设置 → 内核与代理 → 内核服务 启动",
             (Lang::En, "setup_msg_saved") => "Subscription saved  no core binary: press Ctrl+D to download, then Esc and start it in Settings → Core & Proxy → Core service",
             (Lang::Ja, "setup_msg_saved") => "サブスク保存済み  コア未導入：Ctrl+D で導入後、Esc で戻り 設定 → コア・プロキシ → Core service で起動",
@@ -1827,18 +2474,66 @@ impl App {
             (Lang::Zh, "help_space") => "开关系统代理。macOS 用 networksetup，Linux 用 GNOME gsettings",
             (Lang::En, "help_space") => "Toggle the system proxy (networksetup, or GNOME gsettings)",
             (Lang::Ja, "help_space") => "システムプロキシを切替（networksetup または GNOME gsettings）",
-            (_, "help_hl") => "Switch focus between Groups [1] and Nodes [2]",
-            (_, "help_jk") => "Navigate up / down in current list",
-            (_, "help_enter") => "Activate highlighted node in current group",
-            (_, "help_r") => "Concurrent URL latency test for current group",
-            (Lang::Zh, "help_a") => "选择全球或当前国家范围，测速后优选",
-            (_, "help_a") => "Choose all countries or current country, test and select fastest",
-            (_, "help_m") => "Cycle routing mode (Rule / Global / Direct)",
+            (Lang::Zh, "help_hl") => "代理页：在策略组 [1] 和节点 [2] 之间切换焦点",
+            (Lang::En, "help_hl") => "Proxies: move focus between Groups [1] and Nodes [2]",
+            (Lang::Ja, "help_hl") => "プロキシ：グループ [1] とノード [2] のフォーカスを切替",
+            (Lang::Zh, "help_jk") => "在当前列表中上下移动",
+            (Lang::En, "help_jk") => "Move up / down in the current list",
+            (Lang::Ja, "help_jk") => "現在のリストを上下に移動",
+            (Lang::Zh, "help_enter") => "在当前策略组中启用选中的节点；url-test / fallback 组会固定该节点",
+            (Lang::En, "help_enter") => "Use the highlighted node in the current group; pins it on url-test / fallback",
+            (Lang::Ja, "help_enter") => "選択中のノードを現在のグループで使用。url-test / fallback では固定",
+            (Lang::Zh, "help_r") => "并发测试当前策略组的延迟",
+            (Lang::En, "help_r") => "Concurrent URL latency test for the current group",
+            (Lang::Ja, "help_r") => "現在のグループを並列で遅延計測",
+            (Lang::Zh, "help_a") => "选择全球或当前国家范围，测速后优选；url-test / fallback 组会固定结果",
+            (Lang::En, "help_a") => "Choose all countries or the current one, test and select the fastest; pins it on url-test / fallback",
+            (Lang::Ja, "help_a") => "全体か現在の国を選び、計測して最速を選択。url-test / fallback では固定",
+            (Lang::Zh, "help_m") => "切换分流模式（规则 / 全局 / 直连）",
+            (Lang::En, "help_m") => "Cycle routing mode (Rule / Global / Direct)",
+            (Lang::Ja, "help_m") => "ルーティングモードを切替（Rule / Global / Direct）",
+            (Lang::Zh, "help_unpin") => "取消 url-test / fallback 组的固定（Enter 或 a 会固定节点）",
+            (Lang::En, "help_unpin") => "Unpin a url-test / fallback group (Enter or a pins a node)",
+            (Lang::Ja, "help_unpin") => "url-test / fallback の固定を解除（Enter か a で固定）",
+            (Lang::Zh, "pin_setting") => "正在固定节点…",
+            (Lang::En, "pin_setting") => "Pinning node…",
+            (Lang::Ja, "pin_setting") => "ノードを固定中…",
+            (Lang::Zh, "pin_note") => "已固定，失效时自动切换",
+            (Lang::En, "pin_note") => "pinned, auto-failover",
+            (Lang::Ja, "pin_note") => "固定・障害時は自動切替",
+            (Lang::Zh, "pin_ignored") => "固定节点不可用，已切换",
+            (Lang::En, "pin_ignored") => "pin down, failed over",
+            (Lang::Ja, "pin_ignored") => "固定先不通・切替中",
+            (Lang::Zh, "best_choice_changed") => "测速期间已手动更改节点，优选取消",
+            (Lang::En, "best_choice_changed") => "The node was changed during the test; best pick cancelled",
+            (Lang::Ja, "best_choice_changed") => "測定中にノードが変更されたため、最適選択を中止しました",
+            (Lang::Zh, "pin_clearing") => "正在取消固定…",
+            (Lang::En, "pin_clearing") => "Unpinning…",
+            (Lang::Ja, "pin_clearing") => "固定を解除中…",
+            (Lang::Zh, "pin_cleared") => "已取消固定，恢复自动选择",
+            (Lang::En, "pin_cleared") => "unpinned, automatic choice again",
+            (Lang::Ja, "pin_cleared") => "固定解除・自動選択に戻りました",
+            (Lang::Zh, "pin_unpinnable") => "仅 url-test / fallback 策略组可固定",
+            (Lang::En, "pin_unpinnable") => "Only url-test / fallback groups can be pinned",
+            (Lang::Ja, "pin_unpinnable") => "固定できるのは url-test / fallback のみ",
             (Lang::Zh, "help_u") => "更新当前方案的订阅，保留来源规则与策略组，校验后重载",
             (_, "help_u") => "Update the active profile subscription; preserve source rules and groups, validate and reload",
-            (_, "help_tabs") => "Switch view: [p] Proxies  [c] Connections  [L] Logs",
+            (Lang::Zh, "help_tabs") => "切换视图：[p] 代理  [c] 连接  [L] 日志；DNS、规则、Provider 在 设置 → 排查工具",
+            (Lang::En, "help_tabs") => "Switch view: [p] Proxies  [c] Connections  [L] Logs; DNS, rules and providers are under Settings → Diagnostics",
+            (Lang::Ja, "help_tabs") => "表示切替：[p] プロキシ  [c] 接続  [L] ログ。DNS・ルール・プロバイダは 設定 → 診断ツール",
             (_, "help_t") => "Toggle top Traffic & Overview panels",
-            (_, "help_s") => "Open Settings board (Core / Theme / Subscription)",
+            (Lang::Zh, "help_s") => "设置：内核与代理、视觉与主题、订阅与分流、排查工具（Tab 或 1–4 切换）",
+            (Lang::En, "help_s") => "Settings: Core & Proxy, Appearance, Sources & Routing, Diagnostics (Tab or 1–4)",
+            (Lang::Ja, "help_s") => "設定：コア・プロキシ、外観・テーマ、サブスクリプション、診断ツール（Tab か 1–4）",
+            (Lang::Zh, "help_conn_close") => "连接：x 断开选中的连接  X 断开全部（会断开长连接或 AI 会话时先确认）",
+            (Lang::En, "help_conn_close") => "Connections: x closes the selected one  X closes all (asks first if long-lived or AI sessions would drop)",
+            (Lang::Ja, "help_conn_close") => "接続：x 選択中を切断  X 全切断（長時間・AI セッションが切れる場合は確認）",
+            (Lang::Zh, "help_dns_keys") => "DNS：e 编辑域名，Enter 查询，[ ] 切换记录类型",
+            (Lang::En, "help_dns_keys") => "DNS: e edits the name, Enter queries, [ ] changes the record type",
+            (Lang::Ja, "help_dns_keys") => "DNS：e 名前を編集、Enter 照会、[ ] レコード種別を切替",
+            (Lang::Zh, "help_provider_keys") => "Provider：Enter 刷新选中项，H 健康检查",
+            (Lang::En, "help_provider_keys") => "Providers: Enter refreshes the selected one, H runs a health check",
+            (Lang::Ja, "help_provider_keys") => "プロバイダ：Enter 選択中を更新、H ヘルスチェック",
             (Lang::Zh, "help_q") => "退出 terc（后台内核继续运行）",
             (Lang::En, "help_q") => "Quit terc (background core stays running)",
             (Lang::Ja, "help_q") => "終了（バックグラウンドのコアは継続）",
@@ -1974,9 +2669,9 @@ impl App {
             (Lang::Zh, "mod_tun") => "TUN 路由",
             (Lang::En, "mod_tun") => "TUN route",
             (Lang::Ja, "mod_tun") => "TUN ルート",
-            (Lang::Zh, "mod_tun_desc") => "mixed 栈、自动路由、劫持 53 端口",
-            (Lang::En, "mod_tun_desc") => "Mixed stack, auto-route, hijack port 53",
-            (Lang::Ja, "mod_tun_desc") => "mixed スタック、自動ルート、53 番を劫持",
+            (Lang::Zh, "mod_tun_desc") => "mixed 栈、自动路由、劫持 53 端口；Linux 开 GSO",
+            (Lang::En, "mod_tun_desc") => "Mixed stack, auto-route, hijack port 53; GSO on Linux",
+            (Lang::Ja, "mod_tun_desc") => "mixed スタック、自動ルート、53 番を劫持。Linux は GSO",
             (Lang::Zh, "mod_sniffer") => "流量嗅探",
             (Lang::En, "mod_sniffer") => "Sniffer",
             (Lang::Ja, "mod_sniffer") => "スニファ",
@@ -2013,9 +2708,9 @@ impl App {
             (Lang::Zh, "mod_find_process") => "进程名",
             (Lang::En, "mod_find_process") => "Process name",
             (Lang::Ja, "mod_find_process") => "プロセス名",
-            (Lang::Zh, "mod_find_process_desc") => "连接上始终带上进程名",
-            (Lang::En, "mod_find_process_desc") => "Attach a process name to every connection",
-            (Lang::Ja, "mod_find_process_desc") => "接続にプロセス名を付与",
+            (Lang::Zh, "mod_find_process_desc") => "连接上始终带上进程名；每个新连接拨号前都要查进程（Linux 约 1–15 ms）",
+            (Lang::En, "mod_find_process_desc") => "Attach a process name to every connection; each new connection looks it up before dialling (about 1–15 ms on Linux)",
+            (Lang::Ja, "mod_find_process_desc") => "接続にプロセス名を付与。新しい接続ごとに発信前に検索します（Linux で約 1–15 ms）",
             (Lang::Zh, "mod_tcp_concurrent") => "并发连接",
             (Lang::En, "mod_tcp_concurrent") => "TCP concurrent",
             (Lang::Ja, "mod_tcp_concurrent") => "TCP 同時接続",
@@ -2043,15 +2738,15 @@ impl App {
             (Lang::Zh, "help_views") => "DNS / 规则 / Provider / 片段 / 配置 / 探测 / 运行时",
             (Lang::En, "help_views") => "DNS / rules / providers / snippets / profiles / probe / runtime",
             (Lang::Ja, "help_views") => "DNS / ルール / プロバイダ / スニペット / プロファイル / 計測 / 状態",
-            (Lang::Zh, "help_rule_x") => "禁用或恢复当前规则（连接页仍是断开连接）",
-            (Lang::En, "help_rule_x") => "Disable or restore the selected rule",
-            (Lang::Ja, "help_rule_x") => "選択中のルールを無効化 / 復帰",
+            (Lang::Zh, "help_rule_x") => "规则：临时禁用或恢复选中的规则",
+            (Lang::En, "help_rule_x") => "Rules: disable or restore the selected rule",
+            (Lang::Ja, "help_rule_x") => "ルール：選択中のルールを一時無効化 / 復帰",
             (Lang::Zh, "help_flush") => "DNS 清空缓存；规则与 Provider 页刷新",
             (Lang::En, "help_flush") => "Flush DNS, or refresh rules and providers",
             (Lang::Ja, "help_flush") => "DNS 消去、またはルールとプロバイダを更新",
-            (Lang::Zh, "help_explain") => "输入目标，解释会命中哪条规则",
-            (Lang::En, "help_explain") => "Type a target and explain which rule hits",
-            (Lang::Ja, "help_explain") => "対象を入力して一致ルールを説明",
+            (Lang::Zh, "help_explain") => "规则：e 输入目标并解释会命中哪条规则，/ 搜索",
+            (Lang::En, "help_explain") => "Rules: e explains which rule a target hits, / searches",
+            (Lang::Ja, "help_explain") => "ルール：e 対象の一致ルールを説明、/ 検索",
             (Lang::Zh, "ov_modules") => "片段会追加到配置末尾，关闭后恢复原文",
             (Lang::En, "ov_modules") => "Snippets append to the config and restore it when removed",
             (Lang::Ja, "ov_modules") => "スニペットは末尾に追加され、外すと元に戻ります",
@@ -2114,28 +2809,38 @@ fn main() -> io::Result<()> {
         println!("terc {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let mut config = Config::load();
+    let (mut config, load_issue) = Config::load();
+    // Nothing is written at startup after an unusable config.json: the user
+    // sees the error first, and only an explicit change saves defaults.
+    let unusable = matches!(load_issue, Some(LoadIssue::Unusable(_)));
     // Migration problems are shown in the UI; legacy files stay untouched.
-    let migration = storage::migrate(&mut config);
+    let migration = if unusable {
+        Ok(Vec::new())
+    } else {
+        storage::migrate(&mut config)
+    };
     let mut app = App::new(config);
-    if app.note_dns_module_change() {
+    if app.note_dns_module_change() && !unusable {
         app.save_preferences();
     }
-    let migration = match migration {
-        Ok(notes) if !notes.is_empty() => Some(format!(
+    let mut problems: Vec<String> = load_issue.iter().map(|i| i.text().to_string()).collect();
+    match migration {
+        Ok(notes) if !notes.is_empty() => problems.push(format!(
             "迁移跳过 / Migration skipped / 移行スキップ: {}",
             notes.join("; ")
         )),
-        Ok(_) => None,
-        Err(err) => Some(format!("迁移失败 / Migration failed / 移行失敗: {err}")),
-    };
-    if let Some(text) = migration {
+        Ok(_) => {}
+        Err(err) => problems.push(format!("迁移失败 / Migration failed / 移行失敗: {err}")),
+    }
+    if let Err(err) = mihomo::controller_socket_addr(&app.config.controller.addr) {
+        problems.push(err.to_string());
+    }
+    if !problems.is_empty() {
         // The one-time DNS notice is already recorded as seen; keep it.
-        let text = match app.status_message.as_str() {
-            "" => text,
-            notice => format!("{text} | {notice}"),
-        };
-        app.set_status(&text, true);
+        if !app.status_message.is_empty() {
+            problems.push(app.status_message.clone());
+        }
+        app.set_status(&problems.join(" | "), true);
     }
     run(&mut app)
 }
@@ -2152,27 +2857,78 @@ impl crossterm::Command for ClickMouse {
     }
 }
 
-fn run(app: &mut App) -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        ClickMouse
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let result = run_app(&mut terminal, app);
-    app.stop_flag.store(true, Ordering::Relaxed);
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
+/// Undo everything `TerminalGuard::enter` turns on. Each step runs even when
+/// an earlier one fails, and it is safe to run twice.
+fn restore_terminal() {
+    TUI_ACTIVE.store(false, Ordering::SeqCst);
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
         DisableBracketedPaste,
         DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+}
+
+/// Restores the terminal however `run` ends: a return, an early `?` after
+/// raw mode is on, or a panic unwinding through it.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        // From here on any error drops the guard and restores raw mode.
+        let guard = Self;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            ClickMouse
+        )?;
+        TUI_ACTIVE.store(true, Ordering::SeqCst);
+        Ok(guard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+        flush_worker_panics();
+    }
+}
+
+/// A main-thread panic restores the terminal before the message prints, so it
+/// lands on the normal screen instead of the discarded alternate one. Worker
+/// panics leave the TUI running: `SendOnDrop` reports them as failures, the
+/// toast shows the message, and it prints on the normal screen at exit.
+fn install_panic_hook() {
+    let main = thread::current().id();
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let current = thread::current();
+        let on_main = current.id() == main;
+        if holds_panic(on_main, TUI_ACTIVE.load(Ordering::SeqCst)) {
+            hold_worker_panic(format!(
+                "thread '{}' {info}",
+                current.name().unwrap_or("<unnamed>")
+            ));
+            return;
+        }
+        if on_main {
+            restore_terminal();
+            flush_worker_panics();
+        }
+        default(info);
+    }));
+}
+
+fn run(app: &mut App) -> io::Result<()> {
+    install_panic_hook();
+    let _guard = TerminalGuard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let result = run_app(&mut terminal, app);
+    app.stop_flag.store(true, Ordering::Relaxed);
     result
 }
 
@@ -2744,6 +3500,7 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             app.connection_detail = false;
         }
         KeyCode::Char('x') if app.main_tab == MainTab::Rules => app.toggle_selected_rule(),
+        KeyCode::Char('x') if app.main_tab == MainTab::Proxies => app.unpin_selected_group(),
         KeyCode::Char('x') if app.main_tab == MainTab::Connections && !app.conn_closed_view => {
             if let Some(c) = app.selected_connection() {
                 let id = c.id.clone();
@@ -3059,6 +3816,16 @@ fn handle_help_key(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+/// What only a person changes in a group: the pin on url-test/fallback,
+/// the selection on a Selector.
+fn best_choice(group: &mihomo::ProxyGroup) -> &str {
+    if group.pinnable() {
+        &group.fixed
+    } else {
+        &group.now
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3073,6 +3840,72 @@ mod tests {
 
     fn press(app: &mut App, key: KeyCode) -> bool {
         handle_key(app, KeyEvent::new(key, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn hints_and_help_name_only_live_keys_in_each_language() {
+        let mut app = offline_app();
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            app.screen = Screen::Dashboard;
+            for tab in [
+                MainTab::Proxies,
+                MainTab::Connections,
+                MainTab::Logs,
+                MainTab::Dns,
+                MainTab::Rules,
+                MainTab::Providers,
+            ] {
+                app.main_tab = tab;
+                let text = render_text(&mut app, 160, 50);
+                // Panel-title hotkeys removed from the dashboard in 0.2.
+                for dead in ["[t]", "[v]", "[d]"] {
+                    assert!(!text.contains(dead), "{lang:?} {tab:?}: {dead}");
+                }
+                // Footers speak the selected language, not always Chinese.
+                let chinese_footer = ["返回", "阅读"].iter().any(|w| text.contains(w));
+                if tab != MainTab::Proxies {
+                    assert_eq!(chinese_footer, lang == Lang::Zh, "{lang:?} {tab:?}");
+                }
+            }
+            app.main_tab = MainTab::Proxies;
+            let footer = render_text(&mut app, 160, 50);
+            let quit = match lang {
+                Lang::Zh => "q退出",
+                Lang::En => "qQuit",
+                Lang::Ja => "q終了",
+            };
+            assert!(footer.contains(quit), "{lang:?}");
+
+            app.screen = Screen::Help;
+            app.help_scroll = 0;
+            let help = render_text(&mut app, 200, 80);
+            for key in [
+                "c:x/X",
+                "p:x",
+                "Providers:Enter/H",
+                "DNS:e/Enter/[]",
+                "Tab←→hl12",
+            ] {
+                assert!(help.contains(key), "{lang:?}: {key}");
+            }
+            for id in [
+                "help_conn_close",
+                "help_rule_x",
+                "help_hl",
+                "help_s",
+                "help_a",
+                "help_enter",
+                "help_unpin",
+            ] {
+                assert!(
+                    help.contains(&prefix(&app.t(id).replace(' ', ""), 8)),
+                    "{lang:?}: {id}"
+                );
+            }
+            // The zh/en pairs that were shown to every language are gone.
+            assert!(!help.contains("Logs:pause,search"), "{lang:?}");
+        }
     }
 
     #[test]
@@ -3456,13 +4289,275 @@ mod tests {
     }
 
     #[test]
+    fn best_pick_retests_leaders_and_keeps_a_close_current_node() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        // Round two must not reach a real controller.
+        app.config.controller.addr = "127.0.0.1:1".into();
+        let names = ["N0", "N1", "N2"];
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "Main".into(),
+            kind: "Selector".into(),
+            now: "N1".into(),
+            fixed: String::new(),
+            all: names.iter().map(|s| s.to_string()).collect(),
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
+        });
+        for name in names {
+            app.snapshot.nodes.insert(
+                name.into(),
+                mihomo::ProxyNode {
+                    name: name.into(),
+                    kind: "Shadowsocks".into(),
+                    udp: true,
+                    delay: None,
+                    provider: None,
+                    url_delays: Default::default(),
+                },
+            );
+        }
+        let first = vec![
+            ("N0".to_string(), Some(40)),
+            ("N1".to_string(), Some(70)),
+            ("N2".to_string(), None),
+        ];
+        app.best_choice = "N1".into();
+        app.pending_best_group = Some(("Main".into(), None));
+        app.select_best_node_in_group_after_test(None, first.clone());
+        assert!(app.pending_best_group.is_some());
+        assert_eq!(app.best_rounds, std::slice::from_ref(&first));
+        assert_eq!(app.best_retest, ["N0", "N1"]);
+        assert_eq!(app.status_message, "Re-testing 2 leading nodes (1/2)…");
+
+        // One timeout of the current node in a re-test does not drop it.
+        app.pending_best_group = None;
+        let second = vec![("N0".to_string(), Some(60)), ("N1".to_string(), None)];
+        app.select_best_node_in_group_after_test(None, second);
+        assert!(app.pending_best_group.is_some());
+        assert!(app.status_message.contains("(2/2)"));
+
+        // Medians 50 and 70: N1 stays within 30 ms of N0.
+        app.pending_best_group = None;
+        let third = vec![("N0".to_string(), Some(50)), ("N1".to_string(), Some(75))];
+        app.select_best_node_in_group_after_test(None, third);
+        assert!(app.pending_best_group.is_none());
+        assert!(app.best_rounds.is_empty() && app.best_retest.is_empty());
+        // A Selector keeps its node without a request.
+        assert!(!app.action_busy);
+        assert!(
+            app.status_message.starts_with("Kept N1 (75 ms)"),
+            "{}",
+            app.status_message
+        );
+        assert!(app.status_message.contains("N0 (50 ms)"));
+    }
+
+    #[test]
+    fn best_pick_stops_when_the_node_is_changed_by_hand_meanwhile() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        app.config.controller.addr = "127.0.0.1:1".into();
+        app.snapshot.groups.push(pinned_group("Selector", ""));
+        app.best_choice = "JP 01".into();
+        app.best_rounds = vec![vec![("JP 01".into(), Some(40))]];
+        app.select_best_node_in_group_after_test(None, vec![("JP 01".into(), Some(40))]);
+        assert_eq!(app.status_message, app.t("best_choice_changed"));
+        assert!(app.best_rounds.is_empty() && !app.action_busy);
+    }
+
+    /// Answers each request with `reply(method, path)`, passing back
+    /// `METHOD path body` for each.
+    fn mock_controller(
+        app: &mut App,
+        reply: fn(&str, &str) -> (u16, String),
+    ) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        app.config.controller.addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    let mut first = String::new();
+                    let _ = reader.read_line(&mut first);
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    let _ = reader.read_exact(&mut body);
+                    let mut parts = first.split_whitespace();
+                    let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                    let _ = tx.send(format!(
+                        "{method} {path} {}",
+                        String::from_utf8_lossy(&body)
+                    ));
+                    let (status, text) = reply(method, path);
+                    let _ = write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                });
+            }
+        });
+        rx
+    }
+
+    /// `AI` is an unpinned url-test on https://ai.test/x now using N1. The
+    /// delay route answers 200 for every node, but N0 misses the expected
+    /// status, so only `extra` shows it unusable for the group.
+    fn url_test_reply(method: &str, path: &str) -> (u16, String) {
+        let group = r#""AI":{"type":"URLTest","all":["N0","N1","N2"],"now":"N1","fixed":"","testUrl":"https://ai.test/x","expectedStatus":"204"}"#;
+        let node = |name: &str, alive: bool, ms: u16| {
+            format!(
+                r#""{name}":{{"type":"Vmess","history":[{{"delay":5}}],"extra":{{"https://ai.test/x":{{"alive":{alive},"history":[{{"delay":{ms}}}]}}}}}}"#
+            )
+        };
+        match (method, path) {
+            ("GET", "/version") => (200, r#"{"version":"v1.19.28"}"#.into()),
+            ("GET", "/proxies/AI") => (200, group[5..].to_string()),
+            ("GET", "/proxies") => (
+                200,
+                format!(
+                    "{{\"proxies\":{{{group},{},{},{}}}}}",
+                    node("N0", false, 10),
+                    node("N1", true, 70),
+                    node("N2", true, 60)
+                ),
+            ),
+            ("GET", p) if p.contains("/delay?") => (200, r#"{"delay":5}"#.into()),
+            ("PUT", "/proxies/AI") => (204, String::new()),
+            _ => (404, String::new()),
+        }
+    }
+
+    fn pump_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done(app) {
+            assert!(Instant::now() < deadline, "{}", app.status_message);
+            app.drain_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn best_pick_on_url_test_ranks_on_extra_and_always_ends_pinned() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        let rx = mock_controller(&mut app, url_test_reply);
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "AI".into(),
+            kind: "URLTest".into(),
+            now: "N1".into(),
+            all: vec!["N0".into(), "N1".into(), "N2".into()],
+            ..Default::default()
+        });
+        for name in ["N0", "N1", "N2"] {
+            app.snapshot.nodes.insert(
+                name.into(),
+                mihomo::ProxyNode {
+                    name: name.into(),
+                    kind: "Vmess".into(),
+                    udp: true,
+                    delay: Some(5),
+                    provider: None,
+                    url_delays: Default::default(),
+                },
+            );
+        }
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+        pump_until(&mut app, |app| {
+            app.pending_best_group.is_none()
+                && !app.action_busy
+                && app.status_message.contains("Kept")
+        });
+        // N0 answered fastest on the delay route but is dead for the group;
+        // N1 (70) is within 30 ms of N2 (60), and is pinned so url-test
+        // does not move off it at its next check.
+        assert!(
+            app.status_message.starts_with("Kept N1 (70 ms)"),
+            "{}",
+            app.status_message
+        );
+        assert!(app.status_message.contains(app.t("pin_note")));
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert!(
+            lines.contains(&r#"PUT /proxies/AI {"name":"N1"}"#.to_string()),
+            "{lines:?}"
+        );
+        let tests = lines.iter().filter(|l| l.contains("/delay?")).count();
+        // Three nodes, then the two live leaders twice.
+        assert_eq!(tests, 3 + 2 + 2, "{lines:?}");
+        assert!(lines
+            .iter()
+            .filter(|l| l.contains("/delay?"))
+            .all(|l| l.contains("url=https%3A%2F%2Fai.test%2Fx&timeout=5000&expected=204")));
+        // The node list shows what the group ranks on, not the 5 ms history.
+        app.group_index = 0;
+        let view = render_text(&mut app, 80, 24);
+        assert!(view.contains("70ms") && view.contains("60ms"), "{view}");
+        assert!(!view.contains("5ms"), "{view}");
+    }
+
+    #[test]
+    fn best_pick_keeps_a_pin_that_is_already_set_without_a_request() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        app.config.controller.addr = "127.0.0.1:1".into();
+        let mut group = pinned_group("URLTest", "US 01");
+        group.now = "US 01".into();
+        app.snapshot.groups.push(group);
+        for name in ["JP 01", "US 01"] {
+            app.snapshot.nodes.insert(
+                name.into(),
+                mihomo::ProxyNode {
+                    name: name.into(),
+                    kind: "Vmess".into(),
+                    udp: true,
+                    delay: None,
+                    provider: None,
+                    url_delays: Default::default(),
+                },
+            );
+        }
+        app.best_choice = "US 01".into();
+        let round = vec![
+            ("JP 01".to_string(), Some(50)),
+            ("US 01".to_string(), Some(40)),
+        ];
+        app.best_rounds = vec![round.clone(), round.clone()];
+        app.best_retest = vec!["US 01".into(), "JP 01".into()];
+        app.select_best_node_in_group_after_test(None, round);
+        assert!(app
+            .status_message
+            .starts_with("US 01 is already the fastest"));
+        assert!(!app.action_busy);
+    }
+
+    #[test]
     fn best_scope_popup_uses_active_country_and_rejects_unknown_country() {
         let mut app = offline_app();
         app.snapshot.groups.push(mihomo::ProxyGroup {
             name: "Main".into(),
             kind: "Selector".into(),
             now: "Unknown".into(),
+            fixed: String::new(),
             all: vec!["US 01".into()],
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
         });
         for (width, height) in [(42, 12), (80, 24)] {
             press(&mut app, KeyCode::Char('a'));
@@ -3480,6 +4575,134 @@ mod tests {
         }
     }
 
+    /// Serves `count` requests with 204 and passes each request line back.
+    fn pin_controller(app: &mut App, count: usize) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        app.config.controller.addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten().take(count) {
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let _ = tx.send(first.trim_end().to_string());
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 204 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        rx
+    }
+
+    fn pinned_group(kind: &str, fixed: &str) -> mihomo::ProxyGroup {
+        mihomo::ProxyGroup {
+            name: "Auto".into(),
+            kind: kind.into(),
+            now: "US 01".into(),
+            fixed: fixed.into(),
+            all: vec!["JP 01".into(), "US 01".into()],
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
+        }
+    }
+
+    #[test]
+    fn x_unpins_url_test_and_fallback_groups_only() {
+        let mut app = offline_app();
+        app.snapshot.groups.push(pinned_group("Selector", ""));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.status_is_error && !app.action_busy);
+
+        // A Fallback reports no pin once the pinned node died, but the
+        // saved pin returns at the next reload, so DELETE goes out anyway.
+        let rx = pin_controller(&mut app, 1);
+        app.snapshot.groups[0] = pinned_group("Fallback", "");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.action_busy);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "DELETE /proxies/Auto HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn best_pick_pins_url_test_groups() {
+        let mut app = offline_app();
+        app.snapshot.groups.push(pinned_group("URLTest", ""));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.overlay, Overlay::Best);
+        press(&mut app, KeyCode::Enter);
+        // No candidate nodes are known, but the group itself is accepted.
+        assert_eq!(
+            app.status_message,
+            "范围内没有可选代理节点 / No selectable proxy nodes in this scope"
+        );
+
+        // Enter on a url-test node pins it and says so.
+        let rx = pin_controller(&mut app, 1);
+        app.overlay = Overlay::None;
+        app.clear_status();
+        app.focus = FocusPane::Nodes;
+        app.node_index = 0;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status_message, app.t("pin_setting"));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "PUT /proxies/Auto HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn pinned_groups_show_the_pin_and_the_node_in_use() {
+        let mut app = offline_app();
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            // Pin honoured: the pinned node is the one in use.
+            app.snapshot.groups = vec![pinned_group("URLTest", "US 01")];
+            let view = render_text(&mut app, 80, 24);
+            assert!(view.contains("◆US01"), "{view}");
+            assert!(view.contains(&app.t("pin_note").replace(' ', "")), "{view}");
+            // Pin ignored: both the pin and the fallback node are shown.
+            app.snapshot.groups[0].fixed = "JP 01".into();
+            let view = render_text(&mut app, 80, 24);
+            assert!(view.contains("◇JP01"), "{view}");
+            assert!(view.contains("●US01"), "{view}");
+            assert!(
+                view.contains(&app.t("pin_ignored").replace(' ', "")),
+                "{view}"
+            );
+            // Unpinned: no marker at all.
+            app.snapshot.groups[0].fixed.clear();
+            let view = render_text(&mut app, 80, 24);
+            assert!(!view.contains('◆') && !view.contains('◇'), "{view}");
+        }
+    }
+
+    #[test]
+    fn the_failed_over_pin_note_survives_long_group_names_at_80_columns() {
+        let mut app = offline_app();
+        let mut group = pinned_group("URLTest", "JP 01");
+        group.name = "🚀 节点选择-自动测速".into();
+        group.all = (0..120).map(|i| format!("Node {i}")).collect();
+        app.snapshot.groups = vec![group];
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            let view = render_text(&mut app, 80, 24);
+            let note = app.t("pin_ignored").replace(' ', "");
+            assert!(view.contains(&format!("◇{note}┌")), "{view}");
+            assert!(view.contains("🚀"), "{view}");
+        }
+    }
+
     #[test]
     fn toast_expires_without_moving_lists_and_keeps_full_result() {
         let mut app = offline_app();
@@ -3487,7 +4710,11 @@ mod tests {
             name: "Group".into(),
             kind: "Selector".into(),
             now: "node".into(),
+            fixed: String::new(),
             all: vec!["node".into()],
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
         });
         render_text(&mut app, 80, 24);
         let before = app.proxy_hits.clone();
@@ -3516,7 +4743,11 @@ mod tests {
                 name: format!("Group{i}"),
                 kind: "Selector".into(),
                 now: "Node0".into(),
+                fixed: String::new(),
                 all: (0..40).map(|n| format!("Node{n}")).collect(),
+                test_url: String::new(),
+                expected_status: String::new(),
+                timeout_ms: 0,
             })
             .collect();
         for (width, height) in [(42, 12), (80, 24), (120, 30)] {
@@ -3740,6 +4971,25 @@ mod tests {
         assert_eq!(cfg.settings.theme, ThemeId::Mono);
         assert_eq!(cfg.settings.graph_interval_secs, 1);
         assert!(cfg.settings.connections_stream);
+    }
+
+    #[test]
+    fn load_migrates_only_the_old_default_test_url_and_caps_the_timeout() {
+        let mut cfg = Config::default();
+        cfg.controller.test_url = mihomo::OLD_DEFAULT_TEST_URL.into();
+        cfg.controller.timeout_ms = 60_000;
+        assert!(cfg.migrate());
+        assert_eq!(cfg.controller.test_url, mihomo::DEFAULT_TEST_URL);
+        assert_eq!(cfg.controller.timeout_ms, mihomo::MAX_DELAY_TIMEOUT_MS);
+        assert!(!cfg.migrate());
+        for own in [
+            "http://www.gstatic.com/generate_204?x",
+            "http://cp.cloudflare.com/generate_204",
+        ] {
+            cfg.controller.test_url = own.into();
+            assert!(!cfg.migrate());
+            assert_eq!(cfg.controller.test_url, own);
+        }
     }
 
     #[test]
@@ -4096,7 +5346,11 @@ mod tests {
             name: "AUTO".into(),
             kind: "URLTest".into(),
             now: String::new(),
+            fixed: String::new(),
             all: vec![],
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
         });
         press(&mut app, KeyCode::Char(' '));
         assert_eq!(app.ai_picker_selected, vec!["AUTO".to_string()]);

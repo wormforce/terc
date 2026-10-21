@@ -99,6 +99,11 @@ const URI_SCHEMES: &[&str] = &[
 /// last health check by any margin.
 const URL_TEST_TOLERANCE: u64 = 50;
 
+/// For TUIC nodes that name no congestion controller. Mihomo matches no case
+/// on an empty value, so quic-go keeps NewReno, which backs off hard on lossy
+/// long-haul UDP. This only affects client-to-server sending.
+const TUIC_CONGESTION: &str = "bbr";
+
 const SURGE_PROXY_TYPES: &[&str] = &[
     "ss",
     "shadowsocks",
@@ -176,8 +181,24 @@ pub fn convert_subscription(raw: &str) -> Result<Converted, String> {
     }
 }
 
-/// Parse one user-pasted node: a Surge `Name = type, ...` line or a URI.
+/// Parse one user-pasted node: a Surge `Name = type, ...` line or a URI. A
+/// value the conversion would drop (a subscription only notes it) is an
+/// error here, so the user can correct the line they just typed.
 pub fn parse_node_line(line: &str) -> Result<Value, String> {
+    let mut dropped = Vec::new();
+    let node = parse_node_line_noting(line, &mut dropped)?;
+    match dropped.first() {
+        Some(what) => Err(format!(
+            "{what} 无效：需要秒数 N 或范围 N-M / invalid {}: use seconds N or a range N-M",
+            what.rsplit(": ").next().unwrap_or(what)
+        )),
+        None => Ok(node),
+    }
+}
+
+/// `parse_node_line`, keeping the node and adding a note for each value
+/// dropped from it.
+pub fn parse_node_line_noting(line: &str, dropped: &mut Vec<String>) -> Result<Value, String> {
     let line = line.trim().trim_start_matches('\u{feff}');
     if line.starts_with('{') {
         let mut value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
@@ -211,7 +232,7 @@ pub fn parse_node_line(line: &str) -> Result<Value, String> {
         return Err("需要 Surge 节点行或节点链接 / expected a Surge line or URI".into());
     };
     let mut alias = HashMap::new();
-    match parse_surge_proxy(name.trim(), rest, &mut alias, &SurgeCtx::default())? {
+    match parse_surge_proxy(name.trim(), rest, &mut alias, &SurgeCtx::default(), dropped)? {
         Some(node) => Ok(node),
         None => Err("DIRECT / REJECT 不是节点 / not a node".into()),
     }
@@ -242,6 +263,8 @@ fn convert_surge(text: &str) -> Converted {
     let mut rule_lines = Vec::new();
     let mut ctx = SurgeCtx::default();
     let mut wg_section: Option<String> = None;
+    // Surge's fallback for groups without url=; Mihomo would use its own default.
+    let mut proxy_test_url: Option<String> = None;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty()
@@ -278,6 +301,14 @@ fn convert_surge(text: &str) -> Converted {
             "proxy" => proxy_lines.push(line.to_string()),
             "proxy group" => group_lines.push(line.to_string()),
             "rule" => rule_lines.push(line.to_string()),
+            "general" => {
+                if let Some((k, v)) = line.split_once('=') {
+                    let url = unquote(v.trim());
+                    if k.trim().eq_ignore_ascii_case("proxy-test-url") && !url.is_empty() {
+                        proxy_test_url = Some(https_generate_204(&url));
+                    }
+                }
+            }
             "keystore" => {
                 if let Some((k, v)) = line.split_once('=') {
                     ctx.keystore.insert(unquote(k.trim()), v.trim().to_string());
@@ -298,7 +329,7 @@ fn convert_surge(text: &str) -> Converted {
             continue;
         };
         let name = unquote(name.trim());
-        match parse_surge_proxy(&name, rest, &mut alias, &ctx) {
+        match parse_surge_proxy(&name, rest, &mut alias, &ctx, &mut out.skipped) {
             Ok(Some(mut node)) => {
                 unique_name(&mut node, &mut names);
                 out.proxies.push(node);
@@ -422,7 +453,9 @@ fn convert_surge(text: &str) -> Converted {
             obj.insert("proxies".into(), json!(members));
         }
         if group.kind != "select" {
-            if let Some(url) = group.params.get("url") {
+            // An empty `url=` is no URL, so the [General] fallback applies.
+            let own = group.params.get("url").filter(|u| !u.trim().is_empty());
+            if let Some(url) = own.or(proxy_test_url.as_ref()) {
                 obj.insert("url".into(), json!(url));
             }
             if let Some(v) = group
@@ -463,6 +496,34 @@ fn convert_surge(text: &str) -> Converted {
         }
     }
     out
+}
+
+/// Public generate_204 endpoints known to serve the same check over HTTPS.
+const HTTPS_204_HOSTS: &[&str] = &[
+    "www.gstatic.com",
+    "connectivitycheck.gstatic.com",
+    "www.google.com",
+    "cp.cloudflare.com",
+];
+
+/// `http://<host>/generate_204` becomes HTTPS for the public hosts in
+/// `HTTPS_204_HOSTS`, where providers cannot intercept the test. Any other
+/// host, or an explicit port, may serve HTTP only, so it is kept as written.
+fn https_generate_204(url: &str) -> String {
+    match url.get(..7) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("http://") => {
+            let rest = &url[7..];
+            match rest.split_once('/') {
+                Some((host, "generate_204"))
+                    if HTTPS_204_HOSTS.iter().any(|h| h.eq_ignore_ascii_case(host)) =>
+                {
+                    format!("https://{host}/generate_204")
+                }
+                _ => url.to_string(),
+            }
+        }
+        _ => url.to_string(),
+    }
 }
 
 fn is_param_key(key: &str) -> bool {
@@ -784,12 +845,24 @@ fn keystore_private_key(name: &str, item: &str, ctx: &SurgeCtx) -> Result<String
     Ok(pem)
 }
 
+/// Matches Mihomo's `hop-interval` parser: `N` or `N-M`, unsigned 64-bit.
+fn hop_interval_range(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let ok = |p: Option<&str>| {
+        p.is_some_and(|p| {
+            !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u64>().is_ok()
+        })
+    };
+    ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
+}
+
 /// Ok(None) means the line defines a built-in policy alias (direct/reject).
 fn parse_surge_proxy(
     name: &str,
     rest: &str,
     alias: &mut HashMap<String, String>,
     ctx: &SurgeCtx,
+    skipped: &mut Vec<String>,
 ) -> Result<Option<Value>, String> {
     let name = unquote(name);
     if name.is_empty() {
@@ -873,7 +946,8 @@ fn parse_surge_proxy(
                 let mut headers = Map::new();
                 for pair in h.split('|') {
                     if let Some((k, v)) = pair.split_once(':') {
-                        headers.insert(k.trim().to_string(), json!(v.trim()));
+                        // Surge allows `Host:"a.example"`; the quotes are not part of it.
+                        headers.insert(unquote(k), json!(unquote(v)));
                     }
                 }
                 if !headers.is_empty() {
@@ -1040,6 +1114,21 @@ fn parse_surge_proxy(
             if let Some(p) = kv.get("port-hopping") {
                 node.insert("ports".into(), json!(p.replace(';', ",")));
             }
+            // Mihomo also takes an `a-b` range here. Anything else fails its
+            // config check for the whole profile, so it is dropped and noted.
+            if let Some(i) = kv
+                .get("port-hopping-interval")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+            {
+                if let Ok(secs) = i.parse::<u64>() {
+                    node.insert("hop-interval".into(), json!(secs));
+                } else if hop_interval_range(i) {
+                    node.insert("hop-interval".into(), json!(i));
+                } else {
+                    skipped.push(format!("Proxy {name}: port-hopping-interval"));
+                }
+            }
         }
         "tuic" | "tuic-v5" => {
             node.insert("type".into(), json!("tuic"));
@@ -1064,6 +1153,13 @@ fn parse_surge_proxy(
             if let Some(a) = kv.get("alpn") {
                 node.insert("alpn".into(), json!([a]));
             }
+            // Surge has no key for it; an empty value leaves quic-go on NewReno.
+            let cc = kv
+                .get("congestion-controller")
+                .filter(|v| !v.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| TUIC_CONGESTION.into());
+            node.insert("congestion-controller".into(), json!(cc));
         }
         "anytls" => {
             node.insert("type".into(), json!("anytls"));
@@ -1603,9 +1699,10 @@ pub fn parse_uri(raw: &str) -> Result<Value, String> {
                 let list: Vec<String> = a.split(',').map(|s| s.trim().to_string()).collect();
                 node.insert("alpn".into(), json!(list));
             }
-            if let Some(c) = url.q("congestion_control") {
-                node.insert("congestion-controller".into(), json!(c));
-            }
+            let cc = url
+                .q("congestion_control")
+                .unwrap_or_else(|| TUIC_CONGESTION.into());
+            node.insert("congestion-controller".into(), json!(cc));
             if let Some(m) = url.q("udp_relay_mode") {
                 node.insert("udp-relay-mode".into(), json!(m));
             }
@@ -2741,5 +2838,169 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
             assert!(!normalize_ws_network(&mut node));
             assert_eq!(node, other);
         }
+    }
+
+    #[test]
+    fn tuic_defaults_to_bbr_but_keeps_explicit_controllers() {
+        let out = convert_subscription(SURGE).unwrap();
+        assert_eq!(
+            by_name(&out.proxies, "TUIC")["congestion-controller"],
+            "bbr"
+        );
+        let surge = convert_subscription(
+            "[Proxy]\nT4 = tuic, 192.0.2.5, 443, token=fake\n\
+             TC = tuic-v5, 192.0.2.5, 443, uuid=u, password=fake, congestion-controller=cubic\n\
+             TE = tuic-v5, 192.0.2.5, 443, uuid=u, password=fake, congestion-controller=\n",
+        )
+        .unwrap();
+        // An empty value is no choice; Mihomo would keep NewReno for it.
+        assert_eq!(
+            by_name(&surge.proxies, "TE")["congestion-controller"],
+            "bbr"
+        );
+        assert_eq!(
+            by_name(&surge.proxies, "T4")["congestion-controller"],
+            "bbr"
+        );
+        assert_eq!(
+            by_name(&surge.proxies, "TC")["congestion-controller"],
+            "cubic"
+        );
+        let bare = parse_uri("tuic://uuid-x:fake@192.0.2.7:443?alpn=h3#TU").unwrap();
+        assert_eq!(bare["congestion-controller"], "bbr");
+        let cubic =
+            parse_uri("tuic://uuid-x:fake@192.0.2.7:443?congestion_control=cubic#TU").unwrap();
+        assert_eq!(cubic["congestion-controller"], "cubic");
+        // Only TUIC nodes get it.
+        assert!(by_name(&out.proxies, "TW-HY2")
+            .get("congestion-controller")
+            .is_none());
+    }
+
+    #[test]
+    fn surge_hysteria2_port_hopping_interval_maps_to_hop_interval() {
+        let out = convert_subscription(
+            "[Proxy]\nH = hysteria2, 192.0.2.4, 8443, password=fake, port-hopping=\"5000-6000;7000\", port-hopping-interval=30\n\
+             R = hysteria2, 192.0.2.4, 8443, password=fake, port-hopping=5000-6000, port-hopping-interval=10-30\n\
+             N = hysteria2, 192.0.2.4, 8443, password=fake\n",
+        )
+        .unwrap();
+        let h = by_name(&out.proxies, "H");
+        assert_eq!(h["ports"], "5000-6000,7000");
+        assert_eq!(h["hop-interval"], 30);
+        // Ranges pass through as text for cores that randomise the interval.
+        assert_eq!(by_name(&out.proxies, "R")["hop-interval"], "10-30");
+        let n = by_name(&out.proxies, "N");
+        assert!(n.get("hop-interval").is_none());
+        // Bandwidth is never guessed.
+        assert!(n.get("up").is_none() && n.get("down").is_none());
+        assert!(out.skipped.is_empty());
+    }
+
+    #[test]
+    fn surge_hysteria2_bad_port_hopping_interval_is_dropped_not_fatal() {
+        // Mihomo rejects these with "invalid range", which would fail the
+        // whole profile's `mihomo -t`; the node must still import without it.
+        let bad = [
+            "30s",
+            "-1",
+            "30.5",
+            "10-",
+            "1-2-3",
+            "+5-9",
+            "99999999999999999999",
+        ];
+        for value in bad {
+            let out = convert_subscription(&format!(
+                "[Proxy]\nB = hysteria2, 192.0.2.4, 8443, password=fake, port-hopping=5000-6000, port-hopping-interval={value}\n"
+            ))
+            .unwrap();
+            let b = by_name(&out.proxies, "B");
+            assert_eq!(b["ports"], "5000-6000", "{value}");
+            assert!(b.get("hop-interval").is_none(), "{value}");
+            assert_eq!(out.skipped, ["Proxy B: port-hopping-interval"], "{value}");
+        }
+        // A pasted node says so instead of dropping it silently; migration of
+        // stored lines keeps the node and notes the value.
+        let line = "B = hysteria2, 192.0.2.4, 8443, password=fake, port-hopping=5000-6000, port-hopping-interval=30s";
+        let err = parse_node_line(line).unwrap_err();
+        assert!(err.contains("invalid port-hopping-interval"), "{err}");
+        let mut dropped = Vec::new();
+        let node = parse_node_line_noting(line, &mut dropped).unwrap();
+        assert!(node.get("hop-interval").is_none());
+        assert_eq!(dropped, ["Proxy B: port-hopping-interval"]);
+    }
+
+    #[test]
+    fn surge_ws_header_values_lose_their_quotes() {
+        let out = convert_subscription(
+            "[Proxy]\nW = vmess, 192.0.2.6, 443, username=12345678-1234-1234-1234-123456789abc, ws=true, ws-path=/ws, ws-headers=Host:\"sg.example.com\"|User-Agent:\"Mozilla/5.0\"|X:plain\n",
+        )
+        .unwrap();
+        let headers = &by_name(&out.proxies, "W")["ws-opts"]["headers"];
+        assert_eq!(headers["Host"], "sg.example.com");
+        assert_eq!(headers["User-Agent"], "Mozilla/5.0");
+        assert_eq!(headers["X"], "plain");
+    }
+
+    #[test]
+    fn surge_general_proxy_test_url_fills_groups_without_url() {
+        let profile = |general: &str| {
+            convert_subscription(&format!(
+                "[General]\n{general}\n[Proxy]\nA = socks5, 192.0.2.1, 1080\n\
+                 [Proxy Group]\nSel = select, A\nAuto = url-test, A\n\
+                 Own = fallback, A, url=http://example.com/own\nLB = load-balance, A\n"
+            ))
+            .unwrap()
+        };
+        let out = profile(
+            "internet-test-url = http://direct.example/\n\
+             proxy-test-url = http://www.gstatic.com/generate_204",
+        );
+        // generate_204 hosts serve HTTPS, which providers cannot intercept.
+        let upgraded = "https://www.gstatic.com/generate_204";
+        assert_eq!(by_name(&out.groups, "Auto")["url"], upgraded);
+        assert_eq!(by_name(&out.groups, "LB")["url"], upgraded);
+        assert_eq!(by_name(&out.groups, "Own")["url"], "http://example.com/own");
+        assert!(by_name(&out.groups, "Sel").get("url").is_none());
+        // Other hosts keep their scheme; without the key groups stay unset.
+        let other = profile("proxy-test-url = \"http://example.org/ping\"");
+        assert_eq!(
+            by_name(&other.groups, "Auto")["url"],
+            "http://example.org/ping"
+        );
+        let none = profile("internet-test-url = http://direct.example/");
+        assert!(by_name(&none.groups, "Auto").get("url").is_none());
+        // An HTTP-only probe or an explicit port keeps its scheme: TLS there
+        // would time out every health check.
+        for kept in [
+            "http://probe.airport.example/generate_204",
+            "http://www.gstatic.com:80/generate_204",
+        ] {
+            let out = profile(&format!("proxy-test-url = {kept}"));
+            assert_eq!(by_name(&out.groups, "Auto")["url"], kept);
+        }
+        let cf = profile("proxy-test-url = http://CP.cloudflare.com/generate_204");
+        assert_eq!(
+            by_name(&cf.groups, "Auto")["url"],
+            "https://CP.cloudflare.com/generate_204"
+        );
+        // An empty url= falls back to proxy-test-url like a missing one.
+        let empty = convert_subscription(
+            "[General]\nproxy-test-url = http://cp.cloudflare.com/generate_204\n\
+             [Proxy]\nA = socks5, 192.0.2.1, 1080\n[Proxy Group]\nAuto = url-test, A, url=\n",
+        )
+        .unwrap();
+        assert_eq!(
+            by_name(&empty.groups, "Auto")["url"],
+            "https://cp.cloudflare.com/generate_204"
+        );
+        // The shared fixture sets a per-group url and no proxy-test-url.
+        let fixture = convert_subscription(SURGE).unwrap();
+        assert!(by_name(&fixture.groups, "Fail").get("url").is_none());
+        assert_eq!(
+            by_name(&fixture.groups, "Auto")["url"],
+            "http://www.gstatic.com/generate_204"
+        );
     }
 }

@@ -405,7 +405,11 @@ pub(crate) fn set_tun(
             // The restart closes every connection.
             mihomo::announce_disruption(crate::conns::Cause::Tun, crate::conns::Scope::All);
             return match start_core(cfg, Some(pid)) {
-                Ok(text) => Ok(text),
+                Ok(text) => {
+                    // A fresh process starts with an empty resolver cache.
+                    mihomo::mark_core_refreshed();
+                    Ok(text)
+                }
                 Err(error) => {
                     // On cancelled authorization the old process is untouched.
                     if process_details(pid).is_ok_and(|(_, command, executable)| {
