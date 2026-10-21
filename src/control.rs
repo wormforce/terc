@@ -124,14 +124,22 @@ impl App {
         self.run_action("Applying runtime switch…", None, None, move |cfg| {
             let refs: Vec<&str> = path.iter().map(String::as_str).collect();
             if running {
-                // The core accepted and reports the value, so saving it skips
-                // `mihomo -t`. A value that does not read back is not saved.
+                // The core accepted the value, so saving it skips `mihomo -t`.
                 set_bool_config(&cfg, &field, next)
-                    .map_err(|e| e.to_string())
-                    .and_then(|()| verify_runtime_value(&cfg, &field, &next.into()))
                     .map_err(|err| format!("Runtime change rejected: {err}"))?;
+                let live = verify_runtime_value(&cfg, &field, &next.into());
                 persist_live_bool(&cfg, &refs, next)
                     .map_err(|err| format!("Runtime changed, but could not save: {err}"))?;
+                // Mihomo ignores `sniffing` while the sniffer was off at load.
+                // The file now differs from the core, so the next
+                // regeneration reloads even when its output is unchanged.
+                if let Err(err) = live {
+                    crate::mihomo::RELOAD_UNCERTAIN
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(format!(
+                        "已保存，重载配置或重启内核后生效 / Saved; the core did not apply it live ({err}), so it takes effect after the next reload or core restart"
+                    ));
+                }
             } else {
                 persist_nested_bool(&cfg, &refs, next)?;
             }
