@@ -247,6 +247,8 @@ fn convert_surge(text: &str) -> Converted {
     let mut rule_lines = Vec::new();
     let mut ctx = SurgeCtx::default();
     let mut wg_section: Option<String> = None;
+    // Surge's fallback for groups without url=; Mihomo would use its own default.
+    let mut proxy_test_url: Option<String> = None;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty()
@@ -283,6 +285,14 @@ fn convert_surge(text: &str) -> Converted {
             "proxy" => proxy_lines.push(line.to_string()),
             "proxy group" => group_lines.push(line.to_string()),
             "rule" => rule_lines.push(line.to_string()),
+            "general" => {
+                if let Some((k, v)) = line.split_once('=') {
+                    let url = unquote(v.trim());
+                    if k.trim().eq_ignore_ascii_case("proxy-test-url") && !url.is_empty() {
+                        proxy_test_url = Some(https_generate_204(&url));
+                    }
+                }
+            }
             "keystore" => {
                 if let Some((k, v)) = line.split_once('=') {
                     ctx.keystore.insert(unquote(k.trim()), v.trim().to_string());
@@ -427,7 +437,7 @@ fn convert_surge(text: &str) -> Converted {
             obj.insert("proxies".into(), json!(members));
         }
         if group.kind != "select" {
-            if let Some(url) = group.params.get("url") {
+            if let Some(url) = group.params.get("url").or(proxy_test_url.as_ref()) {
                 obj.insert("url".into(), json!(url));
             }
             if let Some(v) = group
@@ -468,6 +478,24 @@ fn convert_surge(text: &str) -> Converted {
         }
     }
     out
+}
+
+/// `http://<host>/generate_204` becomes HTTPS: every common generate_204 host
+/// serves it, and providers cannot intercept the test there. Other URLs are
+/// returned unchanged.
+fn https_generate_204(url: &str) -> String {
+    match url.get(..7) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("http://") => {
+            let rest = &url[7..];
+            match rest.split_once('/') {
+                Some((host, "generate_204")) if !host.is_empty() => {
+                    format!("https://{host}/generate_204")
+                }
+                _ => url.to_string(),
+            }
+        }
+        _ => url.to_string(),
+    }
 }
 
 fn is_param_key(key: &str) -> bool {
@@ -2814,5 +2842,42 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
         assert!(n.get("hop-interval").is_none());
         // Bandwidth is never guessed.
         assert!(n.get("up").is_none() && n.get("down").is_none());
+    }
+
+    #[test]
+    fn surge_general_proxy_test_url_fills_groups_without_url() {
+        let profile = |general: &str| {
+            convert_subscription(&format!(
+                "[General]\n{general}\n[Proxy]\nA = socks5, 192.0.2.1, 1080\n\
+                 [Proxy Group]\nSel = select, A\nAuto = url-test, A\n\
+                 Own = fallback, A, url=http://example.com/own\nLB = load-balance, A\n"
+            ))
+            .unwrap()
+        };
+        let out = profile(
+            "internet-test-url = http://direct.example/\n\
+             proxy-test-url = http://www.gstatic.com/generate_204",
+        );
+        // generate_204 hosts serve HTTPS, which providers cannot intercept.
+        let upgraded = "https://www.gstatic.com/generate_204";
+        assert_eq!(by_name(&out.groups, "Auto")["url"], upgraded);
+        assert_eq!(by_name(&out.groups, "LB")["url"], upgraded);
+        assert_eq!(by_name(&out.groups, "Own")["url"], "http://example.com/own");
+        assert!(by_name(&out.groups, "Sel").get("url").is_none());
+        // Other hosts keep their scheme; without the key groups stay unset.
+        let other = profile("proxy-test-url = \"http://example.org/ping\"");
+        assert_eq!(
+            by_name(&other.groups, "Auto")["url"],
+            "http://example.org/ping"
+        );
+        let none = profile("internet-test-url = http://direct.example/");
+        assert!(by_name(&none.groups, "Auto").get("url").is_none());
+        // The shared fixture sets a per-group url and no proxy-test-url.
+        let fixture = convert_subscription(SURGE).unwrap();
+        assert!(by_name(&fixture.groups, "Fail").get("url").is_none());
+        assert_eq!(
+            by_name(&fixture.groups, "Auto")["url"],
+            "http://www.gstatic.com/generate_204"
+        );
     }
 }
