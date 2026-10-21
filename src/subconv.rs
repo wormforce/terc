@@ -94,6 +94,11 @@ const URI_SCHEMES: &[&str] = &[
     "ssh://",
 ];
 
+/// For Surge url-test / smart groups that set none. Mihomo's default is 0,
+/// which moves new connections (and the exit IP) to whichever node won the
+/// last health check by any margin.
+const URL_TEST_TOLERANCE: u64 = 50;
+
 const SURGE_PROXY_TYPES: &[&str] = &[
     "ss",
     "shadowsocks",
@@ -175,7 +180,7 @@ pub fn convert_subscription(raw: &str) -> Result<Converted, String> {
 pub fn parse_node_line(line: &str) -> Result<Value, String> {
     let line = line.trim().trim_start_matches('\u{feff}');
     if line.starts_with('{') {
-        let value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+        let mut value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
         if value["name"].as_str().is_none()
             || value["type"].as_str().is_none()
             || value["server"].as_str().is_none()
@@ -186,6 +191,7 @@ pub fn parse_node_line(line: &str) -> Result<Value, String> {
         {
             return Err("节点缺少名称、类型、服务器或有效端口 / Incomplete proxy".into());
         }
+        normalize_ws_network(&mut value);
         return Ok(value);
     }
 
@@ -426,11 +432,12 @@ fn convert_surge(text: &str) -> Converted {
             {
                 obj.insert("interval".into(), json!(v));
             }
-            if let Some(v) = group
+            let tolerance = group
                 .params
                 .get("tolerance")
                 .and_then(|v| v.parse::<u64>().ok())
-            {
+                .or((group.kind == "url-test").then_some(URL_TEST_TOLERANCE));
+            if let Some(v) = tolerance {
                 obj.insert("tolerance".into(), json!(v));
             }
             if let Some(v) = group
@@ -445,7 +452,7 @@ fn convert_surge(text: &str) -> Converted {
     }
 
     for line in &rule_lines {
-        match convert_surge_rule(line, &resolve, out.rule_providers.len()) {
+        match convert_surge_rule(line, &resolve, &out.rule_providers) {
             Ok((rule, provider)) => {
                 if let Some(p) = provider {
                     out.rule_providers.push(p);
@@ -1147,10 +1154,11 @@ const RULE_PASS: &[&str] = &[
     "SRC-IP-CIDR",
 ];
 
+/// A provider is returned only for a list that `providers` does not hold yet.
 fn convert_surge_rule(
     line: &str,
     resolve: &dyn Fn(&str) -> Option<String>,
-    provider_index: usize,
+    providers: &[(String, Value)],
 ) -> Result<(String, Option<(String, Value)>), String> {
     let parts = split_params(line);
     let kind = parts
@@ -1193,20 +1201,32 @@ fn convert_surge_rule(
                 return Err(format!("Rule {kind},{url}"));
             }
             let policy = policy_at(2)?;
-            let name = format!("surge-{}", provider_index + 1);
             let behavior = if kind == "DOMAIN-SET" {
                 "domain"
             } else {
                 "classical"
             };
-            let provider = json!({
-                "type": "http",
-                "behavior": behavior,
-                "format": "text",
-                "url": url,
-                "path": format!("./rules/{name}.list"),
-                "interval": 86400,
-            });
+            // No `path`: Mihomo then caches the list under a hash of its URL.
+            // A path from the running index let a reordered rule list reuse
+            // another list's cached file for up to `interval`. A repeated URL
+            // shares one provider rather than two racing on the same file.
+            let seen = providers
+                .iter()
+                .find(|(_, p)| p["url"] == url.as_str() && p["behavior"] == behavior);
+            let (name, provider) = match seen {
+                Some((name, _)) => (name.clone(), None),
+                None => {
+                    let name = format!("surge-{}", providers.len() + 1);
+                    let provider = json!({
+                        "type": "http",
+                        "behavior": behavior,
+                        "format": "text",
+                        "url": url,
+                        "interval": 86400,
+                    });
+                    (name.clone(), Some((name, provider)))
+                }
+            };
             let mut rule = format!("RULE-SET,{name},{policy}");
             if parts
                 .iter()
@@ -1215,7 +1235,7 @@ fn convert_surge_rule(
             {
                 rule.push_str(",no-resolve");
             }
-            Ok((rule, Some((name, provider))))
+            Ok((rule, provider))
         }
         _ => {
             let mapped = match kind.as_str() {
@@ -1352,18 +1372,15 @@ fn transport(node: &mut Map<String, Value>, url: &Url, name: &str) -> Result<(),
         .to_ascii_lowercase();
     match net.as_str() {
         "tcp" | "none" | "" => {}
-        "ws" => {
-            node.insert("network".into(), json!("ws"));
-            let mut opts = Map::new();
-            opts.insert(
-                "path".into(),
-                json!(url.q("path").unwrap_or_else(|| "/".into())),
-            );
-            if let Some(h) = url.q("host") {
-                opts.insert("headers".into(), json!({ "Host": h }));
-            }
-            node.insert("ws-opts".into(), Value::Object(opts));
-        }
+        "ws" | "httpupgrade" => ws_transport(
+            node,
+            net == "httpupgrade",
+            url.q("path").unwrap_or_default(),
+            url.q("host"),
+            url.q("ed"),
+            url.q("eh"),
+            name,
+        )?,
         "grpc" => {
             node.insert("network".into(), json!("grpc"));
             node.insert(
@@ -1374,6 +1391,105 @@ fn transport(node: &mut Map<String, Value>, url: &Url, name: &str) -> Result<(),
         other => return Err(format!("{name}: transport {other} unsupported")),
     }
     Ok(())
+}
+
+/// WebSocket or V2Ray HTTPUpgrade share-link transport. Mihomo has no
+/// `network: httpupgrade`; it is `network: ws` plus `v2ray-http-upgrade`.
+/// `ed` / `eh` are v2rayN's early-data size and header name.
+fn ws_transport(
+    node: &mut Map<String, Value>,
+    upgrade: bool,
+    path: String,
+    host: Option<String>,
+    ed: Option<String>,
+    eh: Option<String>,
+    name: &str,
+) -> Result<(), String> {
+    node.insert("network".into(), json!("ws"));
+    let mut opts = Map::new();
+    let path = if path.is_empty() { "/".into() } else { path };
+    opts.insert("path".into(), json!(path));
+    if let Some(h) = host.filter(|h| !h.is_empty()) {
+        opts.insert("headers".into(), json!({ "Host": h }));
+    }
+    if upgrade {
+        opts.insert("v2ray-http-upgrade".into(), json!(true));
+    }
+    if let Some(ed) = ed.filter(|e| !e.is_empty()) {
+        let size: u64 = ed
+            .parse()
+            .map_err(|_| format!("{name}: WebSocket early data {ed} invalid"))?;
+        if upgrade {
+            opts.insert("v2ray-http-upgrade-fast-open".into(), json!(true));
+        } else if size > 0 {
+            opts.insert("max-early-data".into(), json!(size));
+            opts.insert(
+                "early-data-header-name".into(),
+                json!("Sec-WebSocket-Protocol"),
+            );
+        }
+    }
+    if let Some(eh) = eh.filter(|h| !upgrade && !h.is_empty()) {
+        opts.insert("early-data-header-name".into(), json!(eh));
+    }
+    node.insert("ws-opts".into(), Value::Object(opts));
+    Ok(())
+}
+
+/// Split a numeric `ed=` early-data hint out of a vmess JSON WebSocket path.
+fn split_path_ed(path: &str) -> (String, Option<String>) {
+    let Some((base, query)) = path.split_once('?') else {
+        return (path.to_string(), None);
+    };
+    let mut ed = None;
+    let mut rest = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        match pair.strip_prefix("ed=") {
+            Some(v) if ed.is_none() && v.parse::<u64>().is_ok() => ed = Some(v.to_string()),
+            _ => rest.push(pair),
+        }
+    }
+    match (ed, rest.is_empty()) {
+        (None, _) => (path.to_string(), None),
+        (ed, true) => (base.to_string(), ed),
+        (ed, false) => (format!("{base}?{}", rest.join("&")), ed),
+    }
+}
+
+/// Rewrite a Clash `network: httpupgrade` node to Mihomo's form, `network: ws`
+/// plus `ws-opts.v2ray-http-upgrade: true`. Mihomo's vmess / vless / trojan
+/// adapters have no httpupgrade case and silently dial plain TCP for an unknown
+/// `network`. A non-standard `httpupgrade-opts {path, host}` is folded into
+/// `ws-opts`. Returns whether anything changed; a second run changes nothing.
+pub fn normalize_ws_network(node: &mut Value) -> bool {
+    let upgrade = node["network"]
+        .as_str()
+        .is_some_and(|n| n.eq_ignore_ascii_case("httpupgrade"));
+    let Some(node) = node.as_object_mut().filter(|_| upgrade) else {
+        return false;
+    };
+    node.insert("network".into(), json!("ws"));
+    let legacy = node.remove("httpupgrade-opts");
+    let opts = node.entry("ws-opts").or_insert_with(|| json!({}));
+    if !opts.is_object() {
+        *opts = json!({});
+    }
+    let opts = opts.as_object_mut().unwrap();
+    // `network: httpupgrade` means HTTPUpgrade, even next to an explicit false.
+    opts.insert("v2ray-http-upgrade".into(), json!(true));
+    let legacy = legacy.as_ref().and_then(Value::as_object);
+    if let Some(path) = legacy.and_then(|l| l.get("path")).filter(|p| p.is_string()) {
+        opts.entry("path").or_insert_with(|| path.clone());
+    }
+    if let Some(host) = legacy.and_then(|l| l.get("host")).filter(|h| h.is_string()) {
+        let headers = opts.entry("headers").or_insert_with(|| json!({}));
+        if let Some(headers) = headers.as_object_mut() {
+            if !headers.keys().any(|k| k.eq_ignore_ascii_case("host")) {
+                headers.insert("Host".into(), host.clone());
+            }
+        }
+    }
+    true
 }
 
 pub fn parse_uri(raw: &str) -> Result<Value, String> {
@@ -1740,18 +1856,17 @@ fn parse_vmess(raw: &str) -> Result<Value, String> {
     }
     match s("net").as_str() {
         "" | "tcp" => {}
-        "ws" => {
-            node.insert("network".into(), json!("ws"));
-            let mut opts = Map::new();
-            let path = s("path");
-            opts.insert(
-                "path".into(),
-                json!(if path.is_empty() { "/".into() } else { path }),
-            );
-            if !s("host").is_empty() {
-                opts.insert("headers".into(), json!({ "Host": s("host") }));
-            }
-            node.insert("ws-opts".into(), Value::Object(opts));
+        net @ ("ws" | "httpupgrade") => {
+            let (path, ed) = split_path_ed(&s("path"));
+            ws_transport(
+                &mut node,
+                net == "httpupgrade",
+                path,
+                Some(s("host")),
+                ed,
+                None,
+                &name,
+            )?;
         }
         "grpc" => {
             node.insert("network".into(), json!("grpc"));
@@ -2186,6 +2301,11 @@ FINAL,Proxy,dns-failed
         let auto = by_name(&out.groups, "Auto");
         assert_eq!(auto["interval"], 600);
         assert_eq!(auto["timeout"], 5000);
+        assert_eq!(auto["tolerance"], 80);
+        // url-test and smart without one get a tolerance; other kinds never do.
+        assert_eq!(by_name(&out.groups, "Smart")["tolerance"], 50);
+        assert!(by_name(&out.groups, "Fail").get("tolerance").is_none());
+        assert!(by_name(&out.groups, "LB").get("tolerance").is_none());
         assert_eq!(by_name(&out.groups, "Fail")["type"], "fallback");
         assert_eq!(by_name(&out.groups, "LB")["type"], "load-balance");
         let smart = by_name(&out.groups, "Smart");
@@ -2222,6 +2342,54 @@ FINAL,Proxy,dns-failed
                 out.skipped
             );
         }
+    }
+
+    #[test]
+    fn surge_rule_sets_cache_by_url_and_share_repeated_lists() {
+        let surge = |rules: &str| {
+            convert_subscription(&format!(
+                "[Proxy]\nA = ss, 192.0.2.1, 8388, encrypt-method=aes-128-gcm, password=fake\n\n[Proxy Group]\nP = select, A\n\n[Rule]\n{rules}FINAL,P\n"
+            ))
+            .unwrap()
+        };
+        let out = surge(
+            "RULE-SET,https://example.com/ai.list,P\n\
+             DOMAIN-SET,https://example.com/ads.txt,REJECT\n\
+             RULE-SET,https://example.com/ai.list,DIRECT,no-resolve\n\
+             DOMAIN-SET,https://example.com/ai.list,REJECT\n",
+        );
+        assert_eq!(
+            out.rules,
+            [
+                "RULE-SET,surge-1,P",
+                "RULE-SET,surge-2,REJECT",
+                "RULE-SET,surge-1,DIRECT,no-resolve",
+                "RULE-SET,surge-3,REJECT",
+                "MATCH,P",
+            ]
+        );
+        let names: Vec<_> = out.rule_providers.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["surge-1", "surge-2", "surge-3"]);
+        assert_eq!(out.rule_providers[2].1["behavior"], "domain");
+        assert_eq!(
+            out.rule_providers[2].1["url"],
+            "https://example.com/ai.list"
+        );
+        // Mihomo keys the cache file on the URL, so a reorder cannot hand one
+        // policy another list's cached rules.
+        assert!(out
+            .rule_providers
+            .iter()
+            .all(|(_, p)| p.get("path").is_none()));
+        let swapped = surge(
+            "DOMAIN-SET,https://example.com/ads.txt,REJECT\n\
+             RULE-SET,https://example.com/ai.list,P\n",
+        );
+        assert_eq!(
+            swapped.rule_providers[0].1["url"],
+            "https://example.com/ads.txt"
+        );
+        assert_eq!(swapped.rules[0], "RULE-SET,surge-1,REJECT");
     }
 
     #[test]
@@ -2272,6 +2440,54 @@ FINAL,Proxy,dns-failed
         assert!(parse_uri("ssr://abc").is_err());
         assert!(parse_uri("vless://u@192.0.2.8:443?type=kcp#K").is_err());
         assert!(parse_uri("trojan://p@nohost").is_err());
+    }
+
+    #[test]
+    fn websocket_early_data_and_http_upgrade_links() {
+        let vl = parse_uri("vless://00000000-0000-0000-0000-000000000000@192.0.2.4:443?security=tls&type=ws&path=%2Fws&host=w.example&ed=2048#WS").unwrap();
+        assert_eq!(vl["network"], "ws");
+        assert_eq!(vl["ws-opts"]["path"], "/ws");
+        assert_eq!(vl["ws-opts"]["headers"]["Host"], "w.example");
+        assert_eq!(vl["ws-opts"]["max-early-data"], 2048);
+        assert_eq!(
+            vl["ws-opts"]["early-data-header-name"],
+            "Sec-WebSocket-Protocol"
+        );
+        let eh = parse_uri("vless://u@192.0.2.4:443?type=ws&ed=2048&eh=X-Early#EH").unwrap();
+        assert_eq!(eh["ws-opts"]["early-data-header-name"], "X-Early");
+        assert_eq!(eh["ws-opts"]["path"], "/");
+        let plain = parse_uri("trojan://p@192.0.2.3:443?type=ws#P").unwrap();
+        assert!(plain["ws-opts"].get("max-early-data").is_none());
+        assert!(plain["ws-opts"].get("v2ray-http-upgrade").is_none());
+
+        let up =
+            parse_uri("trojan://p@192.0.2.3:443?type=httpupgrade&path=%2Fup&host=u.example#UP")
+                .unwrap();
+        assert_eq!(up["network"], "ws");
+        assert_eq!(up["ws-opts"]["v2ray-http-upgrade"], true);
+        assert_eq!(up["ws-opts"]["headers"]["Host"], "u.example");
+        assert!(up["ws-opts"].get("v2ray-http-upgrade-fast-open").is_none());
+        let fast = parse_uri("vless://u@192.0.2.4:443?type=HTTPUpgrade&ed=2048#F").unwrap();
+        assert_eq!(fast["ws-opts"]["v2ray-http-upgrade-fast-open"], true);
+        assert!(fast["ws-opts"].get("max-early-data").is_none());
+        assert!(parse_uri("vless://u@192.0.2.4:443?type=ws&ed=lots#Bad").is_err());
+
+        let vm = |net: &str, path: &str| {
+            let body = format!(
+                r#"{{"ps":"VM","add":"192.0.2.5","port":"443","id":"x","net":"{net}","path":"{path}","host":"v.example"}}"#
+            );
+            parse_uri(&format!("vmess://{}", encode_base64(body.as_bytes()))).unwrap()
+        };
+        let ws = vm("ws", "/v?ed=2048&x=1");
+        assert_eq!(ws["ws-opts"]["path"], "/v?x=1");
+        assert_eq!(ws["ws-opts"]["max-early-data"], 2048);
+        let up = vm("httpupgrade", "/u?ed=2048");
+        assert_eq!(up["network"], "ws");
+        assert_eq!(up["ws-opts"]["path"], "/u");
+        assert_eq!(up["ws-opts"]["v2ray-http-upgrade"], true);
+        assert_eq!(up["ws-opts"]["v2ray-http-upgrade-fast-open"], true);
+        assert_eq!(vm("ws", "/k?ed=big")["ws-opts"]["path"], "/k?ed=big");
+        assert_eq!(vm("ws", "")["ws-opts"]["path"], "/");
     }
 
     #[test]
@@ -2478,5 +2694,52 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
         }
         assert!(decode_base64("not base64!").is_none());
         assert_eq!(percent_decode("a%2Fb%zz%"), "a/b%zz%");
+    }
+
+    #[test]
+    fn httpupgrade_nodes_become_ws_with_v2ray_http_upgrade() {
+        let pasted = parse_node_line(
+            r#"{"name":"U","type":"vless","server":"192.0.2.4","port":443,"uuid":"u","network":"HTTPUpgrade","httpupgrade-opts":{"path":"/up","host":"u.example"}}"#,
+        )
+        .unwrap();
+        assert_eq!(pasted["network"], "ws");
+        assert!(pasted.get("httpupgrade-opts").is_none());
+        assert_eq!(
+            pasted["ws-opts"],
+            json!({"path": "/up", "headers": {"Host": "u.example"}, "v2ray-http-upgrade": true})
+        );
+        // Existing ws-opts win over the legacy keys; a lowercase host counts.
+        let mut node = json!({"network": "httpupgrade",
+            "ws-opts": {"path": "/keep", "headers": {"host": "k.example"},
+                "v2ray-http-upgrade-fast-open": true},
+            "httpupgrade-opts": {"path": "/old", "host": "old.example"}});
+        assert!(normalize_ws_network(&mut node));
+        assert_eq!(
+            node["ws-opts"],
+            json!({"path": "/keep", "headers": {"host": "k.example"},
+                "v2ray-http-upgrade": true, "v2ray-http-upgrade-fast-open": true})
+        );
+        let once = node.clone();
+        assert!(!normalize_ws_network(&mut node));
+        assert_eq!(node, once);
+        // ws-opts that is not an object is replaced.
+        let mut odd = json!({"network": "httpupgrade", "ws-opts": null});
+        assert!(normalize_ws_network(&mut odd));
+        assert_eq!(odd["ws-opts"], json!({"v2ray-http-upgrade": true}));
+        // `network: httpupgrade` wins over a converter's default false.
+        let mut off = json!({"network": "httpupgrade", "ws-opts": {"v2ray-http-upgrade": false}});
+        assert!(normalize_ws_network(&mut off));
+        assert_eq!(off["ws-opts"], json!({"v2ray-http-upgrade": true}));
+        for other in [
+            json!({"network": "ws", "ws-opts": {"path": "/?ed=2048"}}),
+            json!({"network": "grpc", "grpc-opts": {"grpc-service-name": "s"}}),
+            json!({"network": "tcp"}),
+            json!({"type": "ss"}),
+            json!("httpupgrade"),
+        ] {
+            let mut node = other.clone();
+            assert!(!normalize_ws_network(&mut node));
+            assert_eq!(node, other);
+        }
     }
 }

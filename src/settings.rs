@@ -31,6 +31,7 @@ pub enum SettingId {
     Timeout,
     Traffic,
     Toolbar,
+    ConnStream,
     Modules,
     Probe,
     Runtime,
@@ -250,8 +251,8 @@ impl App {
             "内核日志级别",
             "Core log level",
             self.core_setting("log-level", "info"),
-            "默认 info。遇到问题可临时切换 debug。",
-            "Use info normally; switch to debug while investigating issues.",
+            "内核自己写出的日志（terc 启动时为 terc-core.log）。新生成的配置默认 warning；日志页始终按 info 订阅，不受影响。排查时可临时切换 debug。",
+            "What the core writes itself (terc-core.log when terc starts it). New configs use warning; the Logs view always subscribes at info. Switch to debug while investigating.",
         );
         add(
             TestUrl,
@@ -288,6 +289,22 @@ impl App {
             on(self.config.settings.show_toolbar),
             "显示一行常用快捷键。",
             "Show the single-line shortcut footer.",
+        );
+        let stream = if !self.config.settings.connections_stream {
+            "OFF"
+        } else if self.stream_live() {
+            "ON · WebSocket"
+        } else {
+            "ON · HTTP"
+        };
+        add(
+            ConnStream,
+            C::Diagnostics,
+            "连接实时推送",
+            "Live connection stream",
+            stream.into(),
+            self.t("desc_conn_stream"),
+            self.t("desc_conn_stream"),
         );
         for (id, zh, en) in [
             (Modules, "配置片段", "Config snippets"),
@@ -409,6 +426,17 @@ impl App {
                 self.config.settings.show_toolbar = !self.config.settings.show_toolbar;
                 self.save_preferences();
             }
+            ConnStream => {
+                let on = !self.config.settings.connections_stream;
+                self.config.settings.connections_stream = on;
+                self.conn_stream
+                    .enabled
+                    .store(on, std::sync::atomic::Ordering::Relaxed);
+                if !on {
+                    self.conn_stream_at = None;
+                }
+                self.save_preferences();
+            }
             Modules => self.open_modules(),
             Probe => self.open_probe(),
             Runtime => self.open_runtime(),
@@ -452,6 +480,13 @@ impl App {
                 let raw = crate::mihomo::read_config_text(&cfg)?;
                 let base = crate::ops::strip_marked_modules(&raw);
                 if matches!(key.as_str(), "port" | "socks-port" | "mixed-port") {
+                    // The shown state may be a cached lookup up to 15 s old.
+                    if crate::mihomo::detect_sysproxy().1 {
+                        return Err(
+                            "请先关闭系统代理再修改端口 / Turn off system proxy before changing ports"
+                                .into(),
+                        );
+                    }
                     let old = crate::ops::split_chunks(&base)
                         .into_iter()
                         .find(|c| c.key.as_deref() == Some(&key))
@@ -481,11 +516,82 @@ impl App {
                     &modules,
                     &crate::ops::saved_switches(&raw),
                 )?;
-                crate::mihomo::install_config(&cfg, &generated, running)?;
-                Ok("设置已保存 / Settings saved".into())
+                if !running
+                    || !live_patchable(&raw, &generated, &key, &value)
+                    || crate::mihomo::RELOAD_UNCERTAIN.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    crate::mihomo::install_config(&cfg, &generated, running)?;
+                    return Ok("设置已保存 / Settings saved".into());
+                }
+                // A reload would drop proxy-provider connections; PATCH only
+                // rebuilds the listener or switch that changed. The core checks
+                // the value and it is read back, so the file that differs from
+                // the active one only by this key is saved without `mihomo -t`.
+                crate::mihomo::validate_listener_ports(&generated)?;
+                match crate::mihomo::patch_config_value(&cfg, &key, &value) {
+                    Ok(()) => {
+                        crate::mihomo::save_config_unchecked(&cfg, &generated, true).map_err(
+                            |err| format!("设置已实时生效，但保存失败 / Applied live, but could not save: {err}"),
+                        )?;
+                        Ok("设置已实时生效，未重载 / Applied live; no reload".into())
+                    }
+                    // The reload validates through the core and saves the file.
+                    Err(err) => match crate::mihomo::install_config(&cfg, &generated, true) {
+                        Ok(()) => Ok(format!(
+                            "实时修改未生效，已重载配置 / Live change failed ({err}); configuration reloaded"
+                        )),
+                        Err(e) => {
+                            // The PATCH may have half-applied; the next
+                            // regeneration must reload even when its output is
+                            // unchanged.
+                            crate::mihomo::RELOAD_UNCERTAIN
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            Err(format!(
+                                "实时修改失败，重载也失败 / Live change failed ({err}); reload failed: {e}"
+                            ))
+                        }
+                    },
+                }
             },
         );
     }
+}
+
+/// Whether `PATCH /configs` alone brings the core in line with `generated`,
+/// the active file `raw` regenerated with `key` set to `value`.
+fn live_patchable(raw: &str, generated: &str, key: &str, value: &serde_json::Value) -> bool {
+    // `PATCH /configs` applies these without suspending the tunnel or
+    // re-initialising providers.
+    const LIVE: &[&str] = &[
+        "allow-lan",
+        "port",
+        "socks-port",
+        "mixed-port",
+        "tcp-concurrent",
+        "find-process-mode",
+        "log-level",
+    ];
+    // A module may override the key; then only a reload makes the core match
+    // the file.
+    let effective = crate::ops::split_chunks(generated)
+        .into_iter()
+        .rev()
+        .find(|c| c.key.as_deref() == Some(key))
+        .and_then(|c| {
+            c.lines
+                .first()
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| crate::ops::clean_scalar(v))
+        });
+    let wanted = value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_string);
+    // The regenerated file also carries each module's current text; when that
+    // differs from the active file (an edited or upgraded module), only a
+    // reload, which the core validates, brings it live.
+    LIVE.contains(&key)
+        && effective.as_deref() == Some(wanted.as_str())
+        && crate::control::differs_only_in(raw, generated, key)
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
@@ -602,4 +708,63 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         _ => {}
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::{apply_enabled_modules, builtin_modules, enabled_snippets};
+
+    /// The active file regenerated with `key` set, as `apply_core_setting` does.
+    fn regenerate(raw: &str, key: &str, literal: &str, ids: &[&str]) -> String {
+        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        let base = crate::ops::set_top_scalar(&crate::ops::strip_marked_modules(raw), key, literal);
+        crate::ops::apply_modules_with_switches(
+            &base,
+            &enabled_snippets(&builtin_modules(), &ids),
+            &crate::ops::saved_switches(raw),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn live_setting_patches_only_when_nothing_else_changed() {
+        let base = "mixed-port: 7890\nallow-lan: false\nlog-level: warning\nproxies: []\n";
+        let ids = ["dns-fakeip"];
+        let raw = apply_enabled_modules(
+            base,
+            &enabled_snippets(&builtin_modules(), &ids.map(String::from)),
+        )
+        .unwrap();
+        let next = regenerate(&raw, "allow-lan", "true", &ids);
+        assert!(live_patchable(&raw, &next, "allow-lan", &true.into()));
+        // A key outside the PATCH set reloads.
+        let next = regenerate(&raw, "ipv6", "true", &ids);
+        assert!(!live_patchable(&raw, &next, "ipv6", &true.into()));
+        // The active file still holds an older DNS module body: a PATCH of
+        // `allow-lan` would save the new body without bringing it live.
+        let old_body = raw.replace("listen: 127.0.0.1:1053", "listen: 0.0.0.0:1053");
+        assert_ne!(old_body, raw);
+        let next = regenerate(&old_body, "log-level", "info", &ids);
+        assert!(next.contains("listen: 127.0.0.1:1053"));
+        assert!(!live_patchable(
+            &old_body,
+            &next,
+            "log-level",
+            &"info".into()
+        ));
+        // A module that overrides the key keeps the old value live.
+        let raw = apply_enabled_modules(
+            base,
+            &enabled_snippets(&builtin_modules(), &["find-process".to_string()]),
+        )
+        .unwrap();
+        let next = regenerate(&raw, "find-process-mode", "off", &["find-process"]);
+        assert!(!live_patchable(
+            &raw,
+            &next,
+            "find-process-mode",
+            &"off".into()
+        ));
+    }
 }

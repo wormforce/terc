@@ -12,7 +12,9 @@ use std::{
 
 pub mod best;
 pub mod compose;
+mod conns;
 pub mod control;
+mod guard;
 pub mod manage;
 pub mod mihomo;
 pub mod ops;
@@ -24,13 +26,14 @@ mod settings;
 pub mod storage;
 pub mod subconv;
 pub mod ui;
+mod ws;
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event as CEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event as CEvent,
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
-    execute,
+    execute, queue,
     terminal::{
         disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
         EnterAlternateScreen, LeaveAlternateScreen,
@@ -49,6 +52,8 @@ use ui::{draw, theme, Theme, ThemeId, WaveRenderer, THEMES};
 const REFRESH_RATES: &[u16] = &[15, 30, 60, 120];
 const ROUTING_MODES: &[&str] = &["Rule", "Global", "Direct"];
 const HISTORY_LEN: usize = 256;
+/// `Config::seen_notices` entry for the mainland `dns-fakeip` module body.
+const DNS_MODULE_NOTICE: &str = "dns-fakeip-mainland";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,10 +135,18 @@ pub struct Settings {
     pub graph_interval_ms: Option<u64>,
     pub show_traffic: bool,
     pub show_toolbar: bool,
+    /// Without a serde default an older config.json would fail to load and be
+    /// replaced by `Config::default()` on the next save.
+    #[serde(default = "default_true")]
+    pub connections_stream: bool,
 }
 
 fn default_graph_interval() -> u64 {
     1
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Settings {
@@ -155,6 +168,7 @@ impl Default for Settings {
             graph_interval_ms: Some(1000),
             show_traffic: true,
             show_toolbar: true,
+            connections_stream: true,
         }
     }
 }
@@ -165,6 +179,9 @@ pub struct Config {
     pub controller: ControllerConfig,
     #[serde(default)]
     pub enabled_modules: Vec<String>,
+    /// One-time notices already shown, such as `DNS_MODULE_NOTICE`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen_notices: Vec<String>,
     #[serde(default, skip_serializing)]
     pub active_profile: String,
     #[serde(default, skip_serializing)]
@@ -210,6 +227,20 @@ impl Config {
 
 /// Deliver a worker's completion event even when the worker panics, so
 /// `snapshot_pending` and `action_busy` are always cleared.
+/// Space asks for the opposite of what the panel shows. A fresh lookup may
+/// disagree (the proxy changed outside terc since a cached poll, up to 15 s
+/// ago), and flipping that would undo what the user asked for; setting the
+/// shown opposite is harmless when the system already has it.
+fn sysproxy_toggle(
+    shown: bool,
+    ports: Result<(u16, u16), String>,
+    set: impl FnOnce(bool, u16, u16) -> Result<String, String>,
+) -> Result<String, String> {
+    let target = !shown;
+    let (http, socks) = if target { ports? } else { (0, 0) };
+    set(target, http, socks)
+}
+
 struct SendOnDrop {
     tx: Sender<BackendEvent>,
     event: Option<BackendEvent>,
@@ -396,6 +427,14 @@ pub struct App {
     pub conn_index: usize,
     pub connection_detail: bool,
     pub detail_scroll: u16,
+    pub conns: conns::Tracker,
+    /// Indices into `snapshot.connections` in display order; `conn_index` points here.
+    pub conn_view: Vec<usize>,
+    pub conn_sort: conns::SortKey,
+    pub conn_filter: bool,
+    pub conn_closed_view: bool,
+    pub closed_index: usize,
+    pub session_toast_at: Option<Instant>,
     pub help_scroll: u16,
     pub logs_paused: bool,
     pub frozen_logs: Vec<(String, String)>,
@@ -408,6 +447,9 @@ pub struct App {
     pub best_scope_index: usize,
     pub action_busy: bool,
     pub snapshot_pending: bool,
+    /// A full refresh was asked for while a poll ran (whose host lookups may
+    /// be cached); it starts when that poll ends.
+    pub refresh_queued: bool,
     pub setting_index: usize,
     pub setting_input: Option<String>,
     pub rule_index: usize,
@@ -446,7 +488,8 @@ pub struct App {
     pub graph_samples: (f64, f64, u64),
     pub up_history: Vec<f32>,
     pub down_history: Vec<f32>,
-    pub pulse_phase: f32,
+    /// Bumped on every graph shift, so `run_app` sees one that repeats a value.
+    pub graph_gen: u64,
     pub logs: Vec<(String, String)>,
     pub toast_started: Option<Instant>,
     pub toast_area: Option<ratatui::layout::Rect>,
@@ -456,7 +499,21 @@ pub struct App {
     pub tx: Sender<BackendEvent>,
     pub rx: Receiver<BackendEvent>,
     pub stop_flag: Arc<AtomicBool>,
+    /// Switch shared with the `/connections` WebSocket worker.
+    pub conn_stream: Arc<mihomo::ConnStream>,
+    /// When the last pushed `/connections` snapshot arrived.
+    pub conn_stream_at: Option<Instant>,
+    /// Polls in a row that found the core not running.
+    pub down_polls: u8,
     pub last_snapshot_poll: Instant,
+    /// The tab open when the last poll started; entering Rules or Providers
+    /// polls at once, since their data is not read on other tabs.
+    pub poll_tab: MainTab,
+    /// When a snapshot last carried `/providers/*`.
+    pub providers_polled_at: Option<Instant>,
+    /// The last accepted snapshot found the core. A `/traffic` push sets
+    /// `snapshot.running` but brings no groups, rules or providers.
+    pub core_polled: bool,
     pub setup_origin: Screen,
     pub setup_editor: LineEditor,
     pub setup_phase: SetupPhase,
@@ -472,6 +529,8 @@ pub struct App {
     pub ai_picker_index: usize,
     pub ai_picker_selected: Vec<String>,
     pub pending_regen: bool,
+    /// An action that would cut sessions and was pressed once (`guard`).
+    pub pending_confirm: Option<(guard::Disrupt, Instant)>,
 }
 
 impl App {
@@ -484,6 +543,7 @@ impl App {
             app.config.controller.secret.clone(),
             app.tx.clone(),
             app.stop_flag.clone(),
+            app.conn_stream.clone(),
         );
         app
     }
@@ -491,6 +551,9 @@ impl App {
     fn from_snapshot(config: Config, initial_snapshot: CoreSnapshot) -> Self {
         let (tx, rx) = mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let conn_stream = Arc::new(mihomo::ConnStream {
+            enabled: AtomicBool::new(config.settings.connections_stream),
+        });
         let screen = launch_screen(
             &config.controller.subscription_url,
             initial_snapshot.running,
@@ -508,6 +571,13 @@ impl App {
             conn_index: 0,
             connection_detail: false,
             detail_scroll: 0,
+            conns: conns::Tracker::default(),
+            conn_view: (0..initial_snapshot.connections.len()).collect(),
+            conn_sort: conns::SortKey::default(),
+            conn_filter: false,
+            conn_closed_view: false,
+            closed_index: 0,
+            session_toast_at: None,
             help_scroll: 0,
             logs_paused: false,
             frozen_logs: Vec::new(),
@@ -520,6 +590,7 @@ impl App {
             best_scope_index: 0,
             action_busy: false,
             snapshot_pending: false,
+            refresh_queued: false,
             setting_index: 0,
             setting_input: None,
             rule_index: 0,
@@ -558,7 +629,7 @@ impl App {
             graph_samples: (0.0, 0.0, 0),
             up_history: vec![0.0; HISTORY_LEN],
             down_history: vec![0.0; HISTORY_LEN],
-            pulse_phase: 0.0,
+            graph_gen: 0,
             logs: Vec::new(),
             toast_started: None,
             toast_area: None,
@@ -568,7 +639,13 @@ impl App {
             tx,
             rx,
             stop_flag,
+            conn_stream,
+            conn_stream_at: None,
+            down_polls: 0,
             last_snapshot_poll: Instant::now(),
+            poll_tab: MainTab::Proxies,
+            providers_polled_at: None,
+            core_polled: false,
             setup_origin: Screen::Dashboard,
             setup_editor: LineEditor::default(),
             setup_phase: SetupPhase::Editing,
@@ -584,6 +661,7 @@ impl App {
             ai_picker_index: 0,
             ai_picker_selected: Vec::new(),
             pending_regen: false,
+            pending_confirm: None,
         };
         app.routing_mode = routing::selected(&app.config.controller);
         app.routing_plans = routing::entries(&app.config.controller, app.lang() == Lang::Zh);
@@ -667,6 +745,33 @@ impl App {
         self.update_subscription();
     }
 
+    /// The built-in `dns-fakeip` module switched from foreign DoH with a
+    /// fallback on 0.0.0.0 to mainland DoH on loopback. Users who had it on
+    /// are told once; the new body lands with the next generated config.
+    /// True when the preferences need saving.
+    fn note_dns_module_change(&mut self) -> bool {
+        if self
+            .config
+            .seen_notices
+            .iter()
+            .any(|n| n == DNS_MODULE_NOTICE)
+        {
+            return false;
+        }
+        self.config.seen_notices.push(DNS_MODULE_NOTICE.into());
+        if self
+            .config
+            .enabled_modules
+            .iter()
+            .any(|id| id == "dns-fakeip")
+        {
+            let text = self.t("dns_module_notice");
+            self.logs.push(("warning".into(), text.into()));
+            self.set_status(text, false);
+        }
+        true
+    }
+
     pub fn set_status(&mut self, text: &str, is_error: bool) {
         self.toast_started = Some(Instant::now());
         self.status_message = text.to_string();
@@ -698,7 +803,7 @@ impl App {
         }
         self.clear_status();
         self.core_downloading = true;
-        download_managed_core_async(self.tx.clone());
+        download_managed_core_async(self.tx.clone(), mihomo::core_download_proxy(&self.snapshot));
     }
 
     fn finish_setup_fetch(&mut self, ok: bool) {
@@ -761,8 +866,16 @@ impl App {
         Duration::from_micros(1_000_000 / hz)
     }
 
-    pub fn drain_events(&mut self) {
+    /// Applies queued backend events. Returns whether any of them can change
+    /// the screen: `/logs` sends a line per new connection, but only the live
+    /// Logs tab shows them (a TUN failure still raises a toast).
+    pub fn drain_events(&mut self) -> bool {
+        let mut visible = false;
         while let Ok(ev) = self.rx.try_recv() {
+            visible |= !matches!(ev, BackendEvent::Log { .. })
+                || (self.screen == Screen::Dashboard
+                    && self.main_tab == MainTab::Logs
+                    && !self.logs_paused);
             match ev {
                 BackendEvent::Traffic { up, down } => {
                     self.up_rate = up;
@@ -793,8 +906,15 @@ impl App {
                     result,
                     modules,
                     profile,
+                    snapshot_follows,
                 } => {
                     self.action_busy = false;
+                    // The action thread fetches a snapshot next; skip the poll.
+                    // A panicked action sends none, so the next tick polls.
+                    if snapshot_follows {
+                        self.last_snapshot_poll = Instant::now();
+                    }
+                    self.conns.action_finished(Instant::now());
                     let ok = result.is_ok();
                     match &result {
                         Ok(text) => self.set_status(text, false),
@@ -856,10 +976,25 @@ impl App {
                         }
                     }
                 }
+                BackendEvent::Disrupting { cause, scope } => self.conns.note(cause, scope),
+                // Live data: accepted even while an action runs.
+                BackendEvent::Connections {
+                    items,
+                    upload_total,
+                    download_total,
+                } => {
+                    self.conn_stream_at = Some(Instant::now());
+                    self.snapshot.upload_total = upload_total;
+                    self.snapshot.download_total = download_total;
+                    self.install_connections(items, true);
+                }
                 BackendEvent::SnapshotDone(snap) => {
                     self.snapshot_pending = false;
                     if !self.action_busy {
                         self.accept_snapshot(*snap);
+                    }
+                    if std::mem::take(&mut self.refresh_queued) {
+                        self.refresh_snapshot_now();
                     }
                 }
                 BackendEvent::Snapshot(snap) => {
@@ -921,6 +1056,7 @@ impl App {
                 }
             }
         }
+        visible
     }
 
     pub fn advance_graph(&mut self, elapsed: Duration) {
@@ -936,13 +1072,12 @@ impl App {
             self.down_history.remove(0);
             self.down_history.push((down / count as f64) as f32);
             self.graph_samples = (0.0, 0.0, 0);
+            self.graph_gen = self.graph_gen.wrapping_add(1);
         }
     }
 
     pub fn tick(&mut self, elapsed: Duration) {
         self.advance_graph(elapsed);
-        let dt = elapsed.as_secs_f32();
-        self.pulse_phase = (self.pulse_phase + dt * 0.9) % 1.0;
 
         if self.screen == Screen::Setup
             && self.setup_phase == SetupPhase::Starting
@@ -952,48 +1087,209 @@ impl App {
             self.set_status(self.t("setup_msg_still_starting"), false);
         }
 
+        let entered = self.main_tab != self.poll_tab
+            && matches!(self.main_tab, MainTab::Rules | MainTab::Providers);
         if !self.action_busy
             && !self.snapshot_pending
-            && self.last_snapshot_poll.elapsed() >= Duration::from_millis(2200)
+            && (entered || self.last_snapshot_poll.elapsed() >= Duration::from_millis(2200))
         {
             self.snapshot_pending = true;
             self.last_snapshot_poll = Instant::now();
+            self.poll_tab = self.main_tab;
             let cfg = self.config.controller.clone();
             let tx = self.tx.clone();
+            let fetch = self.poll_fetch();
             thread::spawn(move || {
                 let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
-                done.set(BackendEvent::SnapshotDone(Box::new(fetch_snapshot(&cfg))));
+                let snap = mihomo::fetch_snapshot_with(&cfg, fetch);
+                done.set(BackendEvent::SnapshotDone(Box::new(snap)));
             });
         }
     }
 
-    pub fn accept_snapshot(&mut self, snapshot: CoreSnapshot) {
+    /// What a background poll reads besides `/version`, `/configs` and
+    /// `/proxies`. `/rules` (about 600 kB with 3000 rules) is read only on the
+    /// Rules tab; the providers on their tab and every 30 s elsewhere, for
+    /// the provider nodes' delays on the Proxies tab. A core that was not
+    /// running gets everything, since it may have just started.
+    fn poll_fetch(&self) -> mihomo::Fetch {
+        // After a poll that missed the core everything it carried is gone.
+        let fresh_core = !self.core_polled;
+        let providers_due = self
+            .providers_polled_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+        mihomo::Fetch {
+            // Pushed snapshots already cover /connections; skip that GET.
+            connections: !self.stream_live(),
+            rules: fresh_core || self.main_tab == MainTab::Rules,
+            providers: fresh_core || providers_due || self.main_tab == MainTab::Providers,
+            // Spawning gsettings or networksetup every poll is the costly part.
+            cached_host: true,
+        }
+    }
+
+    /// `/connections` pushes are arriving; a gap of 3 s (three missed pushes)
+    /// hands the list back to HTTP polling.
+    pub fn stream_live(&self) -> bool {
+        self.conn_stream.enabled.load(Ordering::Relaxed)
+            && self
+                .conn_stream_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+    }
+
+    pub fn accept_snapshot(&mut self, mut snapshot: CoreSnapshot) {
         if self.snapshot.running && !snapshot.running {
             self.load_core_log();
         }
-        let selected = self
-            .snapshot
-            .connections
-            .get(self.conn_index)
-            .map(|c| c.id.clone());
-        let was_empty = self.snapshot.connections.is_empty();
+        // A poll may have started before the latest push: never let it replace
+        // fresher pushed data or report sessions as closed.
+        if self.stream_live() {
+            snapshot.connections_ok = false;
+        }
+        let fresh = std::mem::take(&mut snapshot.connections);
+        snapshot.connections = std::mem::take(&mut self.snapshot.connections);
+        // A transient /connections failure while the core runs keeps the last
+        // list, so its sessions are not reported as closed. One slow or failed
+        // /version (load, a GC pause, waking from sleep) also reads as a stopped
+        // core, so only a second such poll in a row, with no live push, ends it.
+        self.down_polls = if snapshot.running {
+            0
+        } else {
+            self.down_polls.saturating_add(1)
+        };
+        let doubtful_stop = !snapshot.running && (self.down_polls < 2 || self.stream_live());
+        let keep = (snapshot.running && !snapshot.connections_ok) || doubtful_stop;
+        if keep {
+            snapshot.upload_total = self.snapshot.upload_total;
+            snapshot.download_total = self.snapshot.download_total;
+        }
+        if snapshot.running && snapshot.fetched.providers {
+            self.providers_polled_at = Some(Instant::now());
+        }
+        self.core_polled = snapshot.running;
+        snapshot.carry_skipped(&mut self.snapshot);
         self.snapshot = snapshot;
-        self.conn_index = selected
-            .and_then(|id| self.snapshot.connections.iter().position(|c| c.id == id))
-            .unwrap_or(if was_empty {
-                0
-            } else {
-                self.snapshot.connections.len()
-            });
-        // An expired selection stays empty until the user navigates again.
+        if !keep {
+            self.install_connections(fresh, self.snapshot.running);
+        }
         self.group_index = self
             .group_index
             .min(self.snapshot.groups.len().saturating_sub(1));
         self.clamp_aux();
     }
 
+    fn install_connections(&mut self, mut list: Vec<mihomo::ConnectionItem>, running: bool) {
+        let selected = self.selected_connection().map(|c| c.id.clone());
+        let was_empty = self.conn_view.is_empty();
+        let now_ms = conns::now_ms();
+        let had_closed = !self.conns.closed().is_empty();
+        if running {
+            let (up, down) = (self.snapshot.upload_total, self.snapshot.download_total);
+            self.conns.note_totals(up, down);
+        }
+        let closed = self
+            .conns
+            .observe(&mut list, running, Instant::now(), now_ms);
+        self.snapshot.connections = list;
+        self.rebuild_conn_view();
+        // An expired selection stays empty until the user navigates again.
+        self.reselect_connection(selected, was_empty);
+        if closed.is_empty() {
+            return;
+        }
+        // New entries go in front; keep the closed-view cursor on its entry.
+        if had_closed {
+            self.closed_index =
+                (self.closed_index + closed.len()).min(self.conns.closed().len().saturating_sub(1));
+        }
+        let lang = self.lang();
+        let age = |c: &conns::ClosedConn| c.lifetime_secs.map_or("—".into(), conns::fmt_age);
+        if closed.len() > 5 {
+            let level = if closed.iter().any(|c| c.ai) {
+                "warning"
+            } else {
+                "info"
+            };
+            let payload = format!(
+                "terc: {} long-lived/AI connections closed ({})",
+                closed.len(),
+                closed[0].describe(lang)
+            );
+            self.logs.push((level.into(), payload));
+        } else {
+            for c in &closed {
+                let payload = format!(
+                    "terc: closed {} after {} ↑{} ↓{} via {} ({})",
+                    c.host,
+                    age(c),
+                    ui::format_bytes(c.upload),
+                    ui::format_bytes(c.download),
+                    if c.chains.is_empty() {
+                        "—"
+                    } else {
+                        &c.chains
+                    },
+                    c.describe(lang)
+                );
+                let level = if c.ai { "warning" } else { "info" };
+                self.logs.push((level.into(), payload));
+            }
+        }
+        if self.logs.len() > 300 {
+            self.logs.drain(..self.logs.len() - 300);
+        }
+        let quiet =
+            |at: Option<Instant>| at.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+        if !self.action_busy && quiet(self.session_toast_at) && !self.toast_visible() {
+            if let Some(c) = closed.iter().find(|c| c.ai && c.cause.is_none()) {
+                let text = format!(
+                    "{}: {} ({})",
+                    self.t("conn_toast_ai_closed"),
+                    conns::host_only(&c.host),
+                    age(c)
+                );
+                self.set_status(&text, false);
+                self.session_toast_at = Some(Instant::now());
+            }
+        }
+    }
+
+    pub fn rebuild_conn_view(&mut self) {
+        let now_ms = conns::now_ms();
+        let list = &self.snapshot.connections;
+        let filter = self.conn_filter;
+        self.conn_view.clear();
+        self.conn_view
+            .extend((0..list.len()).filter(|&i| !filter || conns::is_session(&list[i], now_ms)));
+        match self.conn_sort {
+            // mihomo.rs already sorts by total bytes.
+            conns::SortKey::Bytes => {}
+            conns::SortKey::Age => self
+                .conn_view
+                .sort_by_key(|&i| list[i].start_ms.filter(|&ms| ms > 0).unwrap_or(i64::MAX)),
+            conns::SortKey::Rate => self.conn_view.sort_by_key(|&i| {
+                std::cmp::Reverse(list[i].up_rate.saturating_add(list[i].down_rate))
+            }),
+        }
+    }
+
+    pub fn selected_connection(&self) -> Option<&mihomo::ConnectionItem> {
+        self.conn_view
+            .get(self.conn_index)
+            .and_then(|&i| self.snapshot.connections.get(i))
+    }
+
+    /// Points `conn_index` back at `id`; a vanished or hidden one leaves no selection.
+    fn reselect_connection(&mut self, id: Option<String>, was_empty: bool) {
+        let list = &self.snapshot.connections;
+        self.conn_index = id
+            .and_then(|id| self.conn_view.iter().position(|&i| list[i].id == id))
+            .unwrap_or(if was_empty { 0 } else { self.conn_view.len() });
+    }
+
     pub fn refresh_snapshot_now(&mut self) {
         if self.snapshot_pending {
+            self.refresh_queued = true;
             return;
         }
         self.snapshot_pending = true;
@@ -1023,12 +1319,14 @@ impl App {
         let cfg = self.config.controller.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
+            mihomo::report_disruptions(tx.clone());
             let mut done = SendOnDrop::new(
                 tx.clone(),
                 BackendEvent::ActionDone {
                     result: Err("Operation failed unexpectedly".into()),
                     modules: None,
                     profile: None,
+                    snapshot_follows: false,
                 },
             );
             let result = action(cfg.clone());
@@ -1036,6 +1334,7 @@ impl App {
                 result,
                 modules,
                 profile,
+                snapshot_follows: true,
             });
             drop(done);
             let _ = tx.send(BackendEvent::Snapshot(Box::new(fetch_snapshot(&cfg))));
@@ -1043,6 +1342,9 @@ impl App {
     }
 
     pub fn update_subscription(&mut self) {
+        if self.screen != Screen::Setup && !self.confirm_disruption(guard::Disrupt::Reload) {
+            return;
+        }
         let catalog = crate::ops::module_catalog(&crate::ops::modules_dir(&PathBuf::from(
             env::var_os("HOME").unwrap_or_default(),
         )));
@@ -1053,7 +1355,8 @@ impl App {
             "Fetching and validating subscription…",
             None,
             None,
-            move |cfg| mihomo::regenerate_config(&cfg, &modules, running, true, zh),
+            // An unchanged result refreshes HTTP proxy providers in place.
+            move |cfg| mihomo::update_subscription(&cfg, &modules, running, zh),
         );
     }
 
@@ -1182,24 +1485,20 @@ impl App {
     }
 
     pub fn toggle_sysproxy(&mut self) {
-        let target = !self.snapshot.sysproxy_enabled;
-        let ports = if target {
-            if !self.snapshot.running {
-                self.set_status("Start the core before enabling system proxy", true);
+        let ports = if self.snapshot.running {
+            mihomo::proxy_ports(&self.snapshot)
+        } else {
+            Err("Start the core before enabling system proxy".into())
+        };
+        if !self.snapshot.sysproxy_enabled {
+            if let Err(e) = &ports {
+                self.set_status(e, true);
                 return;
             }
-            match mihomo::proxy_ports(&self.snapshot) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.set_status(&e, true);
-                    return;
-                }
-            }
-        } else {
-            (0, 0)
-        };
+        }
+        let shown = self.snapshot.sysproxy_enabled;
         self.run_action("Updating system proxy…", None, None, move |_| {
-            set_sysproxy(target, ports.0, ports.1)
+            sysproxy_toggle(shown, ports, set_sysproxy)
         });
     }
 
@@ -1225,6 +1524,9 @@ impl App {
     }
 
     pub fn toggle_core_service(&mut self) {
+        if self.snapshot.running && !self.confirm_disruption(guard::Disrupt::CoreStop) {
+            return;
+        }
         let running = self.snapshot.running
             || crate::privilege::managed_core(&self.config.controller).is_ok();
         self.run_action("Updating core service…", None, None, move |cfg| {
@@ -1285,6 +1587,42 @@ impl App {
             (Lang::Zh, "no_connections") => "当前没有活跃连接",
             (Lang::En, "no_connections") => "No active connections",
             (Lang::Ja, "no_connections") => "アクティブな接続はありません",
+            (Lang::Zh, "conn_sort_bytes") => "按流量",
+            (Lang::En, "conn_sort_bytes") => "by bytes",
+            (Lang::Ja, "conn_sort_bytes") => "転送量順",
+            (Lang::Zh, "conn_sort_age") => "按时长",
+            (Lang::En, "conn_sort_age") => "by age",
+            (Lang::Ja, "conn_sort_age") => "経過時間順",
+            (Lang::Zh, "conn_sort_rate") => "按速率",
+            (Lang::En, "conn_sort_rate") => "by rate",
+            (Lang::Ja, "conn_sort_rate") => "速度順",
+            (Lang::Zh, "conn_filter_sessions") => "仅长连接/AI",
+            (Lang::En, "conn_filter_sessions") => "long & AI only",
+            (Lang::Ja, "conn_filter_sessions") => "長時間/AI のみ",
+            (Lang::Zh, "conn_closed_title") => "最近断开的长连接/AI 连接",
+            (Lang::En, "conn_closed_title") => "Recently closed long-lived & AI connections",
+            (Lang::Ja, "conn_closed_title") => "最近切断された長時間/AI 接続",
+            (Lang::Zh, "conn_closed_empty") => "还没有长连接或 AI 连接断开",
+            (Lang::En, "conn_closed_empty") => "No long-lived or AI connection has closed yet",
+            (Lang::Ja, "conn_closed_empty") => "長時間/AI 接続の切断はまだありません",
+            (Lang::Zh, "conn_none_filtered") => "没有存活 60 秒以上或访问 AI 服务的连接（f 显示全部）",
+            (Lang::En, "conn_none_filtered") => "No connection older than 60 s or to an AI service (f shows all)",
+            (Lang::Ja, "conn_none_filtered") => "60 秒以上または AI サービスへの接続はありません（f で全表示）",
+            (Lang::Zh, "conn_closed_note") => "Mihomo 不提供断开原因；原因由 terc 根据自己的操作推断",
+            (Lang::En, "conn_closed_note") => "Mihomo reports no close reason; terc infers it from its own actions",
+            (Lang::Ja, "conn_closed_note") => "Mihomo は切断理由を返しません。terc が自身の操作から推定します",
+            (Lang::Zh, "conn_toast_ai_closed") => "AI 长连接已断开",
+            (Lang::En, "conn_toast_ai_closed") => "AI session closed",
+            (Lang::Ja, "conn_toast_ai_closed") => "AI 長時間接続が切断されました",
+            (Lang::Zh, "conn_long_lived") => "长连接",
+            (Lang::En, "conn_long_lived") => "long-lived",
+            (Lang::Ja, "conn_long_lived") => "長時間接続",
+            (Lang::Zh, "conn_ago") => "前",
+            (Lang::En, "conn_ago") => "ago",
+            (Lang::Ja, "conn_ago") => "前",
+            (Lang::Zh, "help_conn_keys") => "连接：o 排序（流量/时长/速率）  f 仅长连接/AI  d 最近断开",
+            (Lang::En, "help_conn_keys") => "Connections: o sort (bytes/age/rate)  f long & AI only  d recently closed",
+            (Lang::Ja, "help_conn_keys") => "接続：o 並べ替え（転送量/経過時間/速度）  f 長時間/AI のみ  d 最近の切断",
             (Lang::Zh, "no_logs") => "等待实时日志流...",
             (Lang::En, "no_logs") => "Waiting for live logs...",
             (Lang::Ja, "no_logs") => "ログ待機中...",
@@ -1363,6 +1701,9 @@ impl App {
             (Lang::Zh, "desc_theme") => "与 terb 同款的克制低饱和配色：Spring（浅青珊瑚）、Vintage（苔绿陶土）、Mono（极简黑白）。",
             (Lang::En, "desc_theme") => "Restrained palettes matching terb: Spring, Vintage, and Mono.",
             (Lang::Ja, "desc_theme") => "terbと同じ配色テーマ（Spring / Vintage / Mono）。",
+            (Lang::Zh, "desc_conn_stream") => "用 WebSocket 接收 Mihomo 每秒推送的连接列表，单连接速率更准；握手失败、数据过大或中断时自动改回 HTTP 轮询。",
+            (Lang::En, "desc_conn_stream") => "Receive Mihomo's per-second connection list over WebSocket for more accurate per-connection rates; falls back to HTTP polling on handshake failure, oversized data or drops.",
+            (Lang::Ja, "desc_conn_stream") => "Mihomo が毎秒送る接続一覧を WebSocket で受信し、接続ごとの速度をより正確にします。ハンドシェイク失敗・サイズ超過・切断時は自動で HTTP ポーリングに戻ります。",
             (Lang::Zh, "set_renderer") => "速率图样式",
             (Lang::En, "set_renderer") => "Rate Graph Style",
             (Lang::Ja, "set_renderer") => "グラフスタイル",
@@ -1378,9 +1719,15 @@ impl App {
             (Lang::Zh, "set_refresh") => "界面刷新率",
             (Lang::En, "set_refresh") => "Refresh Rate",
             (Lang::Ja, "set_refresh") => "リフレッシュレート",
-            (Lang::Zh, "desc_refresh") => "控制界面刷新率（15 / 30 / 60 / 120 Hz）。",
-            (Lang::En, "desc_refresh") => "Target UI refresh rate (15 / 30 / 60 / 120 Hz).",
-            (Lang::Ja, "desc_refresh") => "フレームレートを設定します。",
+            (Lang::Zh, "desc_refresh") => {
+                "界面最高重绘频率（15 / 30 / 60 / 120 Hz）。画面无变化时不重绘。"
+            }
+            (Lang::En, "desc_refresh") => {
+                "Maximum UI redraw rate (15 / 30 / 60 / 120 Hz). Nothing redraws while the screen is unchanged."
+            }
+            (Lang::Ja, "desc_refresh") => {
+                "画面の最大再描画レート（15 / 30 / 60 / 120 Hz）。変化がないときは再描画しません。"
+            }
             (Lang::Zh, "set_lang") => "界面语言",
             (Lang::En, "set_lang") => "Language",
             (Lang::Ja, "set_lang") => "言語",
@@ -1639,9 +1986,30 @@ impl App {
             (Lang::Zh, "mod_dns_fakeip") => "Fake-IP DNS",
             (Lang::En, "mod_dns_fakeip") => "Fake-IP DNS",
             (Lang::Ja, "mod_dns_fakeip") => "Fake-IP DNS",
-            (Lang::Zh, "mod_dns_fakeip_desc") => "开启 DNS，使用 Fake-IP 与 DoH",
-            (Lang::En, "mod_dns_fakeip_desc") => "Enable DNS with Fake-IP and DoH",
-            (Lang::Ja, "mod_dns_fakeip_desc") => "Fake-IP と DoH で DNS を有効化",
+            (Lang::Zh, "mod_dns_fakeip_desc") => "开启 DNS，Fake-IP 与国内 DoH",
+            (Lang::En, "mod_dns_fakeip_desc") => "Enable DNS with Fake-IP and mainland DoH",
+            (Lang::Ja, "mod_dns_fakeip_desc") => "Fake-IP と国内 DoH で DNS を有効化",
+            (Lang::Zh, "mod_dns_fakeip_global") => "Fake-IP DNS（境外）",
+            (Lang::En, "mod_dns_fakeip_global") => "Fake-IP DNS (global)",
+            (Lang::Ja, "mod_dns_fakeip_global") => "Fake-IP DNS（海外）",
+            (Lang::Zh, "mod_dns_fakeip_global_desc") => {
+                "Google / Cloudflare DoH 按规则连接，节点域名用国内 DoH"
+            }
+            (Lang::En, "mod_dns_fakeip_global_desc") => {
+                "Google / Cloudflare DoH via the rules; nodes resolved by mainland DoH"
+            }
+            (Lang::Ja, "mod_dns_fakeip_global_desc") => {
+                "Google / Cloudflare DoH をルール経由で使用、ノード名は国内 DoH"
+            }
+            (Lang::Zh, "dns_module_notice") => {
+                "「Fake-IP DNS」片段已改用国内 DoH（doh.pub / alidns），只监听 127.0.0.1:1053，不再带 fallback，下次生成配置时生效。需要境外 DoH 请改开「Fake-IP DNS（境外）」"
+            }
+            (Lang::En, "dns_module_notice") => {
+                "The Fake-IP DNS snippet now uses mainland DoH (doh.pub / alidns), listens on 127.0.0.1:1053 only and has no fallback, from the next generated config. For foreign DoH, enable Fake-IP DNS (global) instead"
+            }
+            (Lang::Ja, "dns_module_notice") => {
+                "Fake-IP DNS スニペットは国内 DoH（doh.pub / alidns）に変わり、127.0.0.1:1053 のみで待ち受け、fallback もなくなりました。次の設定生成から有効です。海外 DoH は Fake-IP DNS（海外）を有効にしてください"
+            }
             (Lang::Zh, "mod_find_process") => "进程名",
             (Lang::En, "mod_find_process") => "Process name",
             (Lang::Ja, "mod_find_process") => "プロセス名",
@@ -1750,21 +2118,38 @@ fn main() -> io::Result<()> {
     // Migration problems are shown in the UI; legacy files stay untouched.
     let migration = storage::migrate(&mut config);
     let mut app = App::new(config);
-    match migration {
-        Ok(notes) if !notes.is_empty() => app.set_status(
-            &format!(
-                "迁移跳过 / Migration skipped / 移行スキップ: {}",
-                notes.join("; ")
-            ),
-            true,
-        ),
-        Ok(_) => {}
-        Err(err) => app.set_status(
-            &format!("迁移失败 / Migration failed / 移行失敗: {err}"),
-            true,
-        ),
+    if app.note_dns_module_change() {
+        app.save_preferences();
+    }
+    let migration = match migration {
+        Ok(notes) if !notes.is_empty() => Some(format!(
+            "迁移跳过 / Migration skipped / 移行スキップ: {}",
+            notes.join("; ")
+        )),
+        Ok(_) => None,
+        Err(err) => Some(format!("迁移失败 / Migration failed / 移行失敗: {err}")),
+    };
+    if let Some(text) = migration {
+        // The one-time DNS notice is already recorded as seen; keep it.
+        let text = match app.status_message.as_str() {
+            "" => text,
+            notice => format!("{text} | {notice}"),
+        };
+        app.set_status(&text, true);
     }
     run(&mut app)
+}
+
+/// Click and wheel reports only (1000, in SGR 1006 encoding). crossterm's
+/// `EnableMouseCapture` also asks for drag (1002) and any-motion (1003)
+/// reports, which terc never handles and which woke the loop on every mouse
+/// move. `DisableMouseCapture` on exit still clears all of them.
+struct ClickMouse;
+
+impl crossterm::Command for ClickMouse {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1006h")
+    }
 }
 
 fn run(app: &mut App) -> io::Result<()> {
@@ -1774,7 +2159,7 @@ fn run(app: &mut App) -> io::Result<()> {
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture
+        ClickMouse
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -1791,91 +2176,219 @@ fn run(app: &mut App) -> io::Result<()> {
     result
 }
 
+/// Longest the loop blocks on input before it drains backend events again.
+const IDLE_WAKE: Duration = Duration::from_millis(50);
+/// Data repaints (pushes, polls, toasts) run at most this often; Mihomo
+/// pushes once a second anyway.
+const DATA_FRAME: Duration = Duration::from_millis(100);
+/// Ages, "ago" columns and the Setup screen's config check change with time
+/// alone.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+/// Key repeats and pastes applied before one repaint.
+const INPUT_BURST: usize = 64;
+
+/// When `run_app` repaints: input at once (capped by `refresh_hz`), data at
+/// most every `DATA_FRAME`, and nothing while the screen cannot have changed.
+struct Redraw {
+    input: bool,
+    data: bool,
+    last: Instant,
+    toast: (bool, Option<Instant>),
+    graph: u64,
+}
+
+impl Redraw {
+    fn new(now: Instant) -> Self {
+        Self {
+            input: true,
+            data: false,
+            // Long enough ago that the first frame draws at once.
+            last: now.checked_sub(HEARTBEAT).unwrap_or(now),
+            toast: (false, None),
+            graph: 0,
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.input || self.data
+    }
+
+    fn toast_of(app: &App) -> (bool, Option<Instant>) {
+        (app.toast_visible(), app.toast_started)
+    }
+
+    /// Notes changes no event reports: a toast shown, replaced or expired, a
+    /// graph shift, and the heartbeat.
+    fn observe(&mut self, app: &App, now: Instant) {
+        self.data |= Self::toast_of(app) != self.toast
+            || app.graph_gen != self.graph
+            || now.saturating_duration_since(self.last) >= HEARTBEAT;
+    }
+
+    /// Time since the last frame the pending change has to wait for.
+    fn gap(&self, frame: Duration) -> Option<Duration> {
+        if self.input {
+            Some(frame)
+        } else if self.data {
+            Some(frame.max(DATA_FRAME))
+        } else {
+            None
+        }
+    }
+
+    fn due(&self, now: Instant, frame: Duration) -> bool {
+        self.gap(frame)
+            .is_some_and(|gap| now.saturating_duration_since(self.last) >= gap)
+    }
+
+    /// How long the loop may wait for input before it has to look again.
+    fn wait(&self, now: Instant, frame: Duration) -> Duration {
+        let since = now.saturating_duration_since(self.last);
+        self.gap(frame)
+            .unwrap_or(HEARTBEAT)
+            .saturating_sub(since)
+            .min(IDLE_WAKE)
+    }
+
+    fn drawn(&mut self, app: &App, now: Instant) {
+        self.input = false;
+        self.data = false;
+        self.last = now;
+        self.toast = Self::toast_of(app);
+        self.graph = app.graph_gen;
+    }
+}
+
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     let mut last_tick = Instant::now();
+    let mut redraw = Redraw::new(last_tick);
+    // A mouse event read behind undrawn changes waits for the next frame: its
+    // hit areas (proxy_hits, list scroll) come from the last draw.
+    let mut held: Option<CEvent> = None;
 
     loop {
-        app.drain_events();
-        execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let draw_res = terminal.draw(|frame| draw(frame, app)).map(|_| ());
-        let sync_res = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
-        draw_res?;
-        sync_res?;
+        redraw.data |= app.drain_events();
+        let now = Instant::now();
+        redraw.observe(app, now);
+        let frame = app.frame_duration();
+        if redraw.due(now, frame) || (held.is_some() && redraw.pending()) {
+            // Queued, so Begin and End ride along with the frame's own flushes.
+            queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+            let draw_res = terminal.draw(|frame| draw(frame, app)).map(|_| ());
+            let sync_res = queue!(terminal.backend_mut(), EndSynchronizedUpdate)
+                .and_then(|()| io::Write::flush(terminal.backend_mut()));
+            draw_res?;
+            sync_res?;
+            redraw.drawn(app, Instant::now());
+        }
 
-        let tick_rate = app.frame_duration();
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_millis(0));
-
-        if event::poll(timeout)? {
-            match event::read()? {
-                CEvent::Key(key) => {
-                    if handle_key(app, key) {
-                        return Ok(());
-                    }
-                }
-                CEvent::Mouse(mouse) => {
-                    if proxy_mouse_action(app, mouse) {
-                        app.activate_selected_node();
-                    }
-                }
-                CEvent::Paste(text) => {
-                    if let Some(form) = app.proxy_form.as_mut() {
-                        form.paste(&text);
-                    } else if app.screen == Screen::Settings && app.setting_input.is_some() {
-                        let text = text.trim();
-                        let id = app.settings_rows()[app.setting_index].id;
-                        if id == crate::settings::SettingId::TestUrl
-                            || (text.len() <= 8 && text.chars().all(|c| c.is_ascii_digit()))
-                        {
-                            app.setting_input = Some(text.trim().to_string());
-                        }
-                    } else if app.screen == Screen::Setup && app.setup_phase == SetupPhase::Editing
-                    {
-                        if text.trim().lines().count() > 1 {
-                            app.setup_editor.load(text.trim());
-                        } else {
-                            app.setup_editor.insert_text(text.trim());
-                        }
-                    } else if matches!(app.screen, Screen::Dashboard | Screen::Settings)
-                        && (app.settings_management
-                            || matches!(app.overlay, Overlay::OwnNodes | Overlay::PrivateRules))
-                    {
-                        crate::manage::handle_manage_paste(app, &text);
-                    } else if app.screen == Screen::Dashboard && app.overlay == Overlay::Probe {
-                        app.probe_editor.insert(&text);
-                    } else if app.screen == Screen::Dashboard
-                        && app.main_tab == MainTab::Dns
-                        && app.dns_editing
-                    {
-                        app.dns_editor.insert(&text);
-                    } else if app.screen == Screen::Dashboard
-                        && app.main_tab == MainTab::Rules
-                        && app.rule_editing
-                    {
-                        if app.rule_explaining {
-                            app.rule_target_editor.insert_text(&text);
-                        } else {
-                            app.rule_query.insert_text(&text);
-                            app.rule_index = 0;
-                        }
-                    } else if app.screen == Screen::Dashboard
-                        && app.main_tab == MainTab::Logs
-                        && app.log_editing
-                    {
-                        app.log_query.insert_text(&text);
-                        app.log_index = 0;
-                    }
-                }
-                _ => {}
+        let mut next = match held.take() {
+            Some(ev) => Some(ev),
+            None if event::poll(redraw.wait(Instant::now(), frame))? => Some(event::read()?),
+            None => None,
+        };
+        let mut applied = 0;
+        while let Some(ev) = next.take() {
+            if matches!(&ev, CEvent::Mouse(m) if mouse_acts(m.kind)) && redraw.pending() {
+                held = Some(ev);
+                break;
+            }
+            let burst = matches!(ev, CEvent::Key(_) | CEvent::Paste(_));
+            match handle_event(app, ev) {
+                Handled::Quit => return Ok(()),
+                Handled::Changed => redraw.input = true,
+                Handled::Unchanged => {}
+            }
+            applied += 1;
+            // Key repeat and pastes coalesce into one frame; mouse events do
+            // not, since each hit-tests against the frame before it.
+            if burst && applied < INPUT_BURST && event::poll(Duration::ZERO)? {
+                next = Some(event::read()?);
             }
         }
 
-        let elapsed = last_tick.elapsed();
-        if elapsed >= tick_rate {
-            app.tick(elapsed);
-            last_tick = Instant::now();
+        let shown = (app.screen, app.setup_phase);
+        app.tick(last_tick.elapsed());
+        last_tick = Instant::now();
+        redraw.data |= shown != (app.screen, app.setup_phase);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Handled {
+    Quit,
+    Changed,
+    Unchanged,
+}
+
+/// Mouse events terc acts on; release, drag and motion change nothing.
+fn mouse_acts(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    )
+}
+
+fn handle_event(app: &mut App, ev: CEvent) -> Handled {
+    match ev {
+        CEvent::Key(key) => {
+            if handle_key(app, key) {
+                return Handled::Quit;
+            }
         }
+        CEvent::Mouse(mouse) => {
+            if !mouse_acts(mouse.kind) {
+                return Handled::Unchanged;
+            }
+            if proxy_mouse_action(app, mouse) {
+                app.activate_selected_node();
+            }
+        }
+        CEvent::Paste(text) => handle_paste(app, &text),
+        // The next draw picks up the new size.
+        CEvent::Resize(..) => {}
+        CEvent::FocusGained | CEvent::FocusLost => return Handled::Unchanged,
+    }
+    Handled::Changed
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    if let Some(form) = app.proxy_form.as_mut() {
+        form.paste(text);
+    } else if app.screen == Screen::Settings && app.setting_input.is_some() {
+        let text = text.trim();
+        let id = app.settings_rows()[app.setting_index].id;
+        if id == crate::settings::SettingId::TestUrl
+            || (text.len() <= 8 && text.chars().all(|c| c.is_ascii_digit()))
+        {
+            app.setting_input = Some(text.trim().to_string());
+        }
+    } else if app.screen == Screen::Setup && app.setup_phase == SetupPhase::Editing {
+        if text.trim().lines().count() > 1 {
+            app.setup_editor.load(text.trim());
+        } else {
+            app.setup_editor.insert_text(text.trim());
+        }
+    } else if matches!(app.screen, Screen::Dashboard | Screen::Settings)
+        && (app.settings_management
+            || matches!(app.overlay, Overlay::OwnNodes | Overlay::PrivateRules))
+    {
+        crate::manage::handle_manage_paste(app, text);
+    } else if app.screen == Screen::Dashboard && app.overlay == Overlay::Probe {
+        app.probe_editor.insert(text);
+    } else if app.screen == Screen::Dashboard && app.main_tab == MainTab::Dns && app.dns_editing {
+        app.dns_editor.insert(text);
+    } else if app.screen == Screen::Dashboard && app.main_tab == MainTab::Rules && app.rule_editing
+    {
+        if app.rule_explaining {
+            app.rule_target_editor.insert_text(text);
+        } else {
+            app.rule_query.insert_text(text);
+            app.rule_index = 0;
+        }
+    } else if app.screen == Screen::Dashboard && app.main_tab == MainTab::Logs && app.log_editing {
+        app.log_query.insert_text(text);
+        app.log_index = 0;
     }
 }
 
@@ -2104,12 +2617,18 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                     }
                 }
             },
+            MainTab::Connections if app.conn_closed_view => {
+                let len = app.conns.closed().len();
+                if len > 0 {
+                    app.closed_index = app.closed_index.checked_sub(1).unwrap_or(len - 1);
+                }
+            }
             MainTab::Connections => {
-                if !app.snapshot.connections.is_empty() {
+                if !app.conn_view.is_empty() {
                     app.conn_index = app
                         .conn_index
                         .checked_sub(1)
-                        .unwrap_or(app.snapshot.connections.len() - 1);
+                        .unwrap_or(app.conn_view.len() - 1);
                 }
             }
             MainTab::Logs => {
@@ -2148,12 +2667,18 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                     }
                 }
             },
+            MainTab::Connections if app.conn_closed_view => {
+                let len = app.conns.closed().len();
+                if len > 0 {
+                    app.closed_index = (app.closed_index + 1) % len;
+                }
+            }
             MainTab::Connections => {
-                if !app.snapshot.connections.is_empty() {
-                    app.conn_index = if app.conn_index >= app.snapshot.connections.len() {
+                if !app.conn_view.is_empty() {
+                    app.conn_index = if app.conn_index >= app.conn_view.len() {
                         0
                     } else {
-                        (app.conn_index + 1) % app.snapshot.connections.len()
+                        (app.conn_index + 1) % app.conn_view.len()
                     };
                 }
             }
@@ -2186,6 +2711,9 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                 app.detail_scroll = 0;
             }
             MainTab::Providers => app.refresh_selected_provider(),
+            // In the closed view this shows the entry, its cause and the note
+            // full-width, which narrow windows have no right pane for.
+            MainTab::Connections if app.conn_closed_view && app.conns.closed().is_empty() => {}
             MainTab::Connections => {
                 app.connection_detail = true;
                 app.detail_scroll = 0;
@@ -2196,17 +2724,46 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
                 app.detail_scroll = 0;
             }
         },
+        KeyCode::Char('o') if app.main_tab == MainTab::Connections => {
+            let id = app.selected_connection().map(|c| c.id.clone());
+            let was_empty = app.conn_view.is_empty();
+            app.conn_sort = app.conn_sort.next();
+            app.rebuild_conn_view();
+            app.reselect_connection(id, was_empty);
+        }
+        KeyCode::Char('f') if app.main_tab == MainTab::Connections => {
+            let id = app.selected_connection().map(|c| c.id.clone());
+            let was_empty = app.conn_view.is_empty();
+            app.conn_filter = !app.conn_filter;
+            app.rebuild_conn_view();
+            app.reselect_connection(id, was_empty);
+        }
+        KeyCode::Char('d') if app.main_tab == MainTab::Connections => {
+            app.conn_closed_view = !app.conn_closed_view;
+            app.closed_index = 0;
+            app.connection_detail = false;
+        }
         KeyCode::Char('x') if app.main_tab == MainTab::Rules => app.toggle_selected_rule(),
-        KeyCode::Char('x') if app.main_tab == MainTab::Connections => {
-            if let Some(c) = app.snapshot.connections.get(app.conn_index) {
+        KeyCode::Char('x') if app.main_tab == MainTab::Connections && !app.conn_closed_view => {
+            if let Some(c) = app.selected_connection() {
                 let id = c.id.clone();
+                if !app.action_busy {
+                    app.conns
+                        .note(conns::Cause::UserClose, conns::Scope::Id(id.clone()));
+                }
                 app.run_action("Closing connection…", None, None, move |cfg| {
                     close_connection(&cfg, Some(&id)).map_err(|e| e.to_string())?;
                     Ok("Connection closed".into())
                 });
             }
         }
-        KeyCode::Char('X') if app.main_tab == MainTab::Connections => {
+        KeyCode::Char('X') if app.main_tab == MainTab::Connections && !app.conn_closed_view => {
+            if !app.confirm_disruption(guard::Disrupt::CloseAll) {
+                return false;
+            }
+            if !app.action_busy {
+                app.conns.note(conns::Cause::CloseAll, conns::Scope::All);
+            }
             app.run_action("Closing all connections…", None, None, |cfg| {
                 close_connection(&cfg, None).map_err(|e| e.to_string())?;
                 Ok("All connections closed".into())
@@ -2518,6 +3075,34 @@ mod tests {
         handle_key(app, KeyEvent::new(key, KeyModifiers::NONE))
     }
 
+    #[test]
+    fn dns_module_change_is_announced_once_to_users_who_had_it_on() {
+        let mut app = offline_app();
+        app.config.enabled_modules = vec!["tun".into(), "dns-fakeip".into()];
+        assert!(app.note_dns_module_change());
+        assert_eq!(app.status_message, app.t("dns_module_notice"));
+        assert!(app.status_message.contains("127.0.0.1:1053"));
+        assert!(app.logs.iter().any(|(_, line)| line.contains("doh.pub")));
+        // Saved, so the next start stays quiet.
+        let saved: Config =
+            serde_json::from_str(&serde_json::to_string(&app.config).unwrap()).unwrap();
+        let mut again = App::from_snapshot(saved, CoreSnapshot::default());
+        assert!(!again.note_dns_module_change());
+        assert!(again.status_message.is_empty());
+
+        // Without the module: marked seen, nothing shown, so enabling the new
+        // body later never triggers it.
+        let mut fresh = offline_app();
+        assert!(fresh.note_dns_module_change());
+        assert!(fresh.status_message.is_empty());
+        fresh.config.enabled_modules = vec!["dns-fakeip".into()];
+        assert!(!fresh.note_dns_module_change());
+        assert!(serde_json::to_string(&Config::default())
+            .unwrap()
+            .find("seen_notices")
+            .is_none());
+    }
+
     fn render_text(app: &mut App, width: u16, height: u16) -> String {
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         term.draw(|frame| ui::draw(frame, app)).unwrap();
@@ -2567,19 +3152,23 @@ mod tests {
             mihomo::connection_from_value(&serde_json::json!({"id": id, "metadata": {"host": id}}))
                 .unwrap()
         };
-        app.snapshot.connections = vec![connection("a"), connection("b")];
+        let snapshot = |ids: &[&str]| CoreSnapshot {
+            running: true,
+            connections_ok: true,
+            connections: ids.iter().map(|id| connection(id)).collect(),
+            ..Default::default()
+        };
+        app.accept_snapshot(snapshot(&["a", "b"]));
+        assert_eq!(app.conn_index, 0);
         app.conn_index = 1;
-        let mut next = app.snapshot.clone();
-        next.connections.reverse();
-        app.accept_snapshot(next);
-        assert_eq!(app.snapshot.connections[app.conn_index].id, "b");
-        let mut next = app.snapshot.clone();
-        next.connections.remove(0);
-        app.accept_snapshot(next);
-        assert!(app.snapshot.connections.get(app.conn_index).is_none());
+        app.accept_snapshot(snapshot(&["b", "a"]));
+        assert_eq!(app.selected_connection().unwrap().id, "b");
+        assert_eq!(app.conn_index, 0);
+        app.accept_snapshot(snapshot(&["a"]));
+        assert!(app.selected_connection().is_none());
         app.main_tab = MainTab::Connections;
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.snapshot.connections[app.conn_index].id, "a");
+        assert_eq!(app.selected_connection().unwrap().id, "a");
     }
 
     #[test]
@@ -3026,11 +3615,12 @@ mod tests {
             assert_eq!(app.help_scroll, previous.saturating_sub(1));
             app.screen = Screen::Dashboard;
         }
-        app.snapshot.connections = vec![mihomo::connection_from_value(
+        let mut conn = mihomo::connection_from_value(
             &serde_json::json!({"id":"a", "metadata":{"host":"visible.test", "process":"curl"}}),
         )
-        .unwrap()];
-        app.snapshot.connections[0].host = "visible.test".into();
+        .unwrap();
+        conn.host = "visible.test".into();
+        app.accept_snapshot(live_snapshot(vec![conn]));
         app.main_tab = MainTab::Connections;
         app.conn_index = 0;
         press(&mut app, KeyCode::Enter);
@@ -3149,6 +3739,294 @@ mod tests {
         assert!(cfg.active_profile.is_empty());
         assert_eq!(cfg.settings.theme, ThemeId::Mono);
         assert_eq!(cfg.settings.graph_interval_secs, 1);
+        assert!(cfg.settings.connections_stream);
+    }
+
+    #[test]
+    fn pushed_connections_are_not_overwritten_by_an_older_poll() {
+        let mut app = offline_app();
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        let ids = |app: &App| {
+            app.conn_view
+                .iter()
+                .map(|&i| app.snapshot.connections[i].id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(!app.stream_live());
+        // Pushes are live data and land even while an action runs.
+        app.action_busy = true;
+        app.tx
+            .send(BackendEvent::Connections {
+                items: vec![
+                    live_conn("ai", "api.openai.com:443", Some(2), 800),
+                    live_conn("new", "chatgpt.com:443", Some(1), 50),
+                ],
+                upload_total: 5,
+                download_total: 9,
+            })
+            .unwrap();
+        app.drain_events();
+        app.action_busy = false;
+        assert!(app.stream_live());
+        assert_eq!(ids(&app), ["ai", "new"]);
+        assert_eq!(
+            (app.snapshot.upload_total, app.snapshot.download_total),
+            (5, 9)
+        );
+        // `long` was a long-lived session the push no longer lists.
+        let closed = app.conns.closed().len();
+        assert_eq!(app.conns.closed()[0].host, "ws.example.com:443");
+
+        // A poll that started before the push carries the older list.
+        app.snapshot_pending = true;
+        let mut stale = live_snapshot(sample_connections());
+        stale.mode = "Global".into();
+        stale.upload_total = 1;
+        app.tx
+            .send(BackendEvent::SnapshotDone(Box::new(stale)))
+            .unwrap();
+        app.drain_events();
+        assert!(!app.snapshot_pending);
+        assert_eq!(app.snapshot.mode, "Global");
+        assert_eq!(ids(&app), ["ai", "new"]);
+        assert_eq!(app.snapshot.upload_total, 5);
+        assert_eq!(app.conns.closed().len(), closed);
+
+        // Three seconds without a push hand the list back to polling.
+        app.conn_stream_at = Instant::now().checked_sub(Duration::from_secs(4));
+        assert!(!app.stream_live());
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        assert_eq!(ids(&app), ["big", "ai", "long"]);
+        // Switched off, a fresh push does not count as live.
+        app.conn_stream_at = Some(Instant::now());
+        app.config.settings.connections_stream = false;
+        app.conn_stream.enabled.store(false, Ordering::Relaxed);
+        assert!(!app.stream_live());
+    }
+
+    /// A controller on 127.0.0.1:0 that answers `{}` and records each path.
+    fn recording_controller() -> (String, mpsc::Receiver<String>) {
+        use std::{io::Read as _, io::Write as _, net::TcpListener};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (paths_tx, paths) = mpsc::channel();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+                if paths_tx.send(path).is_err() {
+                    return;
+                }
+            }
+        });
+        (addr, paths)
+    }
+
+    /// Wait for the poll `tick` started and return the paths it asked for.
+    fn finish_poll(app: &mut App, paths: &mpsc::Receiver<String>) -> Vec<String> {
+        assert!(app.snapshot_pending, "no poll started");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot_pending {
+            assert!(Instant::now() < deadline, "poll never finished");
+            app.drain_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        paths.try_iter().collect()
+    }
+
+    #[test]
+    fn polls_skip_the_connections_get_only_while_pushes_arrive() {
+        let (addr, paths) = recording_controller();
+        let mut app = offline_app();
+        app.config.controller.addr = addr;
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        let poll = |app: &mut App| {
+            app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
+            app.tick(Duration::from_millis(10));
+            finish_poll(app, &paths)
+        };
+        app.conn_stream_at = Some(Instant::now());
+        assert!(app.stream_live());
+        let pushed = poll(&mut app);
+        assert!(pushed.iter().any(|p| p == "/version"), "{pushed:?}");
+        assert!(!pushed.iter().any(|p| p == "/connections"), "{pushed:?}");
+        app.conn_stream_at = None;
+        let polled = poll(&mut app);
+        assert!(polled.iter().any(|p| p == "/connections"), "{polled:?}");
+    }
+
+    #[test]
+    fn polls_read_rules_and_providers_only_where_they_show() {
+        let (addr, paths) = recording_controller();
+        let mut app = offline_app();
+        app.config.controller.addr = addr;
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        let has = |got: &[String], path: &str| got.iter().any(|p| p == path);
+        let poll = |app: &mut App| {
+            app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
+            app.tick(Duration::from_millis(10));
+            finish_poll(app, &paths)
+        };
+        // The core looked stopped, so it may have just started: read everything.
+        let first = poll(&mut app);
+        assert!(app.snapshot.running);
+        assert!(
+            has(&first, "/rules") && has(&first, "/providers/proxies"),
+            "{first:?}"
+        );
+
+        // Proxies tab, providers read moments ago: neither, and what the
+        // first poll brought stays.
+        app.snapshot.rules =
+            crate::ops::parse_rules_json(r#"{"rules":[{"type":"Match","proxy":"P"}]}"#);
+        let lean = poll(&mut app);
+        assert!(has(&lean, "/version") && has(&lean, "/proxies"), "{lean:?}");
+        assert!(
+            !has(&lean, "/rules") && !has(&lean, "/providers/proxies"),
+            "{lean:?}"
+        );
+        assert!(!has(&lean, "/providers/rules"), "{lean:?}");
+        assert_eq!(app.snapshot.rules.len(), 1);
+
+        // Entering Rules polls at once instead of waiting for the timer;
+        // staying there does not poll early again.
+        app.main_tab = MainTab::Rules;
+        app.tick(Duration::from_millis(10));
+        let rules = finish_poll(&mut app, &paths);
+        assert!(
+            has(&rules, "/rules") && !has(&rules, "/providers/proxies"),
+            "{rules:?}"
+        );
+        app.tick(Duration::from_millis(10));
+        assert!(!app.snapshot_pending);
+
+        app.main_tab = MainTab::Providers;
+        app.tick(Duration::from_millis(10));
+        let providers = finish_poll(&mut app, &paths);
+        assert!(has(&providers, "/providers/proxies"), "{providers:?}");
+        assert!(has(&providers, "/providers/rules"), "{providers:?}");
+        assert!(!has(&providers, "/rules"), "{providers:?}");
+
+        // Other tabs poll on the timer and read the providers every 30 s.
+        app.main_tab = MainTab::Logs;
+        app.tick(Duration::from_millis(10));
+        assert!(!app.snapshot_pending);
+        assert!(!has(&poll(&mut app), "/providers/proxies"));
+        app.providers_polled_at = Some(Instant::now() - Duration::from_secs(31));
+        assert!(has(&poll(&mut app), "/providers/proxies"));
+    }
+
+    #[test]
+    fn refresh_asked_during_a_poll_runs_after_it() {
+        let (addr, paths) = recording_controller();
+        let mut app = offline_app();
+        app.config.controller.addr = addr;
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        // A finished core download asks while a cached poll is in flight.
+        app.snapshot_pending = true;
+        app.tx
+            .send(BackendEvent::CoreDownloadDone { ok: true })
+            .unwrap();
+        app.drain_events();
+        assert!(app.refresh_queued);
+        assert!(paths.try_iter().next().is_none());
+        // The queued full refresh starts when that poll ends.
+        app.tx
+            .send(BackendEvent::SnapshotDone(Box::default()))
+            .unwrap();
+        app.drain_events();
+        assert!(!app.refresh_queued);
+        let full = finish_poll(&mut app, &paths);
+        assert!(full.iter().any(|p| p == "/version"), "{full:?}");
+    }
+
+    #[test]
+    fn space_sets_the_opposite_of_the_shown_system_proxy_state() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let set = |on, http, socks| {
+            calls.borrow_mut().push((on, http, socks));
+            Ok(String::new())
+        };
+        // Shown ON but turned off outside terc since: Space still turns it off.
+        sysproxy_toggle(true, Ok((7890, 7891)), set).unwrap();
+        sysproxy_toggle(false, Ok((7890, 7891)), set).unwrap();
+        assert!(sysproxy_toggle(false, Err("no port".into()), set).is_err());
+        assert_eq!(*calls.borrow(), [(false, 0, 0), (true, 7890, 7891)]);
+    }
+
+    #[test]
+    fn poll_after_a_missed_version_reads_everything_despite_a_push() {
+        let (addr, paths) = recording_controller();
+        let mut app = offline_app();
+        app.config.controller.addr = addr;
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        let has = |got: &[String], path: &str| got.iter().any(|p| p == path);
+        let poll = |app: &mut App| {
+            app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
+            app.tick(Duration::from_millis(10));
+            finish_poll(app, &paths)
+        };
+        poll(&mut app);
+        // One poll misses `/version`; the `/traffic` stream keeps pushing.
+        app.accept_snapshot(CoreSnapshot::default());
+        app.tx
+            .send(BackendEvent::Traffic { up: 1, down: 1 })
+            .unwrap();
+        app.drain_events();
+        assert!(app.snapshot.running);
+        let next = poll(&mut app);
+        assert!(
+            has(&next, "/rules") && has(&next, "/providers/proxies"),
+            "{next:?}"
+        );
+    }
+
+    #[test]
+    fn live_connection_stream_row_shows_its_transport() {
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            for (width, height) in [(80, 24), (160, 40)] {
+                let mut app = offline_app();
+                app.config.settings.lang = lang;
+                app.screen = Screen::Settings;
+                app.setting_index = app
+                    .settings_rows()
+                    .iter()
+                    .position(|r| r.id == crate::settings::SettingId::ConnStream)
+                    .unwrap();
+                assert_eq!(
+                    app.settings_rows()[app.setting_index].category,
+                    SettingCategory::Diagnostics
+                );
+                let label = match lang {
+                    Lang::Zh => "连接实时推送",
+                    _ => "Liveconnectionstream",
+                };
+                let desc = prefix(&app.t("desc_conn_stream").replace(' ', ""), 8);
+                // The list may put the value under the label; the detail pane
+                // states it on one line.
+                let shows = |app: &mut App, value: &str| {
+                    let text = render_text(app, width, height);
+                    let state = format!("{}:{value}", app.t("current_value"));
+                    assert!(text.contains(label), "{lang:?} {width}\n{text}");
+                    assert!(text.contains(&state), "{lang:?} {width} {value}\n{text}");
+                    assert!(text.contains(&desc), "{lang:?} {width}\n{text}");
+                };
+                shows(&mut app, "ON·HTTP");
+                app.conn_stream_at = Some(Instant::now());
+                shows(&mut app, "ON·WebSocket");
+                app.config.settings.connections_stream = false;
+                app.conn_stream.enabled.store(false, Ordering::Relaxed);
+                shows(&mut app, "OFF");
+            }
+        }
     }
 
     #[test]
@@ -3229,5 +4107,653 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(!app.ai_picker);
         assert_eq!(app.overlay, Overlay::PrivateRules);
+    }
+
+    fn live_conn(
+        id: &str,
+        host: &str,
+        age_secs: Option<i64>,
+        bytes: u64,
+    ) -> mihomo::ConnectionItem {
+        let mut conn =
+            mihomo::connection_from_value(&serde_json::json!({ "id": id, "rule": "Match" }))
+                .unwrap();
+        conn.host = host.into();
+        conn.chains = "PROXY › HK-01".into();
+        conn.start_ms = age_secs.map(|secs| conns::now_ms() - secs * 1000);
+        conn.download = bytes;
+        conn
+    }
+
+    fn live_snapshot(conns: Vec<mihomo::ConnectionItem>) -> CoreSnapshot {
+        CoreSnapshot {
+            running: true,
+            connections_ok: true,
+            connections: conns,
+            ..Default::default()
+        }
+    }
+
+    fn sample_connections() -> Vec<mihomo::ConnectionItem> {
+        vec![
+            live_conn("big", "cdn.example.com:443", Some(5), 9000),
+            live_conn("ai", "api.openai.com:443", Some(20), 500),
+            live_conn("long", "ws.example.com:443", Some(90), 100),
+        ]
+    }
+
+    #[test]
+    fn sort_key_cycles_and_keeps_the_selected_connection() {
+        let mut app = offline_app();
+        app.main_tab = MainTab::Connections;
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        let order = |app: &App| {
+            app.conn_view
+                .iter()
+                .map(|&i| app.snapshot.connections[i].id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(order(&app), "big,ai,long");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_connection().unwrap().id, "ai");
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.conn_sort, conns::SortKey::Age);
+        assert_eq!(order(&app), "long,ai,big");
+        assert_eq!(app.selected_connection().unwrap().id, "ai");
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.conn_sort, conns::SortKey::Rate);
+        assert_eq!(app.selected_connection().unwrap().id, "ai");
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.conn_sort, conns::SortKey::Bytes);
+        assert_eq!(order(&app), "big,ai,long");
+        assert_eq!(app.selected_connection().unwrap().id, "ai");
+    }
+
+    #[test]
+    fn session_filter_hides_short_rows_and_close_targets_the_visible_row() {
+        let mut app = offline_app();
+        app.main_tab = MainTab::Connections;
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        assert_eq!(app.selected_connection().unwrap().id, "big");
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.conn_view.len(), 2);
+        // The selected row was hidden, so nothing is selected until the user moves.
+        assert!(app.selected_connection().is_none());
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_connection().unwrap().id, "ai");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_connection().unwrap().id, "long");
+        let text = render_text(&mut app, 100, 30);
+        assert!(!text.contains("cdn.example.com"), "{text}");
+        assert!(text.contains("(2/3)"), "{text}");
+
+        // `x` reads the same row; a busy app refuses it without noting a cause,
+        // so this does not reach the controller.
+        app.action_busy = true;
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.status_message, "Another operation is still running");
+        app.action_busy = false;
+        app.accept_snapshot(live_snapshot(vec![live_conn(
+            "ai",
+            "api.openai.com:443",
+            Some(2),
+            500,
+        )]));
+        assert_eq!(app.conns.closed()[0].host, "ws.example.com:443");
+        assert_eq!(app.conns.closed()[0].cause, None);
+
+        press(&mut app, KeyCode::Char('f'));
+        assert!(!app.conn_filter);
+        assert_eq!(app.conn_view.len(), 1);
+        app.accept_snapshot(live_snapshot(vec![live_conn(
+            "s",
+            "a.test:443",
+            Some(1),
+            1,
+        )]));
+        press(&mut app, KeyCode::Char('f'));
+        assert!(app.conn_view.is_empty());
+        let text = render_text(&mut app, 100, 30);
+        assert!(text.contains("没有存活60秒以上"), "{text}");
+    }
+
+    #[test]
+    fn x_closes_and_blames_the_highlighted_row() {
+        let mut app = offline_app();
+        // Nothing listens here, so the close request cannot reach a real core.
+        app.config.controller.addr = "127.0.0.1:1".into();
+        app.main_tab = MainTab::Connections;
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('o'));
+        // Filtered and by age: row 0 is `long`, which is row 2 of the snapshot.
+        while app.selected_connection().is_none_or(|c| c.id != "long") {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.conn_index, 0);
+        assert_eq!(app.snapshot.connections[2].id, "long");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.action_busy);
+        let mut closed: Vec<_> = sample_connections();
+        closed.retain(|c| c.id == "big");
+        let gone = app
+            .conns
+            .observe(&mut closed, true, Instant::now(), conns::now_ms());
+        let cause = |host: &str| gone.iter().find(|c| c.host == host).map(|c| c.cause);
+        assert_eq!(
+            cause("ws.example.com:443"),
+            Some(Some(conns::Cause::UserClose))
+        );
+        assert_eq!(cause("api.openai.com:443"), Some(None));
+    }
+
+    #[test]
+    fn failed_connection_fetch_keeps_the_list_and_reports_no_closures() {
+        let mut app = offline_app();
+        let mut snapshot = live_snapshot(sample_connections());
+        snapshot.upload_total = 77;
+        app.accept_snapshot(snapshot);
+        let logs = app.logs.len();
+        app.accept_snapshot(CoreSnapshot {
+            running: true,
+            mode: "Rule".into(),
+            ..Default::default()
+        });
+        assert_eq!(app.snapshot.connections.len(), 3);
+        assert_eq!(app.snapshot.upload_total, 77);
+        assert_eq!(app.snapshot.mode, "Rule");
+        assert_eq!(app.conn_view.len(), 3);
+        assert!(app.conns.closed().is_empty());
+        assert_eq!(app.logs.len(), logs);
+
+        // A real empty list closes them; the long-lived and AI ones are kept.
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        assert!(app.snapshot.connections.is_empty());
+        assert_eq!(app.conns.closed().len(), 2);
+        let lines: Vec<_> = app.logs[logs..].iter().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().any(|(level, text)| level == "warning"
+            && text.starts_with("terc: closed api.openai.com:443 after 20s")));
+        assert!(lines.iter().any(|(level, text)| level == "info"
+            && text.contains("ws.example.com:443 after 1m3")
+            && text.contains("via PROXY › HK-01")));
+        // The AI session closed for no known reason: one quiet toast.
+        assert!(app
+            .status_message
+            .starts_with("AI 长连接已断开: api.openai.com"));
+        assert!(!app.status_is_error);
+
+        // A second one inside 30 s does not toast again, and a stop is attributed.
+        app.clear_status();
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        assert!(app.status_message.is_empty());
+        assert_eq!(app.conns.closed()[0].cause, None);
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        app.accept_snapshot(CoreSnapshot::default());
+        app.accept_snapshot(CoreSnapshot::default());
+        assert!(app.status_message.is_empty());
+        assert_eq!(app.conns.closed()[0].cause, Some(conns::Cause::CoreStopped));
+    }
+
+    #[test]
+    fn one_failed_poll_is_not_a_core_stop() {
+        let mut app = offline_app();
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        let logs = app.logs.len();
+        // A slow /version and `SendOnDrop`'s fallback both read as not running.
+        app.accept_snapshot(CoreSnapshot::default());
+        assert!(!app.snapshot.running);
+        assert_eq!(app.snapshot.connections.len(), 3);
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        assert!(app.conns.closed().is_empty());
+        assert_eq!(app.logs.len(), logs);
+        // The session closes once, for no known reason, and is recorded once.
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        let ws = |app: &App| {
+            app.conns
+                .closed()
+                .iter()
+                .filter(|c| c.host == "ws.example.com:443")
+                .map(|c| c.cause)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ws(&app), [None]);
+
+        // Two in a row are a stop.
+        app.accept_snapshot(live_snapshot(sample_connections()));
+        app.accept_snapshot(CoreSnapshot::default());
+        assert_eq!(app.snapshot.connections.len(), 3);
+        app.accept_snapshot(CoreSnapshot::default());
+        assert!(app.snapshot.connections.is_empty());
+        assert_eq!(ws(&app), [Some(conns::Cause::CoreStopped), None]);
+
+        // While pushes arrive the core is plainly up, whatever polls say.
+        app.tx
+            .send(BackendEvent::Connections {
+                items: sample_connections(),
+                upload_total: 1,
+                download_total: 1,
+            })
+            .unwrap();
+        app.drain_events();
+        for _ in 0..3 {
+            app.accept_snapshot(CoreSnapshot::default());
+        }
+        assert_eq!(app.snapshot.connections.len(), 3);
+        assert_eq!(ws(&app).len(), 2);
+    }
+
+    #[test]
+    fn short_ai_requests_closing_normally_stay_quiet() {
+        let mut app = offline_app();
+        let short = |id: &str, host: &str| live_conn(id, host, Some(1), 10);
+        app.accept_snapshot(live_snapshot(vec![
+            short("page", "chatgpt.com:443"),
+            short("ab", "ab.chatgpt.com:443"),
+            short("cdn", "cdn.oaistatic.com:443"),
+        ]));
+        assert!(app.snapshot.connections.iter().all(|c| c.ai));
+        let logs = app.logs.len();
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        assert!(app.conns.closed().is_empty());
+        assert_eq!(app.logs.len(), logs);
+        assert!(app.status_message.is_empty());
+    }
+
+    #[test]
+    fn closing_many_sessions_logs_one_summary_line() {
+        let mut app = offline_app();
+        let many = (0..7)
+            .map(|i| live_conn(&i.to_string(), &format!("h{i}.test:443"), Some(120), 1))
+            .collect();
+        app.accept_snapshot(live_snapshot(many));
+        let logs = app.logs.len();
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        assert_eq!(app.logs.len(), logs + 1);
+        let (level, text) = app.logs.last().unwrap();
+        assert_eq!(level, "info");
+        assert!(
+            text.starts_with("terc: 7 long-lived/AI connections closed (同时断开 7 条"),
+            "{text}"
+        );
+        assert_eq!(app.conns.closed().len(), 7);
+        assert!(app.conns.closed().iter().all(|c| c.bulk == 7));
+    }
+
+    #[test]
+    fn connections_view_shows_ai_tags_ages_and_closed_sessions() {
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            for (width, height) in [(80, 24), (100, 30), (160, 40)] {
+                let mut app = offline_app();
+                app.config.settings.lang = lang;
+                app.config.settings.show_traffic = false;
+                app.main_tab = MainTab::Connections;
+                app.accept_snapshot(live_snapshot(sample_connections()));
+                let text = render_text(&mut app, width, height);
+                let row = |needle: &str| {
+                    text.lines()
+                        .find(|line| line.contains(needle))
+                        .unwrap_or_else(|| panic!("{lang:?} {width}: {needle}\n{text}"))
+                        .to_string()
+                };
+                assert!(row("api.openai.com").contains("AIapi.openai.com"), "{text}");
+                assert!(!row("ws.example.com").contains("AIws"), "{text}");
+                assert!(row("ws.example.com").contains("1m3"), "{text}");
+                assert!(row("cdn.example.com").contains("5s"), "{text}");
+                assert!(text.contains("(3/3)"), "{lang:?} {width}\n{text}");
+                let sort = app.t("conn_sort_bytes").replace(' ', "");
+                assert!(text.contains(&sort), "{lang:?} {width}\n{text}");
+                let sel = text.lines().find(|l| l.contains("›")).unwrap();
+                assert!(sel.contains("cdn.example.com"), "{text}");
+
+                press(&mut app, KeyCode::Char('o'));
+                press(&mut app, KeyCode::Char('o'));
+                let text = render_text(&mut app, width, height);
+                let sort = app.t("conn_sort_rate").replace(' ', "");
+                assert!(text.contains(&sort), "{lang:?} {width}\n{text}");
+                if width >= 100 {
+                    assert!(text.contains("0B/s"), "{lang:?} {width}\n{text}");
+                }
+
+                app.accept_snapshot(live_snapshot(vec![live_conn(
+                    "big",
+                    "cdn.example.com:443",
+                    Some(5),
+                    9000,
+                )]));
+                app.clear_status();
+                press(&mut app, KeyCode::Char('d'));
+                assert!(app.conn_closed_view);
+                let text = render_text(&mut app, width, height);
+                assert!(text.contains("ws.example.com"), "{lang:?} {width}\n{text}");
+                assert!(
+                    !text.contains("cdn.example.com"),
+                    "{lang:?} {width}\n{text}"
+                );
+                assert!(row_has(&text, "api.openai.com", "AI"), "{text}");
+                let ago = app.t("conn_ago");
+                assert!(
+                    text.contains(&format!("0s{ago}")),
+                    "{lang:?} {width}\n{text}"
+                );
+                // The note wraps inside the right pane.
+                assert!(text.contains("Mihomo"), "{lang:?} {width}\n{text}");
+                let footer = text.lines().last().unwrap();
+                assert!(footer.starts_with("↑↓"), "{lang:?} {width}\n{text}");
+
+                press(&mut app, KeyCode::Down);
+                assert_eq!(app.closed_index, 1);
+                press(&mut app, KeyCode::Enter);
+                assert!(app.connection_detail);
+                let text = render_text(&mut app, width, height);
+                assert!(
+                    text.contains("cause"),
+                    "{lang:?} {width}
+{text}"
+                );
+                press(&mut app, KeyCode::Enter);
+                assert!(!app.connection_detail);
+                press(&mut app, KeyCode::Char('x'));
+                assert!(!app.action_busy);
+                press(&mut app, KeyCode::Char('d'));
+                assert!(!app.conn_closed_view);
+                assert_eq!(app.closed_index, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn connection_rows_fill_the_width_by_priority() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        app.config.settings.show_traffic = false;
+        app.main_tab = MainTab::Connections;
+        let mut conn = live_conn("c", "cdn.example.com:443", Some(5), 3 << 20);
+        conn.process = "Cursor Helper".into();
+        conn.rule = "DomainSuffix".into();
+        conn.inbound = "Mixed".into();
+        conn.upload = 1 << 20;
+        app.accept_snapshot(live_snapshot(vec![conn]));
+        let row = |app: &mut App, width: u16| {
+            let text = render_text(app, width, 30);
+            let line = text
+                .lines()
+                .find(|l| l.contains("cdn.example.com"))
+                .unwrap();
+            // Only the list pane, not the detail pane on the right.
+            line.split('│').nth(1).unwrap().to_string()
+        };
+        // At 80 columns the sort metric shows as one total.
+        let narrow = row(&mut app, 80);
+        assert!(narrow.contains("4.0MB"), "{narrow}");
+        assert!(!narrow.contains("CursorHelp"), "{narrow}");
+        let mid = row(&mut app, 120);
+        for part in ["CursorHelp", "DomainSuffix", "5s", "4.0MB"] {
+            assert!(mid.contains(part), "{part}: {mid}");
+        }
+        let wide = row(&mut app, 160);
+        for part in ["CursorHelp", "DomainSuffix", "↑1.0MB", "↓3.0MB", "Mixed"] {
+            assert!(wide.contains(part), "{part}: {wide}");
+        }
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('o'));
+        assert!(row(&mut app, 80).contains("0B/s"));
+    }
+
+    #[test]
+    fn narrow_closed_view_shows_the_cause_and_keeps_its_cursor() {
+        let mut app = offline_app();
+        app.config.settings.lang = Lang::En;
+        app.config.settings.show_traffic = false;
+        app.main_tab = MainTab::Connections;
+        let long = |id: &str| live_conn(id, &format!("{id}.test:443"), Some(90), 1);
+        app.accept_snapshot(live_snapshot(vec![long("a"), long("b"), long("c")]));
+        app.accept_snapshot(live_snapshot(vec![long("c")]));
+        press(&mut app, KeyCode::Char('d'));
+        let text = render_text(&mut app, 70, 24);
+        assert!(row_has(&text, "a.test", "closedbytheapp"), "{text}");
+        assert!(
+            text.contains("Enterdetail") && !text.contains("Xall"),
+            "{text}"
+        );
+        press(&mut app, KeyCode::Down);
+        let host = |app: &App| app.conns.closed()[app.closed_index].host.clone();
+        let picked = host(&app);
+        app.accept_snapshot(live_snapshot(Vec::new()));
+        assert_eq!(app.conns.closed().len(), 3);
+        assert_eq!(host(&app), picked);
+        press(&mut app, KeyCode::Enter);
+        let text = render_text(&mut app, 70, 24);
+        assert!(text.contains("Mihomo"), "{text}");
+    }
+
+    fn prefix(text: &str, chars: usize) -> String {
+        text.chars().take(chars).collect()
+    }
+
+    fn row_has(text: &str, needle: &str, other: &str) -> bool {
+        text.lines()
+            .any(|line| line.contains(needle) && line.contains(other))
+    }
+
+    #[test]
+    fn connection_detail_shows_age_rate_provider_and_ai() {
+        let mut app = offline_app();
+        app.main_tab = MainTab::Connections;
+        let mut conn = live_conn("ai", "api.openai.com:443", Some(75), 10);
+        conn.provider = "sub".into();
+        app.accept_snapshot(live_snapshot(vec![conn]));
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            press(&mut app, KeyCode::Enter);
+            let text = render_text(&mut app, 80, 30);
+            let long = app.t("conn_long_lived").replace(' ', "");
+            assert!(text.contains(&format!("({long})")), "{text}");
+            assert!(text.contains("age1m1"), "{text}");
+            assert!(text.contains("rate↑0B/s↓0B/s"), "{text}");
+            assert!(text.contains("provsub"), "{text}");
+            assert!(text.contains("aiyes"), "{text}");
+            press(&mut app, KeyCode::Esc);
+        }
+        app.screen = Screen::Help;
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            let help = app.t("help_conn_keys").replace(' ', "");
+            assert!(
+                render_text(&mut app, 160, 60).contains(&prefix(&help, 9)),
+                "{lang:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn action_done_restarts_the_poll_timer() {
+        let mut app = offline_app();
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        app.action_busy = true;
+        app.last_snapshot_poll = Instant::now() - Duration::from_secs(10);
+        app.tx
+            .send(BackendEvent::ActionDone {
+                result: Ok("done".into()),
+                modules: None,
+                profile: None,
+                snapshot_follows: true,
+            })
+            .unwrap();
+        assert!(app.drain_events());
+        assert!(!app.action_busy);
+        // The action thread's own snapshot is on its way; no second poll now.
+        app.tick(Duration::from_millis(10));
+        assert!(!app.snapshot_pending);
+        // A panicked action sends no snapshot: the overdue poll runs at once.
+        app.last_snapshot_poll = Instant::now() - Duration::from_secs(10);
+        app.run_action("", None, None, |_| panic!("action panicked"));
+        let start = Instant::now();
+        while app.action_busy && start.elapsed() < Duration::from_secs(5) {
+            app.drain_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.status_message.contains("failed unexpectedly"));
+        app.tick(Duration::from_millis(10));
+        assert!(app.snapshot_pending);
+    }
+
+    fn log(level: &str, payload: &str) -> BackendEvent {
+        BackendEvent::Log {
+            level: level.into(),
+            payload: payload.into(),
+        }
+    }
+
+    #[test]
+    fn drain_reports_only_changes_the_screen_shows() {
+        let mut app = offline_app();
+        assert!(!app.drain_events());
+        // /logs carries a line per new connection; off the Logs tab it is kept, not drawn.
+        app.tx.send(log("info", "[TCP] a --> b match x")).unwrap();
+        assert!(!app.drain_events());
+        assert_eq!(app.logs.len(), 1);
+        app.main_tab = MainTab::Logs;
+        app.tx.send(log("info", "[TCP] c --> d match x")).unwrap();
+        assert!(app.drain_events());
+        app.pause_logs();
+        app.tx.send(log("info", "[TCP] e --> f match x")).unwrap();
+        assert!(!app.drain_events());
+        // A TUN failure still reaches the screen through the toast.
+        app.main_tab = MainTab::Proxies;
+        app.tx
+            .send(log("error", "Start TUN listening error: denied"))
+            .unwrap();
+        assert!(!app.drain_events());
+        assert!(app.toast_visible());
+        app.tx
+            .send(BackendEvent::Traffic { up: 1, down: 2 })
+            .unwrap();
+        app.tx.send(log("info", "[TCP] g --> h match x")).unwrap();
+        assert!(app.drain_events());
+        assert_eq!(app.logs.len(), 5);
+    }
+
+    #[test]
+    fn graph_generation_counts_shifts_even_of_equal_samples() {
+        let mut app = offline_app();
+        let gen = app.graph_gen;
+        app.advance_graph(Duration::from_secs(1));
+        assert_eq!(app.graph_gen, gen, "no samples, no shift");
+        for round in 1..=2 {
+            app.graph_samples = (100.0, 100.0, 1);
+            app.advance_graph(Duration::from_secs(1));
+            assert_eq!(app.graph_gen, gen + round);
+        }
+        assert_eq!(app.up_history[HISTORY_LEN - 2..], [100.0, 100.0]);
+    }
+
+    #[test]
+    fn redraw_draws_input_at_once_and_caps_data_and_heartbeat() {
+        let app = offline_app();
+        let frame = Duration::from_millis(16);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut redraw = Redraw::new(t0);
+        assert!(redraw.due(t0, frame), "first frame at once");
+        redraw.drawn(&app, t0);
+        redraw.observe(&app, at(10));
+        assert!(!redraw.pending());
+        assert_eq!(redraw.wait(at(10), frame), IDLE_WAKE);
+        // Data waits for the 100 ms frame, input only for refresh_hz.
+        redraw.data = true;
+        assert!(!redraw.due(at(40), frame));
+        assert_eq!(redraw.wait(at(70), frame), Duration::from_millis(30));
+        assert!(redraw.due(at(100), frame));
+        redraw.input = true;
+        assert!(redraw.due(at(16), frame));
+        assert!(!redraw.due(at(16), Duration::from_millis(66)), "15 Hz cap");
+        redraw.drawn(&app, at(100));
+        // Nothing changed: one heartbeat a second for ages and "ago" columns.
+        redraw.observe(&app, at(1099));
+        assert!(!redraw.pending());
+        redraw.observe(&app, at(1100));
+        assert!(redraw.due(at(1100), frame));
+    }
+
+    #[test]
+    fn redraw_sees_toast_edges_and_graph_shifts() {
+        let mut app = offline_app();
+        let frame = Duration::from_millis(16);
+        let t0 = Instant::now();
+        let mut redraw = Redraw::new(t0);
+        redraw.drawn(&app, t0);
+        app.set_status("first", false);
+        redraw.observe(&app, t0);
+        assert!(redraw.pending(), "toast shown");
+        redraw.drawn(&app, t0);
+        // A new message while one is still up replaces it.
+        app.toast_started = Some(Instant::now() + Duration::from_millis(1));
+        redraw.observe(&app, t0);
+        assert!(redraw.pending(), "toast replaced");
+        redraw.drawn(&app, t0);
+        app.toast_started = Some(Instant::now() - Duration::from_secs(5));
+        redraw.observe(&app, t0);
+        assert!(redraw.pending(), "toast expired");
+        redraw.drawn(&app, t0);
+        app.graph_gen += 1;
+        redraw.observe(&app, t0);
+        assert!(redraw.pending(), "graph shifted");
+        redraw.drawn(&app, t0);
+        redraw.observe(&app, t0);
+        assert!(!redraw.due(t0 + Duration::from_millis(500), frame));
+    }
+
+    #[test]
+    fn terminal_events_mark_only_what_can_change_the_screen() {
+        let mut app = offline_app();
+        let mouse = |kind| {
+            CEvent::Mouse(MouseEvent {
+                kind,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let key = |code| CEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(handle_event(&mut app, key(KeyCode::Down)), Handled::Changed);
+        assert_eq!(
+            handle_event(&mut app, CEvent::Resize(80, 24)),
+            Handled::Changed
+        );
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        ] {
+            assert!(!mouse_acts(kind));
+            assert_eq!(handle_event(&mut app, mouse(kind)), Handled::Unchanged);
+        }
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            assert!(mouse_acts(kind));
+            assert_eq!(handle_event(&mut app, mouse(kind)), Handled::Changed);
+        }
+        assert_eq!(
+            handle_event(&mut app, CEvent::FocusGained),
+            Handled::Unchanged
+        );
+        assert_eq!(
+            handle_event(&mut app, key(KeyCode::Char('q'))),
+            Handled::Quit
+        );
+    }
+
+    #[test]
+    fn mouse_mode_asks_for_clicks_and_wheel_only() {
+        let mut out = String::new();
+        crossterm::Command::write_ansi(&ClickMouse, &mut out).unwrap();
+        // 1000 click/wheel + 1006 SGR; never 1002 (drag) or 1003 (any motion).
+        assert_eq!(out, "\x1b[?1000h\x1b[?1006h");
     }
 }

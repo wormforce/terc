@@ -581,6 +581,8 @@ pub struct ComposeReport {
     pub private_rules: usize,
     pub ai_enabled: bool,
     pub ai_group: String,
+    /// Nodes rewritten from `network: httpupgrade` to Mihomo's ws form.
+    pub normalized: Vec<String>,
 }
 
 impl ComposeReport {
@@ -607,16 +609,31 @@ impl ComposeReport {
                 self.skipped_total()
             ));
         }
+        let n = self.normalized.len();
+        if n > 0 {
+            text.push_str(&if zh {
+                format!("  {n} 个 httpupgrade 节点已改为 ws + v2ray-http-upgrade")
+            } else {
+                format!("  {n} httpupgrade node(s) rewritten to ws + v2ray-http-upgrade")
+            });
+        }
         text
     }
 
-    /// Skipped entries, one per line (names and types only, never secrets).
+    /// Skipped, then rewritten entries, one per line (names and types only,
+    /// never secrets).
     pub fn details(&self) -> String {
+        let normalized: Vec<String> = self
+            .normalized
+            .iter()
+            .map(|name| format!("httpupgrade → ws: {name}"))
+            .collect();
         let all: Vec<&String> = self
             .sub_skipped
             .iter()
             .chain(&self.manual_skipped)
             .chain(&self.rule_skipped)
+            .chain(&normalized)
             .collect();
         let mut text = String::new();
         for item in all.iter().take(60) {
@@ -644,7 +661,7 @@ fn template_base(addr: &str, secret: &str) -> String {
         "mixed-port: 7890\n\
 allow-lan: false\n\
 mode: rule\n\
-log-level: info\n\
+log-level: warning\n\
 ipv6: false\n\
 unified-delay: true\n\
 tcp-concurrent: true\n\
@@ -654,15 +671,41 @@ external-controller: {addr}\n"
     if !secret.is_empty() {
         text.push_str(&format!("secret: {}\n", json!(secret)));
     }
+    text.push_str("geodata-mode: false\n");
+    for line in geox_url_chunk().lines {
+        text.push_str(&line);
+        text.push('\n');
+    }
     text.push_str(
-        "geodata-mode: false\n\
-geox-url:\n  mmdb: \"https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb\"\n\
-profile:\n  store-selected: true\n\
+        "profile:\n  store-selected: true\n\
 sniffer:\n  enable: false\n  sniff:\n    HTTP:\n      ports: [80, 8080-8880]\n      override-destination: true\n    TLS:\n      ports: [443, 8443]\n    QUIC:\n      ports: [443, 8443]\n\
 tun:\n  enable: false\n  stack: mixed\n  auto-route: true\n  auto-detect-interface: true\n  dns-hijack: [\"any:53\"]\n\
 dns:\n  enable: true\n  ipv6: false\n  listen: 127.0.0.1:1053\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n  fake-ip-filter: [\"*.lan\", \"+.local\", \"localhost\"]\n  default-nameserver: [223.5.5.5, 119.29.29.29]\n  nameserver: [\"https://doh.pub/dns-query\", \"https://dns.alidns.com/dns-query\"]\n",
     );
     text
+}
+
+/// jsDelivr mirror of the meta-rules-dat `release` branch. Mihomo's defaults
+/// are GitHub release downloads with 90 s per file, and a failed download
+/// fails `mihomo -t`, so a first run on a slow link would not start.
+const GEOX_MIRROR: &str = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/";
+
+/// All four keys: one left out falls back to Mihomo's GitHub default.
+fn geox_url_chunk() -> YamlChunk {
+    let files = [
+        ("geoip", "geoip.dat"),
+        ("geosite", "geosite.dat"),
+        ("mmdb", "country.mmdb"),
+        ("asn", "GeoLite2-ASN.mmdb"),
+    ];
+    YamlChunk {
+        key: Some("geox-url".into()),
+        lines: std::iter::once("geox-url:".to_string())
+            .chain(files.iter().map(|(key, file)| {
+                format!("  {key}: {}", yaml_str(&format!("{GEOX_MIRROR}{file}")))
+            }))
+            .collect(),
+    }
 }
 
 fn yaml_str(s: &str) -> String {
@@ -715,6 +758,277 @@ pub(crate) fn clash_item_names(chunk: &YamlChunk) -> Vec<String> {
         }
     }
     names
+}
+
+/// Rewrite `network: httpupgrade` items of a Clash `proxies` chunk to Mihomo's
+/// `network: ws` + `ws-opts.v2ray-http-upgrade: true` (see
+/// `subconv::normalize_ws_network`), keeping all other text and comments.
+/// Handles one-line flow items and block items; an item whose `ws-opts` cannot
+/// be read stays as it is. Returns the names of the rewritten items.
+pub(crate) fn normalize_httpupgrade_items(chunk: &mut YamlChunk) -> Vec<String> {
+    let mut names = Vec::new();
+    if chunk.key.as_deref() != Some("proxies") {
+        return names;
+    }
+    let item_indent = chunk
+        .lines
+        .iter()
+        .skip(1)
+        .find(|l| l.trim_start().starts_with('-'))
+        .map(|l| leading_spaces(l));
+    let Some(item_indent) = item_indent else {
+        return names;
+    };
+    let starts: Vec<usize> = (1..chunk.lines.len())
+        .filter(|&i| {
+            leading_spaces(&chunk.lines[i]) == item_indent
+                && chunk.lines[i].trim_start().starts_with('-')
+        })
+        .collect();
+    // Back to front, so lines inserted into one item do not shift the next.
+    for (k, &start) in starts.iter().enumerate().rev() {
+        let end = starts.get(k + 1).copied().unwrap_or(chunk.lines.len());
+        let name = if chunk.lines[start].trim_start()[1..]
+            .trim_start()
+            .starts_with('{')
+        {
+            normalize_flow_item(&mut chunk.lines[start])
+        } else {
+            normalize_block_item(&mut chunk.lines, start, end)
+        };
+        names.extend(name);
+    }
+    names.reverse();
+    names
+}
+
+fn is_httpupgrade(token: &str) -> bool {
+    let t = token.trim();
+    let t = ['"', '\'']
+        .iter()
+        .find_map(|q| t.strip_prefix(*q)?.strip_suffix(*q))
+        .unwrap_or(t);
+    t.eq_ignore_ascii_case("httpupgrade")
+}
+
+/// A YAML null: `~`, `null` or nothing.
+fn is_null(token: &str) -> bool {
+    matches!(token.trim(), "" | "~" | "null" | "Null" | "NULL")
+}
+
+/// The value that sets a key whose value spans `start..end`; an empty span
+/// sits right after the colon.
+fn true_value(start: usize, end: usize) -> &'static str {
+    if start == end {
+        " true"
+    } else {
+        "true"
+    }
+}
+
+/// The edit (byte range in `map`, replacement) that makes the flow map `map`
+/// set `v2ray-http-upgrade: true`; None when `map` is no flow map.
+/// `network: httpupgrade` means HTTPUpgrade, so an explicit `false` becomes true.
+fn upgrade_flag_edit(map: &str) -> Option<(usize, usize, &'static str)> {
+    if !(map.starts_with('{') && map.ends_with('}')) {
+        return None;
+    }
+    if let Some((s, e)) = flow_key_value(map, "v2ray-http-upgrade") {
+        return Some((s, e, true_value(s, e)));
+    }
+    let empty = map[1..map.len() - 1].trim().is_empty();
+    Some((
+        1,
+        1,
+        if empty {
+            "v2ray-http-upgrade: true"
+        } else {
+            "v2ray-http-upgrade: true, "
+        },
+    ))
+}
+
+/// A one-line flow item `- {...}`; JSON-style items go through serde_json.
+fn normalize_flow_item(line: &mut String) -> Option<String> {
+    let open = line.find('{')?;
+    if let Ok(mut node) = serde_json::from_str::<Value>(&line[open..]) {
+        if !crate::subconv::normalize_ws_network(&mut node) {
+            return None;
+        }
+        *line = format!("{}{node}", &line[..open]);
+        return Some(node["name"].as_str().unwrap_or("?").to_string());
+    }
+    let close = matching_close(line, open)?;
+    let flow = &line[open..=close];
+    let (vs, ve) = flow_key_value(flow, "network")?;
+    if !is_httpupgrade(&flow[vs..ve]) {
+        return None;
+    }
+    let (at, end, text) = match flow_key_value(flow, "ws-opts") {
+        Some((os, oe)) if is_null(&flow[os..oe]) => (os, oe, "{v2ray-http-upgrade: true}"),
+        Some((os, oe)) => {
+            let (s, e, text) = upgrade_flag_edit(&flow[os..oe])?;
+            (os + s, os + e, text)
+        }
+        None => {
+            // A trailing comma is valid in a flow map; `,,` is not.
+            let body = flow[..flow.len() - 1].trim_end();
+            let text = if body.ends_with(',') {
+                " ws-opts: {v2ray-http-upgrade: true}"
+            } else {
+                ", ws-opts: {v2ray-http-upgrade: true}"
+            };
+            (body.len(), body.len(), text)
+        }
+    };
+    let name = flow_value(&flow[1..], "name").unwrap_or_else(|| "?".into());
+    // The later edit first, so the earlier offsets stay valid.
+    let mut edits = [(open + vs, open + ve, "ws"), (open + at, open + end, text)];
+    edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+    for (s, e, text) in edits {
+        line.replace_range(s..e, text);
+    }
+    Some(name)
+}
+
+/// A block item in `lines[start..end]`.
+fn normalize_block_item(lines: &mut Vec<String>, start: usize, end: usize) -> Option<String> {
+    let skip = |l: &String| l.trim().is_empty() || l.trim_start().starts_with('#');
+    let first = &lines[start];
+    let first_key = first.len() - first.trim_start()[1..].trim_start().len();
+    let inline_key = first_key < first.len() && !first[first_key..].starts_with('#');
+    let key_indent = if inline_key {
+        first_key
+    } else {
+        leading_spaces(lines[start + 1..end].iter().find(|l| !skip(l))?)
+    };
+    // (line, byte offset of the key) for each of the item's own keys.
+    let keys: Vec<(usize, usize)> = std::iter::once((start, first_key))
+        .filter(|_| inline_key)
+        .chain(
+            (start + 1..end)
+                .filter(|&i| !skip(&lines[i]) && leading_spaces(&lines[i]) == key_indent)
+                .map(|i| (i, key_indent)),
+        )
+        .collect();
+    let find = |lines: &[String], key: &str| {
+        keys.iter()
+            .find_map(|&(i, at)| Some((i, block_value(&lines[i], at, key)?)))
+    };
+    let (net, (vs, ve)) = find(lines, "network")?;
+    if !is_httpupgrade(&lines[net][vs..ve]) {
+        return None;
+    }
+    let name = find(lines, "name")
+        .map(|(i, (s, e))| clean_scalar(&lines[i][s..e]))
+        .unwrap_or_else(|| "?".into());
+    // Plan the ws-opts edit before changing anything.
+    let mut inline = None;
+    let mut insert = None;
+    match find(lines, "ws-opts") {
+        Some((i, (s, e))) if s == e => {
+            let children: Vec<usize> = (i + 1..end)
+                .take_while(|&j| skip(&lines[j]) || leading_spaces(&lines[j]) > key_indent)
+                .filter(|&j| !skip(&lines[j]))
+                .collect();
+            let indent = children
+                .first()
+                .map_or(key_indent + 2, |&j| leading_spaces(&lines[j]));
+            let flag = children.iter().find_map(|&j| {
+                let value = block_value(&lines[j], indent, "v2ray-http-upgrade")?;
+                (leading_spaces(&lines[j]) == indent).then_some((j, value))
+            });
+            match flag {
+                Some((j, (fs, fe))) => inline = Some((j, fs, fe, true_value(fs, fe))),
+                None => {
+                    let line = format!("{}v2ray-http-upgrade: true", " ".repeat(indent));
+                    insert = Some((i + 1, vec![line]));
+                }
+            }
+        }
+        Some((i, (s, e))) if is_null(&lines[i][s..e]) => {
+            inline = Some((i, s, e, "{v2ray-http-upgrade: true}"));
+        }
+        Some((i, (s, e))) => {
+            let (a, b, text) = upgrade_flag_edit(&lines[i][s..e])?;
+            inline = Some((i, s + a, s + b, text));
+        }
+        None => {
+            let pad = " ".repeat(key_indent);
+            insert = Some((
+                net + 1,
+                vec![
+                    format!("{pad}ws-opts:"),
+                    format!("{pad}  v2ray-http-upgrade: true"),
+                ],
+            ));
+        }
+    }
+    lines[net].replace_range(vs..ve, "ws");
+    if let Some((i, s, e, text)) = inline {
+        lines[i].replace_range(s..e, text);
+    }
+    if let Some((at, new)) = insert {
+        lines.splice(at..at, new);
+    }
+    Some(name)
+}
+
+/// Byte span of the value of `key:` at byte `at` of a block line, without a
+/// trailing comment. Empty for `key:` alone; a flow map spans to its `}`.
+fn block_value(line: &str, at: usize, key: &str) -> Option<(usize, usize)> {
+    let after = line[at..]
+        .strip_prefix(key)?
+        .trim_start_matches(' ')
+        .strip_prefix(':')?;
+    if !(after.is_empty() || after.starts_with([' ', '\t'])) {
+        return None;
+    }
+    let start = line.len() - after.trim_start().len();
+    let v = &line[start..];
+    let len = if v.starts_with('#') {
+        0
+    } else if v.starts_with('{') {
+        matching_close(v, 0).map_or(v.trim_end().len(), |c| c + 1)
+    } else {
+        v.find(" #").map_or(v, |e| &v[..e]).trim_end().len()
+    };
+    Some((start, start + len))
+}
+
+/// Byte span of the value of a top-level `key` in a one-line YAML flow map.
+fn flow_key_value(flow: &str, key: &str) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut at_key = false;
+    for (i, c) in flow_unquoted(flow) {
+        if depth == 1 && at_key && !c.is_whitespace() {
+            at_key = false;
+            let value = flow[i..]
+                .strip_prefix(key)
+                .map(str::trim_start)
+                .and_then(|a| a.strip_prefix(':'));
+            if let Some(value) = value {
+                let start = flow.len() - value.trim_start().len();
+                let v = &flow[start..];
+                let end = match v.chars().next()? {
+                    '{' | '[' => matching_close(flow, start)? + 1,
+                    q @ ('"' | '\'') => start + 1 + v[1..].find(q)? + 1,
+                    _ => start + v.find([',', '}']).map_or(v, |e| &v[..e]).trim_end().len(),
+                };
+                return Some((start, end));
+            }
+        }
+        match c {
+            '[' | '{' => {
+                depth += 1;
+                at_key = depth == 1;
+            }
+            ']' | '}' => depth = depth.saturating_sub(1),
+            ',' => at_key = depth == 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn flow_value(inner: &str, key: &str) -> Option<String> {
@@ -1533,6 +1847,234 @@ mod tests {
         let (yaml, _) = compose(&input(None, &nodes, &rules)).unwrap();
         fs::write(out, yaml).unwrap();
     }
+
+    fn normalized(lines: &[&str]) -> (Vec<String>, Vec<String>) {
+        let mut chunk = YamlChunk {
+            key: Some("proxies".into()),
+            lines: std::iter::once("proxies:")
+                .chain(lines.iter().copied())
+                .map(String::from)
+                .collect(),
+        };
+        let names = normalize_httpupgrade_items(&mut chunk);
+        (names, chunk.lines[1..].to_vec())
+    }
+
+    #[test]
+    fn httpupgrade_block_items_are_rewritten_in_place() {
+        let (names, out) = normalized(&[
+            "  - name: Nested",
+            "    type: vless",
+            "    network: httpupgrade  # from a converter",
+            "    ws-opts:",
+            "      path: /up",
+            "      headers:",
+            "        Host: u.example",
+            "  # a comment between items",
+            "  - name: Bare",
+            "    type: trojan",
+            "    network: \"HTTPUpgrade\"",
+            "    sni: b.example",
+            "  - name: Inline",
+            "    network: 'httpupgrade'",
+            "    ws-opts: {path: /x}",
+            "  - name: Set",
+            "    network: httpupgrade",
+            "    ws-opts:",
+            "      path: /s",
+            "      v2ray-http-upgrade: true",
+            "  - network: httpupgrade",
+            "    name: First",
+            "  - name: Plain",
+            "    network: ws",
+            "    ws-opts:",
+            "      path: /ws",
+            "  - name: Null",
+            "    network: httpupgrade",
+            "    ws-opts: ~",
+            "  - name: Off",
+            "    network: httpupgrade",
+            "    ws-opts:",
+            "      v2ray-http-upgrade: false  # converter default",
+            "  - name: Odd",
+            "    network: httpupgrade",
+            "    ws-opts: [1]",
+        ]);
+        assert_eq!(
+            names,
+            ["Nested", "Bare", "Inline", "Set", "First", "Null", "Off"]
+        );
+        assert_eq!(
+            out,
+            [
+                "  - name: Nested",
+                "    type: vless",
+                "    network: ws  # from a converter",
+                "    ws-opts:",
+                "      v2ray-http-upgrade: true",
+                "      path: /up",
+                "      headers:",
+                "        Host: u.example",
+                "  # a comment between items",
+                "  - name: Bare",
+                "    type: trojan",
+                "    network: ws",
+                "    ws-opts:",
+                "      v2ray-http-upgrade: true",
+                "    sni: b.example",
+                "  - name: Inline",
+                "    network: ws",
+                "    ws-opts: {v2ray-http-upgrade: true, path: /x}",
+                "  - name: Set",
+                "    network: ws",
+                "    ws-opts:",
+                "      path: /s",
+                "      v2ray-http-upgrade: true",
+                "  - network: ws",
+                "    ws-opts:",
+                "      v2ray-http-upgrade: true",
+                "    name: First",
+                "  - name: Plain",
+                "    network: ws",
+                "    ws-opts:",
+                "      path: /ws",
+                // A null ws-opts becomes the flag, as in `normalize_ws_network`.
+                "  - name: Null",
+                "    network: ws",
+                "    ws-opts: {v2ray-http-upgrade: true}",
+                // `network: httpupgrade` wins over an explicit false.
+                "  - name: Off",
+                "    network: ws",
+                "    ws-opts:",
+                "      v2ray-http-upgrade: true  # converter default",
+                // ws-opts it cannot read: left alone rather than half rewritten.
+                "  - name: Odd",
+                "    network: httpupgrade",
+                "    ws-opts: [1]",
+            ]
+        );
+        // Other chunks are never touched.
+        let mut other = YamlChunk {
+            key: Some("x-templates".into()),
+            lines: vec![
+                "x-templates:".into(),
+                "  - {name: T, network: httpupgrade}".into(),
+            ],
+        };
+        let before = other.clone();
+        assert!(normalize_httpupgrade_items(&mut other).is_empty());
+        assert_eq!(other, before);
+    }
+
+    #[test]
+    fn httpupgrade_flow_items_are_rewritten_in_place() {
+        let (names, out) = normalized(&[
+            "  - {name: F1, type: vmess, network: httpupgrade, ws-opts: {path: /f}}",
+            "  - {name: F2, type: vmess, network: \"httpupgrade\" }  # kept",
+            "  - {name: F3, network: HttpUpgrade, ws-opts: {}}",
+            "  - {name: F4, network: httpupgrade, ws-opts: {v2ray-http-upgrade: true, path: /p}}",
+            "  - {name: F5, network: ws, ws-opts: {path: /w}}",
+            "  - {name: 'a, network: httpupgrade', network: grpc}",
+            "  - {name: N, ws-opts: {headers: {network: httpupgrade}}, network: tcp}",
+            r#"  - {"name":"J","type":"vless","network":"httpupgrade","ws-opts":{"path":"/j"}}"#,
+            "  - {name: T, network: httpupgrade, }",
+            "  - {name: U, network: httpupgrade, ws-opts: null}",
+            "  - {name: V, network: httpupgrade, ws-opts: {v2ray-http-upgrade: false}}",
+        ]);
+        assert_eq!(names, ["F1", "F2", "F3", "F4", "J", "T", "U", "V"]);
+        assert_eq!(
+            out[8..],
+            [
+                // A trailing comma stays valid YAML (no `,,`).
+                "  - {name: T, network: ws, ws-opts: {v2ray-http-upgrade: true} }",
+                "  - {name: U, network: ws, ws-opts: {v2ray-http-upgrade: true}}",
+                "  - {name: V, network: ws, ws-opts: {v2ray-http-upgrade: true}}",
+            ]
+        );
+        assert_eq!(
+            out[..7],
+            [
+                "  - {name: F1, type: vmess, network: ws, ws-opts: {v2ray-http-upgrade: true, path: /f}}",
+                "  - {name: F2, type: vmess, network: ws, ws-opts: {v2ray-http-upgrade: true} }  # kept",
+                "  - {name: F3, network: ws, ws-opts: {v2ray-http-upgrade: true}}",
+                "  - {name: F4, network: ws, ws-opts: {v2ray-http-upgrade: true, path: /p}}",
+                "  - {name: F5, network: ws, ws-opts: {path: /w}}",
+                "  - {name: 'a, network: httpupgrade', network: grpc}",
+                "  - {name: N, ws-opts: {headers: {network: httpupgrade}}, network: tcp}",
+            ]
+        );
+        assert!(out[7].starts_with("  - {"));
+        let json: Value = serde_json::from_str(&out[7][4..]).unwrap();
+        assert_eq!(json["network"], "ws");
+        assert_eq!(
+            json["ws-opts"],
+            json!({"path": "/j", "v2ray-http-upgrade": true})
+        );
+    }
+
+    #[test]
+    fn compose_rewrites_httpupgrade_proxies_and_names_them() {
+        let doc = "proxies:\r\n  - name: Up\r\n    type: vless\r\n    server: 192.0.2.4\r\n    port: 443\r\n    uuid: 12345678-1234-1234-1234-123456789abc\r\n    network: httpupgrade\r\n  # network: httpupgrade in a comment\r\n  - {name: Ws, type: vless, server: 192.0.2.5, port: 443, uuid: 12345678-1234-1234-1234-123456789abc, network: ws}\r\nx-templates:\r\n  - name: Tpl\r\n    network: httpupgrade\r\nproxy-groups:\r\n  - {name: G, type: select, proxies: [Up, Ws]}\r\nrules:\r\n  - MATCH,G\r\n";
+        let sub = convert_subscription(doc).unwrap();
+        // A node saved before normalisation existed, loaded as is.
+        let nodes = vec![ManualNode {
+            line: String::new(),
+            parsed: Ok(
+                json!({"name": "Own", "type": "trojan", "server": "192.0.2.6",
+                "port": 443, "password": "fake", "network": "httpupgrade"}),
+            ),
+        }];
+        let rules = PrivateRules::default();
+        let (yaml, report) = compose_profile(&input(Some(&sub), &nodes, &rules)).unwrap();
+        assert_eq!(report.normalized, ["Up", "Own"]);
+        assert!(
+            yaml.contains("    network: ws\n    ws-opts:\n      v2ray-http-upgrade: true\n  # network: httpupgrade in a comment\n"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("network: ws}"));
+        assert!(yaml.contains("x-templates:\n  - name: Tpl\n    network: httpupgrade\n"));
+        let own = yaml.lines().find(|l| l.contains("\"Own\"")).unwrap();
+        let own: Value = serde_json::from_str(own.trim_start()[1..].trim()).unwrap();
+        assert_eq!(own["network"], "ws");
+        assert_eq!(own["ws-opts"]["v2ray-http-upgrade"], true);
+        // The raw source is not rewritten.
+        assert!(sub
+            .clash_doc
+            .as_deref()
+            .unwrap()
+            .contains("    network: httpupgrade\r\n"));
+        assert!(report
+            .summary(true)
+            .ends_with("  2 个 httpupgrade 节点已改为 ws + v2ray-http-upgrade"));
+        assert!(report
+            .summary(false)
+            .ends_with("  2 httpupgrade node(s) rewritten to ws + v2ray-http-upgrade"));
+        assert_eq!(
+            report.details(),
+            "\n  - httpupgrade → ws: Up\n  - httpupgrade → ws: Own"
+        );
+        // Node-list subscriptions are normalised too.
+        let list = Converted {
+            format: Some(SubFormat::UriList),
+            proxies: vec![json!({"name": "L", "type": "vless", "server": "192.0.2.7",
+                "port": 443, "uuid": "12345678-1234-1234-1234-123456789abc",
+                "network": "httpupgrade"})],
+            ..Converted::default()
+        };
+        let (yaml, report) = compose_profile(&input(Some(&list), &[], &rules)).unwrap();
+        assert_eq!(report.normalized, ["L"]);
+        assert!(!yaml.contains("httpupgrade\""), "{yaml}");
+        assert!(yaml.contains("\"v2ray-http-upgrade\":true"));
+        assert!(compose_profile(&input(
+            None,
+            &manual(&["P = ss, 192.0.2.8, 8388, encrypt-method=aes-128-gcm, password=fake"]),
+            &rules
+        ))
+        .unwrap()
+        .1
+        .normalized
+        .is_empty());
+    }
 }
 
 /// Preserve the source's routing policy. Node-only sources get one simple selector.
@@ -1552,6 +2094,15 @@ pub fn compose_profile_reserving(
         Some(doc) => split_chunks(doc),
         None => split_chunks(&template_base(input.controller_addr, input.secret)),
     };
+    // Only the generated config is rewritten; the raw subscription cache is not.
+    if input.subscription.is_some_and(|s| s.clash_doc.is_some()) {
+        if let Some(c) = chunks
+            .iter_mut()
+            .find(|c| c.key.as_deref() == Some("proxies"))
+        {
+            report.normalized = normalize_httpupgrade_items(c);
+        }
+    }
     // Source sub-rules stay: its SUB-RULE rules reference them.
     let mut names = HashSet::new();
     if let Some(c) = chunks.iter().find(|c| c.key.as_deref() == Some("proxies")) {
@@ -1566,7 +2117,12 @@ pub fn compose_profile_reserving(
                 if let Some(name) = node["name"].as_str() {
                     names.insert(name.to_string());
                 }
-                new_nodes.push(node.clone());
+                let mut node = node.clone();
+                if crate::subconv::normalize_ws_network(&mut node) {
+                    let name = node["name"].as_str().unwrap_or("?");
+                    report.normalized.push(name.to_string());
+                }
+                new_nodes.push(node);
             }
             if !sub.groups.is_empty() {
                 chunks.push(YamlChunk {
@@ -1624,6 +2180,9 @@ pub fn compose_profile_reserving(
                 names.insert(name.clone());
                 manual_names.push(name.clone());
                 node["name"] = json!(name);
+                if crate::subconv::normalize_ws_network(&mut node) {
+                    report.normalized.push(name);
+                }
                 new_nodes.push(node);
             }
             Err(reason) => report.manual_skipped.push(reason.clone()),
@@ -1697,6 +2256,14 @@ pub fn compose_profile_reserving(
                 format!("  - {}", yaml_str(&format!("MATCH,{fallback}"))),
             ],
         });
+    }
+    // A source's own geox-url, even a partial one, is left as it is.
+    if !chunks.iter().any(|c| c.key.as_deref() == Some("geox-url")) {
+        let pos = chunks
+            .iter()
+            .position(|c| c.key.as_deref() == Some("proxies"))
+            .unwrap_or(chunks.len());
+        chunks.insert(pos, geox_url_chunk());
     }
     let body = crate::mihomo::normalize_subscription(&join_chunks(&chunks), input.controller_addr);
     let body = crate::ops::set_top_scalar(&body, "secret", &json!(input.secret).to_string());
@@ -2034,6 +2601,52 @@ mod profile_tests {
         );
         let yaml = build(Some(&convert_subscription(&flow).unwrap()), &manual());
         assert!(yaml.contains("proxies: [HK, \"Own\"]"));
+    }
+
+    #[test]
+    fn geodata_mirror_fills_only_an_absent_geox_url() {
+        let geox = |yaml: &str| {
+            split_chunks(yaml)
+                .into_iter()
+                .filter(|c| c.key.as_deref() == Some("geox-url"))
+                .map(|c| c.lines.join("\n"))
+                .collect::<Vec<_>>()
+        };
+        let mirror = |file: &str| format!("\"{GEOX_MIRROR}{file}\"");
+        let clash = build(Some(&convert_subscription(CLASH).unwrap()), &manual());
+        let found = geox(&clash);
+        assert_eq!(found.len(), 1, "{clash}");
+        for (key, file) in [
+            ("geoip", "geoip.dat"),
+            ("geosite", "geosite.dat"),
+            ("mmdb", "country.mmdb"),
+            ("asn", "GeoLite2-ASN.mmdb"),
+        ] {
+            assert!(
+                found[0].contains(&format!("  {key}: {}", mirror(file))),
+                "{clash}"
+            );
+        }
+        // Placed ahead of the node list, and recomposing keeps one copy.
+        assert!(clash.find("geox-url:").unwrap() < clash.find("proxies:").unwrap());
+        let again = build(Some(&convert_subscription(&clash).unwrap()), &manual());
+        assert_eq!(geox(&again), found);
+        // A source's own geox-url, even with one key, is left alone.
+        let own = format!("geox-url:\n  geosite: \"https://example.org/gs.dat\"\n{CLASH}");
+        let kept = build(Some(&convert_subscription(&own).unwrap()), &manual());
+        assert_eq!(
+            geox(&kept),
+            vec!["geox-url:\n  geosite: \"https://example.org/gs.dat\"".to_string()]
+        );
+        assert!(!kept.contains(GEOX_MIRROR));
+        // The template carries all four keys and a quiet core log.
+        let template = build(None, &manual());
+        assert_eq!(geox(&template), found);
+        assert!(template.contains("\nlog-level: warning\n"));
+        let source_level = format!("log-level: debug\n{CLASH}");
+        let source_level = build(Some(&convert_subscription(&source_level).unwrap()), &[]);
+        assert!(source_level.contains("log-level: debug\n"));
+        assert!(!source_level.contains("log-level: warning"));
     }
 
     #[test]

@@ -87,7 +87,7 @@ macOS 按 <kbd>T</kbd> 开启 TUN 时，terc 会弹出系统管理员授权窗�
 
 | 视图 | 内容 |
 | --- | --- |
-| **活跃连接** | 进程、入站、嗅探域名、规则载荷、链路、Geo/ASN，可单条或全部断开 |
+| **活跃连接** | 进程、入站、嗅探域名、规则载荷、链路、Geo/ASN；时长、单连接速率、AI 标记，最近断开的长连接/AI 连接及推断原因；可单条或全部断开，会断线的操作先确认 |
 | **DNS** | 从配置读出的解析状态、即时查询，以及 DNS / Fake-IP 缓存清空 |
 | **规则** | 顺序列表、实时命中次数、本机解释，以及运行时禁用 |
 | **远程资源（设置 → 排查）** | `proxy-providers` 与 `rule-providers`，不是机场订阅链接。可单条或全部刷新，代理源可做健康检查 |
@@ -138,6 +138,7 @@ macOS 按 <kbd>T</kbd> 开启 TUN 时，terc 会弹出系统管理员授权窗�
 | DNS | Enter / F / [ ] | 查询、清空 DNS 与 Fake-IP、切换记录类型 |
 | Provider | Enter / F / H | 刷新当前项、刷新全部，或对代理源做健康检查 |
 | 连接监控 | x / X | 断开当前选中连接 / 一键断开全部活跃连接 |
+| 连接监控 | o / f / d | 按流量、时长、速率排序 / 只看长连接和 AI 连接 / 最近断开 |
 
 </details>
 
@@ -153,7 +154,7 @@ macOS 按 <kbd>T</kbd> 开启 TUN 时，terc 会弹出系统管理员授权窗�
 | --- | --- |
 | **内核与代理** | 启停 `mihomo`、切换系统代理、切换分流模式、按本机下载 `mihomo-darwin-arm64`、`darwin-amd64`、`linux-arm64` 或 `linux-amd64` 到 `~/.config/terc/core/mihomo` |
 | **片段** | 内置 YAML 叠加，以及 `~/.config/terc/modules` 里的文件。开启时递归合并映射，关闭时还原原配置；应用前由内核验证 |
-| **视觉与主题** | 色彩主题（`Spring` / `Vintage` / `Mono`）、速率图样式（`Braille` / `Blocks`）、界面刷新率（`15` / `30` / `60` / `120 Hz`）、图表更新间隔（`1000–86400000 ms`，方向键每次调 `100 ms`，Enter 可直接输入；取期间平均速率，改变间隔会清空旧图）、界面语言 |
+| **视觉与主题** | 色彩主题（`Spring` / `Vintage` / `Mono`）、速率图样式（`Braille` / `Blocks`）、界面刷新率（`15` / `30` / `60` / `120 Hz`，重绘上限，画面不变时不重绘）、图表更新间隔（`1000–86400000 ms`，方向键每次调 `100 ms`，Enter 可直接输入；取期间平均速率，改变间隔会清空旧图）、界面语言 |
 | **代理订阅与分流方案** | 节点来源与规则策略独立管理，订阅记住分流选择，方案可复用；校验后应用。自有规则与 AI 预设编辑暂缓 |
 | **常用代理设置** | 混合 / HTTP / SOCKS 端口、局域网访问、TUN、DNS、IPv6、测速地址和超时；诊断工具集中在设置的排查分类 |
 
@@ -161,7 +162,7 @@ macOS 按 <kbd>T</kbd> 开启 TUN 时，terc 会弹出系统管理员授权窗�
 
 ## 工作原理
 
-`terc` 不用异步 HTTP 运行时，而是用标准库 `std::net::TcpStream` 连接本机 `127.0.0.1:9090`。后台线程读取 `/traffic`、`/memory` 和 `/logs`。开关走 `PATCH /configs`（`tun.enable`、`sniffing`、`ipv6`）。DNS 查询是 `GET /dns/query`，清空是 `POST /cache/dns/flush` 与 `POST /cache/fakeip/flush`，Provider 刷新是 `PUT /providers/...`。远端订阅和内核包通过系统 `curl` 下载。
+`terc` 不用异步 HTTP 运行时，而是用标准库 `std::net::TcpStream` 连接本机 `127.0.0.1:9090`。后台线程读取 `/traffic`、`/memory` 和 `/logs`；`/connections` 走 WebSocket 推送（`src/ws.rs`，只用标准库），不可用时回退到轮询。开关走 `PATCH /configs`（`tun.enable`、`sniffing`、`ipv6`）。DNS 查询是 `GET /dns/query`，清空是 `POST /cache/dns/flush` 与 `POST /cache/fakeip/flush`，Provider 刷新是 `PUT /providers/...`。远端订阅和内核包通过系统 `curl` 下载。
 
 ```mermaid
 flowchart LR
