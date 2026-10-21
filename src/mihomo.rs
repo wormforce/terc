@@ -115,6 +115,71 @@ pub struct CoreSnapshot {
     pub dns: DnsStatus,
     pub rules: Vec<RuleInfo>,
     pub providers: Vec<ProviderInfo>,
+    /// The optional endpoints this snapshot read; see `carry_skipped`.
+    pub fetched: Fetch,
+}
+
+/// The optional endpoints a snapshot poll reads. `/version` (the liveness
+/// probe), `/configs` and `/proxies` are read every time; the default reads
+/// everything, as every snapshot after an action does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fetch {
+    /// `/connections`; the WebSocket push supplies it while live.
+    pub connections: bool,
+    /// `/rules`, which only the Rules tab shows.
+    pub rules: bool,
+    /// `/providers/proxies` and `/providers/rules`: the Providers tab, plus
+    /// provider nodes and their delays, which `/proxies` omits since v1.19.28.
+    pub providers: bool,
+    /// Reuse the system proxy and core binary lookups for up to `HOST_TTL`
+    /// instead of looking again; see `host_state`.
+    pub cached_host: bool,
+}
+
+impl Default for Fetch {
+    fn default() -> Self {
+        Self {
+            connections: true,
+            rules: true,
+            providers: true,
+            cached_host: false,
+        }
+    }
+}
+
+impl CoreSnapshot {
+    /// Take what this poll skipped from `old`, the snapshot it replaces:
+    /// rules, providers, and the provider nodes with their delays (`old` is
+    /// left without them). Connections are the caller's business.
+    pub fn carry_skipped(&mut self, old: &mut CoreSnapshot) {
+        if !self.running || !old.running {
+            return;
+        }
+        if !self.fetched.rules {
+            self.rules = std::mem::take(&mut old.rules);
+        }
+        if !self.fetched.providers {
+            self.providers = std::mem::take(&mut old.providers);
+            use std::collections::hash_map::Entry;
+            for (name, node) in old.nodes.drain() {
+                if node.provider.is_none() {
+                    continue;
+                }
+                match self.nodes.entry(name) {
+                    // Older cores still list provider nodes in /proxies.
+                    Entry::Occupied(mut fresh) => {
+                        let fresh = fresh.get_mut();
+                        if fresh.provider.is_none() {
+                            fresh.provider = node.provider;
+                        }
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(node);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -283,11 +348,11 @@ pub fn http_request(
 
     // Keep the body as bytes until the chunk framing is gone: a chunk boundary
     // may split a multibyte character, and lossy-decoding first shifts offsets.
-    let (head, rest) = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
-        Some(pos) => (&raw[..pos], &raw[pos + 4..]),
-        None => (&raw[..], &[][..]),
+    let (head_end, body_start) = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(pos) => (pos, pos + 4),
+        None => (raw.len(), raw.len()),
     };
-    let headers = String::from_utf8_lossy(head);
+    let headers = String::from_utf8_lossy(&raw[..head_end]);
     let status = headers
         .lines()
         .next()
@@ -295,21 +360,28 @@ pub fn http_request(
         .and_then(|code| code.parse::<u16>().ok())
         // A dropped connection is not an answer from the controller.
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no HTTP response"))?;
-
-    let body = if headers.lines().any(|l| {
+    let chunked = headers.lines().any(|l| {
         l.to_ascii_lowercase()
             .contains("transfer-encoding: chunked")
-    }) {
-        decode_chunked(rest)
-    } else {
-        rest.to_vec()
-    };
+    });
+    drop(headers);
 
-    Ok((status, String::from_utf8_lossy(&body).into_owned()))
+    // A plain body moves to the front of `raw` instead of into a new buffer.
+    let body = if chunked {
+        decode_chunked(&raw[body_start..])
+    } else {
+        raw.drain(..body_start);
+        raw
+    };
+    // Valid UTF-8, the normal case, becomes the String without a copy.
+    let text = String::from_utf8(body)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
+    Ok((status, text))
 }
 
 fn decode_chunked(mut input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    // The framing only adds bytes, so the input length bounds the output.
+    let mut out = Vec::with_capacity(input.len());
     while let Some(line_end) = input.windows(2).position(|w| w == b"\r\n") {
         let len_line = String::from_utf8_lossy(&input[..line_end]);
         let Ok(chunk_len) = usize::from_str_radix(len_line.trim(), 16) else {
@@ -653,11 +725,7 @@ fn stream_session(
         match client.read_message() {
             Ok(Message::Text(text)) => {
                 idle = 0;
-                let snapshot = serde_json::from_str::<Value>(&text).ok().filter(|v| {
-                    v.get("connections")
-                        .is_some_and(|c| c.is_null() || c.is_array())
-                });
-                let Some(v) = snapshot else {
+                let Some((items, upload_total, download_total)) = parse_connections(&text) else {
                     garbled += 1;
                     if garbled >= 3 {
                         return ended("3 unreadable snapshots in a row".into(), delivered);
@@ -665,7 +733,6 @@ fn stream_session(
                     continue;
                 };
                 garbled = 0;
-                let (items, upload_total, download_total) = connections_from_snapshot_json(&v);
                 let event = BackendEvent::Connections {
                     items,
                     upload_total,
@@ -722,52 +789,188 @@ fn stream_session(
 }
 
 /// A `/connections` body, polled or pushed: items sorted by total bytes, then
-/// the upload and download totals. `connections: null` means none.
-pub fn connections_from_snapshot_json(v: &Value) -> (Vec<ConnectionItem>, u64, u64) {
-    let upload_total = v.get("uploadTotal").and_then(Value::as_u64).unwrap_or(0);
-    let download_total = v.get("downloadTotal").and_then(Value::as_u64).unwrap_or(0);
-    let mut connections = Vec::new();
-    for c in v
-        .get("connections")
-        .and_then(Value::as_array)
+/// the upload and download totals. `connections: null` means none; a body
+/// without the key is not a snapshot and gives `None`.
+pub fn parse_connections(text: &str) -> Option<(Vec<ConnectionItem>, u64, u64)> {
+    let snap: conn_json::Snap = serde_json::from_str(text).ok()?;
+    let mut connections: Vec<ConnectionItem> = snap
+        .connections
         .into_iter()
-        .flatten()
-    {
-        // Id, rule, byte counters and the rest come from connection_from_value.
-        let Some(mut item) = connection_from_value(c) else {
-            continue;
-        };
-        let meta = c.get("metadata");
-        let field = |key: &str| {
-            meta.and_then(|m| m.get(key))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-        };
-        let host = match field("host") {
-            "" => field("destinationIP"),
-            host => host,
-        };
-        item.host = format!("{host}:{}", field("destinationPort"));
-        item.network = meta
-            .and_then(|m| m.get("network"))
-            .and_then(Value::as_str)
-            .unwrap_or("tcp")
-            .to_uppercase();
-        item.chains = c
-            .get("chains")
-            .and_then(Value::as_array)
-            .map(|ch| {
-                ch.iter()
-                    .rev()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" › ")
-            })
-            .unwrap_or_default();
-        connections.push(item);
-    }
+        .map(conn_json::Conn::into_item)
+        .collect();
     connections.sort_by_key(|c| std::cmp::Reverse(c.download + c.upload));
-    (connections, upload_total, download_total)
+    Some((connections, snap.upload_total, snap.download_total))
+}
+
+/// Typed `/connections` JSON. Only the fields `ConnectionItem` shows are
+/// declared; serde skips the rest without building a tree, and each string
+/// moves into the item. Fields read as leniently as the old `Value` lookups
+/// did: null, a missing key or an odd type gives the default.
+mod conn_json {
+    use super::ConnectionItem;
+    use serde::{Deserialize, Deserializer};
+    use serde_json::Value;
+
+    fn text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::String(s) => s,
+            _ => String::new(),
+        })
+    }
+
+    fn opt_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::String(s) => Some(s),
+            _ => None,
+        })
+    }
+
+    fn count<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        Ok(Value::deserialize(d)?.as_u64().unwrap_or(0))
+    }
+
+    /// String array entries; anything else is skipped.
+    fn texts<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::Array(items) => items
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+    }
+
+    fn nul<'de, D, T>(d: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Default + Deserialize<'de>,
+    {
+        Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Snap {
+        #[serde(rename = "uploadTotal", default, deserialize_with = "count")]
+        pub upload_total: u64,
+        #[serde(rename = "downloadTotal", default, deserialize_with = "count")]
+        pub download_total: u64,
+        // No `default`: the key must be present, as Mihomo always writes it.
+        #[serde(deserialize_with = "nul")]
+        pub connections: Vec<Conn>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    pub(super) struct Conn {
+        #[serde(deserialize_with = "text")]
+        id: String,
+        #[serde(deserialize_with = "nul")]
+        metadata: Meta,
+        #[serde(deserialize_with = "count")]
+        upload: u64,
+        #[serde(deserialize_with = "count")]
+        download: u64,
+        #[serde(deserialize_with = "text")]
+        start: String,
+        #[serde(deserialize_with = "texts")]
+        chains: Vec<String>,
+        #[serde(rename = "providerChains", deserialize_with = "texts")]
+        provider_chains: Vec<String>,
+        #[serde(deserialize_with = "text")]
+        rule: String,
+        #[serde(rename = "rulePayload", deserialize_with = "text")]
+        rule_payload: String,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Meta {
+        #[serde(deserialize_with = "opt_text")]
+        network: Option<String>,
+        #[serde(rename = "type", deserialize_with = "text")]
+        inbound: String,
+        #[serde(rename = "inboundName", deserialize_with = "text")]
+        inbound_name: String,
+        #[serde(rename = "sourceIP", deserialize_with = "text")]
+        source_ip: String,
+        #[serde(rename = "sourcePort", deserialize_with = "text")]
+        source_port: String,
+        #[serde(rename = "destinationIP", deserialize_with = "text")]
+        destination_ip: String,
+        #[serde(rename = "destinationPort", deserialize_with = "text")]
+        destination_port: String,
+        #[serde(deserialize_with = "text")]
+        host: String,
+        #[serde(rename = "sniffHost", deserialize_with = "text")]
+        sniff_host: String,
+        #[serde(rename = "dnsMode", deserialize_with = "text")]
+        dns_mode: String,
+        #[serde(deserialize_with = "text")]
+        process: String,
+        #[serde(rename = "processPath", deserialize_with = "text")]
+        process_path: String,
+        #[serde(rename = "destinationGeoIP", deserialize_with = "texts")]
+        destination_geo_ip: Vec<String>,
+        #[serde(rename = "destinationIPASN", deserialize_with = "text")]
+        destination_ip_asn: String,
+    }
+
+    impl Conn {
+        pub(super) fn into_item(self) -> ConnectionItem {
+            let m = self.metadata;
+            let host = if m.host.is_empty() {
+                &m.destination_ip
+            } else {
+                &m.host
+            };
+            let source = if m.source_ip.is_empty() {
+                String::new()
+            } else {
+                format!("{}:{}", m.source_ip, m.source_port)
+            };
+            let provider: Vec<&str> = self
+                .provider_chains
+                .iter()
+                .rev()
+                .map(String::as_str)
+                .filter(|name| !name.is_empty())
+                .collect();
+            ConnectionItem {
+                host: format!("{host}:{}", m.destination_port),
+                network: m.network.as_deref().unwrap_or("tcp").to_uppercase(),
+                chains: self
+                    .chains
+                    .iter()
+                    .rev()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" › "),
+                upload: self.upload,
+                download: self.download,
+                process: m.process,
+                process_path: m.process_path,
+                inbound: m.inbound,
+                inbound_name: m.inbound_name,
+                source,
+                sniff_host: m.sniff_host,
+                start_ms: crate::conns::parse_rfc3339_ms(&self.start),
+                start: self.start,
+                provider: provider.join(" › "),
+                dns_mode: m.dns_mode,
+                dest_geo: m.destination_geo_ip.join(","),
+                dest_asn: m.destination_ip_asn,
+                id: self.id,
+                rule: self.rule,
+                rule_payload: self.rule_payload,
+                up_rate: 0,
+                down_rate: 0,
+                ai: false,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1171,8 +1374,7 @@ mod stream_tests {
     #[test]
     fn snapshot_parser_matches_the_polled_list() {
         // The shape Mihomo 88dcbf7 writes: ports as strings, chains leaf first.
-        let v: Value = serde_json::from_str(
-            r#"{"downloadTotal":5000,"uploadTotal":700,"memory":1,"connections":[
+        let text = r#"{"downloadTotal":5000,"uploadTotal":700,"memory":1,"connections":[
               {"id":"small","metadata":{"network":"udp","type":"Tun","sourceIP":"198.18.0.1",
                "destinationIP":"1.1.1.1","sourcePort":"53000","destinationPort":"53","host":"",
                "dnsMode":"normal","process":"mDNSResponder"},
@@ -1186,10 +1388,8 @@ mod stream_tests {
                "rule":"DomainSuffix","rulePayload":"openai.com"},
               {"id":"bare","metadata":{"destinationIP":"203.0.113.7","destinationPort":"8443"},
                "upload":10,"download":10}
-            ]}"#,
-        )
-        .unwrap();
-        let (items, up, down) = connections_from_snapshot_json(&v);
+            ]}"#;
+        let (items, up, down) = parse_connections(text).unwrap();
         assert_eq!((up, down), (700, 5000));
         fn row(c: &ConnectionItem) -> (&str, &str, &str, &str, &str, u64, u64) {
             (
@@ -1224,9 +1424,341 @@ mod stream_tests {
         assert!(items[0].start_ms.is_some());
         assert!(items[2].start_ms.is_some());
 
-        let empty = json!({"downloadTotal": 1, "uploadTotal": 2, "connections": null});
-        assert_eq!(connections_from_snapshot_json(&empty).0.len(), 0);
-        assert_eq!(connections_from_snapshot_json(&empty).1, 2);
+        let empty = r#"{"downloadTotal": 1, "uploadTotal": 2, "connections": null}"#;
+        let (items, up, down) = parse_connections(empty).unwrap();
+        assert!(items.is_empty());
+        assert_eq!((up, down), (2, 1));
+    }
+
+    #[test]
+    fn snapshot_parser_reads_nulls_and_odd_types_as_defaults() {
+        let text = r#"{"uploadTotal":null,"downloadTotal":-1,"connections":[
+            {"id":"n","metadata":{"network":null,"type":"Tun","host":null,
+             "destinationIP":"198.51.100.4","destinationPort":"80","sourceIP":"",
+             "destinationGeoIP":null,"destinationIPASN":null,"process":7},
+             "upload":1.5,"download":null,"chains":null,"providerChains":null,
+             "rule":null,"rulePayload":null,"start":null},
+            {"id":"m","metadata":null,"chains":["A",null,"B"],"providerChains":"x",
+             "destinationGeoIP":["CN"],"upload":3,"download":4,"extra":{"deep":[1,2]}}
+        ]}"#;
+        let (items, up, down) = parse_connections(text).unwrap();
+        assert_eq!((up, down), (0, 0));
+        let m = &items[0];
+        assert_eq!((m.id.as_str(), m.host.as_str()), ("m", ":"));
+        assert_eq!((m.network.as_str(), m.chains.as_str()), ("TCP", "B › A"));
+        assert_eq!((m.upload, m.download, m.provider.as_str()), (3, 4, ""));
+        let n = &items[1];
+        assert_eq!(n.host, "198.51.100.4:80");
+        assert_eq!((n.network.as_str(), n.inbound.as_str()), ("TCP", "Tun"));
+        assert_eq!((n.upload, n.download), (0, 0));
+        assert_eq!((n.chains.as_str(), n.provider.as_str()), ("", ""));
+        assert_eq!((n.dest_geo.as_str(), n.dest_asn.as_str()), ("", ""));
+        assert_eq!((n.process.as_str(), n.source.as_str()), ("", ""));
+        assert_eq!((n.rule.as_str(), n.start.as_str()), ("", ""));
+        assert_eq!(n.start_ms, None);
+    }
+
+    #[test]
+    fn snapshot_parser_rejects_bodies_without_a_connection_list() {
+        for text in [
+            "",
+            "not json",
+            "{}",
+            r#"{"uploadTotal":1,"downloadTotal":2}"#,
+            r#"{"connections":{}}"#,
+            r#"{"connections":"none"}"#,
+            r#"[{"connections":[]}]"#,
+        ] {
+            assert!(parse_connections(text).is_none(), "{text}");
+        }
+        assert!(parse_connections(r#"{"connections":[]}"#).is_some());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    /// A controller that answers each path from `routes` (404 otherwise) and
+    /// records the paths it was asked for.
+    fn controller(
+        routes: Vec<(&'static str, String)>,
+    ) -> (ControllerConfig, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                if reader.read_line(&mut first).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, body) = match routes.iter().find(|(p, _)| *p == path) {
+                    Some((_, body)) => (200, body.as_str()),
+                    None => (404, r#"{"message":"resource not found"}"#),
+                };
+                log.lock().unwrap().push(path);
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let cfg = ControllerConfig {
+            addr,
+            config_dir: "/nonexistent/terc-snapshot-test".into(),
+            ..ControllerConfig::default()
+        };
+        (cfg, seen)
+    }
+
+    #[test]
+    fn polled_body_without_a_connection_list_is_not_an_empty_list() {
+        let conns = r#"{"uploadTotal":5,"downloadTotal":6,"connections":[{"id":"a","metadata":{"host":"a.test","destinationPort":"443"},"upload":1,"download":2}]}"#;
+        let (cfg, _) = controller(vec![
+            ("/version", r#"{"version":"v1.19.28"}"#.into()),
+            ("/connections", conns.into()),
+        ]);
+        let snap = fetch_snapshot(&cfg);
+        assert!(snap.running && snap.connections_ok);
+        assert_eq!(snap.connections[0].host, "a.test:443");
+        assert_eq!((snap.upload_total, snap.download_total), (5, 6));
+
+        for body in [r#"{"uploadTotal":5,"downloadTotal":6}"#, "{}", "oops"] {
+            let (cfg, _) = controller(vec![
+                ("/version", r#"{"version":"v1.19.28"}"#.into()),
+                ("/connections", body.into()),
+            ]);
+            let snap = fetch_snapshot(&cfg);
+            assert!(snap.running, "{body}");
+            // App::accept_snapshot then keeps the previous list and totals.
+            assert!(!snap.connections_ok, "{body}");
+        }
+    }
+
+    const PROXIES: &str = r#"{"proxies":{
+        "GLOBAL":{"type":"Selector","all":["PROXY"],"now":"PROXY"},
+        "PROXY":{"type":"Selector","all":["Inline","JP 01"],"now":"JP 01"},
+        "Inline":{"type":"Shadowsocks","udp":true,"history":[{"delay":30}]}}}"#;
+    const PROVIDERS: &str = r#"{"providers":{
+        "default":{"name":"default","vehicleType":"Compatible","proxies":[{"name":"Inline","type":"Shadowsocks"}]},
+        "air":{"name":"air","vehicleType":"HTTP","proxies":[{"name":"JP 01","type":"Vmess","history":[{"delay":88}]}]}}}"#;
+
+    fn routes() -> Vec<(&'static str, String)> {
+        vec![
+            ("/version", r#"{"version":"v1.19.28"}"#.into()),
+            ("/configs", r#"{"mode":"rule","mixed-port":7890}"#.into()),
+            ("/proxies", PROXIES.into()),
+            ("/connections", r#"{"connections":[]}"#.into()),
+            (
+                "/rules",
+                r#"{"rules":[{"type":"Match","payload":"","proxy":"PROXY"}]}"#.into(),
+            ),
+            ("/providers/proxies", PROVIDERS.into()),
+            (
+                "/providers/rules",
+                r#"{"providers":{"ads":{"name":"ads","vehicleType":"HTTP","ruleCount":9}}}"#.into(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_tiered_poll_reads_only_what_it_was_asked_for() {
+        let (cfg, seen) = controller(routes());
+        let full = fetch_snapshot(&cfg);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "/version",
+                "/configs",
+                "/proxies",
+                "/connections",
+                "/rules",
+                "/providers/proxies",
+                "/providers/rules"
+            ]
+        );
+        assert_eq!(full.fetched, Fetch::default());
+        assert_eq!(full.rules.len(), 1);
+        // The reserved `default` provider is not listed; `air` brings its node.
+        let names: Vec<_> = full.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["air", "ads"]);
+        let jp = &full.nodes["JP 01"];
+        assert_eq!((jp.delay, jp.provider.as_deref()), (Some(88), Some("air")));
+        assert_eq!(full.nodes["Inline"].provider, None);
+
+        seen.lock().unwrap().clear();
+        let fetch = Fetch {
+            connections: false,
+            rules: false,
+            providers: false,
+            cached_host: true,
+        };
+        let lean = fetch_snapshot_with(&cfg, fetch);
+        assert_eq!(*seen.lock().unwrap(), ["/version", "/configs", "/proxies"]);
+        assert!(lean.running && !lean.connections_ok);
+        assert_eq!(lean.fetched, fetch);
+        assert_eq!(lean.mixed_port, 7890);
+        assert_eq!(lean.groups.len(), 1);
+        assert!(lean.rules.is_empty() && lean.providers.is_empty());
+        assert!(!lean.nodes.contains_key("JP 01"));
+    }
+
+    #[test]
+    fn skipped_parts_carry_over_with_provider_nodes_and_their_delays() {
+        let (cfg, _) = controller(routes());
+        let mut old = fetch_snapshot(&cfg);
+        // A latency test since then updated the provider node locally.
+        old.nodes.get_mut("JP 01").unwrap().delay = Some(61);
+        let fetch = Fetch {
+            rules: false,
+            providers: false,
+            ..Fetch::default()
+        };
+        let mut lean = fetch_snapshot_with(&cfg, fetch);
+        lean.carry_skipped(&mut old);
+        assert_eq!(lean.rules.len(), 1);
+        assert_eq!(lean.providers.len(), 2);
+        let jp = &lean.nodes["JP 01"];
+        assert_eq!((jp.delay, jp.provider.as_deref()), (Some(61), Some("air")));
+        assert_eq!(jp.kind, "Vmess");
+        // Fresh /proxies data wins for the nodes it lists.
+        assert_eq!(lean.nodes["Inline"].delay, Some(30));
+
+        // An older core lists provider nodes in /proxies too: the provider
+        // name still carries over, the fresh delay stays.
+        let mut old = fetch_snapshot(&cfg);
+        let mut lean = fetch_snapshot_with(&cfg, fetch);
+        lean.nodes.insert(
+            "JP 01".into(),
+            ProxyNode {
+                name: "JP 01".into(),
+                kind: "Vmess".into(),
+                udp: false,
+                delay: Some(70),
+                provider: None,
+            },
+        );
+        lean.carry_skipped(&mut old);
+        let jp = &lean.nodes["JP 01"];
+        assert_eq!((jp.delay, jp.provider.as_deref()), (Some(70), Some("air")));
+
+        // What a poll did read is never replaced, and a stopped core gets nothing.
+        let mut old = fetch_snapshot(&cfg);
+        let mut full = fetch_snapshot(&cfg);
+        full.rules.clear();
+        full.carry_skipped(&mut old);
+        assert!(full.rules.is_empty());
+        let mut stopped = CoreSnapshot {
+            fetched: fetch,
+            ..CoreSnapshot::default()
+        };
+        stopped.carry_skipped(&mut old);
+        assert!(stopped.rules.is_empty() && stopped.nodes.is_empty());
+    }
+
+    #[test]
+    fn host_lookups_are_reused_for_polls_and_redone_after_actions() {
+        let cache = Mutex::new(None);
+        let dir = std::env::temp_dir().join(format!("terc-host-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("mihomo");
+        fs::write(&bin, "").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let found = |on: bool| {
+            calls.set(calls.get() + 1);
+            HostState {
+                sysproxy: ("GNOME".into(), on),
+                core_bin: Some(bin.clone()),
+            }
+        };
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert!(
+            !host_state_with(&cache, true, at(0), || found(false))
+                .sysproxy
+                .1
+        );
+        // Polls within the TTL reuse it, even though the proxy changed.
+        assert!(
+            !host_state_with(&cache, true, at(14), || found(true))
+                .sysproxy
+                .1
+        );
+        assert_eq!(calls.get(), 1);
+        // After an action terc looks again, and later polls get that answer.
+        assert!(
+            host_state_with(&cache, false, at(15), || found(true))
+                .sysproxy
+                .1
+        );
+        assert!(
+            host_state_with(&cache, true, at(16), || found(false))
+                .sysproxy
+                .1
+        );
+        assert_eq!(calls.get(), 2);
+        // Expired: a poll looks again.
+        assert!(
+            !host_state_with(&cache, true, at(31), || found(false))
+                .sysproxy
+                .1
+        );
+        assert_eq!(calls.get(), 3);
+        // A cached binary that is gone is looked up again at once.
+        fs::remove_file(&bin).unwrap();
+        let missing = || HostState {
+            sysproxy: ("GNOME".into(), false),
+            core_bin: None,
+        };
+        assert_eq!(
+            host_state_with(&cache, true, at(32), missing).core_bin,
+            None
+        );
+        // "Not found" is reused only until it expires, so an outside install shows.
+        fs::write(&bin, "").unwrap();
+        assert_eq!(
+            host_state_with(&cache, true, at(40), || found(false)).core_bin,
+            None
+        );
+        let later = host_state_with(&cache, true, at(48), || found(false));
+        assert_eq!(later.core_bin.as_deref(), Some(bin.as_path()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_core_binary_is_found_on_path_without_which() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("terc-path-{}", std::process::id()));
+        let (plain, exec) = (root.join("plain"), root.join("exec"));
+        fs::create_dir_all(&plain).unwrap();
+        fs::create_dir_all(&exec).unwrap();
+        // Not executable, then a directory of that name: both skipped.
+        fs::write(plain.join("mihomo"), "").unwrap();
+        fs::create_dir_all(root.join("dir/mihomo")).unwrap();
+        fs::write(exec.join("mihomo"), "").unwrap();
+        fs::set_permissions(exec.join("mihomo"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([
+            PathBuf::from("relative"),
+            plain.clone(),
+            root.join("dir"),
+            exec.clone(),
+        ])
+        .unwrap();
+        assert_eq!(find_executable(&path, "mihomo"), Some(exec.join("mihomo")));
+        assert_eq!(find_executable(&path, "absent"), None);
+        assert_eq!(find_executable(std::ffi::OsStr::new(""), "mihomo"), None);
+        fs::remove_dir_all(&root).unwrap();
     }
 }
 
@@ -1246,14 +1778,17 @@ fn local_flags(cfg: &ControllerConfig) -> RuntimeFlags {
 }
 
 pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
-    fetch_snapshot_with(cfg, true)
+    fetch_snapshot_with(cfg, Fetch::default())
 }
 
-/// `include_connections: false` skips the `/connections` GET (the WebSocket
-/// push supplies it); the snapshot then has `connections_ok == false`.
-pub fn fetch_snapshot_with(cfg: &ControllerConfig, include_connections: bool) -> CoreSnapshot {
-    let mut snapshot = fetch_core_snapshot(cfg, include_connections);
-    if let Ok(raw) = read_config_text(cfg) {
+/// A snapshot reading only the optional endpoints in `fetch`. Without
+/// `connections` it has `connections_ok == false`; the other skipped parts
+/// stay empty until `CoreSnapshot::carry_skipped` fills them.
+pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot {
+    // One read serves both the runtime flags and the configured values.
+    let raw = read_config_text(cfg).ok();
+    let mut snapshot = fetch_core_snapshot(cfg, fetch, raw.as_deref());
+    if let Some(raw) = raw {
         for chunk in crate::ops::split_chunks(&raw) {
             if let Some(key) = chunk.key {
                 if ![
@@ -1303,13 +1838,16 @@ pub fn fetch_snapshot_with(cfg: &ControllerConfig, include_connections: bool) ->
     snapshot
 }
 
-fn fetch_core_snapshot(cfg: &ControllerConfig, include_connections: bool) -> CoreSnapshot {
+fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) -> CoreSnapshot {
     let timeout = Duration::from_millis(700);
-    let (net_service, sysproxy_enabled) = detect_sysproxy();
-    let core_bin_path = discover_mihomo_binary()
+    let HostState {
+        sysproxy: (net_service, sysproxy_enabled),
+        core_bin,
+    } = host_state(fetch.cached_host);
+    let core_bin_path = core_bin
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
-    let mut flags = local_flags(cfg);
+    let mut flags = raw.map(parse_yaml_flags).unwrap_or_default();
 
     let Ok((200, ver_body)) =
         http_request(&cfg.addr, &cfg.secret, "GET", "/version", None, timeout)
@@ -1447,51 +1985,50 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, include_connections: bool) -> Cor
     let mut upload_total = 0;
     let mut download_total = 0;
 
-    if include_connections {
+    if fetch.connections {
         if let Ok((200, conn_body)) =
             http_request(&cfg.addr, &cfg.secret, "GET", "/connections", None, timeout)
         {
-            if let Ok(v) = serde_json::from_str::<Value>(&conn_body) {
-                (connections, upload_total, download_total) = connections_from_snapshot_json(&v);
+            // A body without a connection list keeps the last one (`connections_ok`
+            // stays false) instead of reporting every session as closed.
+            if let Some(parsed) = parse_connections(&conn_body) {
+                (connections, upload_total, download_total) = parsed;
                 connections_ok = true;
             }
         }
     }
 
     let mut rules = Vec::new();
-    if let Ok((200, body)) = http_request(&cfg.addr, &cfg.secret, "GET", "/rules", None, timeout) {
-        rules = parse_rules_json(&body);
-    }
-    let mut providers = Vec::new();
-    if let Ok((200, body)) = http_request(
-        &cfg.addr,
-        &cfg.secret,
-        "GET",
-        "/providers/proxies",
-        None,
-        timeout,
-    ) {
-        providers.extend(parse_providers_json(&body, "proxy"));
-        for found in crate::ops::parse_provider_nodes(&body) {
-            let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
-                name: found.name,
-                kind: found.kind,
-                udp: found.udp,
-                delay: found.delay,
-                provider: None,
-            });
-            node.provider.get_or_insert(found.provider);
+    if fetch.rules {
+        if let Ok((200, body)) =
+            http_request(&cfg.addr, &cfg.secret, "GET", "/rules", None, timeout)
+        {
+            rules = parse_rules_json(&body);
         }
     }
-    if let Ok((200, body)) = http_request(
-        &cfg.addr,
-        &cfg.secret,
-        "GET",
-        "/providers/rules",
-        None,
-        timeout,
-    ) {
-        providers.extend(parse_providers_json(&body, "rule"));
+    let mut providers = Vec::new();
+    let get = |path: &str| match http_request(&cfg.addr, &cfg.secret, "GET", path, None, timeout) {
+        Ok((200, body)) => serde_json::from_str::<Value>(&body).ok(),
+        _ => None,
+    };
+    if fetch.providers {
+        // One parse feeds both the provider list and the provider nodes.
+        if let Some(v) = get("/providers/proxies") {
+            providers.extend(crate::ops::providers_from_value(&v, "proxy"));
+            for found in crate::ops::provider_nodes_from_value(&v) {
+                let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
+                    name: found.name,
+                    kind: found.kind,
+                    udp: found.udp,
+                    delay: found.delay,
+                    provider: None,
+                });
+                node.provider.get_or_insert(found.provider);
+            }
+        }
+        if let Some(v) = get("/providers/rules") {
+            providers.extend(crate::ops::providers_from_value(&v, "rule"));
+        }
     }
 
     CoreSnapshot {
@@ -1523,6 +2060,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, include_connections: bool) -> Cor
         dns: flags.dns,
         rules,
         providers,
+        fetched: fetch,
     }
 }
 
@@ -1552,6 +2090,9 @@ fn snapshot_from_flags(
     }
 }
 
+/// Test helper: one connection's columns except `host` and `chains`, which
+/// `parse_connections` fills.
+#[cfg(test)]
 pub fn connection_from_value(value: &Value) -> Option<ConnectionItem> {
     let meta = value.get("metadata");
     let text = |key: &str| {
@@ -1822,21 +2363,71 @@ pub fn discover_mihomo_binary() -> Option<PathBuf> {
     }
     candidates.push(PathBuf::from("/opt/homebrew/bin/mihomo"));
     candidates.push(PathBuf::from("/usr/local/bin/mihomo"));
+    // Distribution and AUR packages.
+    candidates.push(PathBuf::from("/usr/bin/mihomo"));
 
     for p in candidates {
         if p.is_file() {
             return Some(p);
         }
     }
-    if let Ok(output) = Command::new("which").arg("mihomo").output() {
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Some(PathBuf::from(s));
-            }
+    std::env::var_os("PATH").and_then(|path| find_executable(&path, "mihomo"))
+}
+
+/// What `which` does, without starting it: the first executable `name` in
+/// the directories of `path`.
+fn find_executable(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
+/// The two lookups a snapshot makes outside the controller.
+#[derive(Clone, Debug, PartialEq)]
+struct HostState {
+    sysproxy: (String, bool),
+    core_bin: Option<PathBuf>,
+}
+
+/// How long a background poll reuses `HostState`. Reading the system proxy
+/// starts gsettings on Linux and three to five scutil and networksetup
+/// processes on macOS, which every 2.2 s poll used to do. A change made
+/// outside terc shows up within this; terc's own actions are followed by a
+/// full snapshot, which looks again.
+const HOST_TTL: Duration = Duration::from_secs(15);
+
+static HOST_CACHE: Mutex<Option<(Instant, HostState)>> = Mutex::new(None);
+
+fn host_state(cached: bool) -> HostState {
+    host_state_with(&HOST_CACHE, cached, Instant::now(), || HostState {
+        sysproxy: detect_sysproxy(),
+        core_bin: discover_mihomo_binary(),
+    })
+}
+
+/// A fresh lookup, stored for later `cached` calls. A cached result is used
+/// while younger than `HOST_TTL` and its binary is still there; a missing
+/// binary expires like any other result, so an install made outside terc
+/// shows up.
+fn host_state_with(
+    cache: &Mutex<Option<(Instant, HostState)>>,
+    cached: bool,
+    now: Instant,
+    detect: impl FnOnce() -> HostState,
+) -> HostState {
+    // Held while detecting, so a poll and an action never both spawn.
+    let mut slot = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, state)) = slot.as_ref().filter(|_| cached) {
+        let fresh = now.saturating_duration_since(*at) < HOST_TTL;
+        if fresh && state.core_bin.as_ref().is_none_or(|bin| bin.is_file()) {
+            return state.clone();
         }
     }
-    None
+    let state = detect();
+    *slot = Some((now, state.clone()));
+    state
 }
 
 pub fn validate_listener_ports(text: &str) -> Result<(), String> {

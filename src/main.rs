@@ -489,6 +489,11 @@ pub struct App {
     /// Polls in a row that found the core not running.
     pub down_polls: u8,
     pub last_snapshot_poll: Instant,
+    /// The tab open when the last poll started; entering Rules or Providers
+    /// polls at once, since their data is not read on other tabs.
+    pub poll_tab: MainTab,
+    /// When a snapshot last carried `/providers/*`.
+    pub providers_polled_at: Option<Instant>,
     pub setup_origin: Screen,
     pub setup_editor: LineEditor,
     pub setup_phase: SetupPhase,
@@ -617,6 +622,8 @@ impl App {
             conn_stream_at: None,
             down_polls: 0,
             last_snapshot_poll: Instant::now(),
+            poll_tab: MainTab::Proxies,
+            providers_polled_at: None,
             setup_origin: Screen::Dashboard,
             setup_editor: LineEditor::default(),
             setup_phase: SetupPhase::Editing,
@@ -1051,21 +1058,43 @@ impl App {
             self.set_status(self.t("setup_msg_still_starting"), false);
         }
 
+        let entered = self.main_tab != self.poll_tab
+            && matches!(self.main_tab, MainTab::Rules | MainTab::Providers);
         if !self.action_busy
             && !self.snapshot_pending
-            && self.last_snapshot_poll.elapsed() >= Duration::from_millis(2200)
+            && (entered || self.last_snapshot_poll.elapsed() >= Duration::from_millis(2200))
         {
             self.snapshot_pending = true;
             self.last_snapshot_poll = Instant::now();
+            self.poll_tab = self.main_tab;
             let cfg = self.config.controller.clone();
             let tx = self.tx.clone();
-            // Pushed snapshots already cover /connections; skip that GET.
-            let include_connections = !self.stream_live();
+            let fetch = self.poll_fetch();
             thread::spawn(move || {
                 let mut done = SendOnDrop::new(tx, BackendEvent::SnapshotDone(Box::default()));
-                let snap = mihomo::fetch_snapshot_with(&cfg, include_connections);
+                let snap = mihomo::fetch_snapshot_with(&cfg, fetch);
                 done.set(BackendEvent::SnapshotDone(Box::new(snap)));
             });
+        }
+    }
+
+    /// What a background poll reads besides `/version`, `/configs` and
+    /// `/proxies`. `/rules` (about 600 kB with 3000 rules) is read only on the
+    /// Rules tab; the providers on their tab and every 30 s elsewhere, for
+    /// the provider nodes' delays on the Proxies tab. A core that was not
+    /// running gets everything, since it may have just started.
+    fn poll_fetch(&self) -> mihomo::Fetch {
+        let fresh_core = !self.snapshot.running;
+        let providers_due = self
+            .providers_polled_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+        mihomo::Fetch {
+            // Pushed snapshots already cover /connections; skip that GET.
+            connections: !self.stream_live(),
+            rules: fresh_core || self.main_tab == MainTab::Rules,
+            providers: fresh_core || providers_due || self.main_tab == MainTab::Providers,
+            // Spawning gsettings or networksetup every poll is the costly part.
+            cached_host: true,
         }
     }
 
@@ -1104,6 +1133,10 @@ impl App {
             snapshot.upload_total = self.snapshot.upload_total;
             snapshot.download_total = self.snapshot.download_total;
         }
+        if snapshot.running && snapshot.fetched.providers {
+            self.providers_polled_at = Some(Instant::now());
+        }
+        snapshot.carry_skipped(&mut self.snapshot);
         self.snapshot = snapshot;
         if !keep {
             self.install_connections(fresh, self.snapshot.running);
@@ -1418,24 +1451,23 @@ impl App {
     }
 
     pub fn toggle_sysproxy(&mut self) {
-        let target = !self.snapshot.sysproxy_enabled;
-        let ports = if target {
-            if !self.snapshot.running {
-                self.set_status("Start the core before enabling system proxy", true);
+        let ports = if self.snapshot.running {
+            mihomo::proxy_ports(&self.snapshot)
+        } else {
+            Err("Start the core before enabling system proxy".into())
+        };
+        if !self.snapshot.sysproxy_enabled {
+            if let Err(e) = &ports {
+                self.set_status(e, true);
                 return;
             }
-            match mihomo::proxy_ports(&self.snapshot) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.set_status(&e, true);
-                    return;
-                }
-            }
-        } else {
-            (0, 0)
-        };
+        }
         self.run_action("Updating system proxy…", None, None, move |_| {
-            set_sysproxy(target, ports.0, ports.1)
+            // The shown state can be a poll's cached lookup, up to 15 s old:
+            // flip what the system has now.
+            let target = !mihomo::detect_sysproxy().1;
+            let (http, socks) = if target { ports? } else { (0, 0) };
+            set_sysproxy(target, http, socks)
         });
     }
 
@@ -3739,13 +3771,12 @@ mod tests {
         assert!(!app.stream_live());
     }
 
-    #[test]
-    fn polls_skip_the_connections_get_only_while_pushes_arrive() {
+    /// A controller on 127.0.0.1:0 that answers `{}` and records each path.
+    fn recording_controller() -> (String, mpsc::Receiver<String>) {
         use std::{io::Read as _, io::Write as _, net::TcpListener};
-        // A controller on 127.0.0.1:0 that answers `{}` and records each path.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let (paths_tx, paths) = std::sync::mpsc::channel();
+        let (paths_tx, paths) = mpsc::channel();
         thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
                 let mut head = Vec::new();
@@ -3763,20 +3794,31 @@ mod tests {
                 }
             }
         });
+        (addr, paths)
+    }
+
+    /// Wait for the poll `tick` started and return the paths it asked for.
+    fn finish_poll(app: &mut App, paths: &mpsc::Receiver<String>) -> Vec<String> {
+        assert!(app.snapshot_pending, "no poll started");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot_pending {
+            assert!(Instant::now() < deadline, "poll never finished");
+            app.drain_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        paths.try_iter().collect()
+    }
+
+    #[test]
+    fn polls_skip_the_connections_get_only_while_pushes_arrive() {
+        let (addr, paths) = recording_controller();
         let mut app = offline_app();
         app.config.controller.addr = addr;
         app.config.controller.config_dir = "/nonexistent/terc-test".into();
         let poll = |app: &mut App| {
             app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
             app.tick(Duration::from_millis(10));
-            assert!(app.snapshot_pending);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while app.snapshot_pending {
-                assert!(Instant::now() < deadline, "poll never finished");
-                app.drain_events();
-                thread::sleep(Duration::from_millis(5));
-            }
-            paths.try_iter().collect::<Vec<String>>()
+            finish_poll(app, &paths)
         };
         app.conn_stream_at = Some(Instant::now());
         assert!(app.stream_live());
@@ -3786,6 +3828,67 @@ mod tests {
         app.conn_stream_at = None;
         let polled = poll(&mut app);
         assert!(polled.iter().any(|p| p == "/connections"), "{polled:?}");
+    }
+
+    #[test]
+    fn polls_read_rules_and_providers_only_where_they_show() {
+        let (addr, paths) = recording_controller();
+        let mut app = offline_app();
+        app.config.controller.addr = addr;
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        let has = |got: &[String], path: &str| got.iter().any(|p| p == path);
+        let poll = |app: &mut App| {
+            app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
+            app.tick(Duration::from_millis(10));
+            finish_poll(app, &paths)
+        };
+        // The core looked stopped, so it may have just started: read everything.
+        let first = poll(&mut app);
+        assert!(app.snapshot.running);
+        assert!(
+            has(&first, "/rules") && has(&first, "/providers/proxies"),
+            "{first:?}"
+        );
+
+        // Proxies tab, providers read moments ago: neither, and what the
+        // first poll brought stays.
+        app.snapshot.rules =
+            crate::ops::parse_rules_json(r#"{"rules":[{"type":"Match","proxy":"P"}]}"#);
+        let lean = poll(&mut app);
+        assert!(has(&lean, "/version") && has(&lean, "/proxies"), "{lean:?}");
+        assert!(
+            !has(&lean, "/rules") && !has(&lean, "/providers/proxies"),
+            "{lean:?}"
+        );
+        assert!(!has(&lean, "/providers/rules"), "{lean:?}");
+        assert_eq!(app.snapshot.rules.len(), 1);
+
+        // Entering Rules polls at once instead of waiting for the timer;
+        // staying there does not poll early again.
+        app.main_tab = MainTab::Rules;
+        app.tick(Duration::from_millis(10));
+        let rules = finish_poll(&mut app, &paths);
+        assert!(
+            has(&rules, "/rules") && !has(&rules, "/providers/proxies"),
+            "{rules:?}"
+        );
+        app.tick(Duration::from_millis(10));
+        assert!(!app.snapshot_pending);
+
+        app.main_tab = MainTab::Providers;
+        app.tick(Duration::from_millis(10));
+        let providers = finish_poll(&mut app, &paths);
+        assert!(has(&providers, "/providers/proxies"), "{providers:?}");
+        assert!(has(&providers, "/providers/rules"), "{providers:?}");
+        assert!(!has(&providers, "/rules"), "{providers:?}");
+
+        // Other tabs poll on the timer and read the providers every 30 s.
+        app.main_tab = MainTab::Logs;
+        app.tick(Duration::from_millis(10));
+        assert!(!app.snapshot_pending);
+        assert!(!has(&poll(&mut app), "/providers/proxies"));
+        app.providers_polled_at = Some(Instant::now() - Duration::from_secs(31));
+        assert!(has(&poll(&mut app), "/providers/proxies"));
     }
 
     #[test]
