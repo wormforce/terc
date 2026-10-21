@@ -947,7 +947,7 @@ fn draw_nodes_panel(frame: &mut Frame, app: &mut App, area: Rect) {
 
             let node_meta = app.snapshot.nodes.get(node_name);
             let proto = node_meta.map(|n| n.kind.as_str()).unwrap_or("").to_string();
-            let delay = node_meta.and_then(|n| n.delay);
+            let delay = node_meta.and_then(|n| group.member_delay(n));
 
             let delay_str = match delay {
                 Some(ms) => format!("{ms:>4} ms"),

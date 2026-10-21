@@ -151,6 +151,8 @@ mod tests {
             kind: "Selector".into(),
             now: "JP 01".into(),
             all: names.iter().map(|s| s.to_string()).collect(),
+            test_url: String::new(),
+            expected_status: String::new(),
         });
         for name in names {
             snapshot.nodes.insert(
@@ -166,6 +168,7 @@ mod tests {
                     udp: true,
                     delay: Some(1),
                     provider: None,
+                    url_delays: Default::default(),
                 },
             );
         }
@@ -187,6 +190,8 @@ mod tests {
             kind: "Selector".into(),
             now: "US 01".into(),
             all: vec!["US 01".into()],
+            test_url: String::new(),
+            expected_status: String::new(),
         });
         snapshot.groups[0].now = "Nested".into();
         assert_eq!(active_country(&snapshot, 0).as_deref(), Some("US"));
