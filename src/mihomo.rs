@@ -3233,8 +3233,24 @@ pub fn flush_dns_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
     });
 }
 
+/// The controller route for a provider kind. `ProviderInfo.kind` keeps the
+/// singular label the UI compares; Mihomo mounts only the plural routes.
+fn provider_route(kind: &str) -> &str {
+    match kind {
+        "proxy" => "proxies",
+        "rule" => "rules",
+        other => other,
+    }
+}
+
+/// Unlike a reload, this swaps the provider's content without closing the
+/// connections through its nodes.
 pub fn refresh_provider(cfg: &ControllerConfig, kind: &str, name: &str) -> Result<(), String> {
-    let path = format!("/providers/{kind}/{}", percent_encode(name));
+    let path = format!(
+        "/providers/{}/{}",
+        provider_route(kind),
+        percent_encode(name)
+    );
     match http_request(
         &cfg.addr,
         &cfg.secret,
@@ -3250,20 +3266,97 @@ pub fn refresh_provider(cfg: &ControllerConfig, kind: &str, name: &str) -> Resul
     }
 }
 
-pub fn provider_healthcheck(cfg: &ControllerConfig, name: &str) -> Result<(), String> {
+/// Mihomo's reserved `default` provider is its only `Compatible` one, and
+/// updating it does nothing.
+pub fn refreshable_provider(provider: &ProviderInfo) -> bool {
+    !provider.vehicle.eq_ignore_ascii_case("Compatible")
+        && !(provider.kind == "proxy" && provider.name == "default")
+}
+
+/// Each refresh is a download inside the core; a few run at once.
+const PROVIDER_WORKERS: usize = 4;
+
+/// Refresh `(kind, name)` pairs concurrently; returns (updated, failed).
+fn refresh_providers(cfg: &ControllerConfig, providers: &[(String, String)]) -> (usize, usize) {
+    use std::sync::atomic::AtomicUsize;
+    let next = AtomicUsize::new(0);
+    let ok = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..PROVIDER_WORKERS.min(providers.len()) {
+            scope.spawn(|| {
+                while let Some((kind, name)) = providers.get(next.fetch_add(1, Ordering::SeqCst)) {
+                    if refresh_provider(cfg, kind, name).is_ok() {
+                        ok.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+    });
+    let ok = ok.into_inner();
+    (ok, providers.len() - ok)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HealthCheck {
+    Done,
+    /// No answer within the cap. The core keeps checking and records the
+    /// delays, which the next poll picks up.
+    StillRunning,
+    Failed(String),
+}
+
+/// Mihomo answers only after every node was tried, ten at a time and each up
+/// to its own timeout, so a large provider takes well over a few seconds.
+const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub fn provider_healthcheck(cfg: &ControllerConfig, name: &str) -> HealthCheck {
+    provider_healthcheck_with(cfg, name, HEALTHCHECK_TIMEOUT)
+}
+
+fn provider_healthcheck_with(cfg: &ControllerConfig, name: &str, timeout: Duration) -> HealthCheck {
     let path = format!("/providers/proxies/{}/healthcheck", percent_encode(name));
-    match http_request(
-        &cfg.addr,
-        &cfg.secret,
-        "GET",
-        &path,
-        None,
-        Duration::from_millis(4000),
-    ) {
-        Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-        Ok((status, body)) => Err(format!("HTTP {status} {}", brief(&body))),
-        Err(err) => Err(err.to_string()),
+    match http_request(&cfg.addr, &cfg.secret, "GET", &path, None, timeout) {
+        Ok((status, _)) if (200..300).contains(&status) => HealthCheck::Done,
+        Ok((status, body)) => HealthCheck::Failed(format!("HTTP {status} {}", brief(&body))),
+        // A read timeout surfaces as WouldBlock on Unix.
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            HealthCheck::StillRunning
+        }
+        Err(err) => HealthCheck::Failed(err.to_string()),
     }
+}
+
+/// Health check outcomes in the UI language.
+pub struct HealthTexts {
+    pub done: String,
+    pub still: String,
+}
+
+/// Runs beside the action queue, so polling continues and delays show up
+/// while the core checks.
+pub fn provider_healthcheck_async(
+    cfg: ControllerConfig,
+    name: String,
+    texts: HealthTexts,
+    tx: Sender<BackendEvent>,
+) {
+    thread::spawn(move || {
+        let (text, is_error) = match provider_healthcheck(&cfg, &name) {
+            HealthCheck::Done => {
+                let snap = fetch_snapshot(&cfg);
+                let _ = tx.send(BackendEvent::Snapshot(Box::new(snap)));
+                (texts.done, false)
+            }
+            HealthCheck::StillRunning => (texts.still, false),
+            HealthCheck::Failed(err) => (err, true),
+        };
+        let _ = tx.send(BackendEvent::StatusMessage { text, is_error });
+    });
 }
 
 pub fn refresh_provider_async(
@@ -3290,18 +3383,20 @@ pub fn refresh_provider_async(
     });
 }
 
-pub fn refresh_all_providers_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
+/// Refresh the providers the UI already lists, then take one snapshot for the
+/// new nodes and rule counts.
+pub fn refresh_all_providers_async(
+    cfg: ControllerConfig,
+    providers: Vec<ProviderInfo>,
+    tx: Sender<BackendEvent>,
+) {
     thread::spawn(move || {
-        let snap = fetch_snapshot(&cfg);
-        let mut ok = 0usize;
-        let mut failed = 0usize;
-        for provider in &snap.providers {
-            if refresh_provider(&cfg, &provider.kind, &provider.name).is_ok() {
-                ok += 1;
-            } else {
-                failed += 1;
-            }
-        }
+        let list: Vec<(String, String)> = providers
+            .into_iter()
+            .filter(refreshable_provider)
+            .map(|p| (p.kind, p.name))
+            .collect();
+        let (ok, failed) = refresh_providers(&cfg, &list);
         let fresh = fetch_snapshot(&cfg);
         let _ = tx.send(BackendEvent::Snapshot(Box::new(fresh)));
         let _ = tx.send(BackendEvent::StatusMessage {
@@ -3677,6 +3772,162 @@ mod provider_tests {
         sorted.sort();
         assert_eq!(streamed, sorted);
         assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+
+    /// Mock controller that records each request line, answers `PUT`s after
+    /// `delay` and tracks how many were in flight at once.
+    struct Recorder {
+        cfg: ControllerConfig,
+        lines: Arc<Mutex<Vec<String>>>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    fn recorder(delay: Duration, reply: fn(&str) -> (u16, &'static str)) -> Recorder {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let peak: Arc<AtomicUsize> = Arc::default();
+        let busy: Arc<AtomicUsize> = Arc::default();
+        let (seen, high) = (lines.clone(), peak.clone());
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (seen, high, busy) = (seen.clone(), high.clone(), busy.clone());
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let line = first.trim_end().to_string();
+                    seen.lock().unwrap().push(line.clone());
+                    if line.starts_with("PUT ") {
+                        let now = busy.fetch_add(1, Ordering::SeqCst) + 1;
+                        high.fetch_max(now, Ordering::SeqCst);
+                        thread::sleep(delay);
+                        busy.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    let path = line.split_whitespace().nth(1).unwrap_or("");
+                    let (status, body) = reply(path);
+                    let _ = write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        Recorder {
+            cfg: ControllerConfig {
+                addr,
+                timeout_ms: 500,
+                ..ControllerConfig::default()
+            },
+            lines,
+            peak,
+        }
+    }
+
+    fn provider(kind: &str, name: &str, vehicle: &str) -> ProviderInfo {
+        ProviderInfo {
+            name: name.into(),
+            kind: kind.into(),
+            vehicle: vehicle.into(),
+            behavior: String::new(),
+            count: 0,
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn provider_refresh_puts_to_the_plural_routes_mihomo_mounts() {
+        let mock = recorder(Duration::ZERO, |path| {
+            if path.starts_with("/providers/proxies/") || path.starts_with("/providers/rules/") {
+                (204, "")
+            } else {
+                (404, r#"{"message":"resource not found"}"#)
+            }
+        });
+        assert_eq!(refresh_provider(&mock.cfg, "proxy", "air port"), Ok(()));
+        assert_eq!(refresh_provider(&mock.cfg, "rule", "reject"), Ok(()));
+        let lines = mock.lines.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            [
+                "PUT /providers/proxies/air%20port HTTP/1.1",
+                "PUT /providers/rules/reject HTTP/1.1"
+            ]
+        );
+    }
+
+    #[test]
+    fn refresh_all_runs_four_at_once_and_skips_the_reserved_provider() {
+        let mock = recorder(Duration::from_millis(250), |path| match path {
+            "/providers/rules/broken" => (500, r#"{"message":"download failed"}"#),
+            p if p.starts_with("/providers/") => (204, ""),
+            _ => (404, ""),
+        });
+        let mut providers = vec![
+            provider("proxy", "default", "Compatible"),
+            provider("proxy", "air", "HTTP"),
+            provider("rule", "broken", "HTTP"),
+        ];
+        for i in 0..6 {
+            providers.push(provider("rule", &format!("r{i}"), "HTTP"));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        refresh_all_providers_async(mock.cfg.clone(), providers, tx);
+        let status = loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                BackendEvent::StatusMessage { text, is_error } => break (text, is_error),
+                BackendEvent::Snapshot(_) => {}
+                _ => panic!("unexpected event"),
+            }
+        };
+        // 8 PUTs of 250 ms, four at a time: two rounds, not eight.
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert_eq!(status, ("providers 7 updated  1 failed".into(), false));
+        assert_eq!(mock.peak.load(Ordering::SeqCst), PROVIDER_WORKERS);
+        let lines = mock.lines.lock().unwrap().clone();
+        let puts: Vec<_> = lines.iter().filter(|l| l.starts_with("PUT ")).collect();
+        assert_eq!(puts.len(), 8);
+        assert!(puts.iter().all(|l| !l.contains("default")));
+        assert!(puts.contains(&&"PUT /providers/proxies/air HTTP/1.1".to_string()));
+        // The list came from the UI, so no snapshot is fetched before the PUTs.
+        assert!(lines[0].starts_with("PUT "), "{lines:?}");
+    }
+
+    #[test]
+    fn slow_health_check_reports_the_core_still_checking() {
+        let mock = recorder(Duration::ZERO, |path| match path {
+            "/providers/proxies/air/healthcheck" => (204, ""),
+            _ => (404, r#"{"message":"resource not found"}"#),
+        });
+        assert_eq!(provider_healthcheck(&mock.cfg, "air"), HealthCheck::Done);
+        assert!(matches!(
+            provider_healthcheck(&mock.cfg, "gone"),
+            HealthCheck::Failed(err) if err.starts_with("HTTP 404")
+        ));
+        // A controller that accepts but stays silent past the cap.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            ..ControllerConfig::default()
+        };
+        let hold = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(800));
+            drop(stream);
+        });
+        assert_eq!(
+            provider_healthcheck_with(&cfg, "air", Duration::from_millis(200)),
+            HealthCheck::StillRunning
+        );
+        hold.join().unwrap();
     }
 }
 

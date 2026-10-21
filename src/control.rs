@@ -9,9 +9,9 @@ use std::{fs, path::PathBuf};
 use crate::{
     mihomo::{
         dns_query_async, flush_dns_async, is_info_pseudo_node, persist_nested_bool, probe_async,
-        provider_healthcheck, read_config_text, refresh_all_providers_async,
-        refresh_provider_async, set_bool_config, set_rule_disabled, test_group_delays_async,
-        test_node_async, ProxyNode,
+        provider_healthcheck_async, read_config_text, refresh_all_providers_async,
+        refresh_provider_async, refreshable_provider, set_bool_config, set_rule_disabled,
+        test_group_delays_async, test_node_async, HealthTexts, ProxyNode,
     },
     ops::{
         apply_enabled_modules, enabled_snippets, explain_rules, is_runtime_tunnel, module_catalog,
@@ -260,19 +260,39 @@ impl App {
             self.set_status(self.t("st_provider_rule"), false);
             return;
         }
-        self.run_action("Running provider health check…", None, None, move |cfg| {
-            provider_healthcheck(&cfg, &provider.name)?;
-            Ok(format!("Health check requested: {}", provider.name))
-        });
+        let name = provider.name;
+        let texts = match self.lang() {
+            crate::Lang::Zh => HealthTexts {
+                done: format!("健康检查完成  {name}"),
+                still: format!("内核仍在检测 {name}，延迟会陆续更新"),
+            },
+            crate::Lang::En => HealthTexts {
+                done: format!("Health check finished  {name}"),
+                still: format!("The core is still checking {name}; delays update as they come in"),
+            },
+            crate::Lang::Ja => HealthTexts {
+                done: format!("ヘルスチェック完了  {name}"),
+                still: format!("コアが {name} を検査中。遅延は順次更新されます"),
+            },
+        };
+        self.set_status(&format!("{}  {name}", self.t("st_provider_health")), false);
+        provider_healthcheck_async(self.config.controller.clone(), name, texts, self.tx.clone());
     }
 
     pub fn refresh_all_providers(&mut self) {
-        if self.snapshot.providers.is_empty() {
+        let providers: Vec<_> = self
+            .snapshot
+            .providers
+            .iter()
+            .filter(|p| refreshable_provider(p))
+            .cloned()
+            .collect();
+        if providers.is_empty() {
             self.set_status(self.t("st_no_provider"), true);
             return;
         }
         self.set_status(self.t("st_provider_all"), false);
-        refresh_all_providers_async(self.config.controller.clone(), self.tx.clone());
+        refresh_all_providers_async(self.config.controller.clone(), providers, self.tx.clone());
     }
 
     pub fn open_modules(&mut self) {
