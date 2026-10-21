@@ -169,22 +169,64 @@ sniffer:
                 .into(),
             builtin: true,
         },
+        // Matches the template's DNS block. Sequences replace the source's as a
+        // unit, so `fallback: []` drops a source fallback that would race
+        // every non-CN answer. The listener stays on loopback: Mihomo binds it
+        // without checking allow-lan.
         ModuleSnippet {
             id: "dns-fakeip".into(),
             name: "DNS fake-ip".into(),
-            description: "Fake-IP DNS with DoH nameservers".into(),
+            description: "Fake-IP DNS with mainland DoH".into(),
             body: "\
 dns:
   enable: true
-  listen: 0.0.0.0:1053
+  listen: 127.0.0.1:1053
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - \"*.lan\"
+    - \"+.local\"
+    - localhost
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  proxy-server-nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  fallback: []"
+                .into(),
+            builtin: true,
+        },
+        // The foreign resolvers are reached through the rules; node hostnames
+        // still use mainland DoH so connecting never waits on a blocked one.
+        ModuleSnippet {
+            id: "dns-fakeip-global".into(),
+            name: "DNS fake-ip (global)".into(),
+            description: "Fake-IP DNS with Google / Cloudflare DoH".into(),
+            body: "\
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - \"*.lan\"
+    - \"+.local\"
+    - localhost
+  respect-rules: true
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
   nameserver:
     - https://dns.google/dns-query
     - https://cloudflare-dns.com/dns-query
-  fallback:
-    - tls://1.1.1.1
-    - tls://8.8.8.8"
+  proxy-server-nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  fallback: []"
                 .into(),
             builtin: true,
         },
@@ -1527,6 +1569,43 @@ mod tests {
         assert!(restored.contains("stack: system"));
         assert!(restored.contains("mtu: 1400"));
         assert!(!parse_yaml_flags(&restored).tun_enabled);
+    }
+
+    #[test]
+    fn dns_modules_stay_on_loopback_and_drop_a_source_fallback() {
+        let source = "dns:\n  enable: false\n  listen: 0.0.0.0:53\n  ipv6: true\n  nameserver:\n    - 114.114.114.114\n  fallback:\n    - tls://8.8.8.8\nproxies: []\n";
+        let catalog = builtin_modules();
+        let pick = |id: &str| enabled_snippets(&catalog, &[id.to_string()]);
+        for (id, nameserver) in [
+            ("dns-fakeip", "https://doh.pub/dns-query"),
+            ("dns-fakeip-global", "https://dns.google/dns-query"),
+        ] {
+            let applied = apply_enabled_modules(source, &pick(id)).unwrap();
+            let dns = parse_dns_block(&applied);
+            assert!(dns.enable, "{id}");
+            assert_eq!(dns.listen, "127.0.0.1:1053", "{id}");
+            assert_eq!(dns.enhanced_mode, "fake-ip", "{id}");
+            assert_eq!(
+                dns.nameservers.first().map(String::as_str),
+                Some(nameserver)
+            );
+            assert!(dns.fallback.is_empty(), "{id}: {applied}");
+            assert!(!applied.contains("tls://8.8.8.8\n"), "{id}");
+            // Node hostnames never wait on foreign DoH.
+            assert!(applied.contains(
+                "proxy-server-nameserver:\n    - https://doh.pub/dns-query\n    - https://dns.alidns.com/dns-query\n"
+            ));
+            assert!(applied.contains("default-nameserver:\n    - 223.5.5.5\n"));
+            assert!(applied.contains("    - \"+.local\"\n"));
+            // Keys the module does not name are the source's.
+            assert!(applied.contains("  ipv6: true\n"));
+            assert_eq!(strip_marked_modules(&applied), source);
+        }
+        let global = apply_enabled_modules(source, &pick("dns-fakeip-global")).unwrap();
+        assert!(global.contains("  respect-rules: true\n"));
+        let mainland = apply_enabled_modules("proxies: []\n", &pick("dns-fakeip")).unwrap();
+        assert!(!mainland.contains("respect-rules"));
+        assert!(!mainland.contains("dns.google"));
     }
 
     #[test]

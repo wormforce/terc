@@ -63,6 +63,19 @@ Diagnostics contains the log level, core download, snippets, probe, runtime deta
 
 Settings → Proxy toggles the Mihomo sniffer. Many flows arrive with only an IP. The sniffer reads the HTTP Host, TLS SNI, or QUIC name from the start of the flow and fills the domain back in, so domain rules can match. The connections view shows that sniffed host. It does not store page contents, and it is not a packet capture.
 
+## DNS snippets
+
+Settings → Tools → Snippets has two built-in DNS overlays for configs without a usable `dns` block:
+
+| Snippet | Resolvers | Notes |
+| --- | --- | --- |
+| Fake-IP DNS | `doh.pub` and `dns.alidns.com` DoH, bootstrapped by `223.5.5.5` / `119.29.29.29` | Same as terc's template; suited to mainland China |
+| Fake-IP DNS (global) | `dns.google` and `cloudflare-dns.com` DoH, dialed through the rules (`respect-rules`) | Node hostnames still use mainland DoH |
+
+Both listen on `127.0.0.1:1053` only, so the LAN cannot use them as a resolver, carry no `fallback`, and keep `*.lan`, `+.local` and `localhost` out of fake-ip. A list the snippet names (`nameserver`, `fallback`, `fake-ip-filter` and so on) replaces the source's list as a whole; keys it does not name stay as the source wrote them. TUN DNS hijacking does not need the listener.
+
+The previous Fake-IP DNS snippet used foreign DoH with a fallback and listened on `0.0.0.0:1053`. If it was on, terc says so once at the first start after the upgrade; the new body applies from the next generated config. Enable Fake-IP DNS (global) to keep foreign DoH.
+
 ## Connections
 
 Press `c`. Each row shows the connection's age, in bold once it has been open 60 s (long-lived). Connections to AI services are tagged `AI`: the destination or sniffed host matches the AI preset rules, or the chain passes through the `AI` group. When the pane is narrow, columns appear in this order: the current sort value (total bytes or total rate), process, rule, separate up/down, inbound. The host gets the rest.
