@@ -337,8 +337,13 @@ impl App {
             }
         };
         let running = self.snapshot.running;
+        // After an unanswered reload the core may not run the file, so only a
+        // reload makes them match.
+        let uncertain =
+            running && crate::mihomo::RELOAD_UNCERTAIN.load(std::sync::atomic::Ordering::SeqCst);
         let change = match module_change(&raw, &next) {
             ModuleChange::Live(_) if !running => ModuleChange::Reload,
+            _ if uncertain => ModuleChange::Reload,
             change => change,
         };
         // Only a reload re-initialises providers, so only it asks first.
