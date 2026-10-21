@@ -8,10 +8,11 @@ use std::{fs, path::PathBuf};
 
 use crate::{
     mihomo::{
-        dns_query_async, flush_dns_async, is_info_pseudo_node, persist_nested_bool, probe_async,
-        provider_healthcheck_async, read_config_text, refresh_all_providers_async,
-        refresh_provider_async, refreshable_provider, set_bool_config, set_rule_disabled,
-        test_group_delays_async, test_node_async, HealthTexts, ProxyNode,
+        dns_query_async, flush_dns_async, is_info_pseudo_node, persist_live_bool,
+        persist_nested_bool, probe_async, provider_healthcheck_async, read_config_text,
+        refresh_all_providers_async, refresh_provider_async, refreshable_provider, set_bool_config,
+        set_rule_disabled, test_group_delays_async, test_node_async, verify_runtime_value,
+        HealthTexts, ProxyNode,
     },
     ops::{
         apply_enabled_modules, enabled_snippets, explain_rules, is_runtime_tunnel, module_catalog,
@@ -121,18 +122,19 @@ impl App {
         let field = field.to_string();
         let running = self.snapshot.running;
         self.run_action("Applying runtime switch…", None, None, move |cfg| {
-            if running {
-                set_bool_config(&cfg, &field, next)
-                    .map_err(|err| format!("Runtime change rejected: {err}"))?;
-            }
             let refs: Vec<&str> = path.iter().map(String::as_str).collect();
-            persist_nested_bool(&cfg, &refs, next).map_err(|err| {
-                if running {
-                    format!("Runtime changed, but could not save: {err}")
-                } else {
-                    err
-                }
-            })?;
+            if running {
+                // The core accepted and reports the value, so saving it skips
+                // `mihomo -t`. A value that does not read back is not saved.
+                set_bool_config(&cfg, &field, next)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| verify_runtime_value(&cfg, &field, &next.into()))
+                    .map_err(|err| format!("Runtime change rejected: {err}"))?;
+                persist_live_bool(&cfg, &refs, next)
+                    .map_err(|err| format!("Runtime changed, but could not save: {err}"))?;
+            } else {
+                persist_nested_bool(&cfg, &refs, next)?;
+            }
             Ok(if running {
                 "Runtime changed and saved"
             } else {

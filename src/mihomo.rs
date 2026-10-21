@@ -3150,12 +3150,30 @@ fn reload_needed(old: Option<&str>, candidate: &str, running: bool, uncertain: b
     old != Some(candidate) || (running && uncertain)
 }
 
-/// Validate and save `text` with the runtime mode kept, without a reload; the
-/// caller applies the change live.
-pub fn install_config_keep_mode(cfg: &ControllerConfig, text: &str) -> Result<(), String> {
-    let text = keep_runtime_mode(cfg, text);
-    install_config_with(cfg, &text, false, discover_mihomo_binary, &INSTALL_LIMITS)
-        .map_err(|failure| failure.message)
+/// Save `text` without `mihomo -t` or a reload, when what it changes is
+/// already known to hold: the running core accepted and read back each
+/// changed key, or the effective config equals the active one. With the core
+/// running, a mode switched at runtime is kept.
+pub fn save_config_unchecked(
+    cfg: &ControllerConfig,
+    text: &str,
+    running: bool,
+) -> Result<(), String> {
+    validate_listener_ports(text)?;
+    let text = if running {
+        keep_runtime_mode(cfg, text)
+    } else {
+        text.to_string()
+    };
+    let saved = fs::create_dir_all(&cfg.config_dir)
+        .and_then(|()| write_private(&config_yaml_path(cfg), text.as_bytes()))
+        .map_err(|e| e.to_string());
+    // The core now runs a value the file lacks, so the next regeneration
+    // must reload even when its output is unchanged.
+    if saved.is_err() && running {
+        RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+    }
+    saved
 }
 
 /// `PATCH /configs` a key Mihomo applies live, then read it back. Listener rebuilds
@@ -3175,13 +3193,22 @@ pub fn patch_config_value(cfg: &ControllerConfig, key: &str, value: &Value) -> R
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status} {}", brief(&text)));
     }
+    verify_runtime_value(cfg, key, value)
+}
+
+/// Read `key` back from `GET /configs` after a PATCH.
+pub fn verify_runtime_value(
+    cfg: &ControllerConfig,
+    key: &str,
+    value: &Value,
+) -> Result<(), String> {
     let runtime = read_runtime_config(cfg).map_err(|e| e.to_string())?;
     // An older core that does not report the key cannot be checked.
     let Some(actual) = runtime.get(key) else {
         return Ok(());
     };
     let matches = match key {
-        "allow-lan" | "tcp-concurrent" => {
+        "allow-lan" | "tcp-concurrent" | "ipv6" | "sniffing" => {
             actual.as_bool().is_some() && actual.as_bool() == value.as_bool()
         }
         "find-process-mode" | "log-level" => actual
@@ -3205,6 +3232,13 @@ pub fn persist_nested_bool(
     let raw = read_config_text(cfg)?;
     let next = crate::ops::set_nested_bool(&raw, path, value);
     install_config(cfg, &next, false)
+}
+
+/// Record a switch the running core already applied and read back; the edit
+/// is one bool in a file that already validated, so no `mihomo -t`.
+pub fn persist_live_bool(cfg: &ControllerConfig, path: &[&str], value: bool) -> Result<(), String> {
+    let raw = read_config_text(cfg)?;
+    save_config_unchecked(cfg, &crate::ops::set_nested_bool(&raw, path, value), true)
 }
 
 /// Record a mode switched at runtime so later reloads and restarts keep it.
@@ -4929,6 +4963,58 @@ mod listener_tests {
         assert!(first.contains("\nport: 0\n") && first.contains("\nsocks-port: 0\n"));
         // What the next run derives from that file and the same source.
         assert_eq!(carry(&first, base), first);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_changes_are_saved_without_a_check_or_reload() {
+        let (dir, _) = install_fixture("live", "exit 1");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            config_dir: dir.display().to_string(),
+            ..ControllerConfig::default()
+        };
+        fs::write(config_yaml_path(&cfg), "mode: rule\nipv6: false\n").unwrap();
+        // Only the runtime mode is read: no PUT, and no `mihomo -t` to reject it.
+        let mode = || http("200 OK", r#"{"mode":"Global","ipv6":true}"#);
+        let server = serve(listener.try_clone().unwrap(), vec![mode(), mode()]);
+        persist_live_bool(&cfg, &["ipv6"], true).unwrap();
+        assert_eq!(
+            read_config_text(&cfg).unwrap(),
+            "mode: \"global\"\nipv6: true\n"
+        );
+        assert_eq!(mode_of(&config_yaml_path(&cfg)) & 0o077, 0);
+        save_config_unchecked(&cfg, "mode: rule\nmixed-port: 7899\n", true).unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests.iter().all(|r| r.starts_with("GET /configs ")));
+        assert_eq!(
+            read_config_text(&cfg).unwrap(),
+            "mode: \"global\"\nmixed-port: 7899\n"
+        );
+        // Listener clashes are still refused, and a stopped core reads nothing.
+        assert!(save_config_unchecked(&cfg, "port: 7899\nmixed-port: 7899\n", false).is_err());
+        save_config_unchecked(&cfg, "mode: rule\n", false).unwrap();
+        assert_eq!(read_config_text(&cfg).unwrap(), "mode: rule\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn switches_read_back_as_bools() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ControllerConfig {
+            addr: listener.local_addr().unwrap().to_string(),
+            ..ControllerConfig::default()
+        };
+        let runtime = r#"{"ipv6":true,"sniffing":false}"#;
+        let server = serve(
+            listener,
+            vec![http("200 OK", runtime), http("200 OK", runtime)],
+        );
+        assert!(verify_runtime_value(&cfg, "ipv6", &true.into()).is_ok());
+        let err = verify_runtime_value(&cfg, "sniffing", &true.into()).unwrap_err();
+        assert!(err.contains("sniffing reads back as false"), "{err}");
+        server.join().unwrap();
     }
 
     #[test]

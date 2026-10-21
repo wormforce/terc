@@ -541,31 +541,33 @@ impl App {
                     return Ok("设置已保存 / Settings saved".into());
                 }
                 // A reload would drop proxy-provider connections; PATCH only
-                // rebuilds the listener or switch that changed.
-                crate::mihomo::install_config_keep_mode(&cfg, &generated)?;
+                // rebuilds the listener or switch that changed. The core checks
+                // the value and it is read back, so the file that differs from
+                // a validated one by this key is saved without `mihomo -t`.
+                crate::mihomo::validate_listener_ports(&generated)?;
                 match crate::mihomo::patch_config_value(&cfg, &key, &value) {
-                    Ok(()) => Ok("设置已实时生效，未重载 / Applied live; no reload".into()),
-                    Err(err) => {
-                        use std::sync::atomic::Ordering;
-                        let uncertain = &crate::mihomo::RELOAD_UNCERTAIN;
-                        match crate::mihomo::reload_config(&cfg) {
-                            Ok(()) => {
-                                uncertain.store(false, Ordering::SeqCst);
-                                Ok(format!(
-                                    "实时修改未生效，已重载配置 / Live change failed ({err}); configuration reloaded"
-                                ))
-                            }
-                            Err(e) => {
-                                // The file already holds the new value while the
-                                // core may not; the next regeneration must reload
-                                // even when its output is unchanged.
-                                uncertain.store(true, Ordering::SeqCst);
-                                Err(format!(
-                                    "实时修改失败，重载也失败 / Live change failed ({err}); reload failed: {e}"
-                                ))
-                            }
-                        }
+                    Ok(()) => {
+                        crate::mihomo::save_config_unchecked(&cfg, &generated, true).map_err(
+                            |err| format!("设置已实时生效，但保存失败 / Applied live, but could not save: {err}"),
+                        )?;
+                        Ok("设置已实时生效，未重载 / Applied live; no reload".into())
                     }
+                    // The reload validates through the core and saves the file.
+                    Err(err) => match crate::mihomo::install_config(&cfg, &generated, true) {
+                        Ok(()) => Ok(format!(
+                            "实时修改未生效，已重载配置 / Live change failed ({err}); configuration reloaded"
+                        )),
+                        Err(e) => {
+                            // The PATCH may have half-applied; the next
+                            // regeneration must reload even when its output is
+                            // unchanged.
+                            crate::mihomo::RELOAD_UNCERTAIN
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            Err(format!(
+                                "实时修改失败，重载也失败 / Live change failed ({err}); reload failed: {e}"
+                            ))
+                        }
+                    },
                 }
             },
         );
