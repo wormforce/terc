@@ -30,8 +30,8 @@ mod ws;
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event as CEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event as CEvent,
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
@@ -2003,6 +2003,18 @@ fn main() -> io::Result<()> {
     run(&mut app)
 }
 
+/// Click and wheel reports only (1000, in SGR 1006 encoding). crossterm's
+/// `EnableMouseCapture` also asks for drag (1002) and any-motion (1003)
+/// reports, which terc never handles and which woke the loop on every mouse
+/// move. `DisableMouseCapture` on exit still clears all of them.
+struct ClickMouse;
+
+impl crossterm::Command for ClickMouse {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1006h")
+    }
+}
+
 fn run(app: &mut App) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2010,7 +2022,7 @@ fn run(app: &mut App) -> io::Result<()> {
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture
+        ClickMouse
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -4145,5 +4157,13 @@ mod tests {
         // The action thread's own snapshot is on its way; no second poll now.
         app.tick(Duration::from_millis(10));
         assert!(!app.snapshot_pending);
+    }
+
+    #[test]
+    fn mouse_mode_asks_for_clicks_and_wheel_only() {
+        let mut out = String::new();
+        crossterm::Command::write_ansi(&ClickMouse, &mut out).unwrap();
+        // 1000 click/wheel + 1006 SGR; never 1002 (drag) or 1003 (any motion).
+        assert_eq!(out, "\x1b[?1000h\x1b[?1006h");
     }
 }
