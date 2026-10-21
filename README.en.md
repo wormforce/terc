@@ -46,7 +46,7 @@
 
 ## Quick Start
 
-**Requires:** macOS 14+ or Linux (x86_64 / arm64), Rust stable, and a `mihomo` binary (`brew install mihomo` on macOS, or the matching official build from inside `terc`). See the [guide](docs/usage.en.md) and the [Chinese manual](docs/使用说明.md).
+**Requires:** macOS 14+ or Linux (x86_64 / arm64), Rust stable, and a `mihomo` binary, v1.19.27 or newer recommended (`empty-fallback` on region groups takes effect from that release; terc warns about an older core once it runs). Use `brew install mihomo` on macOS (`brew upgrade mihomo` for an existing one), or the matching official build from inside `terc`. See the [guide](docs/usage.en.md) and the [Chinese manual](docs/使用说明.md).
 
 ```bash
 git clone https://github.com/wormforce/terc.git
@@ -62,7 +62,7 @@ Disconnect other full-tunnel VPNs, such as Shadowrocket, before enabling TUN to 
 
 Run `terc --version` to verify the installed version.
 
-Setup appears only when there is no subscription URL, no `config.yaml`, and the core is not running: locate or download `mihomo` first, then paste a subscription URL (<kbd>Ctrl+D</kbd> downloads `darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` for this machine) and start the core. An existing config skips that and lands on the dashboard. <kbd>Esc</kbd> dismisses Setup for this run; add a subscription or node later with `a` in Settings → Sources & Routing, and download the core from Settings → Diagnostics → Download / update core. The system proxy is never switched on for you.
+Setup appears only when there is no subscription URL, no `config.yaml`, and the core is not running: locate or download `mihomo` first, then paste a subscription URL (<kbd>Ctrl+D</kbd> downloads `darwin-arm64`, `darwin-amd64-v1`, `linux-arm64`, or `linux-amd64-v1` for this machine) and start the core. An existing config skips that and lands on the dashboard. <kbd>Esc</kbd> dismisses Setup for this run; add a subscription or node later with `a` in Settings → Sources & Routing, and download the core from Settings → Diagnostics → Download / update core. The system proxy is never switched on for you.
 
 > [!NOTE]
 > `terc` decouples the UI lifecycle from the proxy core. Closing `terc` with <kbd>q</kbd> immediately frees all terminal UI resources while your background `mihomo` tunnel continues running uninterrupted.
@@ -159,7 +159,7 @@ Open **Settings** with <kbd>s</kbd>. UI preferences save to `~/.config/terc/conf
 | Category | Options |
 | --- | --- |
 | **Core & Proxy** | Start/stop `mihomo`, toggle the system proxy, switch routing mode |
-| **Diagnostics** | Download `mihomo-darwin-arm64`, `darwin-amd64`, `linux-arm64`, or `linux-amd64` into `~/.config/terc/core/mihomo`; DNS, rules, providers, snippets, probe, runtime, logs, core log level, live connection stream |
+| **Diagnostics** | Download `mihomo-darwin-arm64`, `darwin-amd64-v1`, `linux-arm64`, or `linux-amd64-v1` into `~/.config/terc/core/mihomo`; DNS, rules, providers, snippets, probe, runtime, logs, core log level, live connection stream |
 | **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling recursively merges mappings; disabling restores the source. Mihomo validates candidates before applying |
 | **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), UI refresh rate (`15` / `30` / `60` / `120 Hz`, a redraw cap; an unchanged screen is not redrawn), graph interval (`1000–86400000 ms`, arrows adjust by `100 ms`, Enter accepts a typed value; averaged rates, clears history on change), UI language |
 | **Sources & routing** | Independent node sources and routing plans, per-source assignments, reusable policies, validation before applying. Custom rule and AI preset editing is paused |

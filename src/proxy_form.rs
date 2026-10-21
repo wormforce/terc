@@ -517,7 +517,12 @@ pub fn handle(app: &mut App, key: KeyEvent) {
                     return;
                 }
                 form.submitting = true;
-                app.save_source_record(record, id);
+                // Not started (a reload prompt, or busy): keep the form editable.
+                if !app.save_source_record(record, id) {
+                    if let Some(form) = app.proxy_form.as_mut() {
+                        form.submitting = false;
+                    }
+                }
             }
             Err(e) => app.set_status(&e, true),
         };
@@ -1225,6 +1230,35 @@ mod tests {
                 assert!(f.ws && !f.upgrade);
             }
         }
+    }
+    #[test]
+    fn saving_a_source_asks_before_a_reload_that_drops_sessions() {
+        let mut app = crate::App::from_snapshot(Default::default(), Default::default());
+        app.screen = crate::Screen::Settings;
+        app.snapshot.running = true;
+        app.snapshot.connections_ok = true;
+        let mut conn =
+            crate::mihomo::connection_from_value(&json!({"id": "long"})).expect("connection");
+        conn.host = "api.test:443".into();
+        conn.provider = "airport".into();
+        conn.start_ms = Some(crate::conns::now_ms() - 120_000);
+        app.snapshot.connections = vec![conn];
+        app.proxy_form = Some(Form::from_record(
+            "proxy-001".into(),
+            ws_record(json!({"path": "/p"})),
+        ));
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        handle(&mut app, ctrl_s);
+        // The prompt, no action, and the form can be saved again.
+        assert!(!app.action_busy);
+        assert!(app.pending_confirm.is_some());
+        assert!(
+            app.status_message.contains("再按一次确认"),
+            "{}",
+            app.status_message
+        );
+        let form = app.proxy_form.as_ref().expect("form stays open");
+        assert!(!form.submitting);
     }
     #[test]
     fn trojan_host_hint_asks_for_sni() {

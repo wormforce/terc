@@ -770,20 +770,24 @@ impl App {
         self.save_source_record(record, None);
     }
 
+    /// Saves `record` (a new source, or `edit_id`), makes it active and
+    /// reloads. Like every other reload it asks first when sessions would
+    /// drop; the form or input stays open, so the same key confirms. `false`
+    /// when nothing was started.
     pub fn save_source_record(
         &mut self,
         record: crate::compose::ProfileSource,
         edit_id: Option<String>,
-    ) {
-        if self.action_busy {
-            return;
+    ) -> bool {
+        if self.action_busy || !self.confirm_disruption(crate::guard::Disrupt::Reload) {
+            return false;
         }
         if self.config.controller.profile_id.is_empty()
             && crate::mihomo::config_file_exists(&self.config.controller)
         {
             self.save_profile_copy();
             if self.config.controller.profile_id.is_empty() {
-                return;
+                return false;
             }
         }
         let id = edit_id.unwrap_or_else(crate::storage::next_id);
@@ -820,6 +824,7 @@ impl App {
                 result
             },
         );
+        true
     }
 
     pub fn load_core_log(&mut self) {

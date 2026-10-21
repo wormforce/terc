@@ -207,10 +207,28 @@ fn install_policy(
     // Provider nodes are only known after the reload, so with providers a
     // region filter is kept; matching nothing then fails closed through the
     // `empty-fallback: REJECT` written beside it.
+    let mut notes = Vec::new();
     let yaml = if has_providers(&chunks) {
+        let regions = region_groups(yaml)?;
+        if !regions.is_empty() {
+            let names = regions.join("、");
+            notes.push(format!(
+                "地区组 {names} 只用订阅提供者里匹配的节点，没有匹配时拒绝连接；select 组把它排在第一位时默认也会拒绝 / Region group(s) {} use only matching provider nodes and reject connections when none match; a select group that lists one first defaults to it",
+                regions.join(", ")
+            ));
+        }
         yaml.to_string()
     } else {
-        drop_unmatched_regions(yaml, proxies)?
+        let mut dropped = Vec::new();
+        let yaml = drop_unmatched_regions(yaml, proxies, &mut dropped)?;
+        if !dropped.is_empty() {
+            notes.push(format!(
+                "地区组 {} 在此来源没有匹配节点，已去掉地区筛选，组内为全部节点 / Region group(s) {} match no node of this source; the region filter was dropped, so they hold every node",
+                dropped.join("、"),
+                dropped.join(", ")
+            ));
+        }
+        yaml
     };
     let yaml = avoid_names(&yaml, proxies)?;
     chunks.retain(|c| !policy_key(c.key.as_deref()));
@@ -227,7 +245,7 @@ fn install_policy(
         crate::compose::default_url_test_tolerance(groups);
     }
     // The source's rule-providers are gone; its DNS block may still name them.
-    let notes = crate::compose::strip_dangling_rule_sets(&mut chunks);
+    notes.extend(crate::compose::strip_dangling_rule_sets(&mut chunks));
     Ok((join_chunks(&chunks), notes))
 }
 
@@ -686,7 +704,61 @@ fn has_providers(chunks: &[YamlChunk]) -> bool {
 /// by template() are judged, and only against nodes in the YAML that the
 /// info part of the exclude-filter keeps; a group whose own exclude-filter
 /// drops the rest still fails closed.
-fn drop_unmatched_regions(yaml: &str, proxies: &HashSet<String>) -> Result<String, String> {
+/// The position of a group's region `filter` and its country, for filters
+/// written by template() only.
+fn template_region(fields: &[YamlChunk]) -> Option<(usize, String)> {
+    let i = fields
+        .iter()
+        .position(|f| f.key.as_deref() == Some("filter"))?;
+    let value = field_value(&fields[i]);
+    // The flag leads every filter country_filter writes.
+    let code: String = value
+        .strip_prefix("(?i)(")
+        .and_then(|v| v.strip_prefix(FLAG_START))
+        .unwrap_or("")
+        .chars()
+        .take(2)
+        .filter_map(|c| char::from_u32((c as u32).wrapping_sub(0x1f1e6 - u32::from(b'A'))))
+        .collect();
+    (code.len() == 2 && country_filter(&code) == value).then_some((i, code))
+}
+
+fn group_name(fields: &[YamlChunk]) -> String {
+    fields
+        .iter()
+        .find(|f| f.key.as_deref() == Some("name"))
+        .map(field_value)
+        .unwrap_or_default()
+}
+
+/// Groups of a plan whose template region filter fails closed through
+/// `empty-fallback: REJECT`.
+fn region_groups(yaml: &str) -> Result<Vec<String>, String> {
+    let chunks = split_chunks(yaml);
+    let Some(groups) = chunks
+        .iter()
+        .find(|c| c.key.as_deref() == Some("proxy-groups"))
+    else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    map_groups(groups, &HashMap::new(), |fields| {
+        let rejects = fields
+            .iter()
+            .any(|f| f.key.as_deref() == Some("empty-fallback") && field_value(f) == "REJECT");
+        if rejects && template_region(fields).is_some() {
+            names.push(group_name(fields));
+        }
+        Ok(())
+    })?;
+    Ok(names)
+}
+
+fn drop_unmatched_regions(
+    yaml: &str,
+    proxies: &HashSet<String>,
+    dropped: &mut Vec<String>,
+) -> Result<String, String> {
     let mut chunks = split_chunks(yaml);
     let Some(groups) = chunks
         .iter()
@@ -696,32 +768,15 @@ fn drop_unmatched_regions(yaml: &str, proxies: &HashSet<String>) -> Result<Strin
     };
     let mut changed = false;
     let output = map_groups(groups, &HashMap::new(), |fields| {
-        let Some(i) = fields
+        let Some((i, code)) = template_region(fields) else {
+            return Ok(());
+        };
+        if !proxies
             .iter()
-            .position(|f| f.key.as_deref() == Some("filter"))
-        else {
-            return Ok(());
-        };
-        let value = field_value(&fields[i]);
-        // The flag leads every filter country_filter writes.
-        let code: String = value
-            .strip_prefix("(?i)(")
-            .and_then(|v| v.strip_prefix(FLAG_START))
-            .unwrap_or("")
-            .chars()
-            .take(2)
-            .filter_map(|c| char::from_u32((c as u32).wrapping_sub(0x1f1e6 - u32::from(b'A'))))
-            .collect();
-        let code = (code.len() == 2 && country_filter(&code) == value).then_some(code);
-        let Some(code) = code else {
-            return Ok(());
-        };
-        if !proxies.iter().any(|n| {
-            !crate::mihomo::is_info_pseudo_node(n)
-                && !crate::compose::info_excluded(n)
-                && crate::best::country_hits(n).contains(&code)
-        }) {
+            .any(|n| !crate::compose::info_entry(n) && crate::best::country_hits(n).contains(&code))
+        {
             fields.remove(i);
+            dropped.push(group_name(fields));
             changed = true;
         }
         Ok(())
@@ -844,6 +899,38 @@ fn avoid_names(yaml: &str, proxies: &HashSet<String>) -> Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn drop_unmatched_regions_for(yaml: &str, proxies: &HashSet<String>) -> Result<String, String> {
+        drop_unmatched_regions(yaml, proxies, &mut Vec::new())
+    }
+    #[test]
+    fn dropped_and_fail_closed_region_filters_are_reported() {
+        let doc = "proxies:\n  - {name: US01, type: ss}\nproxy-groups:\n  - {name: 🇺🇸 美国, type: url-test, proxies: [US01]}\n  - {name: Sel, type: select, proxies: [🇺🇸 美国]}\nrules:\n  - MATCH,Sel\n";
+        let plan = template(doc).unwrap();
+        let notes = |base: &str| {
+            let chunks = split_chunks(base);
+            let proxies = node_names(&chunks);
+            install_policy(chunks, &plan, &proxies).unwrap().1
+        };
+        let plain = "proxies:\n  - {name: HK01, type: ss}\nrules:\n  - MATCH,DIRECT\n";
+        let dropped = notes(plain);
+        assert!(
+            dropped
+                .iter()
+                .any(|n| n.contains("🇺🇸 美国") && n.contains("filter was dropped")),
+            "{dropped:?}"
+        );
+        let providers = "proxies:\n  - {name: HK01, type: ss}\nproxy-providers:\n  Air:\n    type: http\n    url: https://airport.test/sub\nrules:\n  - MATCH,DIRECT\n";
+        let closed = notes(providers);
+        assert!(
+            closed
+                .iter()
+                .any(|n| n.contains("🇺🇸 美国") && n.contains("reject connections")),
+            "{closed:?}"
+        );
+        // A matching node: nothing to say.
+        let matched = notes(&plain.replace("HK01", "US 01"));
+        assert!(!matched.iter().any(|n| n.contains("美国")), "{matched:?}");
+    }
     #[test]
     fn templates_keep_policy_and_filters_but_never_source_nodes() {
         for groups in [
@@ -946,9 +1033,10 @@ mod tests {
         let region = format!("    filter: {}", json!(country_filter("US")));
         let nodes =
             |names: &[&str]| -> HashSet<String> { names.iter().map(|n| n.to_string()).collect() };
-        let kept = drop_unmatched_regions(&route, &nodes(&["剩余流量：1GB", "🇺🇸 洛杉矶"])).unwrap();
+        let kept =
+            drop_unmatched_regions_for(&route, &nodes(&["剩余流量：1GB", "🇺🇸 洛杉矶"])).unwrap();
         assert_eq!(kept, route);
-        let out = drop_unmatched_regions(&route, &nodes(&["剩余流量：US 1GB", "HK1"])).unwrap();
+        let out = drop_unmatched_regions_for(&route, &nodes(&["剩余流量：US 1GB", "HK1"])).unwrap();
         let us = group(&out, "US");
         assert!(
             !us.contains(&region) && us.contains("include-all: true"),
@@ -961,7 +1049,7 @@ mod tests {
             route.contains(&format!("filter: {}", json!(country_filter("IT")))),
             "{route}"
         );
-        let out = drop_unmatched_regions(&route, &nodes(&["US01"])).unwrap();
+        let out = drop_unmatched_regions_for(&route, &nodes(&["US01"])).unwrap();
         assert!(!out.contains("    filter:"), "{out}");
         // Provider nodes are not in the YAML, so their filter is never judged.
         let base = "proxies:\n  - {name: HK1, type: ss}\nproxy-providers:\n  P:\n    type: http\n    url: https://airport.test/sub\nproxy-groups:\n  - {name: G, type: select, proxies: [HK1]}\nrules:\n  - MATCH,G\n";
@@ -971,7 +1059,7 @@ mod tests {
         assert!(!has_providers(&chunks));
         // The only US-labelled node is one the info exclude-filter drops.
         let route = template(doc).unwrap();
-        let out = drop_unmatched_regions(&route, &nodes(&["官网 example.us", "HK1"])).unwrap();
+        let out = drop_unmatched_regions_for(&route, &nodes(&["官网 example.us", "HK1"])).unwrap();
         assert!(!group(&out, "US").contains(&region), "{out}");
     }
 

@@ -39,7 +39,59 @@ pub fn label(name: &str, url: &str, id: &str) -> String {
             return host.into();
         }
     }
-    format!("代理 {}", id.trim_start_matches("proxy-"))
+    // A v0.1.0 profile keeps the name the user gave its file.
+    match id.strip_prefix("proxy-") {
+        Some(n) => format!("代理 {n}"),
+        None => id.into(),
+    }
+}
+/// `name:`s of the `proxies:` list of a Clash document.
+fn proxy_names(doc: &str) -> std::collections::HashSet<String> {
+    crate::ops::split_chunks(doc)
+        .iter()
+        .find(|c| c.key.as_deref() == Some("proxies"))
+        .map(compose::clash_item_names)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+/// What a source holds, as data the list shows in the UI language:
+/// `subscription`, one node's type, or `nodes:<n>`. An imported v0.1.0
+/// profile keeps its nodes in `subscription.yaml`, not in `source.json`.
+fn source_kind(source: &ProfileSource, dir: &Path) -> String {
+    if !source.subscription_url.is_empty() {
+        return "subscription".into();
+    }
+    let cached = fs::read_to_string(dir.join("subscription.yaml"))
+        .map(|doc| proxy_names(&doc).len())
+        .unwrap_or(0);
+    match (source.nodes.as_slice(), cached) {
+        ([node], 0) => node["type"].as_str().unwrap_or("proxy").to_uppercase(),
+        (nodes, cached) => format!("nodes:{}", nodes.len() + cached),
+    }
+}
+/// v0.1.0 marked the saved profile it last switched to in `active_profile`.
+/// It is the active source after migration while the running config still
+/// has that profile's nodes; an edit or update since then had replaced the
+/// running config, and the name was left behind.
+fn legacy_active_profile(name: &str, running: Option<&str>) -> Option<String> {
+    if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) {
+        return None;
+    }
+    if !root().join(name).join("source.json").is_file() {
+        return None;
+    }
+    let Some(running) = running else {
+        return Some(name.into());
+    };
+    let saved = fs::read_to_string(
+        compose::terc_dir()
+            .join("profiles")
+            .join(format!("{name}.yaml")),
+    )
+    .ok()?;
+    let nodes = proxy_names(running);
+    (!nodes.is_empty() && nodes == proxy_names(&saved)).then(|| name.into())
 }
 pub fn list(active: &str) -> Vec<ProfileEntry> {
     let mut result: Vec<_> = fs::read_dir(root())
@@ -54,16 +106,7 @@ pub fn list(active: &str) -> Vec<ProfileEntry> {
             let id = path.file_name()?.to_str()?.to_string();
             let source = ProfileSource::load(&path);
             Some(ProfileEntry {
-                kind: if !source.subscription_url.is_empty() {
-                    "订阅".into()
-                } else if source.nodes.len() == 1 {
-                    source.nodes[0]["type"]
-                        .as_str()
-                        .unwrap_or("代理")
-                        .to_uppercase()
-                } else {
-                    format!("{} 个节点", source.nodes.len())
-                },
+                kind: source_kind(&source, &path),
                 label: label(&source.name, &source.subscription_url, &id),
                 active: id == active,
                 name: id,
@@ -216,7 +259,11 @@ pub fn migrate(cfg: &mut Config) -> Result<Vec<String>, String> {
     }
     if cfg.controller.profile_id.is_empty() {
         let raw = crate::mihomo::read_config_text(&cfg.controller).ok();
-        if raw.is_some()
+        let active = legacy_active_profile(&cfg.active_profile, raw.as_deref());
+        // The running config is that profile's copy then; it is imported
+        // already, so it is not imported a second time here.
+        let snapshot = raw.as_deref().filter(|_| active.is_none());
+        if snapshot.is_some()
             || !cfg.controller.subscription_url.is_empty()
             || compose::terc_dir().join("nodes.conf").exists()
         {
@@ -225,13 +272,16 @@ pub fn migrate(cfg: &mut Config) -> Result<Vec<String>, String> {
             let result = import_old(
                 &compose::terc_dir(),
                 id,
-                raw.as_deref(),
+                snapshot,
                 &cfg.controller.subscription_url,
             );
-            if result.is_ok() {
+            if result.is_ok() && active.is_none() {
                 cfg.controller.profile_id = id.into();
             }
             note(id, result);
+        }
+        if let Some(id) = active {
+            cfg.controller.profile_id = id;
         }
     }
     if !cfg.controller.profile_id.is_empty() {
@@ -263,6 +313,49 @@ mod tests {
             "airport.test"
         );
         assert_eq!(label("", "", "proxy-001"), "代理 001");
+        assert_eq!(label("", "", "work"), "work");
+    }
+    #[test]
+    #[ignore = "changes HOME; run alone with temporary data; never starts a core"]
+    fn migration_keeps_the_v010_profile_that_was_running() {
+        let temp = temp_home("store-active");
+        let home = "proxies:\n  - {name: HomeNode, type: ss, server: 192.0.2.7, port: 8388, cipher: aes-128-gcm, password: fake}\n  - {name: HomeNode2, type: ss, server: 192.0.2.8, port: 8388, cipher: aes-128-gcm, password: fake}\nproxy-groups:\n  - {name: Home, type: select, proxies: [HomeNode, HomeNode2]}\nrules:\n  - MATCH,Home\n";
+        let airport = "proxies:\n  - {name: Remote, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: secret}\nrules:\n  - MATCH,DIRECT\n";
+        let profiles = compose::terc_dir().join("profiles");
+        compose::write_private(&profiles.join("home.yaml"), home).unwrap();
+        compose::write_private(&profiles.join("work.yaml"), airport).unwrap();
+        compose::write_private(&compose::terc_dir().join("subscription.cache"), airport).unwrap();
+        let core = temp.join("core");
+        compose::write_private(&core.join("config.yaml"), home).unwrap();
+        let v010 = |active: &str| {
+            let mut cfg = Config::default();
+            cfg.controller.config_dir = core.display().to_string();
+            cfg.controller.subscription_url = "https://sub.test/s?token=x".into();
+            cfg.active_profile = active.into();
+            cfg
+        };
+        let mut cfg = v010("home");
+        migrate(&mut cfg).unwrap();
+        assert_eq!(cfg.controller.profile_id, "home");
+        assert!(cfg.controller.subscription_url.is_empty());
+        // The airport source is still imported, inactive.
+        let imported = ProfileSource::load(&root().join("imported-001"));
+        assert_eq!(imported.subscription_url, "https://sub.test/s?token=x");
+        let listed = list(&cfg.controller.profile_id);
+        let entry = |id: &str| listed.iter().find(|e| e.name == id).unwrap().clone();
+        assert!(entry("home").active && !entry("imported-001").active);
+        assert_eq!(entry("home").label, "home");
+        assert_eq!(entry("home").kind, "nodes:2");
+        assert_eq!(entry("work").kind, "nodes:1");
+        assert_eq!(entry("imported-001").kind, "subscription");
+
+        // A name left behind after the running config was replaced.
+        fs::remove_dir_all(compose::terc_dir().join("sources")).unwrap();
+        let mut cfg = v010("work");
+        compose::write_private(&core.join("config.yaml"), home).unwrap();
+        migrate(&mut cfg).unwrap();
+        assert_eq!(cfg.controller.profile_id, "imported-001");
+        fs::remove_dir_all(temp).unwrap();
     }
     #[test]
     #[ignore = "changes HOME; run alone with temporary data; never starts a core"]

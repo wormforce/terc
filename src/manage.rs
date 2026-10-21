@@ -46,6 +46,21 @@ pub fn l3(app: &App, zh: &'static str, en: &'static str, ja: &'static str) -> &'
     }
 }
 
+/// `storage::list`'s source kind in the UI language.
+pub fn source_kind_text(app: &App, kind: &str) -> String {
+    if kind == "subscription" {
+        return l3(app, "订阅", "Subscription", "サブスク").into();
+    }
+    match kind.strip_prefix("nodes:") {
+        Some(n) => match app.lang() {
+            Lang::Zh => format!("{n} 个节点"),
+            Lang::En => format!("{n} nodes"),
+            Lang::Ja => format!("{n} ノード"),
+        },
+        None => kind.into(),
+    }
+}
+
 const BUILTIN_POLICIES: &[&str] = &[
     "DIRECT",
     "REJECT",
@@ -1235,7 +1250,10 @@ pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             app.profiles
                 .iter()
-                .map(|p| (format!("{}   {}   [{}]", p.label, p.kind, p.name), p.active))
+                .map(|p| {
+                    let kind = source_kind_text(app, &p.kind);
+                    (format!("{}   {kind}   [{}]", p.label, p.name), p.active)
+                })
                 .collect()
         };
         let selected = if routing {
@@ -1305,7 +1323,7 @@ pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
             let desc = if routing {
                 l3(app,"Enter 为当前订阅应用所选方案。c 将当前规则与策略组保存为可复用方案。保存后节点成员统一跟随订阅，保留组间引用与过滤条件。","Enter assigns the plan to the active subscription. c saves current routing for reuse. Saved groups use current-source nodes, preserving group links and filters.","Enter 適用 c 保存")
             } else {
-                l3(app,"Enter 切换订阅并加载它记住的分流。a 添加代理  e 编辑选中项  n 改名。u 更新当前订阅  v 管理当前节点。Tab 切换分流。","Enter switches source with its assigned routing. a Add  c Copy  n Rename. u Update active  e Edit active URL  v Active nodes.","Enter 切替 a 追加 c 保存 n 名前 u 更新 v ノード")
+                l3(app,"Enter 切换订阅并加载它记住的分流。a 添加代理  e 编辑选中项  n 改名。u 更新当前订阅  v 管理当前节点。Tab 切换分流。","Enter switches source with its assigned routing. a Add  e Edit selected  c Copy  n Rename. u Update active  v Active nodes. Tab switches to routing.","Enter 切替 a 追加 e 編集 c 保存 n 名前 u 更新 v ノード")
             };
             frame.render_widget(
                 Paragraph::new(desc)

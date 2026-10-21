@@ -1277,7 +1277,16 @@ fn draw_runtime(frame: &mut Frame, app: &App, area: Rect) {
         app.snapshot.find_process.as_str()
     };
     let mut lines = vec![
-        kv(theme, "core", &format!("Mihomo {}", app.snapshot.version)),
+        kv(
+            theme,
+            "core",
+            &if crate::core_too_old(&app.snapshot.version) {
+                let (a, b, c) = crate::MIN_CORE;
+                format!("Mihomo {}  ! < v{a}.{b}.{c}", app.snapshot.version)
+            } else {
+                format!("Mihomo {}", app.snapshot.version)
+            },
+        ),
         kv(theme, "mode", &app.snapshot.mode),
         kv(theme, "tun", &format!("{tun}  {stack}  {device}")),
         kv(

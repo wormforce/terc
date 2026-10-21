@@ -602,6 +602,8 @@ pub struct ComposeReport {
     pub checks: Vec<String>,
     /// Nodes whose type defaults `udp` to false and that do not set it.
     pub no_udp: Vec<String>,
+    /// A routing plan replaced the source's own rules and groups.
+    pub plan: bool,
 }
 
 impl ComposeReport {
@@ -616,14 +618,20 @@ impl ComposeReport {
     /// Source and node counts.
     pub fn headline(&self, zh: bool) -> String {
         let fmt = self.format.map(SubFormat::label).unwrap_or("-");
+        let routing = match (zh, self.plan) {
+            (true, false) => "保留来源分流",
+            (true, true) => "已套用分流方案",
+            (false, false) => "Source routing preserved",
+            (false, true) => "Routing plan applied",
+        };
         if zh {
             format!(
-                "来源 {fmt} {} 节点  手动 {}  保留来源分流",
+                "来源 {fmt} {} 节点  手动 {}  {routing}",
                 self.sub_nodes, self.manual_nodes
             )
         } else {
             format!(
-                "{fmt} {} nodes  Manual {}  Source routing preserved",
+                "{fmt} {} nodes  Manual {}  {routing}",
                 self.sub_nodes, self.manual_nodes
             )
         }
@@ -1469,15 +1477,10 @@ fn resolving_rule_note(chunks: &[YamlChunk]) -> Option<String> {
     ))
 }
 
-/// Airport entries that only show traffic or expiry, not real nodes.
-fn info_entry(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    crate::mihomo::is_info_pseudo_node(name)
-        || [
-            "剩余", "到期", "流量", "过期", "官网", "套餐", "expire", "traffic",
-        ]
-        .iter()
-        .any(|k| lower.contains(k))
+/// Airport entries that only show traffic or expiry, not real nodes. The
+/// report, the region check of routing plans and INFO_EXCLUDE share it.
+pub(crate) fn info_entry(name: &str) -> bool {
+    crate::mihomo::is_info_pseudo_node(name) || info_excluded(name)
 }
 
 /// Whether an `smux` value turns UDP on: sing-mux carries UDP unless
@@ -4677,6 +4680,28 @@ mod profile_tests {
         );
     }
 
+    #[test]
+    fn the_headline_says_when_a_routing_plan_replaced_the_source_routing() {
+        let mut report = ComposeReport::default();
+        assert!(report.headline(false).contains("Source routing preserved"));
+        report.plan = true;
+        assert!(report.headline(false).contains("Routing plan applied"));
+        assert!(report.headline(true).contains("已套用分流方案"));
+        assert!(!report.headline(true).contains("保留来源分流"));
+    }
+    #[test]
+    fn every_info_exclude_word_marks_an_info_entry() {
+        let words = INFO_EXCLUDE
+            .trim_start_matches("(?i)(")
+            .trim_end_matches(')')
+            .split('|');
+        for word in words {
+            let name = format!("{} 2026-01-01", word.to_uppercase());
+            assert!(info_entry(&name), "{name}");
+            assert!(info_excluded(&name), "{name}");
+        }
+        assert!(!info_entry("HK 01"));
+    }
     #[test]
     fn anchor_check_ignores_names_with_ampersands_and_stars() {
         for plain in [

@@ -4,7 +4,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -219,7 +219,7 @@ impl Config {
             }
             Err(err) => {
                 return (
-                    Self::default(),
+                    Self::unusable_defaults(""),
                     Some(LoadIssue::Unusable(format!(
                         "无法读取 / Cannot read / 読み込めません {}: {err}",
                         path.display()
@@ -253,7 +253,7 @@ impl Config {
                     Err(rename) => format!("{} ({rename})", path.display()),
                 };
                 (
-                    Self::default(),
+                    Self::unusable_defaults(&raw),
                     Some(LoadIssue::Unusable(format!(
                         "config.json 无法解析，已备份 / could not be parsed, kept as / を解析できず退避: {kept}: {err}"
                     ))),
@@ -262,11 +262,32 @@ impl Config {
         }
     }
 
+    /// Defaults for a run after `raw` could not be used. They still carry a
+    /// controller secret: the core is started with `-secret`, and an empty
+    /// one would leave the controller open to any web page. The broken
+    /// file's own secret is kept when it can be read, so a core it started
+    /// (and the config.yaml written with it) still accepts terc.
+    fn unusable_defaults(raw: &str) -> Self {
+        let mut cfg = Self::default();
+        cfg.controller.secret = salvage_secret(raw)
+            .or_else(random_secret)
+            .unwrap_or_default();
+        cfg
+    }
+
     /// Moves the old http default test URL to the https one, never a URL the
-    /// user set, and caps a timeout saved before the delay route's limit.
+    /// user set, and caps a timeout saved before the delay route's limit. An
+    /// empty controller secret, the v0.1.0 default, gets a random one.
     /// Returns whether anything changed.
     fn migrate(&mut self) -> bool {
         let controller = &mut self.controller;
+        let mut changed = false;
+        if controller.secret.is_empty() {
+            if let Some(secret) = random_secret() {
+                controller.secret = secret;
+                changed = true;
+            }
+        }
         let before = (controller.test_url.clone(), controller.timeout_ms);
         if controller.test_url == crate::mihomo::OLD_DEFAULT_TEST_URL {
             controller.test_url = crate::mihomo::DEFAULT_TEST_URL.to_string();
@@ -274,7 +295,7 @@ impl Config {
         controller.timeout_ms = controller
             .timeout_ms
             .min(crate::mihomo::MAX_DELAY_TIMEOUT_MS);
-        before != (controller.test_url.clone(), controller.timeout_ms)
+        changed || before != (controller.test_url.clone(), controller.timeout_ms)
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -317,6 +338,25 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// The non-empty `controller.secret` of a config.json that did not load,
+/// read even when the JSON itself is broken (a trailing comma, say).
+fn salvage_secret(raw: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+        return value["controller"]["secret"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+    let key = "\"secret\"";
+    let at = raw.find(key)? + key.len();
+    let rest = raw[at..].trim_start().strip_prefix(':')?.trim_start();
+    serde_json::Deserializer::from_str(rest)
+        .into_iter::<String>()
+        .next()?
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// 32 hex characters from `/dev/urandom`. Mihomo installs no auth at all for
 /// an empty secret, and its default CORS lets any web page reach the
 /// controller, so a fresh config never starts without one.
@@ -335,6 +375,104 @@ fn random_secret() -> Option<String> {
 /// disagree (the proxy changed outside terc since a cached poll, up to 15 s
 /// ago), and flipping that would undo what the user asked for; setting the
 /// shown opposite is harmless when the system already has it.
+/// The result of an action whose worker panicked.
+const ACTION_PANICKED: &str = "Operation failed unexpectedly";
+
+/// The oldest Mihomo that reads every key terc writes: `empty-fallback` on
+/// region groups (v1.19.27; older cores ignore it, and a group with no
+/// matching node then dials DIRECT) and `hop-interval` ranges (v1.19.24).
+pub const MIN_CORE: (u32, u32, u32) = (1, 19, 27);
+
+/// `v1.19.26` or `1.19.26` as numbers; alpha builds (`alpha-88dcbf7`) and
+/// anything else unreadable give `None`.
+fn core_version(version: &str) -> Option<(u32, u32, u32)> {
+    let v = version.trim();
+    let v = v.strip_prefix('v').unwrap_or(v);
+    let end = v
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(v.len());
+    let mut parts = v[..end].split('.').map(|p| p.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+/// Whether a readable core version predates `MIN_CORE`.
+pub fn core_too_old(version: &str) -> bool {
+    core_version(version).is_some_and(|v| v < MIN_CORE)
+}
+
+/// A warning for a running core older than `MIN_CORE`.
+fn old_core_notice(version: &str, lang: Lang) -> Option<String> {
+    if !core_too_old(version) {
+        return None;
+    }
+    let (a, b, c) = MIN_CORE;
+    Some(match lang {
+        Lang::Zh => format!("Mihomo {version} 低于 v{a}.{b}.{c}：地区组的 empty-fallback 不生效，没有匹配节点时会直连；hop-interval 范围需要 v1.19.24。请在 设置 → 排查工具 → 下载 / 更新内核 更新，或 brew upgrade mihomo"),
+        Lang::En => format!("Mihomo {version} is older than v{a}.{b}.{c}: region groups ignore empty-fallback and go DIRECT when no node matches; hop-interval ranges need v1.19.24. Update in Settings → Diagnostics → Download / update core, or brew upgrade mihomo"),
+        Lang::Ja => format!("Mihomo {version} は v{a}.{b}.{c} より古い：地域グループの empty-fallback が効かず、一致ノードがないと直接接続になります。hop-interval の範囲指定は v1.19.24 以降。設定 → 診断 → コアのダウンロード / 更新、または brew upgrade mihomo で更新してください"),
+    })
+}
+
+/// A hint for a core error caused by a key the core is too old to read.
+fn old_core_hint(err: &str, lang: Lang) -> Option<&'static str> {
+    if !(err.contains("hop-interval") && err.contains("parse")) {
+        return None;
+    }
+    Some(match lang {
+        Lang::Zh => "（hop-interval 范围写法需要 Mihomo v1.19.24 或更新的内核）",
+        Lang::En => "(hop-interval ranges need Mihomo v1.19.24 or newer)",
+        Lang::Ja => "（hop-interval の範囲指定には Mihomo v1.19.24 以降が必要）",
+    })
+}
+
+/// Whether the TUI owns the terminal (raw mode, alternate screen).
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Worker panics held back while the TUI was up; printed once it closes.
+static WORKER_PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A worker panic printed while the TUI is up would land in the alternate
+/// screen in raw mode, cut through the panels, and vanish on exit.
+fn holds_panic(on_main: bool, tui_active: bool) -> bool {
+    !on_main && tui_active
+}
+
+fn hold_worker_panic(text: String) {
+    if let Ok(mut held) = WORKER_PANICS.lock() {
+        if held.len() >= 8 {
+            held.remove(0);
+        }
+        held.push(text.replace('\n', " "));
+    }
+}
+
+fn last_worker_panic() -> Option<String> {
+    WORKER_PANICS.lock().ok()?.last().cloned()
+}
+
+/// Print the held worker panics on the normal screen.
+fn flush_worker_panics() {
+    let held = WORKER_PANICS
+        .lock()
+        .map(|mut held| std::mem::take(&mut *held))
+        .unwrap_or_default();
+    for text in held {
+        eprintln!("{text}");
+    }
+}
+
+/// Setup's message for a first line that is no subscription link and did not
+/// parse as a node. A line that looks like a node (`Name = type, …` or a
+/// `scheme://` link) gets the parser's reason, such as a bad
+/// `port-hopping-interval`; anything else gets the generic hint.
+fn setup_node_error(hint: &str, line: &str, err: &str) -> String {
+    let line = line.trim();
+    if line.contains("://") || line.contains('=') {
+        format!("{err}  ({hint})")
+    } else {
+        hint.into()
+    }
+}
+
 fn sysproxy_toggle(
     shown: bool,
     ports: Result<(u16, u16), String>,
@@ -412,10 +550,38 @@ mod io_tests {
         assert!(
             matches!(&issue, Some(LoadIssue::Unusable(text)) if text.contains("broken-1700000000"))
         );
-        assert!(cfg.controller.secret.is_empty());
+        assert_eq!(cfg.controller.secret, "keep-me", "the broken file's secret");
         assert!(!path.exists(), "nothing is written back in its place");
         let backup = dir.join("config.json.broken-1700000000");
         assert_eq!(fs::read_to_string(&backup).unwrap(), raw);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unusable_preferences_never_leave_the_controller_without_a_secret() {
+        // Broken JSON: the secret is still read from the text.
+        let raw = r#"{"controller":{"addr":"127.0.0.1:9090","secret": "f12e",},}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(raw).is_err());
+        assert_eq!(salvage_secret(raw).as_deref(), Some("f12e"));
+        assert_eq!(Config::unusable_defaults(raw).controller.secret, "f12e");
+        // No secret, an empty one, or a file that could not be read at all.
+        for raw in [
+            r#"{"settings":{"theme":"dracula"}}"#,
+            r#"{"controller":{"secret":""},"settings":{"theme":"dracula"}}"#,
+            r#"{"controller":{"secret":"",}"#,
+            "",
+        ] {
+            let secret = Config::unusable_defaults(raw).controller.secret;
+            assert_eq!(secret.len(), 32, "{raw}");
+            assert!(secret.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        // Through load_from, with a read error (a directory in its place).
+        let dir = env::temp_dir().join(format!("terc-unreadable-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&path).unwrap();
+        let (cfg, issue) = Config::load_from(&path, 0);
+        assert!(matches!(issue, Some(LoadIssue::Unusable(_))));
+        assert_eq!(cfg.controller.secret.len(), 32);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -455,6 +621,106 @@ mod io_tests {
         assert_eq!(cfg.settings.lang, Lang::En);
         assert_eq!(cfg.enabled_modules, ["sniffer"]);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v010_preferences_with_the_empty_default_secret_get_a_random_one() {
+        let dir = env::temp_dir().join(format!("terc-v010-open-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        let raw = r#"{"settings":{"lang":"zh","theme":"spring","renderer":"braille","refresh_hz":60,"graph_interval_secs":1,"show_traffic":true,"show_toolbar":true},"controller":{"addr":"127.0.0.1:9090","secret":"","config_dir":"/tmp/x","subscription_url":"","test_url":"https://www.gstatic.com/generate_204","timeout_ms":4000}}"#;
+        fs::write(&path, raw).unwrap();
+        let (cfg, issue) = Config::load_from(&path, 0);
+        assert!(issue.is_none());
+        let secret = cfg.controller.secret.clone();
+        assert_eq!(secret.len(), 32);
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["controller"]["secret"], secret.as_str(), "saved once");
+        let (again, _) = Config::load_from(&path, 0);
+        assert_eq!(again.controller.secret, secret, "not regenerated");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn setup_names_the_reason_a_pasted_node_line_was_refused() {
+        let mut app = App::from_snapshot(Config::default(), CoreSnapshot::default());
+        app.snapshot.core_bin_path = "/usr/bin/mihomo".into();
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            app.setup_editor
+                .load("HY = hysteria2, 192.0.2.1, 443, password=x, port-hopping-interval=30s");
+            app.submit_setup();
+            assert!(app.status_is_error);
+            assert!(
+                app.status_message.contains("port-hopping-interval"),
+                "{lang:?}: {}",
+                app.status_message
+            );
+            assert_eq!(app.setup_phase, SetupPhase::Editing);
+            app.setup_editor.load("hello");
+            app.submit_setup();
+            assert_eq!(app.status_message, app.t("setup_err_scheme"));
+        }
+        assert!(app.config.controller.profile_id.is_empty(), "nothing saved");
+        // Japanese names node lines too.
+        app.config.settings.lang = Lang::Ja;
+        assert!(app.t("setup_err_scheme").contains("ss://"));
+    }
+
+    #[test]
+    fn action_errors_read_in_the_ui_language() {
+        let mut app = App::from_snapshot(Config::default(), CoreSnapshot::default());
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            app.config.settings.lang = lang;
+            let text = app.explain_action_error("sysproxy_unavailable");
+            assert_eq!(text, app.t("sysproxy_unavailable"));
+            assert!(text.contains("gsettings"));
+            let parse = "proxy 0: cannot parse 'hop-interval' as int: strconv.ParseInt: parsing \"10-30\": invalid syntax";
+            assert!(app.explain_action_error(parse).contains("v1.19.24"));
+        }
+        assert_eq!(app.explain_action_error("other"), "other");
+        assert!(holds_panic(false, true));
+        assert!(!holds_panic(true, true) && !holds_panic(false, false));
+        hold_worker_panic("thread 'w' panicked at src/x.rs:1:1:\nboom".into());
+        let text = app.explain_action_error(ACTION_PANICKED);
+        assert!(
+            text.starts_with(ACTION_PANICKED) && text.contains("boom"),
+            "{text}"
+        );
+        assert!(!text.contains('\n'));
+    }
+
+    #[test]
+    fn cores_older_than_the_newest_keys_terc_writes_are_flagged() {
+        assert_eq!(core_version("v1.19.26"), Some((1, 19, 26)));
+        assert_eq!(core_version("1.19.32"), Some((1, 19, 32)));
+        assert_eq!(core_version("v1.19.27-alpha"), Some((1, 19, 27)));
+        assert_eq!(core_version("alpha-88dcbf7"), None);
+        assert_eq!(core_version("unknown"), None);
+        assert!(core_too_old("v1.19.26") && core_too_old("v1.18.10"));
+        assert!(!core_too_old("v1.19.27") && !core_too_old("v1.20.0"));
+        assert!(!core_too_old("alpha-88dcbf7"));
+        for lang in [Lang::Zh, Lang::En, Lang::Ja] {
+            let text = old_core_notice("v1.19.23", lang).unwrap();
+            assert!(text.contains("v1.19.27") && text.contains("empty-fallback"));
+        }
+        let mut app = App::from_snapshot(Config::default(), CoreSnapshot::default());
+        app.snapshot.running = true;
+        app.snapshot.version = "v1.19.26".into();
+        // Another toast is up: the notice waits for it.
+        app.set_status("reloaded", false);
+        app.note_old_core();
+        assert_eq!(app.status_message, "reloaded");
+        app.clear_status();
+        app.note_old_core();
+        assert!(app.status_message.contains("v1.19.26"));
+        app.clear_status();
+        app.note_old_core();
+        assert!(app.status_message.is_empty(), "once per version");
+        app.snapshot.version = "v1.19.32".into();
+        app.note_old_core();
+        assert!(app.status_message.is_empty());
     }
 
     #[test]
@@ -610,6 +876,8 @@ pub struct App {
     pub log_editing: bool,
     pub log_detail: bool,
     pub log_index: usize,
+    /// The core version the old-core notice last looked at.
+    pub core_version_noted: String,
     pub pending_best_group: Option<(String, Option<String>)>,
     /// Results of the rounds so far while the leaders are re-tested.
     pub best_rounds: Vec<Vec<(String, Option<u16>)>>,
@@ -760,6 +1028,7 @@ impl App {
             log_editing: false,
             log_detail: false,
             log_index: 0,
+            core_version_noted: String::new(),
             pending_best_group: None,
             best_rounds: Vec::new(),
             best_retest: Vec::new(),
@@ -892,13 +1161,18 @@ impl App {
         let lower = url.to_ascii_lowercase();
         if !lower.starts_with("https://") && !lower.starts_with("http://") {
             // Not a subscription link: accept a pasted node (Surge line or URI).
-            if crate::subconv::parse_node_line(url.lines().next().unwrap_or("")).is_err() {
-                self.set_status(self.t("setup_err_scheme"), true);
-                return;
-            }
-            let name = crate::subconv::parse_node_line(url.lines().next().unwrap_or(""))
-                .ok()
-                .and_then(|n| n["name"].as_str().map(str::to_string))
+            let first = url.lines().next().unwrap_or("");
+            let node = match crate::subconv::parse_node_line(first) {
+                Ok(node) => node,
+                Err(err) => {
+                    let text = setup_node_error(self.t("setup_err_scheme"), first, &err);
+                    self.set_status(&text, true);
+                    return;
+                }
+            };
+            let name = node["name"]
+                .as_str()
+                .map(str::to_string)
                 .unwrap_or_else(|| "导入代理".into());
             let dir = match self.setup_source_dir(name, "proxy", "") {
                 Ok(dir) => dir,
@@ -987,6 +1261,25 @@ impl App {
         true
     }
 
+    /// An action's error as the user should read it: a worker's error key in
+    /// the UI language, a hint when an old core rejected a newer key, and
+    /// the panic message behind a worker that died.
+    fn explain_action_error(&self, err: &str) -> String {
+        if err == "sysproxy_unavailable" {
+            return self.t("sysproxy_unavailable").into();
+        }
+        if err == ACTION_PANICKED {
+            return match last_worker_panic() {
+                Some(panic) => format!("{err}: {panic}"),
+                None => err.into(),
+            };
+        }
+        match old_core_hint(err, self.lang()) {
+            Some(hint) => format!("{err}  {hint}"),
+            None => err.into(),
+        }
+    }
+
     pub fn set_status(&mut self, text: &str, is_error: bool) {
         self.toast_started = Some(Instant::now());
         self.status_message = text.to_string();
@@ -996,6 +1289,23 @@ impl App {
     pub fn save_preferences(&mut self) {
         if let Err(err) = self.config.save() {
             self.set_status(&format!("Could not save preferences: {err}"), true);
+        }
+    }
+
+    /// Once per core version: warn when the running core predates keys terc
+    /// writes. It waits while another toast is up, so an action's result is
+    /// never replaced; the log keeps it too.
+    fn note_old_core(&mut self) {
+        if !self.snapshot.running || self.core_version_noted == self.snapshot.version {
+            return;
+        }
+        if self.toast_visible() {
+            return;
+        }
+        self.core_version_noted = self.snapshot.version.clone();
+        if let Some(text) = old_core_notice(&self.snapshot.version, self.lang()) {
+            self.logs.push(("warning".into(), text.clone()));
+            self.set_status(&text, true);
         }
     }
 
@@ -1134,8 +1444,9 @@ impl App {
                     match &result {
                         Ok(text) => self.set_status(text, false),
                         Err(err) => {
-                            self.set_status(err, true);
-                            self.logs.push(("error".into(), err.clone()));
+                            let err = self.explain_action_error(err);
+                            self.set_status(&err, true);
+                            self.logs.push(("error".into(), err));
                             self.load_core_log();
                         }
                     }
@@ -1207,6 +1518,7 @@ impl App {
                     self.snapshot_pending = false;
                     if !self.action_busy {
                         self.accept_snapshot(*snap);
+                        self.note_old_core();
                     }
                     if std::mem::take(&mut self.refresh_queued) {
                         self.refresh_snapshot_now();
@@ -1214,6 +1526,7 @@ impl App {
                 }
                 BackendEvent::Snapshot(snap) => {
                     self.accept_snapshot(*snap);
+                    self.note_old_core();
                     if self.group_index >= self.snapshot.groups.len() {
                         self.group_index = self.snapshot.groups.len().saturating_sub(1);
                     }
@@ -1538,7 +1851,7 @@ impl App {
             let mut done = SendOnDrop::new(
                 tx.clone(),
                 BackendEvent::ActionDone {
-                    result: Err("Operation failed unexpectedly".into()),
+                    result: Err(ACTION_PANICKED.into()),
                     modules: None,
                     profile: None,
                     snapshot_follows: false,
@@ -1678,10 +1991,12 @@ impl App {
         };
         // url-test/fallback take the pick as a pin with automatic failover.
         if !group.kind.eq_ignore_ascii_case("selector") && !group.pinnable() {
-            self.set_status(
-                "请选择 Selector / url-test / fallback 策略组 / Select a Selector, url-test or fallback group",
-                true,
-            );
+            let text = match self.lang() {
+                Lang::Zh => "请选择 Selector / url-test / fallback 策略组",
+                Lang::En => "Select a Selector, url-test or fallback group",
+                Lang::Ja => "Selector / url-test / fallback グループを選んでください",
+            };
+            self.set_status(text, true);
             return;
         }
         let country = if self.best_scope_index == 1 {
@@ -1749,12 +2064,12 @@ impl App {
         if self.best_retest.len() > 1 && self.best_rounds.len() < best::ROUNDS {
             let (n, round) = (self.best_retest.len(), self.best_rounds.len());
             let of = best::ROUNDS - 1;
-            self.set_status(
-                &format!(
-                    "正在复测领先的 {n} 个节点（{round}/{of}）/ Re-testing {n} leading nodes ({round}/{of})…"
-                ),
-                false,
-            );
+            let text = match self.lang() {
+                Lang::Zh => format!("正在复测领先的 {n} 个节点（{round}/{of}）…"),
+                Lang::En => format!("Re-testing {n} leading nodes ({round}/{of})…"),
+                Lang::Ja => format!("上位 {n} ノードを再測定中（{round}/{of}）…"),
+            };
+            self.set_status(&text, false);
             self.pending_best_group = Some((group_name.clone(), country));
             mihomo::test_best_delays_async(
                 self.config.controller.clone(),
@@ -2143,7 +2458,7 @@ impl App {
             (Lang::Ja, "setup_err_empty") => "まずリンクを入力してください",
             (Lang::Zh, "setup_err_scheme") => "需要 http(s) 订阅链接，或一条 Surge 节点行 / ss:// 等节点链接",
             (Lang::En, "setup_err_scheme") => "Enter an http(s) subscription link, or a Surge proxy line / ss:// style node link",
-            (Lang::Ja, "setup_err_scheme") => "リンクは http:// または https:// で始めてください",
+            (Lang::Ja, "setup_err_scheme") => "http(s) のサブスクリプションリンク、または Surge のノード行 / ss:// などのノードリンクを入力してください",
             (Lang::Zh, "setup_msg_saved") => "订阅已保存  内核未安装：按 Ctrl+D 下载，再按 Esc 返回，在 设置 → 内核与代理 → 内核服务 启动",
             (Lang::En, "setup_msg_saved") => "Subscription saved  no core binary: press Ctrl+D to download, then Esc and start it in Settings → Core & Proxy → Core service",
             (Lang::Ja, "setup_msg_saved") => "サブスク保存済み  コア未導入：Ctrl+D で導入後、Esc で戻り 設定 → コア・プロキシ → Core service で起動",
@@ -2545,6 +2860,7 @@ impl crossterm::Command for ClickMouse {
 /// Undo everything `TerminalGuard::enter` turns on. Each step runs even when
 /// an earlier one fails, and it is safe to run twice.
 fn restore_terminal() {
+    TUI_ACTIVE.store(false, Ordering::SeqCst);
     let _ = disable_raw_mode();
     let _ = execute!(
         io::stdout(),
@@ -2570,6 +2886,7 @@ impl TerminalGuard {
             EnableBracketedPaste,
             ClickMouse
         )?;
+        TUI_ACTIVE.store(true, Ordering::SeqCst);
         Ok(guard)
     }
 }
@@ -2577,18 +2894,30 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         restore_terminal();
+        flush_worker_panics();
     }
 }
 
 /// A main-thread panic restores the terminal before the message prints, so it
 /// lands on the normal screen instead of the discarded alternate one. Worker
-/// panics leave the TUI running: `SendOnDrop` reports them as failures.
+/// panics leave the TUI running: `SendOnDrop` reports them as failures, the
+/// toast shows the message, and it prints on the normal screen at exit.
 fn install_panic_hook() {
     let main = thread::current().id();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if thread::current().id() == main {
+        let current = thread::current();
+        let on_main = current.id() == main;
+        if holds_panic(on_main, TUI_ACTIVE.load(Ordering::SeqCst)) {
+            hold_worker_panic(format!(
+                "thread '{}' {info}",
+                current.name().unwrap_or("<unnamed>")
+            ));
+            return;
+        }
+        if on_main {
             restore_terminal();
+            flush_worker_panics();
         }
         default(info);
     }));
@@ -4000,9 +4329,7 @@ mod tests {
         assert!(app.pending_best_group.is_some());
         assert_eq!(app.best_rounds, std::slice::from_ref(&first));
         assert_eq!(app.best_retest, ["N0", "N1"]);
-        assert!(app
-            .status_message
-            .contains("Re-testing 2 leading nodes (1/2)"));
+        assert_eq!(app.status_message, "Re-testing 2 leading nodes (1/2)…");
 
         // One timeout of the current node in a re-test does not drop it.
         app.pending_best_group = None;

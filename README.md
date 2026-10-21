@@ -46,7 +46,7 @@
 
 ## 快速开始
 
-**需要：** macOS 14 或更新版本，或 Linux（x86_64 / arm64）、Rust 稳定版，以及 `mihomo` 内核。macOS 可用 `brew install mihomo`；两边都可以在设置里下载与本机匹配的官方内核。日常用法见 [使用说明](docs/使用说明.md)。
+**需要：** macOS 14 或更新版本，或 Linux（x86_64 / arm64）、Rust 稳定版，以及 `mihomo` 内核，建议 v1.19.27 或更新（地区组的 `empty-fallback` 从这一版起生效；更旧的内核 terc 会在启动后提示）。macOS 可用 `brew install mihomo`（已装的用 `brew upgrade mihomo` 更新）；两边都可以在设置里下载与本机匹配的官方内核。日常用法见 [使用说明](docs/使用说明.md)。
 
 ```bash
 git clone https://github.com/wormforce/terc.git
@@ -54,7 +54,7 @@ cd terc
 cargo run --release --locked
 ```
 
-还没有订阅链接、配置文件，且内核也没在跑时，会先弹出初始设置：粘贴机场订阅链接、定位 `mihomo` 二进制（Ctrl+D 按本机下载 `darwin-arm64`、`darwin-amd64`、`linux-arm64` 或 `linux-amd64`）、启动内核。已有配置则跳过这一步，直接进入面板。按 Esc 可以先关掉进入面板，之后在 设置 → 订阅与分流 按 `a` 添加订阅或节点，在 设置 → 排查工具 → 下载 / 更新内核 安装内核。
+还没有订阅链接、配置文件，且内核也没在跑时，会先弹出初始设置：粘贴机场订阅链接、定位 `mihomo` 二进制（Ctrl+D 按本机下载 `darwin-arm64`、`darwin-amd64-v1`、`linux-arm64` 或 `linux-amd64-v1`）、启动内核。已有配置则跳过这一步，直接进入面板。按 Esc 可以先关掉进入面板，之后在 设置 → 订阅与分流 按 `a` 添加订阅或节点，在 设置 → 排查工具 → 下载 / 更新内核 安装内核。
 
 在面板按 <kbd>Space</kbd> 开启或关闭系统代理（macOS 用 `networksetup`，Linux 在有 GNOME `gsettings` 时用 `org.gnome.system.proxy`，否则不动并提示）。terc 管理的后台 `mihomo` 在 设置 → 内核与代理 → 内核服务 启动或停止；停止内核时只关闭仍指向本机 terc 端口的系统代理，其他代理（例如公司代理）保持不变。
 
@@ -155,7 +155,7 @@ macOS 在 设置 → 内核与代理 → TUN 虚拟网卡 开启 TUN 时，terc 
 | 分类 | 可调内容 |
 | --- | --- |
 | **内核与代理** | 启停 `mihomo`、切换系统代理、切换分流模式 |
-| **排查工具** | 按本机下载 `mihomo-darwin-arm64`、`darwin-amd64`、`linux-arm64` 或 `linux-amd64` 到 `~/.config/terc/core/mihomo`；DNS、规则、远程资源、片段、探测、运行详情、日志、内核日志级别、连接实时推送 |
+| **排查工具** | 按本机下载 `mihomo-darwin-arm64`、`darwin-amd64-v1`、`linux-arm64` 或 `linux-amd64-v1` 到 `~/.config/terc/core/mihomo`；DNS、规则、远程资源、片段、探测、运行详情、日志、内核日志级别、连接实时推送 |
 | **片段** | 内置 YAML 叠加，以及 `~/.config/terc/modules` 里的文件。开启时递归合并映射，关闭时还原原配置；应用前由内核验证 |
 | **视觉与主题** | 色彩主题（`Spring` / `Vintage` / `Mono`）、速率图样式（`Braille` / `Blocks`）、界面刷新率（`15` / `30` / `60` / `120 Hz`，重绘上限，画面不变时不重绘）、图表更新间隔（`1000–86400000 ms`，方向键每次调 `100 ms`，Enter 可直接输入；取期间平均速率，改变间隔会清空旧图）、界面语言 |
 | **代理订阅与分流方案** | 节点来源与规则策略独立管理，订阅记住分流选择，方案可复用；校验后应用。自有规则与 AI 预设编辑暂缓 |

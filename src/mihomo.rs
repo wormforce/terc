@@ -3260,6 +3260,7 @@ fn generate(
     // A plan replaces the rule-providers; their DNS references go too.
     let (base, removed) = crate::routing::apply_noting(&base, route, cfg)?;
     report.notes.extend(removed);
+    report.plan = route != "subscription";
     let (base, switches) = match old {
         Some(doc) => (
             compose::carry_runtime_state(&crate::ops::strip_marked_modules(doc), &base),
@@ -4026,7 +4027,7 @@ fn install_core_from(
         let _ = fs::remove_file(&fresh);
         let _ = fs::remove_file(&part);
         return Err(format!(
-            "Downloaded {name} is damaged ({}); press Ctrl+D to fetch it again",
+            "Downloaded {name} is damaged ({}); download it again: Settings → Diagnostics → Download / update core, or Ctrl+D in Setup",
             brief(&String::from_utf8_lossy(&unpacked.stderr))
         ));
     }
@@ -4046,7 +4047,7 @@ fn install_managed_core(
     proxy_port: Option<u16>,
 ) -> Result<String, String> {
     let asset = mihomo_asset_id().ok_or_else(|| {
-        "No mihomo build for this OS/CPU (darwin-arm64, darwin-amd64, linux-arm64, linux-amd64)"
+        "No mihomo build for this OS/CPU (darwin-arm64, darwin-amd64-v1, linux-arm64, linux-amd64-v1)"
             .to_string()
     })?;
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
