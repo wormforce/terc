@@ -302,6 +302,10 @@ pub enum Scope {
     Providers,
     /// Entered through TUN: a TUN rebuild closes those.
     TunInbound,
+    /// Covers nothing itself: the next reload announced in this action also
+    /// rebuilds TUN (its `tun:` block changed), so its TUN-inbound closures
+    /// go to `Cause::Tun`.
+    ReloadRebuildsTun,
 }
 
 #[derive(Clone, Debug)]
@@ -354,6 +358,7 @@ impl Scope {
             Self::Id(want) => want == id,
             Self::Providers => !seen.provider.is_empty(),
             Self::TunInbound => seen.inbound.eq_ignore_ascii_case("tun"),
+            Self::ReloadRebuildsTun => false,
         }
     }
 }
@@ -363,9 +368,20 @@ struct PendingCause {
     scope: Scope,
     noted: Instant,
     until: Option<Instant>,
+    /// A reload that also rebuilds TUN: closures `scope` misses that entered
+    /// through TUN go to `Cause::Tun`.
+    tun: bool,
 }
 
 impl PendingCause {
+    fn cause_for(&self, id: &str, seen: &Seen) -> Option<Cause> {
+        if self.scope.covers(id, seen) {
+            Some(self.cause)
+        } else {
+            (self.tun && Scope::TunInbound.covers(id, seen)).then_some(Cause::Tun)
+        }
+    }
+
     fn active(&self, now: Instant) -> bool {
         self.until.map_or(
             now.saturating_duration_since(self.noted) <= CAUSE_MAX,
@@ -381,6 +397,8 @@ pub struct Tracker {
     gen: u64,
     closed: VecDeque<ClosedConn>,
     cause: Option<PendingCause>,
+    /// Set by `Scope::ReloadRebuildsTun` until the action's reload is noted.
+    tun_rebuild: bool,
     was_running: bool,
     totals: (u64, u64),
     restarted: bool,
@@ -449,8 +467,7 @@ impl Tracker {
             }
             let lifetime = age_secs(seen.start_ms, now_ms);
             let cause = pending
-                .filter(|p| p.scope.covers(id, seen))
-                .map(|p| p.cause)
+                .and_then(|p| p.cause_for(id, seen))
                 .or(stopped.then_some(Cause::CoreStopped));
             // A short AI request is recorded only when terc cut it.
             let ai_session =
@@ -493,11 +510,20 @@ impl Tracker {
     /// Attributes closures in `scope` from now on to `cause` until the action
     /// finishes.
     pub fn note(&mut self, cause: Cause, scope: Scope) {
+        if scope == Scope::ReloadRebuildsTun {
+            self.tun_rebuild = true;
+            return;
+        }
+        // A withdrawn reload (`Scope::Id("")`) rebuilt nothing either.
+        let tun = cause == Cause::Reload
+            && scope == Scope::Providers
+            && std::mem::take(&mut self.tun_rebuild);
         self.cause = Some(PendingCause {
             cause,
             scope,
             noted: Instant::now(),
             until: None,
+            tun,
         });
     }
 
@@ -516,6 +542,7 @@ impl Tracker {
     }
 
     pub fn action_finished(&mut self, now: Instant) {
+        self.tun_rebuild = false;
         if let Some(pending) = self.cause.as_mut().filter(|p| p.until.is_none()) {
             pending.until = Some(now + CAUSE_GRACE);
         }
@@ -778,6 +805,56 @@ mod tests {
                 assert_eq!(c.cause, want, "{cause:?} {}", c.host);
             }
         }
+    }
+
+    #[test]
+    fn reload_that_rebuilds_tun_also_blames_tun_connections() {
+        let t0 = Instant::now();
+        let old = Some(NOW_MS - 120_000);
+        let mut sub = item("sub", "sub.test:443", old);
+        sub.provider = "airport".into();
+        sub.inbound = "Tun".into();
+        let mut tun = item("tun", "tun.test:443", old);
+        tun.inbound = "Tun".into();
+        let mut top = item("top", "top.test:443", old);
+        top.inbound = "Mixed".into();
+        let run = |notes: &[(Cause, Scope)], finish_first: bool| {
+            let mut tracker = Tracker::default();
+            let mut conns = vec![sub.clone(), tun.clone(), top.clone()];
+            tracker.observe(&mut conns, true, t0, NOW_MS);
+            for (i, (cause, scope)) in notes.iter().enumerate() {
+                if finish_first && i == 1 {
+                    tracker.action_finished(t0);
+                }
+                tracker.note(*cause, scope.clone());
+            }
+            let closed = tracker.observe(&mut [], true, t0 + Duration::from_secs(1), NOW_MS);
+            let cause = |host: &str| closed.iter().find(|c| c.host == host).unwrap().cause;
+            [
+                cause("sub.test:443"),
+                cause("tun.test:443"),
+                cause("top.test:443"),
+            ]
+        };
+        let arm = (Cause::Tun, Scope::ReloadRebuildsTun);
+        let reload = (Cause::Reload, Scope::Providers);
+        assert_eq!(
+            run(&[arm.clone(), reload.clone()], false),
+            [Some(Cause::Reload), Some(Cause::Tun), None]
+        );
+        // Arming alone blames nothing, and a reload without it spares TUN.
+        assert_eq!(run(std::slice::from_ref(&arm), false), [None, None, None]);
+        assert_eq!(
+            run(std::slice::from_ref(&reload), false),
+            [Some(Cause::Reload), None, None]
+        );
+        // A withdrawn reload cut nothing; the arm ends with its action.
+        let withdrawn = (Cause::Reload, Scope::Id(String::new()));
+        assert_eq!(
+            run(&[arm.clone(), reload.clone(), withdrawn], false),
+            [None, None, None]
+        );
+        assert_eq!(run(&[arm, reload], true), [Some(Cause::Reload), None, None]);
     }
 
     #[test]
