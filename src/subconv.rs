@@ -1045,6 +1045,17 @@ fn parse_surge_proxy(
             if let Some(p) = kv.get("port-hopping") {
                 node.insert("ports".into(), json!(p.replace(';', ",")));
             }
+            // Mihomo also takes an `a-b` range here, so non-numbers pass through.
+            if let Some(i) = kv
+                .get("port-hopping-interval")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+            {
+                match i.parse::<u64>() {
+                    Ok(secs) => node.insert("hop-interval".into(), json!(secs)),
+                    Err(_) => node.insert("hop-interval".into(), json!(i)),
+                };
+            }
         }
         "tuic" | "tuic-v5" => {
             node.insert("type".into(), json!("tuic"));
@@ -2784,5 +2795,24 @@ peer = (public-key = {K1}, allowed-ips = 10.10.0.0/24, endpoint = 192.0.2.30:518
         assert!(by_name(&out.proxies, "TW-HY2")
             .get("congestion-controller")
             .is_none());
+    }
+
+    #[test]
+    fn surge_hysteria2_port_hopping_interval_maps_to_hop_interval() {
+        let out = convert_subscription(
+            "[Proxy]\nH = hysteria2, 192.0.2.4, 8443, password=fake, port-hopping=\"5000-6000;7000\", port-hopping-interval=30\n\
+             R = hysteria2, 192.0.2.4, 8443, password=fake, port-hopping=5000-6000, port-hopping-interval=10-30\n\
+             N = hysteria2, 192.0.2.4, 8443, password=fake\n",
+        )
+        .unwrap();
+        let h = by_name(&out.proxies, "H");
+        assert_eq!(h["ports"], "5000-6000,7000");
+        assert_eq!(h["hop-interval"], 30);
+        // Ranges pass through as text for cores that randomise the interval.
+        assert_eq!(by_name(&out.proxies, "R")["hop-interval"], "10-30");
+        let n = by_name(&out.proxies, "N");
+        assert!(n.get("hop-interval").is_none());
+        // Bandwidth is never guessed.
+        assert!(n.get("up").is_none() && n.get("down").is_none());
     }
 }
