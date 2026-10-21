@@ -19,7 +19,7 @@ The download reads the latest release's `version.txt` and then fetches that exac
 
 ## Subscription URL and Providers
 
-The airport subscription is the single URL you paste. Settings → Proxy subscriptions → Update subscription downloads it, combines it with the active profile’s manual nodes in `config.yaml`, preserving source routing, validates, and hot-reloads the core. Set the source URL in Settings first.
+The airport subscription is the single URL you paste. It is fetched with gzip allowed and retried twice on 5xx, 429 or a timeout, at most 30 s per attempt and about 60 s overall as before; a transfer below 1 KB/s for 15 s gives up early. Settings → Proxy subscriptions → Update subscription downloads it, combines it with the active profile’s manual nodes in `config.yaml`, preserving source routing, validates, and hot-reloads the core. Set the source URL in Settings first.
 
 Settings → Tools opens **订阅源 / Providers**. That page is `proxy-providers` and `rule-providers` inside the Mihomo config: extra URLs the core uses to refresh a node list or a rule list. It is not the airport URL. Refreshing a provider does not replace the subscription link in `~/.config/terc/config.json`.
 

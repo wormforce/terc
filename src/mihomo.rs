@@ -2132,23 +2132,38 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     Ok("Stopped managed Mihomo core".into())
 }
 
+/// Airport CDNs often gzip and now and then answer 5xx or 429, which curl
+/// retries. Each attempt is capped at 30 s and no retry starts after 40 s,
+/// so the worst case stays near the former single 60 s attempt; a link that
+/// stalls below 1 KB/s for 15 s fails instead of running the full time.
+const SUBSCRIPTION_CURL: &[&str] = &[
+    "-fsSL",
+    "--compressed",
+    "--connect-timeout",
+    "10",
+    "--max-time",
+    "30",
+    "--retry",
+    "2",
+    "--retry-delay",
+    "1",
+    "--retry-max-time",
+    "40",
+    "--speed-limit",
+    "1024",
+    "--speed-time",
+    "15",
+    "-A",
+    "clash.meta/1.19.32",
+];
+
 pub fn download_subscription(cfg: &ControllerConfig) -> Result<String, String> {
     if cfg.subscription_url.trim().is_empty() {
         return Err("Subscription URL is empty".into());
     }
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "60",
-            "-A",
-            "clash.meta/1.19.32",
-            "--url",
-            cfg.subscription_url.trim(),
-        ])
-        .stdin(Stdio::null())
+    let output = curl()
+        .args(SUBSCRIPTION_CURL)
+        .args(["--url", cfg.subscription_url.trim()])
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -5098,5 +5113,33 @@ mod download_tests {
         assert!(err.contains("damaged"), "{err}");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn subscription_download_asks_for_gzip_and_retries_a_503() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/sub?token=x", listener.local_addr().unwrap());
+        let body = "proxies:\n  - {name: a, type: ss}\n".repeat(20);
+        let packed = gzip(body.as_bytes());
+        let first = Arc::new(Mutex::new(true));
+        let server = serve_heads(listener, 2, move |_| {
+            if std::mem::replace(&mut *first.lock().unwrap(), false) {
+                return reply("503 Service Unavailable", "", b"");
+            }
+            reply("200 OK", "Content-Encoding: gzip\r\n", &packed)
+        });
+        let cfg = ControllerConfig {
+            subscription_url: url,
+            ..ControllerConfig::default()
+        };
+        assert_eq!(download_subscription(&cfg).unwrap(), body);
+        let heads = server.join().unwrap();
+        assert!(heads[1].starts_with("GET /sub?token=x "));
+        let lower = heads[1].to_ascii_lowercase();
+        assert!(
+            lower.contains("accept-encoding: ") && lower.contains("gzip"),
+            "{lower}"
+        );
+        assert!(heads[1].contains("User-Agent: clash.meta/1.19.32"));
     }
 }
