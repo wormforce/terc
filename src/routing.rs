@@ -122,8 +122,17 @@ pub fn apply(
     id: &str,
     cfg: &crate::mihomo::ControllerConfig,
 ) -> Result<String, String> {
+    apply_noting(base, id, cfg).map(|(doc, _)| doc)
+}
+/// `apply`, also returning a note for each DNS reference to a rule-provider
+/// that the replacement plan no longer defines (and that was removed).
+pub fn apply_noting(
+    base: &str,
+    id: &str,
+    cfg: &crate::mihomo::ControllerConfig,
+) -> Result<(String, Vec<String>), String> {
     if id == "subscription" {
-        return Ok(base.into());
+        return Ok((base.into(), Vec::new()));
     }
     let mut chunks = split_chunks(base);
     let proxies: HashSet<String> = chunks
@@ -181,7 +190,9 @@ pub fn apply(
             .into_iter()
             .filter(|c| policy_key(c.key.as_deref())),
     );
-    Ok(join_chunks(&chunks))
+    // The source's rule-providers are gone; its DNS block may still name them.
+    let notes = crate::compose::strip_dangling_rule_sets(&mut chunks);
+    Ok((join_chunks(&chunks), notes))
 }
 
 // Split flow YAML only at top-level separators, keeping quoted names and nested
@@ -645,5 +656,26 @@ mod tests {
         // A routing template carries sub-rules as policy.
         let route = template(&base).unwrap();
         assert!(route.contains("SUB-RULE,(NETWORK,tcp),s1") && route.contains("sub-rules:\n  s1:"));
+    }
+
+    #[test]
+    fn dropped_rule_providers_take_their_dns_references_along() {
+        let base = "dns:\n  enable: true\n  fake-ip-filter:\n    - '+.lan'\n    - rule-set:private\n  nameserver-policy:\n    'rule-set:cn,private':\n      - https://doh.pub/dns-query\n    geosite:cn: https://doh.pub/dns-query\nproxies:\n  - {name: HK, type: ss}\nproxy-groups:\n  - {name: Airport, type: select, proxies: [HK]}\nrule-providers:\n  cn: {type: http, behavior: domain, url: https://example.org/cn.yaml}\n  private: {type: http, behavior: domain, url: https://example.org/p.yaml}\nrules:\n  - RULE-SET,cn,DIRECT\n  - MATCH,Airport\n";
+        let cfg = crate::mihomo::ControllerConfig::default();
+        let (out, notes) = apply_noting(base, "all", &cfg).unwrap();
+        assert!(
+            !out.contains("rule-set:") && !out.contains("rule-providers"),
+            "{out}"
+        );
+        assert!(out.contains("  fake-ip-filter:\n    - '+.lan'\n  nameserver-policy:\n    geosite:cn: https://doh.pub/dns-query\n"), "{out}");
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("rule-set:private") && notes[0].contains("fake-ip-filter"));
+        assert!(notes[1].contains("rule-set:cn,private") && notes[1].contains("nameserver-policy"));
+        assert_eq!(apply(base, "all", &cfg).unwrap(), out);
+        // The subscription's own routing keeps its providers and references.
+        assert_eq!(
+            apply_noting(base, "subscription", &cfg).unwrap(),
+            (base.into(), Vec::new())
+        );
     }
 }
