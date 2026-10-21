@@ -2165,15 +2165,15 @@ impl App {
             (Lang::Zh, "help_jk") => "在当前列表中上下移动",
             (Lang::En, "help_jk") => "Move up / down in the current list",
             (Lang::Ja, "help_jk") => "現在のリストを上下に移動",
-            (Lang::Zh, "help_enter") => "在当前策略组中启用选中的节点",
-            (Lang::En, "help_enter") => "Use the highlighted node in the current group",
-            (Lang::Ja, "help_enter") => "選択中のノードを現在のグループで使用",
+            (Lang::Zh, "help_enter") => "在当前策略组中启用选中的节点；url-test / fallback 组会固定该节点",
+            (Lang::En, "help_enter") => "Use the highlighted node in the current group; pins it on url-test / fallback",
+            (Lang::Ja, "help_enter") => "選択中のノードを現在のグループで使用。url-test / fallback では固定",
             (Lang::Zh, "help_r") => "并发测试当前策略组的延迟",
             (Lang::En, "help_r") => "Concurrent URL latency test for the current group",
             (Lang::Ja, "help_r") => "現在のグループを並列で遅延計測",
-            (Lang::Zh, "help_a") => "选择全球或当前国家范围，测速后优选",
-            (Lang::En, "help_a") => "Choose all countries or the current one, test and select the fastest",
-            (Lang::Ja, "help_a") => "全体か現在の国を選び、計測して最速を選択",
+            (Lang::Zh, "help_a") => "选择全球或当前国家范围，测速后优选；url-test / fallback 组会固定结果",
+            (Lang::En, "help_a") => "Choose all countries or the current one, test and select the fastest; pins it on url-test / fallback",
+            (Lang::Ja, "help_a") => "全体か現在の国を選び、計測して最速を選択。url-test / fallback では固定",
             (Lang::Zh, "help_m") => "切换分流模式（规则 / 全局 / 直连）",
             (Lang::En, "help_m") => "Cycle routing mode (Rule / Global / Direct)",
             (Lang::Ja, "help_m") => "ルーティングモードを切替（Rule / Global / Direct）",
@@ -3551,10 +3551,24 @@ mod tests {
             app.screen = Screen::Help;
             app.help_scroll = 0;
             let help = render_text(&mut app, 200, 80);
-            for key in ["c:x/X", "Providers:Enter/H", "DNS:e/Enter/[]", "Tab←→hl12"] {
+            for key in [
+                "c:x/X",
+                "p:x",
+                "Providers:Enter/H",
+                "DNS:e/Enter/[]",
+                "Tab←→hl12",
+            ] {
                 assert!(help.contains(key), "{lang:?}: {key}");
             }
-            for id in ["help_conn_close", "help_rule_x", "help_hl", "help_s"] {
+            for id in [
+                "help_conn_close",
+                "help_rule_x",
+                "help_hl",
+                "help_s",
+                "help_a",
+                "help_enter",
+                "help_unpin",
+            ] {
                 assert!(
                     help.contains(&prefix(&app.t(id).replace(' ', ""), 8)),
                     "{lang:?}: {id}"
