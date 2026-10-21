@@ -196,18 +196,56 @@ impl Config {
         base.join(".config").join("terc").join("config.json")
     }
 
-    pub fn load() -> Self {
-        let path = Self::path();
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(cfg) = serde_json::from_str::<Self>(&raw) {
-                return cfg;
+    /// The config plus a notice for the UI when the file could not be used.
+    pub fn load() -> (Self, Option<LoadIssue>) {
+        Self::load_from(&Self::path(), unix_now())
+    }
+
+    /// A missing file starts fresh with defaults. A file
+    /// that will not parse is renamed to `config.json.broken-<now>` and never
+    /// overwritten, so a typo cannot wipe the secret, sources or modules.
+    fn load_from(path: &std::path::Path, now: u64) -> (Self, Option<LoadIssue>) {
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let cfg = Self::default();
+                let notice = cfg.save_to(path).err().map(|err| {
+                    LoadIssue::Unsaved(format!(
+                        "无法保存偏好 / Could not save preferences / 設定を保存できません: {err}"
+                    ))
+                });
+                return (cfg, notice);
+            }
+            Err(err) => {
+                return (
+                    Self::default(),
+                    Some(LoadIssue::Unusable(format!(
+                        "无法读取 / Cannot read / 読み込めません {}: {err}",
+                        path.display()
+                    ))),
+                )
+            }
+        };
+        match serde_json::from_str::<Self>(&raw) {
+            Ok(cfg) => (cfg, None),
+            Err(err) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "config.json".into());
+                let backup = path.with_file_name(format!("{name}.broken-{now}"));
+                let kept = match fs::rename(path, &backup) {
+                    Ok(()) => backup.display().to_string(),
+                    Err(rename) => format!("{} ({rename})", path.display()),
+                };
+                (
+                    Self::default(),
+                    Some(LoadIssue::Unusable(format!(
+                        "config.json 无法解析，已备份 / could not be parsed, kept as / を解析できず退避: {kept}: {err}"
+                    ))),
+                )
             }
         }
-        let cfg = Self::default();
-        if let Err(err) = cfg.save() {
-            eprintln!("Cannot save preferences: {err}");
-        }
-        cfg
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -223,6 +261,31 @@ impl Config {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         crate::mihomo::write_private(path, json.as_bytes()).map_err(|e| e.to_string())
     }
+}
+
+/// Why `Config::load` fell back to defaults.
+#[derive(Debug)]
+pub enum LoadIssue {
+    /// A fresh config could not be written; it still works for this run.
+    Unsaved(String),
+    /// The file exists but could not be read or parsed. Migration is skipped
+    /// so the defaults never import or save over the user's data.
+    Unusable(String),
+}
+
+impl LoadIssue {
+    fn text(&self) -> &str {
+        match self {
+            Self::Unsaved(text) | Self::Unusable(text) => text,
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Deliver a worker's completion event even when the worker panics, so
@@ -287,6 +350,46 @@ mod io_tests {
         assert_eq!(mode & 0o077, 0);
         assert!(fs::read_to_string(&path).unwrap().contains("s3cret"));
         assert!(!dir.join("config.json.tmp").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn broken_preferences_are_kept_aside_not_overwritten() {
+        let dir = env::temp_dir().join(format!("terc-broken-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        let mut good = Config::default();
+        good.controller.secret = "keep-me".into();
+        good.enabled_modules = vec!["dns-fakeip".into()];
+        let raw = serde_json::to_string(&good)
+            .unwrap()
+            .replace("\"spring\"", "\"dracula\"");
+        assert!(raw.contains("dracula"));
+        fs::write(&path, &raw).unwrap();
+
+        let (cfg, issue) = Config::load_from(&path, 1_700_000_000);
+        assert!(
+            matches!(&issue, Some(LoadIssue::Unusable(text)) if text.contains("broken-1700000000"))
+        );
+        assert!(cfg.controller.secret.is_empty());
+        assert!(!path.exists(), "nothing is written back in its place");
+        let backup = dir.join("config.json.broken-1700000000");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), raw);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v010_preferences_still_load() {
+        let dir = env::temp_dir().join(format!("terc-v010-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        let raw = r#"{"settings":{"lang":"en","theme":"vintage","renderer":"braille","refresh_hz":30,"graph_interval_secs":1,"show_traffic":true,"show_toolbar":true},"controller":{"addr":"127.0.0.1:9090","secret":"old","config_dir":"/tmp/x","subscription_url":"","test_url":"http://www.gstatic.com/generate_204","timeout_ms":4000},"enabled_modules":["sniffer"],"active_profile":"work"}"#;
+        fs::write(&path, raw).unwrap();
+        let (cfg, issue) = Config::load_from(&path, 0);
+        assert!(issue.is_none());
+        assert_eq!(cfg.controller.secret, "old");
+        assert_eq!(cfg.settings.lang, Lang::En);
+        assert_eq!(cfg.enabled_modules, ["sniffer"]);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2114,28 +2217,31 @@ fn main() -> io::Result<()> {
         println!("terc {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let mut config = Config::load();
+    let (mut config, load_issue) = Config::load();
     // Migration problems are shown in the UI; legacy files stay untouched.
-    let migration = storage::migrate(&mut config);
+    let migration = match &load_issue {
+        Some(LoadIssue::Unusable(_)) => Ok(Vec::new()),
+        _ => storage::migrate(&mut config),
+    };
     let mut app = App::new(config);
     if app.note_dns_module_change() {
         app.save_preferences();
     }
-    let migration = match migration {
-        Ok(notes) if !notes.is_empty() => Some(format!(
+    let mut problems: Vec<String> = load_issue.iter().map(|i| i.text().to_string()).collect();
+    match migration {
+        Ok(notes) if !notes.is_empty() => problems.push(format!(
             "迁移跳过 / Migration skipped / 移行スキップ: {}",
             notes.join("; ")
         )),
-        Ok(_) => None,
-        Err(err) => Some(format!("迁移失败 / Migration failed / 移行失敗: {err}")),
-    };
-    if let Some(text) = migration {
+        Ok(_) => {}
+        Err(err) => problems.push(format!("迁移失败 / Migration failed / 移行失敗: {err}")),
+    }
+    if !problems.is_empty() {
         // The one-time DNS notice is already recorded as seen; keep it.
-        let text = match app.status_message.as_str() {
-            "" => text,
-            notice => format!("{text} | {notice}"),
-        };
-        app.set_status(&text, true);
+        if !app.status_message.is_empty() {
+            problems.push(app.status_message.clone());
+        }
+        app.set_status(&problems.join(" | "), true);
     }
     run(&mut app)
 }
