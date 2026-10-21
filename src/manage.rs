@@ -939,8 +939,8 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
                 list_inner,
                 l3(
                     app,
-                    "还没有私有规则。按 a 添加，例如 example.com,AI　或　DOMAIN-KEYWORD,steam,DIRECT　或　PROCESS-NAME,Cursor,AI",
-                    "No private rules. Press a, e.g. example.com,AI  or  DOMAIN-KEYWORD,steam,DIRECT  or  PROCESS-NAME,Cursor,AI",
+                    "还没有私有规则。按 a 添加，例如 example.com,AI　或　DOMAIN-KEYWORD,steam,DIRECT　或　PROCESS-NAME,Cursor,AI（较慢：每个连接都要查进程）",
+                    "No private rules. Press a, e.g. example.com,AI  or  DOMAIN-KEYWORD,steam,DIRECT  or  PROCESS-NAME,Cursor,AI (slower: looks up the process per connection)",
                     "a で追加。例：example.com,AI",
                 ),
             );
