@@ -309,6 +309,36 @@ mod tests {
     }
 
     #[test]
+    fn a_reload_that_rebuilds_tun_blames_tun_connections_too() {
+        use crate::{conns::Scope, mihomo::BackendEvent};
+        let mut app = mixed();
+        // A worker composing a changed `tun:` block, then sending the reload.
+        let (tx, worker_tx) = (app.tx.clone(), app.tx.clone());
+        std::thread::spawn(move || {
+            crate::mihomo::report_disruptions(worker_tx);
+            crate::compose::carry_runtime_state(
+                "tun:\n  enable: true\n  stack: mixed\n",
+                "tun:\n  enable: true\n  stack: mixed\n  gso: true\n",
+            );
+        })
+        .join()
+        .unwrap();
+        tx.send(BackendEvent::Disrupting {
+            cause: Cause::Reload,
+            scope: Scope::Providers,
+        })
+        .unwrap();
+        app.drain_events();
+        assert_eq!(
+            cause_for(&mut app, conn("t", 120, false, "", "Tun")),
+            Some(Cause::Tun)
+        );
+        let provider = conn("p", 120, false, "airport", "Tun");
+        assert_eq!(cause_for(&mut app, provider), Some(Cause::Reload));
+        assert_eq!(cause(&mut app), None);
+    }
+
+    #[test]
     fn busy_app_and_setup_never_arm_a_confirmation() {
         let mut app = mixed();
         app.action_busy = true;

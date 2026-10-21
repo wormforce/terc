@@ -1828,7 +1828,31 @@ pub fn carry_runtime_state(old_base: &str, new_base: &str) -> String {
     if find("ipv6").is_some() {
         doc = crate::ops::set_nested_bool(&doc, &["ipv6"], flags.ipv6);
     }
+    // Mihomo rebuilds TUN on a reload that changes its settings (a first
+    // `gso: true`, say), which cuts every TUN connection. A TUN module
+    // overlay can hide the change; then this only arms a cause unused.
+    if tun_lines(old_base) != tun_lines(&doc) {
+        crate::mihomo::announce_disruption(
+            crate::conns::Cause::Tun,
+            crate::conns::Scope::ReloadRebuildsTun,
+        );
+    }
     doc
+}
+
+/// The `tun:` block without blank lines, for comparing two configs.
+fn tun_lines(doc: &str) -> Option<Vec<String>> {
+    split_chunks(doc)
+        .into_iter()
+        .rev()
+        .find(|c| c.key.as_deref() == Some("tun"))
+        .map(|c| {
+            c.lines
+                .iter()
+                .map(|l| l.trim_end().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
 }
 
 pub fn is_generated(doc: &str) -> bool {
@@ -3278,6 +3302,38 @@ mod profile_tests {
         // The raw source is not rewritten.
         let sub = convert_subscription(&src).unwrap();
         assert!(!sub.clash_doc.unwrap().contains("\"chrome\""));
+    }
+
+    #[test]
+    fn a_changed_tun_block_arms_a_tun_cause_for_the_reload() {
+        use crate::conns::{Cause, Scope};
+        use crate::mihomo::BackendEvent;
+        let old = "mixed-port: 7890\ntun:\n  enable: true\n  stack: mixed\nproxies: []\n";
+        let gso =
+            "mixed-port: 7890\ntun:\n  enable: false\n  stack: mixed\n  gso: true\nproxies: []\n";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (same, changed) = std::thread::spawn(move || {
+            crate::mihomo::report_disruptions(tx);
+            let same = carry_runtime_state(old, &old.replace("enable: true", "enable: false"));
+            (same, carry_runtime_state(old, gso))
+        })
+        .join()
+        .unwrap();
+        assert!(same.contains("  enable: true\n"));
+        assert!(changed.contains("  enable: true\n  stack: mixed\n  gso: true\n"));
+        // Only the gso change rebuilds TUN; the carried switch does not.
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(
+            matches!(
+                &events[..],
+                [BackendEvent::Disrupting {
+                    cause: Cause::Tun,
+                    scope: Scope::ReloadRebuildsTun
+                }]
+            ),
+            "{} events",
+            events.len()
+        );
     }
 
     #[test]
