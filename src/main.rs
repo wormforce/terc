@@ -1093,6 +1093,8 @@ impl App {
             connections: !self.stream_live(),
             rules: fresh_core || self.main_tab == MainTab::Rules,
             providers: fresh_core || providers_due || self.main_tab == MainTab::Providers,
+            // Spawning gsettings or networksetup every poll is the costly part.
+            cached_host: true,
         }
     }
 
@@ -1449,24 +1451,23 @@ impl App {
     }
 
     pub fn toggle_sysproxy(&mut self) {
-        let target = !self.snapshot.sysproxy_enabled;
-        let ports = if target {
-            if !self.snapshot.running {
-                self.set_status("Start the core before enabling system proxy", true);
+        let ports = if self.snapshot.running {
+            mihomo::proxy_ports(&self.snapshot)
+        } else {
+            Err("Start the core before enabling system proxy".into())
+        };
+        if !self.snapshot.sysproxy_enabled {
+            if let Err(e) = &ports {
+                self.set_status(e, true);
                 return;
             }
-            match mihomo::proxy_ports(&self.snapshot) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.set_status(&e, true);
-                    return;
-                }
-            }
-        } else {
-            (0, 0)
-        };
+        }
         self.run_action("Updating system proxy…", None, None, move |_| {
-            set_sysproxy(target, ports.0, ports.1)
+            // The shown state can be a poll's cached lookup, up to 15 s old:
+            // flip what the system has now.
+            let target = !mihomo::detect_sysproxy().1;
+            let (http, socks) = if target { ports? } else { (0, 0) };
+            set_sysproxy(target, http, socks)
         });
     }
 

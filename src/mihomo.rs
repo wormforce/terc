@@ -131,6 +131,9 @@ pub struct Fetch {
     /// `/providers/proxies` and `/providers/rules`: the Providers tab, plus
     /// provider nodes and their delays, which `/proxies` omits since v1.19.28.
     pub providers: bool,
+    /// Reuse the system proxy and core binary lookups for up to `HOST_TTL`
+    /// instead of looking again; see `host_state`.
+    pub cached_host: bool,
 }
 
 impl Default for Fetch {
@@ -139,6 +142,7 @@ impl Default for Fetch {
             connections: true,
             rules: true,
             providers: true,
+            cached_host: false,
         }
     }
 }
@@ -1598,6 +1602,7 @@ mod snapshot_tests {
             connections: false,
             rules: false,
             providers: false,
+            cached_host: true,
         };
         let lean = fetch_snapshot_with(&cfg, fetch);
         assert_eq!(*seen.lock().unwrap(), ["/version", "/configs", "/proxies"]);
@@ -1616,9 +1621,9 @@ mod snapshot_tests {
         // A latency test since then updated the provider node locally.
         old.nodes.get_mut("JP 01").unwrap().delay = Some(61);
         let fetch = Fetch {
-            connections: true,
             rules: false,
             providers: false,
+            ..Fetch::default()
         };
         let mut lean = fetch_snapshot_with(&cfg, fetch);
         lean.carry_skipped(&mut old);
@@ -1660,6 +1665,100 @@ mod snapshot_tests {
         };
         stopped.carry_skipped(&mut old);
         assert!(stopped.rules.is_empty() && stopped.nodes.is_empty());
+    }
+
+    #[test]
+    fn host_lookups_are_reused_for_polls_and_redone_after_actions() {
+        let cache = Mutex::new(None);
+        let dir = std::env::temp_dir().join(format!("terc-host-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("mihomo");
+        fs::write(&bin, "").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let found = |on: bool| {
+            calls.set(calls.get() + 1);
+            HostState {
+                sysproxy: ("GNOME".into(), on),
+                core_bin: Some(bin.clone()),
+            }
+        };
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert!(
+            !host_state_with(&cache, true, at(0), || found(false))
+                .sysproxy
+                .1
+        );
+        // Polls within the TTL reuse it, even though the proxy changed.
+        assert!(
+            !host_state_with(&cache, true, at(14), || found(true))
+                .sysproxy
+                .1
+        );
+        assert_eq!(calls.get(), 1);
+        // After an action terc looks again, and later polls get that answer.
+        assert!(
+            host_state_with(&cache, false, at(15), || found(true))
+                .sysproxy
+                .1
+        );
+        assert!(
+            host_state_with(&cache, true, at(16), || found(false))
+                .sysproxy
+                .1
+        );
+        assert_eq!(calls.get(), 2);
+        // Expired: a poll looks again.
+        assert!(
+            !host_state_with(&cache, true, at(31), || found(false))
+                .sysproxy
+                .1
+        );
+        assert_eq!(calls.get(), 3);
+        // A cached binary that is gone is looked up again at once.
+        fs::remove_file(&bin).unwrap();
+        let missing = || HostState {
+            sysproxy: ("GNOME".into(), false),
+            core_bin: None,
+        };
+        assert_eq!(
+            host_state_with(&cache, true, at(32), missing).core_bin,
+            None
+        );
+        // "Not found" is reused only until it expires, so an outside install shows.
+        fs::write(&bin, "").unwrap();
+        assert_eq!(
+            host_state_with(&cache, true, at(40), || found(false)).core_bin,
+            None
+        );
+        let later = host_state_with(&cache, true, at(48), || found(false));
+        assert_eq!(later.core_bin.as_deref(), Some(bin.as_path()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_core_binary_is_found_on_path_without_which() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("terc-path-{}", std::process::id()));
+        let (plain, exec) = (root.join("plain"), root.join("exec"));
+        fs::create_dir_all(&plain).unwrap();
+        fs::create_dir_all(&exec).unwrap();
+        // Not executable, then a directory of that name: both skipped.
+        fs::write(plain.join("mihomo"), "").unwrap();
+        fs::create_dir_all(root.join("dir/mihomo")).unwrap();
+        fs::write(exec.join("mihomo"), "").unwrap();
+        fs::set_permissions(exec.join("mihomo"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([
+            PathBuf::from("relative"),
+            plain.clone(),
+            root.join("dir"),
+            exec.clone(),
+        ])
+        .unwrap();
+        assert_eq!(find_executable(&path, "mihomo"), Some(exec.join("mihomo")));
+        assert_eq!(find_executable(&path, "absent"), None);
+        assert_eq!(find_executable(std::ffi::OsStr::new(""), "mihomo"), None);
+        fs::remove_dir_all(&root).unwrap();
     }
 }
 
@@ -1741,8 +1840,11 @@ pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot
 
 fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) -> CoreSnapshot {
     let timeout = Duration::from_millis(700);
-    let (net_service, sysproxy_enabled) = detect_sysproxy();
-    let core_bin_path = discover_mihomo_binary()
+    let HostState {
+        sysproxy: (net_service, sysproxy_enabled),
+        core_bin,
+    } = host_state(fetch.cached_host);
+    let core_bin_path = core_bin
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
     let mut flags = raw.map(parse_yaml_flags).unwrap_or_default();
@@ -2261,21 +2363,71 @@ pub fn discover_mihomo_binary() -> Option<PathBuf> {
     }
     candidates.push(PathBuf::from("/opt/homebrew/bin/mihomo"));
     candidates.push(PathBuf::from("/usr/local/bin/mihomo"));
+    // Distribution and AUR packages.
+    candidates.push(PathBuf::from("/usr/bin/mihomo"));
 
     for p in candidates {
         if p.is_file() {
             return Some(p);
         }
     }
-    if let Ok(output) = Command::new("which").arg("mihomo").output() {
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Some(PathBuf::from(s));
-            }
+    std::env::var_os("PATH").and_then(|path| find_executable(&path, "mihomo"))
+}
+
+/// What `which` does, without starting it: the first executable `name` in
+/// the directories of `path`.
+fn find_executable(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
+/// The two lookups a snapshot makes outside the controller.
+#[derive(Clone, Debug, PartialEq)]
+struct HostState {
+    sysproxy: (String, bool),
+    core_bin: Option<PathBuf>,
+}
+
+/// How long a background poll reuses `HostState`. Reading the system proxy
+/// starts gsettings on Linux and three to five scutil and networksetup
+/// processes on macOS, which every 2.2 s poll used to do. A change made
+/// outside terc shows up within this; terc's own actions are followed by a
+/// full snapshot, which looks again.
+const HOST_TTL: Duration = Duration::from_secs(15);
+
+static HOST_CACHE: Mutex<Option<(Instant, HostState)>> = Mutex::new(None);
+
+fn host_state(cached: bool) -> HostState {
+    host_state_with(&HOST_CACHE, cached, Instant::now(), || HostState {
+        sysproxy: detect_sysproxy(),
+        core_bin: discover_mihomo_binary(),
+    })
+}
+
+/// A fresh lookup, stored for later `cached` calls. A cached result is used
+/// while younger than `HOST_TTL` and its binary is still there; a missing
+/// binary expires like any other result, so an install made outside terc
+/// shows up.
+fn host_state_with(
+    cache: &Mutex<Option<(Instant, HostState)>>,
+    cached: bool,
+    now: Instant,
+    detect: impl FnOnce() -> HostState,
+) -> HostState {
+    // Held while detecting, so a poll and an action never both spawn.
+    let mut slot = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, state)) = slot.as_ref().filter(|_| cached) {
+        let fresh = now.saturating_duration_since(*at) < HOST_TTL;
+        if fresh && state.core_bin.as_ref().is_none_or(|bin| bin.is_file()) {
+            return state.clone();
         }
     }
-    None
+    let state = detect();
+    *slot = Some((now, state.clone()));
+    state
 }
 
 pub fn validate_listener_ports(text: &str) -> Result<(), String> {
