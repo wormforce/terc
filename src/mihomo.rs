@@ -2768,9 +2768,113 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     let _ = fs::remove_file(Path::new(&cfg.config_dir).join("terc-core.pid"));
     let (_, enabled) = detect_sysproxy();
     if enabled {
-        set_sysproxy(false, 0, 0)?;
+        let ports = read_config_text(cfg)
+            .map(|raw| yaml_listener_ports(&raw))
+            .unwrap_or_default();
+        release_sysproxy(&ports)?;
     }
     Ok("Stopped managed Mihomo core".into())
+}
+
+/// The `port`, `socks-port` and `mixed-port` values a config listens on.
+fn yaml_listener_ports(text: &str) -> Vec<u16> {
+    crate::ops::split_chunks(text)
+        .into_iter()
+        .filter(|c| matches!(c.key.as_deref(), Some("port" | "socks-port" | "mixed-port")))
+        .filter_map(|c| {
+            let (_, value) = c.lines.first()?.split_once(':')?;
+            crate::ops::clean_scalar(value).parse::<u16>().ok()
+        })
+        .filter(|&port| port > 0)
+        .collect()
+}
+
+/// Whether a system proxy entry is terc's: on loopback at one of `ports`.
+/// Anything else, such as a corporate proxy, is left on when the core stops.
+fn proxy_is_ours(host: &str, port: &str, ports: &[u16]) -> bool {
+    let host = host.trim().trim_matches('\'');
+    let port = port.trim().parse::<u16>().unwrap_or(0);
+    matches!(host, "127.0.0.1" | "localhost" | "::1") && port > 0 && ports.contains(&port)
+}
+
+/// `networksetup -getwebproxy` (and the secure and SOCKS variants) output.
+fn macos_proxy_is_ours(text: &str, ports: &[u16]) -> bool {
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(name))
+            .unwrap_or("")
+            .to_string()
+    };
+    field("Enabled:").trim() == "Yes" && proxy_is_ours(&field("Server:"), &field("Port:"), ports)
+}
+
+/// Changing the system proxy is refused under `cargo test` (AGENTS.md); the
+/// readers are kept out by `detect_sysproxy`.
+fn refuse_sysproxy_in_tests() -> Result<(), String> {
+    if cfg!(test) {
+        Err("system proxy is never changed under test".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Turn off the system proxy entries that still point at this core.
+fn release_sysproxy(ports: &[u16]) -> Result<Option<String>, String> {
+    refuse_sysproxy_in_tests()?;
+    match std::env::consts::OS {
+        "macos" => release_macos_sysproxy(ports),
+        "linux" => release_gnome_sysproxy(ports),
+        _ => Ok(None),
+    }
+}
+
+fn release_macos_sysproxy(ports: &[u16]) -> Result<Option<String>, String> {
+    let service =
+        active_macos_network_service().ok_or("Cannot identify the active macOS network service")?;
+    let mut ours = Vec::new();
+    for (get, set) in [
+        ("-getwebproxy", "-setwebproxystate"),
+        ("-getsecurewebproxy", "-setsecurewebproxystate"),
+        ("-getsocksfirewallproxy", "-setsocksfirewallproxystate"),
+    ] {
+        let out = Command::new("networksetup")
+            .args([get, &service])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if macos_proxy_is_ours(&String::from_utf8_lossy(&out.stdout), ports) {
+            ours.push(set);
+        }
+    }
+    if ours.is_empty() {
+        return Ok(None);
+    }
+    for set in ours {
+        run_networksetup(&[set, &service, "off"])?;
+    }
+    Ok(Some(format!("System Proxy OFF ({service})")))
+}
+
+fn release_gnome_sysproxy(ports: &[u16]) -> Result<Option<String>, String> {
+    let get = |schema: &str, key: &str| {
+        Command::new("gsettings")
+            .args(["get", schema, key])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    if get("org.gnome.system.proxy", "mode") != "'manual'" {
+        return Ok(None);
+    }
+    let host = get("org.gnome.system.proxy.http", "host");
+    let port = get("org.gnome.system.proxy.http", "port");
+    if !proxy_is_ours(&host, &port, ports) {
+        return Ok(None);
+    }
+    set_gnome_sysproxy(false, 0, 0).map(Some)
 }
 
 /// Airport CDNs often gzip and now and then answer 5xx or 429, which curl
@@ -4596,6 +4700,7 @@ fn run_gsettings(schema: &str, key: &str, value: &str) -> Result<(), String> {
 }
 
 fn set_gnome_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
+    refuse_sysproxy_in_tests()?;
     if !gnome_proxy_ready() {
         return Err("sysproxy_unavailable".to_string());
     }
@@ -4612,6 +4717,7 @@ fn set_gnome_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<S
 }
 
 pub fn set_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
+    refuse_sysproxy_in_tests()?;
     match std::env::consts::OS {
         "macos" => set_macos_sysproxy(enable, http_port, socks_port),
         "linux" => set_gnome_sysproxy(enable, http_port, socks_port),
@@ -4636,25 +4742,28 @@ pub fn proxy_ports(snapshot: &CoreSnapshot) -> Result<(u16, u16), String> {
     Ok((http, socks))
 }
 
+fn run_networksetup(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("networksetup")
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    // networksetup may print an error while returning status 0.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || stdout.contains("Error") || stdout.contains("error") {
+        return Err(format!(
+            "networksetup: {} {}",
+            stdout.trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 fn set_macos_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
+    refuse_sysproxy_in_tests()?;
     let service =
         active_macos_network_service().ok_or("Cannot identify the active macOS network service")?;
-    let run = |args: &[&str]| -> Result<(), String> {
-        let output = Command::new("networksetup")
-            .args(args)
-            .output()
-            .map_err(|e| e.to_string())?;
-        // networksetup may print an error while returning status 0.
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() || stdout.contains("Error") || stdout.contains("error") {
-            return Err(format!(
-                "networksetup: {} {}",
-                stdout.trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        Ok(())
-    };
+    let run = run_networksetup;
     if enable {
         if http_port == 0 {
             return Err("No HTTP proxy listener is enabled".into());
@@ -5427,6 +5536,57 @@ mod tests {
         let off = gnome_proxy_commands(false, 7890, 7891);
         assert_eq!(off.len(), 1);
         assert_eq!(off[0][4], "'none'");
+    }
+
+    #[test]
+    fn system_proxy_is_never_changed_under_test() {
+        for enable in [true, false] {
+            let err = set_sysproxy(enable, 7890, 7891).unwrap_err();
+            assert!(err.contains("under test"), "{err}");
+            assert!(set_gnome_sysproxy(enable, 7890, 7891).is_err());
+            assert!(set_macos_sysproxy(enable, 7890, 7891).is_err());
+        }
+        assert!(release_sysproxy(&[7890]).is_err());
+    }
+
+    #[test]
+    fn stopping_the_core_only_releases_its_own_system_proxy() {
+        let ports = yaml_listener_ports(
+            "mixed-port: 7890\nsocks-port: \"7891\"\nport: 0\nallow-lan: false\n",
+        );
+        assert_eq!(ports, [7890, 7891]);
+
+        let mac = |enabled: &str, server: &str, port: &str| {
+            format!("Enabled: {enabled}\nServer: {server}\nPort: {port}\nAuthenticated Proxy Enabled: 0\n")
+        };
+        assert!(macos_proxy_is_ours(
+            &mac("Yes", "127.0.0.1", "7890"),
+            &ports
+        ));
+        assert!(macos_proxy_is_ours(
+            &mac("Yes", "localhost", "7891"),
+            &ports
+        ));
+        // A corporate proxy, another app on loopback, or an entry already off.
+        assert!(!macos_proxy_is_ours(
+            &mac("Yes", "proxy.corp.example", "7890"),
+            &ports
+        ));
+        assert!(!macos_proxy_is_ours(
+            &mac("Yes", "127.0.0.1", "8080"),
+            &ports
+        ));
+        assert!(!macos_proxy_is_ours(
+            &mac("No", "127.0.0.1", "7890"),
+            &ports
+        ));
+        assert!(!macos_proxy_is_ours("", &ports));
+
+        // gsettings get prints strings quoted and ints bare.
+        assert!(proxy_is_ours("'127.0.0.1'", "7890", &ports));
+        assert!(!proxy_is_ours("'10.0.0.8'", "7890", &ports));
+        assert!(!proxy_is_ours("'127.0.0.1'", "3128", &ports));
+        assert!(!proxy_is_ours("'127.0.0.1'", "0", &[]));
     }
 
     #[test]
