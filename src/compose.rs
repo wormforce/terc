@@ -4038,9 +4038,11 @@ mod profile_tests {
         assert!(report
             .summary(false)
             .ends_with("  2 TLS node(s) given a client-fingerprint"));
+        // The fixture nodes set no udp, so that report line comes first.
         assert_eq!(
             report.details(),
-            "\n  - client-fingerprint: Reality\n  - client-fingerprint: Json"
+            "\n  - 未开启 udp / no udp: Reality, Tls, Trojan, Plain, Own, SS, Json\
+             \n  - client-fingerprint: Reality\n  - client-fingerprint: Json"
         );
 
         // A known global value goes onto every TLS node without a valid one.
