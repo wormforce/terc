@@ -2808,6 +2808,12 @@ pub fn core_log_excerpt(cfg: &ControllerConfig) -> String {
 }
 
 pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
+    // Key-path tests reach this through Setup and the core toggle. A Mihomo
+    // on PATH would then really start, with listeners and possibly TUN, so
+    // tests stop here, as the system proxy setters do.
+    if cfg!(test) {
+        return Err("the core is never started under test".into());
+    }
     let bin = discover_mihomo_binary()
         .ok_or("mihomo binary not found  download the managed core first")?;
     let config_file = config_yaml_path(cfg);

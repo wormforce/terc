@@ -1094,7 +1094,8 @@ mod profile_integration_tests {
         app.setup_editor
             .load("SetupNode = ss, 192.0.2.2, 8388, encrypt-method=aes-128-gcm, password=fake");
         app.submit_setup();
-        // No core here, so generating fails; the source is written first.
+        // Generating fails without a Mihomo on PATH, and with one the start
+        // is refused under test; either way the source is written first.
         settle(&mut app);
         assert_eq!(app.config.controller.profile_id, "proxy-001");
         let dir = crate::storage::root().join("proxy-001");
