@@ -283,11 +283,11 @@ pub fn http_request(
 
     // Keep the body as bytes until the chunk framing is gone: a chunk boundary
     // may split a multibyte character, and lossy-decoding first shifts offsets.
-    let (head, rest) = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
-        Some(pos) => (&raw[..pos], &raw[pos + 4..]),
-        None => (&raw[..], &[][..]),
+    let (head_end, body_start) = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(pos) => (pos, pos + 4),
+        None => (raw.len(), raw.len()),
     };
-    let headers = String::from_utf8_lossy(head);
+    let headers = String::from_utf8_lossy(&raw[..head_end]);
     let status = headers
         .lines()
         .next()
@@ -295,21 +295,28 @@ pub fn http_request(
         .and_then(|code| code.parse::<u16>().ok())
         // A dropped connection is not an answer from the controller.
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no HTTP response"))?;
-
-    let body = if headers.lines().any(|l| {
+    let chunked = headers.lines().any(|l| {
         l.to_ascii_lowercase()
             .contains("transfer-encoding: chunked")
-    }) {
-        decode_chunked(rest)
-    } else {
-        rest.to_vec()
-    };
+    });
+    drop(headers);
 
-    Ok((status, String::from_utf8_lossy(&body).into_owned()))
+    // A plain body moves to the front of `raw` instead of into a new buffer.
+    let body = if chunked {
+        decode_chunked(&raw[body_start..])
+    } else {
+        raw.drain(..body_start);
+        raw
+    };
+    // Valid UTF-8, the normal case, becomes the String without a copy.
+    let text = String::from_utf8(body)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
+    Ok((status, text))
 }
 
 fn decode_chunked(mut input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    // The framing only adds bytes, so the input length bounds the output.
+    let mut out = Vec::with_capacity(input.len());
     while let Some(line_end) = input.windows(2).position(|w| w == b"\r\n") {
         let len_line = String::from_utf8_lossy(&input[..line_end]);
         let Ok(chunk_len) = usize::from_str_radix(len_line.trim(), 16) else {
