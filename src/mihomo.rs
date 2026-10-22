@@ -134,7 +134,8 @@ pub struct Fetch {
     /// provider nodes and their delays, which `/proxies` omits since v1.19.28.
     pub providers: bool,
     /// Reuse the system proxy and core binary lookups for up to `HOST_TTL`
-    /// instead of looking again; see `host_state`.
+    /// instead of looking again, and config.yaml's parse while the file is
+    /// unchanged; see `host_state` and `config_facts`.
     pub cached_host: bool,
 }
 
@@ -1896,6 +1897,52 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn config_facts_follow_file_changes() {
+        let cache = Mutex::new(None);
+        let dir = std::env::temp_dir().join(format!("terc-facts-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let facts = |cached| config_facts_with(&cache, &path, cached);
+        let port = |facts: Arc<ConfigFacts>| facts.values["mixed-port"].clone();
+        fs::write(&path, "mixed-port: 7890\nsniffer:\n  enable: true\n").unwrap();
+        let first = facts(true).unwrap();
+        assert!(first.flags.sniffing);
+        // A poll of an unchanged file reuses the parse.
+        assert!(Arc::ptr_eq(&first, &facts(true).unwrap()));
+        assert_eq!(port(first), "7890");
+        // terc's own writes: a new inode.
+        write_private(&path, b"mixed-port: 7891\n").unwrap();
+        assert_eq!(port(facts(true).unwrap()), "7891");
+        // An editor writing in place with the same length, after a clock tick.
+        thread::sleep(Duration::from_millis(30));
+        fs::write(&path, "mixed-port: 7892\n").unwrap();
+        assert_eq!(port(facts(true).unwrap()), "7892");
+        // A full snapshot parses again although nothing changed, and later
+        // polls reuse that parse.
+        let polled = facts(true).unwrap();
+        let full = facts(false).unwrap();
+        assert!(!Arc::ptr_eq(&polled, &full));
+        assert!(Arc::ptr_eq(&full, &facts(true).unwrap()));
+        // Deleted: nothing, although the slot still holds the last parse.
+        fs::remove_file(&path).unwrap();
+        assert!(facts(true).is_none() && facts(false).is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_facts_read_repeated_keys_as_before() {
+        // Flags and values come from the last chunk of a key, timeouts from
+        // the first proxy-groups chunk.
+        let doc = "mixed-port: 7890\ndns:\n  enable: false\nsniffer:\n  enable: true\nproxy-groups:\n  - {name: Auto, type: url-test, proxies: [A], timeout: 2000}\nmixed-port: 7891\ndns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\nsniffer:\n  enable: false\nproxy-groups:\n  - {name: Auto, type: url-test, proxies: [A], timeout: 3000}\n";
+        let facts = ConfigFacts::parse(doc);
+        assert!(!facts.flags.sniffing);
+        assert!(facts.flags.dns.enable);
+        assert_eq!(facts.flags.dns.nameservers, ["223.5.5.5"]);
+        assert_eq!(facts.values["mixed-port"], "7891");
+        assert_eq!(facts.timeouts, HashMap::from([("Auto".to_string(), 2000)]));
+    }
+
+    #[test]
     fn the_core_binary_is_found_on_path_without_which() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("terc-path-{}", std::process::id()));
@@ -1944,43 +1991,17 @@ pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
 /// `connections` it has `connections_ok == false`; the other skipped parts
 /// stay empty until `CoreSnapshot::carry_skipped` fills them.
 pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot {
-    // One read serves both the runtime flags and the configured values.
-    let raw = read_config_text(cfg).ok();
-    let mut snapshot = fetch_core_snapshot(cfg, fetch, raw.as_deref());
-    if let Some(raw) = raw
-        .as_deref()
-        .filter(|_| snapshot.groups.iter().any(ProxyGroup::pinnable))
-    {
-        let timeouts = crate::routing::group_timeouts(raw);
-        for group in &mut snapshot.groups {
-            group.timeout_ms = timeouts.get(&group.name).copied().unwrap_or(0);
-        }
-    }
-    if let Some(raw) = raw {
-        for chunk in crate::ops::split_chunks(&raw) {
-            if let Some(key) = chunk.key {
-                if ![
-                    "mode",
-                    "port",
-                    "socks-port",
-                    "mixed-port",
-                    "log-level",
-                    "find-process-mode",
-                    "allow-lan",
-                    "tcp-concurrent",
-                ]
-                .contains(&key.as_str())
-                {
-                    continue;
-                }
-                if let Some((_, value)) = chunk.lines.first().and_then(|l| l.split_once(':')) {
-                    let value = crate::ops::clean_scalar(value);
-                    if !value.is_empty() {
-                        snapshot.config_values.insert(key, value);
-                    }
-                }
+    // One read and one split serve the flags, timeouts and configured values.
+    let facts = config_facts(cfg, fetch.cached_host);
+    let flags = facts.as_ref().map(|facts| facts.flags.clone());
+    let mut snapshot = fetch_core_snapshot(cfg, fetch, flags);
+    if let Some(facts) = &facts {
+        if snapshot.groups.iter().any(ProxyGroup::pinnable) {
+            for group in &mut snapshot.groups {
+                group.timeout_ms = facts.timeouts.get(&group.name).copied().unwrap_or(0);
             }
         }
+        snapshot.config_values = facts.values.clone();
     }
     if !snapshot.running {
         let port = |key: &str| {
@@ -2006,7 +2027,110 @@ pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot
     snapshot
 }
 
-fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) -> CoreSnapshot {
+/// What a snapshot takes from config.yaml.
+#[derive(Debug)]
+struct ConfigFacts {
+    flags: RuntimeFlags,
+    /// Each group's `timeout:`; see `routing::group_timeouts`.
+    timeouts: HashMap<String, u64>,
+    /// Top-level scalars as configured, for the settings rows.
+    values: HashMap<String, String>,
+}
+
+impl ConfigFacts {
+    fn parse(raw: &str) -> Self {
+        let chunks = crate::ops::split_chunks(raw);
+        let mut values = HashMap::new();
+        for chunk in &chunks {
+            let Some(key) = chunk.key.as_deref() else {
+                continue;
+            };
+            if ![
+                "mode",
+                "port",
+                "socks-port",
+                "mixed-port",
+                "log-level",
+                "find-process-mode",
+                "allow-lan",
+                "tcp-concurrent",
+            ]
+            .contains(&key)
+            {
+                continue;
+            }
+            if let Some((_, value)) = chunk.lines.first().and_then(|l| l.split_once(':')) {
+                let value = crate::ops::clean_scalar(value);
+                if !value.is_empty() {
+                    values.insert(key.to_string(), value);
+                }
+            }
+        }
+        Self {
+            flags: crate::ops::parse_yaml_flags_chunks(&chunks),
+            timeouts: crate::routing::group_timeouts(&chunks),
+            values,
+        }
+    }
+}
+
+/// The identity of config.yaml: path, device and inode (terc's writes
+/// replace the file), length, and mtime and ctime to the nanosecond (ctime
+/// cannot be set back by an editor or `touch`).
+type ConfigKey = (PathBuf, u64, u64, u64, (i64, i64), (i64, i64));
+
+/// config.yaml as last parsed, under its identity just before that read.
+static CONFIG_FACTS: Mutex<Option<(ConfigKey, Arc<ConfigFacts>)>> = Mutex::new(None);
+
+fn config_key(path: &Path) -> Option<ConfigKey> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).ok()?;
+    Some((
+        path.to_path_buf(),
+        m.dev(),
+        m.ino(),
+        m.len(),
+        (m.mtime(), m.mtime_nsec()),
+        (m.ctime(), m.ctime_nsec()),
+    ))
+}
+
+fn config_facts(cfg: &ControllerConfig, cached: bool) -> Option<Arc<ConfigFacts>> {
+    config_facts_with(&CONFIG_FACTS, &config_yaml_path(cfg), cached)
+}
+
+/// The facts of the config at `path`, `None` when it cannot be read. A
+/// `cached` call (the background poll) reuses the last parse while the
+/// file's identity is unchanged; any other call reads and parses again, so
+/// a snapshot after terc's own write always sees it, in-place writes
+/// included.
+fn config_facts_with(
+    cache: &Mutex<Option<(ConfigKey, Arc<ConfigFacts>)>>,
+    path: &Path,
+    cached: bool,
+) -> Option<Arc<ConfigFacts>> {
+    // Taken before the read: a write in between leaves a key that no longer
+    // matches, so the next poll reads again.
+    let key = config_key(path);
+    let lock = || cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let (true, Some(key)) = (cached, key.as_ref()) {
+        if let Some((_, facts)) = lock().as_ref().filter(|(at, _)| at == key) {
+            return Some(facts.clone());
+        }
+    }
+    // Read and parsed unlocked, so a large config never holds up another
+    // snapshot; the slot keeps whichever parse finished last, under its key.
+    let raw = fs::read_to_string(path).ok()?;
+    let facts = Arc::new(ConfigFacts::parse(&raw));
+    *lock() = key.map(|key| (key, facts.clone()));
+    Some(facts)
+}
+
+fn fetch_core_snapshot(
+    cfg: &ControllerConfig,
+    fetch: Fetch,
+    flags: Option<RuntimeFlags>,
+) -> CoreSnapshot {
     let timeout = Duration::from_millis(700);
     let HostState {
         sysproxy: (net_service, sysproxy_enabled),
@@ -2015,7 +2139,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
     let core_bin_path = core_bin
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
-    let mut flags = raw.map(parse_yaml_flags).unwrap_or_default();
+    let mut flags = flags.unwrap_or_default();
 
     let Ok((200, ver_body)) =
         http_request(&cfg.addr, &cfg.secret, "GET", "/version", None, timeout)

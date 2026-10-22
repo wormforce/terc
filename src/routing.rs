@@ -632,10 +632,9 @@ fn region(name: &str, kind: Option<&str>, nodes: &[String]) -> Option<String> {
     }
 }
 
-/// Each group's `timeout:` in a config, merge keys included. Mihomo's
-/// group JSON leaves it out.
-pub(crate) fn group_timeouts(raw: &str) -> HashMap<String, u64> {
-    let chunks = split_chunks(raw);
+/// Each group's `timeout:` in a config split into chunks, merge keys
+/// included. Mihomo's group JSON leaves it out.
+pub(crate) fn group_timeouts(chunks: &[YamlChunk]) -> HashMap<String, u64> {
     let mut timeouts = HashMap::new();
     let Some(groups) = chunks
         .iter()
@@ -643,7 +642,7 @@ pub(crate) fn group_timeouts(raw: &str) -> HashMap<String, u64> {
     else {
         return timeouts;
     };
-    let _ = map_groups(groups, &top_anchors(&chunks), |fields| {
+    let _ = map_groups(groups, &top_anchors(chunks), |fields| {
         let value = |key: &str| {
             fields
                 .iter()
@@ -1142,7 +1141,7 @@ mod tests {
         let out = merge_plan(other, &route).unwrap();
         assert!(!out.contains("*p") && !out.contains("*fb"), "{out}");
         assert_eq!(
-            group_timeouts(doc),
+            group_timeouts(&split_chunks(doc)),
             HashMap::from([("🇭🇰 香港节点".to_string(), 2000)])
         );
         assert!(

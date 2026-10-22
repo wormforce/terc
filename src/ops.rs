@@ -514,28 +514,51 @@ pub fn set_nested_bool(doc: &str, path: &[&str], value: bool) -> String {
 }
 
 pub fn parse_yaml_flags(doc: &str) -> RuntimeFlags {
+    parse_yaml_flags_chunks(&split_chunks(doc))
+}
+
+/// `parse_yaml_flags` on a document already split, so one split serves
+/// every key.
+pub(crate) fn parse_yaml_flags_chunks(chunks: &[YamlChunk]) -> RuntimeFlags {
     let mut flags = RuntimeFlags {
-        dns: parse_dns_block(doc),
+        dns: last_chunk_lines(chunks, "dns")
+            .map(dns_from_lines)
+            .unwrap_or_default(),
         ..RuntimeFlags::default()
     };
-    if let Some(value) = last_top_scalar(doc, "ipv6") {
-        flags.ipv6 = parse_yaml_bool(&value).unwrap_or(false);
+    let scalar = |key: &str| {
+        last_chunk_lines(chunks, key)
+            .and_then(|lines| lines.first())
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value)
+    };
+    if let Some(value) = scalar("ipv6") {
+        flags.ipv6 = parse_yaml_bool(value).unwrap_or(false);
     }
-    if let Some(value) = last_top_scalar(doc, "tcp-concurrent") {
-        flags.tcp_concurrent = parse_yaml_bool(&value).unwrap_or(false);
+    if let Some(value) = scalar("tcp-concurrent") {
+        flags.tcp_concurrent = parse_yaml_bool(value).unwrap_or(false);
     }
-    if let Some(value) = last_top_scalar(doc, "find-process-mode") {
-        flags.find_process = clean_scalar(&value);
+    if let Some(value) = scalar("find-process-mode") {
+        flags.find_process = clean_scalar(value);
     }
-    if let Some(lines) = last_block(doc, "tun") {
-        flags.tun_enabled = block_bool(&lines, "enable").unwrap_or(false);
-        flags.tun_stack = block_scalar(&lines, "stack").unwrap_or_default();
-        flags.tun_device = block_scalar(&lines, "device").unwrap_or_default();
+    if let Some(lines) = last_chunk_lines(chunks, "tun") {
+        flags.tun_enabled = block_bool(lines, "enable").unwrap_or(false);
+        flags.tun_stack = block_scalar(lines, "stack").unwrap_or_default();
+        flags.tun_device = block_scalar(lines, "device").unwrap_or_default();
     }
-    if let Some(lines) = last_block(doc, "sniffer") {
-        flags.sniffing = block_bool(&lines, "enable").unwrap_or(false);
+    if let Some(lines) = last_chunk_lines(chunks, "sniffer") {
+        flags.sniffing = block_bool(lines, "enable").unwrap_or(false);
     }
     flags
+}
+
+/// The lines of the last top-level chunk named `key`.
+fn last_chunk_lines<'a>(chunks: &'a [YamlChunk], key: &str) -> Option<&'a [String]> {
+    chunks
+        .iter()
+        .rev()
+        .find(|chunk| chunk.key.as_deref() == Some(key))
+        .map(|chunk| chunk.lines.as_slice())
 }
 
 pub fn apply_general_json(flags: &mut RuntimeFlags, value: &Value) {
@@ -571,9 +594,12 @@ pub fn apply_general_json(flags: &mut RuntimeFlags, value: &Value) {
 }
 
 pub fn parse_dns_block(doc: &str) -> DnsStatus {
-    let Some(lines) = last_block(doc, "dns") else {
-        return DnsStatus::default();
-    };
+    last_chunk_lines(&split_chunks(doc), "dns")
+        .map(dns_from_lines)
+        .unwrap_or_default()
+}
+
+fn dns_from_lines(lines: &[String]) -> DnsStatus {
     let mut status = DnsStatus {
         present: true,
         ..DnsStatus::default()
@@ -1472,22 +1498,6 @@ pub(crate) fn join_chunks(chunks: &[YamlChunk]) -> String {
         lines.extend(chunk.lines.iter().cloned());
     }
     join_lines(&lines)
-}
-
-fn last_block(doc: &str, key: &str) -> Option<Vec<String>> {
-    split_chunks(doc).into_iter().rev().find_map(|chunk| {
-        if chunk.key.as_deref() == Some(key) {
-            Some(chunk.lines)
-        } else {
-            None
-        }
-    })
-}
-
-fn last_top_scalar(doc: &str, key: &str) -> Option<String> {
-    let lines = last_block(doc, key)?;
-    let line = lines.first()?;
-    line.split_once(':').map(|(_, value)| value.to_string())
 }
 
 fn block_bool(lines: &[String], key: &str) -> Option<bool> {
