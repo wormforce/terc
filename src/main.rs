@@ -895,6 +895,9 @@ pub struct App {
     /// A full refresh was asked for while a poll ran (whose host lookups may
     /// be cached); it starts when that poll ends.
     pub refresh_queued: bool,
+    /// A refresh was asked for and its poll has not ended; that poll's
+    /// result draws at once instead of with the next frame.
+    pub refresh_asked: bool,
     pub setting_index: usize,
     pub setting_input: Option<String>,
     pub rule_index: usize,
@@ -1041,6 +1044,7 @@ impl App {
             group_tests: 0,
             snapshot_pending: false,
             refresh_queued: false,
+            refresh_asked: false,
             setting_index: 0,
             setting_input: None,
             rule_index: 0,
@@ -1433,16 +1437,61 @@ impl App {
         Duration::from_micros(1_000_000 / hz)
     }
 
-    /// Applies queued backend events. Returns whether any of them can change
-    /// the screen: `/logs` sends a line per new connection, but only the live
-    /// Logs tab shows them (a TUN failure still raises a toast).
-    pub fn drain_events(&mut self) -> bool {
-        let mut visible = false;
+    /// Applies queued backend events and reports what they change on screen.
+    /// `now`: what the user is looking at (rates, the shown tab's own data,
+    /// action results). `later`: background figures (memory, the overview's
+    /// connection count, a routine poll) that can wait for the next frame or
+    /// the heartbeat. `/logs` sends a line per new connection, but only the
+    /// live Logs tab shows them (a TUN failure still raises a toast).
+    pub fn drain_events(&mut self) -> Shown {
+        let mut shown = Shown::default();
         while let Ok(ev) = self.rx.try_recv() {
-            visible |= !matches!(ev, BackendEvent::Log { .. })
-                || (self.screen == Screen::Dashboard
-                    && self.main_tab == MainTab::Logs
-                    && !self.logs_paused);
+            let dashboard = self.screen == Screen::Dashboard;
+            let live_logs = dashboard && self.main_tab == MainTab::Logs && !self.logs_paused;
+            match &ev {
+                BackendEvent::Log { .. } => shown.now |= live_logs,
+                BackendEvent::Memory { .. } => shown.later = true,
+                BackendEvent::Connections { .. } => {
+                    // Closed sessions also add log lines.
+                    if (dashboard && self.main_tab == MainTab::Connections) || live_logs {
+                        shown.now = true;
+                    } else {
+                        shown.later = true;
+                    }
+                }
+                BackendEvent::DelayResult { .. } => {
+                    if self.main_tab == MainTab::Proxies || self.overlay != Overlay::None {
+                        shown.now = true;
+                    } else {
+                        shown.later = true;
+                    }
+                }
+                BackendEvent::SnapshotDone(snap) => {
+                    let old = &self.snapshot;
+                    let changed = snap.running != old.running
+                        || snap.mode != old.mode
+                        || snap.sysproxy_enabled != old.sysproxy_enabled
+                        || snap.tun_enabled != old.tun_enabled
+                        || snap.groups.len() != old.groups.len()
+                        || snap
+                            .groups
+                            .iter()
+                            .zip(&old.groups)
+                            .any(|(a, b)| a.now != b.now);
+                    // Rules and Providers show only what this poll reads; a
+                    // refresh the user asked for should not look ignored.
+                    if changed
+                        || self.refresh_asked
+                        || self.screen == Screen::Setup
+                        || matches!(self.main_tab, MainTab::Rules | MainTab::Providers)
+                    {
+                        shown.now = true;
+                    } else {
+                        shown.later = true;
+                    }
+                }
+                _ => shown.now = true,
+            }
             match ev {
                 BackendEvent::Traffic { up, down } => {
                     self.up_rate = up;
@@ -1559,6 +1608,8 @@ impl App {
                 }
                 BackendEvent::SnapshotDone(snap) => {
                     self.snapshot_pending = false;
+                    // A queued refresh asks again when it starts below.
+                    self.refresh_asked = false;
                     if !self.action_busy {
                         self.accept_snapshot(*snap);
                         self.note_old_core();
@@ -1628,7 +1679,7 @@ impl App {
                 }
             }
         }
-        visible
+        shown
     }
 
     pub fn advance_graph(&mut self, elapsed: Duration) {
@@ -1864,6 +1915,7 @@ impl App {
     }
 
     pub fn refresh_snapshot_now(&mut self) {
+        self.refresh_asked = true;
         if self.snapshot_pending {
             self.refresh_queued = true;
             return;
@@ -3001,11 +3053,24 @@ const INPUT_BURST: usize = 64;
 /// Background poll of `/version`, `/configs` and `/proxies`.
 const SNAPSHOT_POLL: Duration = Duration::from_millis(2200);
 
+/// What `App::drain_events` changed on screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shown {
+    /// Draw within `DATA_FRAME`.
+    pub now: bool,
+    /// Draw with the next frame, or at the heartbeat.
+    pub later: bool,
+}
+
 /// When `run_app` repaints: input at once (capped by `refresh_hz`), data at
-/// most every `DATA_FRAME`, and nothing while the screen cannot have changed.
+/// most every `DATA_FRAME`, background changes with the next frame or the
+/// heartbeat, and nothing while the screen cannot have changed.
 struct Redraw {
     input: bool,
     data: bool,
+    /// Memory, the overview's connection count, a routine poll, a graph
+    /// shift: they wait for the next data frame or the heartbeat.
+    lazy: bool,
     last: Instant,
     toast: (bool, Option<Instant>),
     graph: u64,
@@ -3016,6 +3081,7 @@ impl Redraw {
         Self {
             input: true,
             data: false,
+            lazy: false,
             // Long enough ago that the first frame draws at once.
             last: now.checked_sub(HEARTBEAT).unwrap_or(now),
             toast: (false, None),
@@ -3023,20 +3089,28 @@ impl Redraw {
         }
     }
 
+    /// Any undrawn change; a held click waits for it, since hit areas come
+    /// from the last draw.
     fn pending(&self) -> bool {
-        self.input || self.data
+        self.input || self.data || self.lazy
+    }
+
+    fn note(&mut self, shown: Shown) {
+        self.data |= shown.now;
+        self.lazy |= shown.later;
     }
 
     fn toast_of(app: &App) -> (bool, Option<Instant>) {
         (app.toast_visible(), app.toast_started)
     }
 
-    /// Notes changes no event reports: a toast shown, replaced or expired, a
-    /// graph shift, and the heartbeat.
+    /// Notes changes no event reports: a toast shown, replaced or expired,
+    /// the heartbeat, and a graph shift (lazy: it runs on its own timer and
+    /// rides the next frame, so a hidden graph never forces one).
     fn observe(&mut self, app: &App, now: Instant) {
         self.data |= Self::toast_of(app) != self.toast
-            || app.graph_gen != self.graph
             || now.saturating_duration_since(self.last) >= HEARTBEAT;
+        self.lazy |= app.graph_gen != self.graph;
     }
 
     /// Time since the last frame the pending change has to wait for.
@@ -3045,6 +3119,8 @@ impl Redraw {
             Some(frame)
         } else if self.data {
             Some(frame.max(DATA_FRAME))
+        } else if self.lazy {
+            Some(HEARTBEAT)
         } else {
             None
         }
@@ -3068,6 +3144,7 @@ impl Redraw {
     fn drawn(&mut self, app: &App, now: Instant) {
         self.input = false;
         self.data = false;
+        self.lazy = false;
         self.last = now;
         self.toast = Self::toast_of(app);
         self.graph = app.graph_gen;
@@ -3083,7 +3160,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
     let mut last_input = last_tick;
 
     loop {
-        redraw.data |= app.drain_events();
+        redraw.note(app.drain_events());
         let now = Instant::now();
         redraw.observe(app, now);
         let frame = app.frame_duration();
@@ -5288,8 +5365,10 @@ mod tests {
             .unwrap();
         app.drain_events();
         assert!(!app.refresh_queued);
+        assert!(app.refresh_asked, "its own result still draws at once");
         let full = finish_poll(&mut app, &paths);
         assert!(full.iter().any(|p| p == "/version"), "{full:?}");
+        assert!(!app.refresh_asked);
     }
 
     #[test]
@@ -5931,7 +6010,7 @@ mod tests {
                 snapshot_follows: true,
             })
             .unwrap();
-        assert!(app.drain_events());
+        assert!(app.drain_events().now);
         assert!(!app.action_busy);
         // The action thread's own snapshot is on its way; no second poll now.
         app.tick(Duration::from_millis(10));
@@ -5959,30 +6038,77 @@ mod tests {
     #[test]
     fn drain_reports_only_changes_the_screen_shows() {
         let mut app = offline_app();
-        assert!(!app.drain_events());
+        assert_eq!(app.drain_events(), Shown::default());
         // /logs carries a line per new connection; off the Logs tab it is kept, not drawn.
         app.tx.send(log("info", "[TCP] a --> b match x")).unwrap();
-        assert!(!app.drain_events());
+        assert_eq!(app.drain_events(), Shown::default());
         assert_eq!(app.logs.len(), 1);
         app.main_tab = MainTab::Logs;
         app.tx.send(log("info", "[TCP] c --> d match x")).unwrap();
-        assert!(app.drain_events());
+        assert!(app.drain_events().now);
         app.pause_logs();
         app.tx.send(log("info", "[TCP] e --> f match x")).unwrap();
-        assert!(!app.drain_events());
+        assert_eq!(app.drain_events(), Shown::default());
         // A TUN failure still reaches the screen through the toast.
         app.main_tab = MainTab::Proxies;
         app.tx
             .send(log("error", "Start TUN listening error: denied"))
             .unwrap();
-        assert!(!app.drain_events());
+        assert_eq!(app.drain_events(), Shown::default());
         assert!(app.toast_visible());
         app.tx
             .send(BackendEvent::Traffic { up: 1, down: 2 })
             .unwrap();
         app.tx.send(log("info", "[TCP] g --> h match x")).unwrap();
-        assert!(app.drain_events());
+        assert!(app.drain_events().now);
         assert_eq!(app.logs.len(), 5);
+        // Background figures wait for the next frame; the shown tab's own data does not.
+        let conns = || BackendEvent::Connections {
+            items: Vec::new(),
+            upload_total: 1,
+            download_total: 2,
+            at: Instant::now(),
+        };
+        let later = Shown {
+            now: false,
+            later: true,
+        };
+        let poll = |app: &App| BackendEvent::SnapshotDone(Box::new(app.snapshot.clone()));
+        app.tx.send(BackendEvent::Memory { inuse: 1 }).unwrap();
+        app.tx.send(conns()).unwrap();
+        assert_eq!(app.drain_events(), later);
+        app.tx.send(poll(&app)).unwrap();
+        assert_eq!(app.drain_events(), later);
+        app.tx
+            .send(BackendEvent::DelayResult {
+                group: "g".into(),
+                node: "n".into(),
+                delay: Some(80),
+            })
+            .unwrap();
+        assert!(app.drain_events().now, "delays on the Proxies tab");
+        // A refresh the user asked for shows at once, even if nothing changed.
+        app.refresh_asked = true;
+        app.tx.send(poll(&app)).unwrap();
+        assert!(app.drain_events().now);
+        assert!(!app.refresh_asked);
+        app.main_tab = MainTab::Connections;
+        app.tx.send(conns()).unwrap();
+        assert!(app.drain_events().now);
+        app.tx
+            .send(BackendEvent::DelayResult {
+                group: "g".into(),
+                node: "n".into(),
+                delay: Some(90),
+            })
+            .unwrap();
+        assert_eq!(app.drain_events(), later);
+        let mut switched = app.snapshot.clone();
+        switched.mode = "global".into();
+        app.tx
+            .send(BackendEvent::SnapshotDone(Box::new(switched)))
+            .unwrap();
+        assert!(app.drain_events().now, "a mode switch shows at once");
     }
 
     #[test]
@@ -6100,6 +6226,20 @@ mod tests {
         app.graph_gen += 1;
         redraw.observe(&app, t0);
         assert!(redraw.pending(), "graph shifted");
+        // It rides the next data frame, or the heartbeat at the latest, and
+        // never wakes an idle loop sooner.
+        assert!(!redraw.due(t0 + Duration::from_millis(500), frame));
+        assert_eq!(
+            redraw.wait(t0 + Duration::from_millis(500), frame, HEARTBEAT),
+            Duration::from_millis(500)
+        );
+        redraw.note(Shown {
+            now: true,
+            later: false,
+        });
+        assert!(redraw.due(t0 + Duration::from_millis(100), frame));
+        redraw.data = false;
+        assert!(redraw.due(t0 + HEARTBEAT, frame));
         redraw.drawn(&app, t0);
         redraw.observe(&app, t0);
         assert!(!redraw.due(t0 + Duration::from_millis(500), frame));
