@@ -1416,6 +1416,10 @@ fn rule_provider_kinds(chunks: &[YamlChunk]) -> HashMap<String, (String, Vec<Str
     out
 }
 
+/// Nested providers followed before the hint gives up; keeps a crafted
+/// chain from overflowing the stack.
+const RULE_SET_DEPTH: usize = 64;
+
 /// Whether Mihomo resolves the host locally to match `rule`: an IP rule
 /// without `no-resolve` (GEOIP,LAN included), a RULE-SET of an ipcidr
 /// provider or of a classical one whose inline payload holds such a rule,
@@ -1424,12 +1428,14 @@ fn rule_provider_kinds(chunks: &[YamlChunk]) -> HashMap<String, (String, Vec<Str
 ///
 /// `seen` remembers each classical provider's answer so a payload is walked
 /// once. A provider counts as non-resolving while its own payload is walked,
-/// so a RULE-SET cycle in a downloaded subscription ends there instead of
-/// overflowing the stack.
+/// so a RULE-SET cycle in a downloaded subscription ends there; past
+/// `RULE_SET_DEPTH` nested providers the hint gives up and reports no
+/// resolve, so a long chain cannot overflow the stack either.
 fn rule_resolves<'a>(
     rule: &str,
     providers: &'a HashMap<String, (String, Vec<String>)>,
     seen: &mut HashMap<&'a str, bool>,
+    depth: usize,
 ) -> bool {
     let fields = flow_split(rule);
     let Some(kind) = fields.first().map(|k| k.to_ascii_uppercase()) else {
@@ -1457,8 +1463,13 @@ fn rule_resolves<'a>(
             if let Some(&hit) = seen.get(name.as_str()) {
                 return hit;
             }
+            if depth >= RULE_SET_DEPTH {
+                return false;
+            }
             seen.insert(name, false);
-            let hit = payload.iter().any(|r| rule_resolves(r, providers, seen));
+            let hit = payload
+                .iter()
+                .any(|r| rule_resolves(r, providers, seen, depth + 1));
             seen.insert(name, hit);
             hit
         }
@@ -1473,7 +1484,7 @@ fn rule_resolves<'a>(
                     .strip_prefix('(')
                     .and_then(|v| v.strip_suffix(')'))
                     .unwrap_or(r);
-                rule_resolves(r, providers, seen)
+                rule_resolves(r, providers, seen, depth)
             })
         }),
         _ => false,
@@ -1492,7 +1503,7 @@ fn resolving_rule_note(chunks: &[YamlChunk]) -> Option<String> {
     let mut seen = HashMap::new();
     let n = rules
         .iter()
-        .position(|r| rule_resolves(r, &providers, &mut seen))?;
+        .position(|r| rule_resolves(r, &providers, &mut seen, 0))?;
     let rule: String = rules[n].chars().take(60).collect();
     let n = n + 1;
     Some(format!(
@@ -3653,7 +3664,7 @@ mod tests {
                 ),
             ),
         ]);
-        let resolves = |r: &str| rule_resolves(r, &providers, &mut HashMap::new());
+        let resolves = |r: &str| rule_resolves(r, &providers, &mut HashMap::new(), 0);
         assert!(resolves("GEOIP,LAN,DIRECT"));
         assert!(resolves("IP-ASN,13335,PROXY"));
         assert!(!resolves("GEOIP,CN,DIRECT,no-resolve"));
@@ -3695,13 +3706,33 @@ mod tests {
                 classical(&["RULE-SET,c,PROXY", "IP-CIDR,192.0.2.0/24"]),
             ),
         ]);
-        let resolves = |r: &str| rule_resolves(r, &providers, &mut HashMap::new());
+        let resolves = |r: &str| rule_resolves(r, &providers, &mut HashMap::new(), 0);
         assert!(!resolves("RULE-SET,self,PROXY"));
         assert!(!resolves("RULE-SET,a,PROXY"));
         assert!(!resolves("RULE-SET,b,PROXY"));
         // An IP rule past the back-reference still counts from either end.
         assert!(resolves("RULE-SET,c,PROXY"));
         assert!(resolves("RULE-SET,d,PROXY"));
+
+        // A long acyclic chain gives up at the depth cap instead of
+        // overflowing the test thread's stack; a short one still resolves.
+        let chain = |len: usize| -> HashMap<String, (String, Vec<String>)> {
+            (0..len)
+                .map(|k| {
+                    let rule = if k + 1 == len {
+                        "IP-CIDR,192.0.2.0/24".to_string()
+                    } else {
+                        format!("RULE-SET,p{},X", k + 1)
+                    };
+                    (format!("p{k}"), classical(&[rule.as_str()]))
+                })
+                .collect()
+        };
+        let head_resolves = |providers: &HashMap<String, (String, Vec<String>)>| {
+            rule_resolves("RULE-SET,p0,X", providers, &mut HashMap::new(), 0)
+        };
+        assert!(!head_resolves(&chain(50_000)));
+        assert!(head_resolves(&chain(3)));
 
         // The same shapes read from a config: a flow self-reference and a
         // block A->B->A cycle are skipped, the GEOIP rule after them is not.

@@ -183,6 +183,7 @@ impl App {
         self.dns_editing = false;
         self.dns_lines = vec![self.t("st_dns_lookup").to_string()];
         self.dns_error = false;
+        self.replies_owed += 1;
         dns_query_async(
             self.config.controller.clone(),
             name,
@@ -197,6 +198,7 @@ impl App {
             return;
         }
         self.set_status(self.t("st_dns_flushing"), false);
+        self.replies_owed += 1;
         flush_dns_async(self.config.controller.clone(), self.tx.clone());
     }
 
@@ -254,6 +256,7 @@ impl App {
             &format!("{} {}", self.t("st_provider_busy"), provider.name),
             false,
         );
+        self.replies_owed += 1;
         refresh_provider_async(
             self.config.controller.clone(),
             provider.kind,
@@ -286,6 +289,7 @@ impl App {
             },
         };
         self.set_status(&format!("{}  {name}", self.t("st_provider_health")), false);
+        self.replies_owed += 1;
         provider_healthcheck_async(self.config.controller.clone(), name, texts, self.tx.clone());
     }
 
@@ -302,6 +306,7 @@ impl App {
             return;
         }
         self.set_status(self.t("st_provider_all"), false);
+        self.replies_owed += 1;
         refresh_all_providers_async(self.config.controller.clone(), providers, self.tx.clone());
     }
 
@@ -547,6 +552,7 @@ impl App {
         let node = self.selected_proxy_name();
         self.probe_lines = vec![format!("{} {raw}", self.t("st_probe_busy"))];
         self.probe_error = false;
+        self.replies_owed += 1;
         probe_async(self.config.controller.clone(), node, raw, self.tx.clone());
     }
 
@@ -561,6 +567,7 @@ impl App {
             return;
         };
         self.set_status(&format!("{} {}", self.t("st_probe_busy"), peer.name), false);
+        self.replies_owed += 1;
         test_node_async(
             self.config.controller.clone(),
             peer.name,

@@ -712,14 +712,7 @@ pub fn providers_from_value(value: &Value, kind: &str) -> Vec<ProviderInfo> {
         .iter()
         .filter(|(_, item)| !json_string(item, "vehicleType").eq_ignore_ascii_case("Compatible"))
         .map(|(key, item)| {
-            let name = {
-                let named = json_string(item, "name");
-                if named.is_empty() {
-                    key.clone()
-                } else {
-                    named
-                }
-            };
+            let name = provider_name(key, &json_string(item, "name")).to_string();
             let count = item
                 .get("ruleCount")
                 .and_then(Value::as_u64)
@@ -769,14 +762,7 @@ pub fn provider_nodes_from_value(value: &Value) -> Vec<ProviderNode> {
     };
     let mut out = Vec::new();
     for (key, item) in obj {
-        let provider = {
-            let named = json_string(item, "name");
-            if named.is_empty() {
-                key.clone()
-            } else {
-                named
-            }
-        };
+        let provider = provider_name(key, &json_string(item, "name")).to_string();
         if provider == "default" {
             continue;
         }
@@ -788,10 +774,7 @@ pub fn provider_nodes_from_value(value: &Value) -> Vec<ProviderNode> {
         {
             let name = json_string(proxy, "name");
             let kind = json_string(proxy, "type");
-            if name.is_empty()
-                || ["selector", "urltest", "fallback", "loadbalance", "relay"]
-                    .contains(&kind.to_ascii_lowercase().as_str())
-            {
+            if name.is_empty() || is_group_kind(&kind) {
                 continue;
             }
             let delay = proxy
@@ -811,6 +794,21 @@ pub fn provider_nodes_from_value(value: &Value) -> Vec<ProviderNode> {
         }
     }
     out
+}
+
+/// A provider's name: its `name`, or its key when that is empty.
+pub(crate) fn provider_name<'a>(key: &'a str, named: &'a str) -> &'a str {
+    if named.is_empty() {
+        key
+    } else {
+        named
+    }
+}
+
+/// Proxy types that are groups, not nodes, in a provider's `proxies`.
+pub(crate) fn is_group_kind(kind: &str) -> bool {
+    ["selector", "urltest", "fallback", "loadbalance", "relay"]
+        .contains(&kind.to_ascii_lowercase().as_str())
 }
 
 pub fn parse_dns_message(body: &str) -> Result<DnsMessage, String> {

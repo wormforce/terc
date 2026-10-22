@@ -888,9 +888,15 @@ pub struct App {
     pub best_choice: String,
     pub best_scope_index: usize,
     pub action_busy: bool,
+    /// The action thread's follow-up `Snapshot` has not arrived yet.
+    pub snapshot_owed: bool,
     /// Group delay tests still sending results; each ends with one
     /// `GroupTestDone`.
     pub group_tests: usize,
+    /// Other workers the user started (provider updates and health checks,
+    /// DNS flushes and lookups, probes, node tests) that have not replied;
+    /// each ends with one `ReplyDone`.
+    pub replies_owed: usize,
     pub snapshot_pending: bool,
     /// A full refresh was asked for while a poll ran (whose host lookups may
     /// be cached); it starts when that poll ends.
@@ -1041,7 +1047,9 @@ impl App {
             best_choice: String::new(),
             best_scope_index: 0,
             action_busy: false,
+            snapshot_owed: false,
             group_tests: 0,
+            replies_owed: 0,
             snapshot_pending: false,
             refresh_queued: false,
             refresh_asked: false,
@@ -1329,20 +1337,24 @@ impl App {
     }
 
     /// Longest `run_app` may block on input. Worker events cannot wake
-    /// `event::poll`, so while a reply is awaited (an action, a delay test, a
-    /// download, or keys pressed just now) the loop looks every `IDLE_WAKE`.
+    /// `event::poll`, so while a reply is awaited (an action and the snapshot
+    /// after it, a refresh, a delay test, a download, another worker the user
+    /// started, or keys pressed just now) the loop looks every `BUSY_WAKE`.
     /// Otherwise it sleeps to the next change no event reports: a toast
     /// expiring, the graph shift, the next poll, or (in `Redraw::wait`) the
     /// heartbeat. Pushes queued meanwhile land in that one frame.
     pub fn wake_cap(&self, since_input: Duration, since_tick: Duration) -> Duration {
         if self.action_busy
+            || self.snapshot_owed
+            || self.refresh_asked
             || self.refresh_queued
             || self.core_downloading
             || self.pending_best_group.is_some()
             || self.group_tests > 0
+            || self.replies_owed > 0
             || since_input < BUSY_AFTER_INPUT
         {
-            return IDLE_WAKE;
+            return BUSY_WAKE;
         }
         let mut cap = HEARTBEAT;
         if self.screen == Screen::Dashboard && self.main_tab == MainTab::Logs && !self.logs_paused {
@@ -1451,6 +1463,8 @@ impl App {
             match &ev {
                 BackendEvent::Log { .. } => shown.now |= live_logs,
                 BackendEvent::Memory { .. } => shown.later = true,
+                // The reply it follows reported itself.
+                BackendEvent::ReplyDone => {}
                 BackendEvent::Connections { .. } => {
                     // Closed sessions also add log lines.
                     if (dashboard && self.main_tab == MainTab::Connections) || live_logs {
@@ -1460,7 +1474,14 @@ impl App {
                     }
                 }
                 BackendEvent::DelayResult { .. } => {
-                    if self.main_tab == MainTab::Proxies || self.overlay != Overlay::None {
+                    // Settings → Subscriptions → Nodes lists own-node delays too.
+                    let own_nodes = self.screen == Screen::Settings
+                        && self.settings_management
+                        && self.profile_page == 2;
+                    if (dashboard && self.main_tab == MainTab::Proxies)
+                        || self.overlay != Overlay::None
+                        || own_nodes
+                    {
                         shown.now = true;
                     } else {
                         shown.later = true;
@@ -1468,6 +1489,8 @@ impl App {
                 }
                 BackendEvent::SnapshotDone(snap) => {
                     let old = &self.snapshot;
+                    // Node keys act by index and are never held for the next
+                    // frame, so a group whose members moved must show first.
                     let changed = snap.running != old.running
                         || snap.mode != old.mode
                         || snap.sysproxy_enabled != old.sysproxy_enabled
@@ -1477,12 +1500,20 @@ impl App {
                             .groups
                             .iter()
                             .zip(&old.groups)
-                            .any(|(a, b)| a.now != b.now);
-                    // Rules and Providers show only what this poll reads; a
-                    // refresh the user asked for should not look ignored.
+                            .any(|(a, b)| a.now != b.now || a.name != b.name || a.all != b.all);
+                    // Without pushes the poll carries the connection list (and
+                    // its closed-session log lines).
+                    let polled_conns = snap.connections_ok
+                        && !self.stream_live()
+                        && ((dashboard && self.main_tab == MainTab::Connections) || live_logs);
+                    // Rules and Providers show only what this poll reads, and
+                    // the Runtime overlay picks a tunnel by index into its
+                    // nodes; a refresh the user asked for should not look ignored.
                     if changed
+                        || polled_conns
                         || self.refresh_asked
                         || self.screen == Screen::Setup
+                        || self.overlay == Overlay::Runtime
                         || matches!(self.main_tab, MainTab::Rules | MainTab::Providers)
                     {
                         shown.now = true;
@@ -1525,6 +1556,7 @@ impl App {
                     snapshot_follows,
                 } => {
                     self.action_busy = false;
+                    self.snapshot_owed = snapshot_follows;
                     // The action thread fetches a snapshot next; skip the poll.
                     // A panicked action sends none, so the next tick polls.
                     if snapshot_follows {
@@ -1619,6 +1651,7 @@ impl App {
                     }
                 }
                 BackendEvent::Snapshot(snap) => {
+                    self.snapshot_owed = false;
                     self.accept_snapshot(*snap);
                     self.note_old_core();
                     if self.group_index >= self.snapshot.groups.len() {
@@ -1670,6 +1703,9 @@ impl App {
                 }
                 BackendEvent::StatusMessage { text, is_error } => {
                     self.set_status(&text, is_error);
+                }
+                BackendEvent::ReplyDone => {
+                    self.replies_owed = self.replies_owed.saturating_sub(1);
                 }
                 BackendEvent::CoreDownloadDone { ok } => {
                     self.core_downloading = false;
@@ -3033,11 +3069,10 @@ fn run(app: &mut App) -> io::Result<()> {
     result
 }
 
-/// Longest the loop blocks on input before it drains backend events again,
-/// while a reply is awaited (`App::wake_cap`); worker events cannot wake
-/// `event::poll`.
-const IDLE_WAKE: Duration = Duration::from_millis(50);
-/// Input this recent keeps the loop at `IDLE_WAKE`, so what a key starts
+/// How often the loop looks for worker events while a reply is awaited
+/// (`App::wake_cap`); they cannot wake `event::poll`.
+const BUSY_WAKE: Duration = Duration::from_millis(50);
+/// Input this recent keeps the loop at `BUSY_WAKE`, so what a key starts
 /// (a DNS lookup, a tab's first poll) shows at once.
 const BUSY_AFTER_INPUT: Duration = Duration::from_secs(3);
 /// The live Logs tab looks this often while idle.
@@ -6150,13 +6185,29 @@ mod tests {
         app.main_tab = MainTab::Connections;
         app.tx.send(conns()).unwrap();
         assert!(app.drain_events().now);
-        app.tx
-            .send(BackendEvent::DelayResult {
-                group: "g".into(),
-                node: "n".into(),
-                delay: Some(90),
-            })
-            .unwrap();
+        // A poll's list waits while pushes own the tab, and draws without them.
+        let polled = |app: &App, ok: bool| {
+            let mut snap = app.snapshot.clone();
+            snap.connections_ok = ok;
+            BackendEvent::SnapshotDone(Box::new(snap))
+        };
+        assert!(app.stream_live());
+        app.tx.send(polled(&app, true)).unwrap();
+        assert_eq!(app.drain_events(), later);
+        app.conn_stream_at = None;
+        app.tx.send(polled(&app, false)).unwrap();
+        assert_eq!(app.drain_events(), later);
+        app.tx.send(polled(&app, true)).unwrap();
+        assert!(
+            app.drain_events().now,
+            "the polled list on the Connections tab"
+        );
+        let delay = || BackendEvent::DelayResult {
+            group: "g".into(),
+            node: "n".into(),
+            delay: Some(90),
+        };
+        app.tx.send(delay()).unwrap();
         assert_eq!(app.drain_events(), later);
         let mut switched = app.snapshot.clone();
         switched.mode = "global".into();
@@ -6164,6 +6215,36 @@ mod tests {
             .send(BackendEvent::SnapshotDone(Box::new(switched)))
             .unwrap();
         assert!(app.drain_events().now, "a mode switch shows at once");
+        // Settings → Subscriptions → Nodes shows own-node delays.
+        app.screen = Screen::Settings;
+        app.tx.send(delay()).unwrap();
+        assert_eq!(app.drain_events(), later);
+        app.settings_management = true;
+        app.profile_page = 2;
+        app.tx.send(delay()).unwrap();
+        assert!(app.drain_events().now, "delays on the own-nodes page");
+        // Node keys act by index: nodes inserted ahead of the cursor show at
+        // once, though every group keeps its `now`.
+        app.screen = Screen::Dashboard;
+        app.main_tab = MainTab::Proxies;
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "Main".into(),
+            now: "HK-01".into(),
+            all: vec!["HK-01".into()],
+            ..Default::default()
+        });
+        app.tx.send(poll(&app)).unwrap();
+        assert_eq!(app.drain_events(), later);
+        let mut shifted = app.snapshot.clone();
+        shifted.groups[0].all.insert(0, "JP-03".into());
+        app.tx
+            .send(BackendEvent::SnapshotDone(Box::new(shifted)))
+            .unwrap();
+        assert!(app.drain_events().now, "a moved member list shows at once");
+        // The Runtime overlay picks a tunnel by index into the poll's nodes.
+        app.overlay = Overlay::Runtime;
+        app.tx.send(poll(&app)).unwrap();
+        assert!(app.drain_events().now);
     }
 
     #[test]
@@ -6191,7 +6272,7 @@ mod tests {
         redraw.drawn(&app, t0);
         redraw.observe(&app, at(10));
         assert!(!redraw.pending());
-        assert_eq!(redraw.wait(at(10), frame, IDLE_WAKE), IDLE_WAKE);
+        assert_eq!(redraw.wait(at(10), frame, BUSY_WAKE), BUSY_WAKE);
         // Idle, the wait runs to the heartbeat.
         assert_eq!(
             redraw.wait(at(10), frame, HEARTBEAT),
@@ -6224,21 +6305,47 @@ mod tests {
         app.snapshot_pending = true;
         assert_eq!(app.wake_cap(idle, Duration::ZERO), HEARTBEAT);
         let typed = Duration::from_millis(500);
-        assert_eq!(app.wake_cap(typed, Duration::ZERO), IDLE_WAKE);
+        assert_eq!(app.wake_cap(typed, Duration::ZERO), BUSY_WAKE);
         app.group_tests = 1;
         assert_eq!(
             app.wake_cap(idle, Duration::ZERO),
-            IDLE_WAKE,
+            BUSY_WAKE,
             "delays stream in"
         );
         app.group_tests = 0;
         app.action_busy = true;
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), IDLE_WAKE);
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), BUSY_WAKE);
         app.action_busy = false;
+        // The action's own snapshot lands after its toast.
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        app.tx
+            .send(BackendEvent::ActionDone {
+                result: Ok("done".into()),
+                modules: None,
+                profile: None,
+                snapshot_follows: true,
+            })
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), BUSY_WAKE);
+        let snap = BackendEvent::Snapshot(Box::new(app.snapshot.clone()));
+        app.tx.send(snap).unwrap();
+        app.drain_events();
+        app.clear_status();
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), HEARTBEAT);
+        app.refresh_asked = true;
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), BUSY_WAKE);
+        app.refresh_asked = false;
+        app.replies_owed = 1;
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), BUSY_WAKE);
+        app.tx.send(BackendEvent::ReplyDone).unwrap();
+        app.drain_events();
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), HEARTBEAT);
         // A toast leaves on time, not up to a heartbeat late.
         app.set_status("hi", false);
-        app.toast_started = Some(Instant::now() - Duration::from_millis(3700));
-        assert!(app.wake_cap(idle, Duration::ZERO) <= Duration::from_millis(300));
+        app.toast_started = Some(Instant::now() - Duration::from_millis(3100));
+        let cap = app.wake_cap(idle, Duration::ZERO);
+        assert!(cap <= Duration::from_millis(900), "{cap:?}");
         app.clear_status();
         // The graph shift, once it has samples to draw.
         app.graph_elapsed = Duration::from_millis(600);
@@ -6256,6 +6363,51 @@ mod tests {
         app.snapshot_pending = true;
         app.main_tab = MainTab::Logs;
         assert_eq!(app.wake_cap(idle, Duration::ZERO), LOG_WAKE);
+    }
+
+    #[test]
+    fn delay_tests_and_lookups_keep_the_loop_awake_until_they_end() {
+        let (addr, _paths) = recording_controller();
+        let mut app = offline_app();
+        app.clear_status();
+        app.config.controller.addr = addr;
+        app.snapshot_pending = true;
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "Main".into(),
+            kind: "Selector".into(),
+            all: vec!["N0".into()],
+            ..Default::default()
+        });
+        app.snapshot.nodes.insert(
+            "WG".into(),
+            mihomo::ProxyNode {
+                name: "WG".into(),
+                kind: "WireGuard".into(),
+                udp: true,
+                delay: None,
+                provider: None,
+                url_delays: Default::default(),
+            },
+        );
+        let idle = Duration::from_secs(60);
+        // A tunnel run counts on its own, so neither ends the other early.
+        app.test_current_group();
+        assert_eq!(app.group_tests, 1);
+        app.test_all_tunnels();
+        assert_eq!(app.group_tests, 2);
+        app.test_selected_tunnel();
+        app.dns_editor.load("example.com");
+        app.submit_dns_query();
+        assert_eq!(app.replies_owed, 2);
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), BUSY_WAKE);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.group_tests + app.replies_owed > 0 {
+            assert!(Instant::now() < deadline, "a worker never finished");
+            app.drain_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        app.clear_status();
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), HEARTBEAT);
     }
 
     #[test]
@@ -6486,6 +6638,9 @@ mod tests {
         ))));
         redraw.drawn(&app, t0);
         assert!(!redraw.holds(&wheel));
+        // A frame clears the lazy flag too, or every click would wait forever.
+        assert!(!redraw.pending());
+        assert!(!redraw.holds(&click));
     }
 
     #[test]

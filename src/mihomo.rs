@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,8 @@ pub enum BackendEvent {
         text: String,
         is_error: bool,
     },
+    /// The last event of a worker the user started (`App::replies_owed`).
+    ReplyDone,
     CoreDownloadDone {
         ok: bool,
     },
@@ -926,15 +928,24 @@ mod conn_json {
 
     /// String array entries; anything else is skipped.
     fn texts<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+        Ok(opt_texts(d)?.unwrap_or_default())
+    }
+
+    /// The string entries of an array, or None when it is no array.
+    pub(super) fn opt_texts<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Vec<String>>, D::Error> {
         Ok(match Value::deserialize(d)? {
-            Value::Array(items) => items
-                .into_iter()
-                .filter_map(|v| match v {
-                    Value::String(s) => Some(s),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
+            Value::Array(items) => Some(
+                items
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
         })
     }
 
@@ -1628,6 +1639,7 @@ mod snapshot_tests {
         ]);
         let snap = fetch_snapshot(&cfg);
         assert!(snap.running && snap.connections_ok);
+        assert!(snap.connections_at.is_some());
         assert_eq!(snap.connections[0].host, "a.test:443");
         assert_eq!((snap.upload_total, snap.download_total), (5, 6));
 
@@ -1686,6 +1698,8 @@ mod snapshot_tests {
             ]
         );
         assert_eq!(full.fetched, Fetch::default());
+        // Rates count from when `/connections` answered.
+        assert!(full.connections_at.is_some());
         assert_eq!(full.rules.len(), 1);
         // The reserved `default` provider is not listed; `air` brings its node.
         let names: Vec<_> = full.providers.iter().map(|p| p.name.as_str()).collect();
@@ -1703,7 +1717,7 @@ mod snapshot_tests {
         };
         let lean = fetch_snapshot_with(&cfg, fetch);
         assert_eq!(*seen.lock().unwrap(), ["/version", "/configs", "/proxies"]);
-        assert!(lean.running && !lean.connections_ok);
+        assert!(lean.running && !lean.connections_ok && lean.connections_at.is_none());
         assert_eq!(lean.fetched, fetch);
         assert_eq!(lean.mixed_port, 7890);
         assert_eq!(lean.groups.len(), 1);
@@ -1912,20 +1926,33 @@ mod snapshot_tests {
         let dir = std::env::temp_dir().join(format!("terc-facts-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
-        let facts = |cached| config_facts_with(&cache, &path, cached);
+        // Polls long after the writes below, whose timestamps are then settled.
+        let later = SystemTime::now() + Duration::from_secs(60);
+        let facts = |cached| config_facts_with(&cache, &path, cached, later);
         let port = |facts: Arc<ConfigFacts>| facts.values["mixed-port"].clone();
         fs::write(&path, "mixed-port: 7890\nsniffer:\n  enable: true\n").unwrap();
+        // A poll in the tick of the write reads again each time, although
+        // the key is unchanged: a second write in that tick could keep it.
+        let written = fs::metadata(&path).unwrap().modified().unwrap();
+        let poll = || config_facts_with(&cache, &path, true, written).unwrap();
+        assert!(!Arc::ptr_eq(&poll(), &poll()));
         let first = facts(true).unwrap();
         assert!(first.flags.sniffing);
         // A poll of an unchanged file reuses the parse.
         assert!(Arc::ptr_eq(&first, &facts(true).unwrap()));
         assert_eq!(port(first), "7890");
-        // terc's own writes: a new inode.
-        write_private(&path, b"mixed-port: 7891\n").unwrap();
+        // terc's own writes replace the file (a new inode), at the same length.
+        write_private(&path, b"mixed-port: 7891\nsniffer:\n  enable: true\n").unwrap();
         assert_eq!(port(facts(true).unwrap()), "7891");
-        // An editor writing in place with the same length, after a clock tick.
-        thread::sleep(Duration::from_millis(30));
-        fs::write(&path, "mixed-port: 7892\n").unwrap();
+        // An editor writing in place with the same length; the mtime moves
+        // clearly, so the step holds on filesystems with 1 s timestamps.
+        fs::write(&path, "mixed-port: 7892\nsniffer:\n  enable: true\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
         assert_eq!(port(facts(true).unwrap()), "7892");
         // A full snapshot parses again although nothing changed, and later
         // polls reuse that parse.
@@ -2128,6 +2155,9 @@ mod snapshot_tests {
     #[test]
     fn typed_proxies_parse_matches_the_value_path() {
         let [synthetic, _, _] = mihomo_bodies(300, 10);
+        let wrong_scalars = r#"{"proxies":{"A":{"type":5,"udp":"yes","all":"x","now":1,"fixed":[],"testUrl":2,"expectedStatus":204}}}"#;
+        let wrong_history = r#"{"proxies":{"A":{"type":"Vmess","history":{"delay":3}}}}"#;
+        let wrong_extra = r#"{"proxies":{"A":{"type":"Vmess","extra":[]}}}"#;
         let odd = [
             "",
             "oops",
@@ -2138,7 +2168,9 @@ mod snapshot_tests {
             r#"{"proxies":[]}"#,
             r#"{"proxies":{"A":null}}"#,
             r#"{"proxies":{"A":["Selector",true]}}"#,
-            r#"{"proxies":{"A":{"type":5,"udp":"yes","history":{"delay":3},"all":"x","now":1,"extra":[]}}}"#,
+            wrong_scalars,
+            wrong_history,
+            wrong_extra,
             r#"{"proxies":{"A":{"type":null,"udp":null,"history":null,"all":null,"now":null,"extra":null,"testUrl":null}}}"#,
             r#"{"proxies":{"A":{"type":"Vmess","history":[{"delay":5},null]}}}"#,
             r#"{"proxies":{"A":{"type":"Vmess","history":[{"delay":5},[7]]}}}"#,
@@ -2165,8 +2197,13 @@ mod snapshot_tests {
                 );
             }
         }
-        // Mihomo's own shape takes the typed path, not the fallback.
-        assert!(serde_json::from_str::<proxies_json::Obj<proxies_json::Body>>(&synthetic).is_ok());
+        // Mihomo's own shape and odd scalars take the typed path, not the
+        // fallback; a history or extra of another type falls back.
+        let typed = |body: &str| {
+            serde_json::from_str::<proxies_json::Obj<proxies_json::Body>>(body).is_ok()
+        };
+        assert!(typed(&synthetic) && typed(wrong_scalars));
+        assert!(!typed(wrong_history) && !typed(wrong_extra));
         let (groups, nodes, sub_info) = parse_proxies(&synthetic, "rule");
         assert_eq!(groups[0].name, "🚀 节点选择");
         assert_eq!(groups.len(), 9);
@@ -2194,6 +2231,7 @@ mod snapshot_tests {
     #[test]
     fn typed_provider_parse_matches_the_value_path() {
         let [_, inline, split] = mihomo_bodies(300, 4);
+        let groups = r#"{"providers":{"p":{"name":"p","proxies":[{"name":"r","type":"Relay"},{"name":"s","type":"selector"},{"name":"b","type":"LoadBalance"},{"name":"n","type":"Trojan"}]}}}"#;
         let odd = [
             "",
             "[]",
@@ -2207,6 +2245,7 @@ mod snapshot_tests {
             // A provider named `default` under another key, and a group
             // that shares a node's name.
             r#"{"providers":{"k":{"name":"default","vehicleType":"HTTP","proxies":[{"name":"x","extra":{"u":{"alive":true,"history":[{"delay":9}]}}}]},"z":{"name":"z","ruleCount":4,"proxies":[{"name":"x","type":"URLTest","extra":{"u":{"alive":true,"history":[{"delay":7}]}}},{"name":"","type":"Vmess"},{"name":"y","type":5,"udp":1,"history":[{"delay":0}]}]}}}"#,
+            groups,
             PROVIDERS,
             &inline,
             &split,
@@ -2227,6 +2266,10 @@ mod snapshot_tests {
                     .is_ok()
             );
         }
+        // Groups a provider lists are not nodes.
+        let (_, found, _) = parse_proxy_providers(groups).unwrap();
+        let names: Vec<_> = found.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["n"]);
         // The `default` mirror brings neither nodes nor their delays.
         let (_, found, extras) = parse_proxy_providers(&inline).unwrap();
         assert!(found.is_empty() && extras.is_empty());
@@ -2265,10 +2308,8 @@ pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot
     let flags = facts.as_ref().map(|facts| facts.flags.clone());
     let mut snapshot = fetch_core_snapshot(cfg, fetch, flags);
     if let Some(facts) = &facts {
-        if snapshot.groups.iter().any(ProxyGroup::pinnable) {
-            for group in &mut snapshot.groups {
-                group.timeout_ms = facts.timeouts.get(&group.name).copied().unwrap_or(0);
-            }
+        for group in &mut snapshot.groups {
+            group.timeout_ms = facts.timeouts.get(&group.name).copied().unwrap_or(0);
         }
         snapshot.config_values = facts.values.clone();
     }
@@ -2364,34 +2405,56 @@ fn config_key(path: &Path) -> Option<ConfigKey> {
     ))
 }
 
+/// Whether any write after `now` must change the key's timestamps. Within
+/// one timestamp tick (a jiffy on Linux before 6.13, a second on HFS+, two
+/// on FAT), a second same-length write in place keeps mtime and ctime, so a
+/// parse of a file that new is not kept for later polls.
+fn settled(key: &ConfigKey, now: SystemTime) -> bool {
+    let (.., (mtime, _), (ctime, _)) = key;
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    *mtime.max(ctime) <= now - 2
+}
+
 fn config_facts(cfg: &ControllerConfig, cached: bool) -> Option<Arc<ConfigFacts>> {
-    config_facts_with(&CONFIG_FACTS, &config_yaml_path(cfg), cached)
+    config_facts_with(
+        &CONFIG_FACTS,
+        &config_yaml_path(cfg),
+        cached,
+        SystemTime::now(),
+    )
 }
 
 /// The facts of the config at `path`, `None` when it cannot be read. A
 /// `cached` call (the background poll) reuses the last parse while the
 /// file's identity is unchanged; any other call reads and parses again, so
 /// a snapshot after terc's own write always sees it, in-place writes
-/// included.
+/// included. The parse is kept for later polls only when the file's
+/// timestamps are `settled` at `now`, a time from before the key is read.
 fn config_facts_with(
     cache: &Mutex<Option<(ConfigKey, Arc<ConfigFacts>)>>,
     path: &Path,
     cached: bool,
+    now: SystemTime,
 ) -> Option<Arc<ConfigFacts>> {
     // Taken before the read: a write in between leaves a key that no longer
     // matches, so the next poll reads again.
     let key = config_key(path);
     let lock = || cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let (true, Some(key)) = (cached, key.as_ref()) {
-        if let Some((_, facts)) = lock().as_ref().filter(|(at, _)| at == key) {
-            return Some(facts.clone());
-        }
+    if let Some((_, facts)) = lock()
+        .as_ref()
+        .filter(|(at, _)| cached && key.as_ref() == Some(at))
+    {
+        return Some(facts.clone());
     }
     // Read and parsed unlocked, so a large config never holds up another
     // snapshot; the slot keeps whichever parse finished last, under its key.
     let raw = fs::read_to_string(path).ok()?;
     let facts = Arc::new(ConfigFacts::parse(&raw));
-    *lock() = key.map(|key| (key, facts.clone()));
+    *lock() = key
+        .filter(|key| settled(key, now))
+        .map(|key| (key, facts.clone()));
     Some(facts)
 }
 
@@ -2954,7 +3017,7 @@ fn proxies_from_typed(body: proxies_json::Body, mode: &str) -> ProxiesPart {
                 name,
                 kind,
                 udp: item.udp,
-                delay: proxies_json::delay_ms(item.history),
+                delay: proxies_json::delay_ms(item.last_delay),
                 provider: None,
                 url_delays: item.extra,
             },
@@ -3094,7 +3157,7 @@ fn proxy_providers_from_typed(body: proxies_json::ProvidersBody) -> ProxyProvide
     let mut found = Vec::new();
     let mut extras = HashMap::new();
     for (key, proxies_json::Obj(item)) in body.providers {
-        let provider = if item.name.is_empty() { key } else { item.name };
+        let provider = crate::ops::provider_name(&key, &item.name).to_string();
         if !item.vehicle.eq_ignore_ascii_case("Compatible") {
             infos.push(ProviderInfo {
                 name: provider.clone(),
@@ -3120,14 +3183,12 @@ fn proxy_providers_from_typed(body: proxies_json::ProvidersBody) -> ProxyProvide
             if !proxy.extra.is_empty() {
                 extras.insert(proxy.name.clone(), proxy.extra);
             }
-            if !["selector", "urltest", "fallback", "loadbalance", "relay"]
-                .contains(&proxy.kind.to_ascii_lowercase().as_str())
-            {
+            if !crate::ops::is_group_kind(&proxy.kind) {
                 found.push(crate::ops::ProviderNode {
                     name: proxy.name,
                     kind: proxy.kind,
                     udp: proxy.udp,
-                    delay: proxies_json::delay_ms(proxy.history),
+                    delay: proxies_json::delay_ms(proxy.last_delay),
                     provider: provider.clone(),
                 });
             }
@@ -3148,11 +3209,14 @@ fn proxy_providers_from_value(v: &Value) -> ProxyProvidersPart {
 /// Typed `/proxies` and `/providers/proxies` JSON. Only the fields the
 /// `Value` functions read are declared, each as leniently as its lookup:
 /// null, a missing key or an odd scalar gives the same default. `history`
-/// keeps only its last delay and `extra` becomes `url_delays` directly. A
-/// shape this rejects (an entry or record that is not an object, a repeated
-/// field) makes the parse fall back to the `Value` functions.
+/// is read as `last_delay`, its last record's delay, and `extra` becomes
+/// `url_delays` directly; those two, a provider's `proxies` and the
+/// top-level maps must be null or the container they expect. A shape this
+/// rejects (an entry or record that is not an object, a history, extra or
+/// map of another type, a repeated field) makes the parse fall back to the
+/// `Value` functions.
 mod proxies_json {
-    use super::conn_json::{nul, opt_text, text};
+    use super::conn_json::{nul, opt_text, opt_texts, text};
     use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
     use serde::Deserialize;
     use serde_json::Value;
@@ -3195,8 +3259,8 @@ mod proxies_json {
         pub kind: Option<String>,
         #[serde(deserialize_with = "flag")]
         pub udp: bool,
-        #[serde(deserialize_with = "last_delay")]
-        pub history: Option<u64>,
+        #[serde(rename = "history", deserialize_with = "last_delay")]
+        pub last_delay: Option<u64>,
         #[serde(deserialize_with = "opt_texts")]
         pub all: Option<Vec<String>>,
         #[serde(deserialize_with = "text")]
@@ -3243,8 +3307,8 @@ mod proxies_json {
         pub kind: String,
         #[serde(deserialize_with = "flag")]
         pub udp: bool,
-        #[serde(deserialize_with = "last_delay")]
-        pub history: Option<u64>,
+        #[serde(rename = "history", deserialize_with = "last_delay")]
+        pub last_delay: Option<u64>,
         #[serde(deserialize_with = "extra")]
         pub extra: HashMap<String, Option<u16>>,
     }
@@ -3261,8 +3325,8 @@ mod proxies_json {
     struct UrlState {
         #[serde(deserialize_with = "flag")]
         alive: bool,
-        #[serde(deserialize_with = "last_delay")]
-        history: Option<u64>,
+        #[serde(rename = "history", deserialize_with = "last_delay")]
+        last_delay: Option<u64>,
     }
 
     /// A `history` delay as `ProxyNode::delay` keeps it: 0 means failed.
@@ -3276,22 +3340,6 @@ mod proxies_json {
 
     fn number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
         Ok(Value::deserialize(d)?.as_u64())
-    }
-
-    /// The string entries of an array, or None when it is no array.
-    fn opt_texts<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
-        Ok(match Value::deserialize(d)? {
-            Value::Array(items) => Some(
-                items
-                    .into_iter()
-                    .filter_map(|v| match v {
-                        Value::String(s) => Some(s),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            _ => None,
-        })
     }
 
     /// The last record's `delay`, without keeping the records.
@@ -3330,7 +3378,7 @@ mod proxies_json {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut out = HashMap::new();
                 while let Some((url, Obj(state))) = map.next_entry::<String, Obj<UrlState>>()? {
-                    out.insert(url, delay_ms(state.history.filter(|_| state.alive)));
+                    out.insert(url, delay_ms(state.last_delay.filter(|_| state.alive)));
                 }
                 Ok(out)
             }
@@ -3378,7 +3426,7 @@ fn provider_url_delays(value: &Value) -> HashMap<String, HashMap<String, Option<
         .flatten()
         .filter(|(key, item)| {
             let named = item.get("name").and_then(Value::as_str);
-            named.filter(|name| !name.is_empty()).unwrap_or(key) != "default"
+            crate::ops::provider_name(key, named.unwrap_or("")) != "default"
         })
         .filter_map(|(_, item)| item.get("proxies").and_then(Value::as_array))
         .flatten()
@@ -5379,6 +5427,7 @@ pub fn dns_query_async(
             Err(err) => (vec![err], true),
         };
         let _ = tx.send(BackendEvent::DnsLookup { lines, is_error });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -5799,6 +5848,7 @@ pub fn flush_dns_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
             Err(err) => (err, true),
         };
         let _ = tx.send(BackendEvent::StatusMessage { text, is_error });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -5925,6 +5975,7 @@ pub fn provider_healthcheck_async(
             HealthCheck::Failed(err) => (err, true),
         };
         let _ = tx.send(BackendEvent::StatusMessage { text, is_error });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -5949,6 +6000,7 @@ pub fn refresh_provider_async(
             text,
             is_error: !ok,
         });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -5972,6 +6024,7 @@ pub fn refresh_all_providers_async(
             text: format!("providers {ok} updated  {failed} failed"),
             is_error: ok == 0 && failed > 0,
         });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -6130,6 +6183,7 @@ pub fn test_node_async(
             node,
             delay,
         });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -6192,6 +6246,7 @@ pub fn probe_async(cfg: ControllerConfig, node: String, raw: String, tx: Sender<
             lines: report.lines,
             is_error: report.is_error,
         });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
