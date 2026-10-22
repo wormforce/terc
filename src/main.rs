@@ -3048,7 +3048,7 @@ const DATA_FRAME: Duration = Duration::from_millis(100);
 /// Ages, "ago" columns and the Setup screen's config check change with time
 /// alone.
 const HEARTBEAT: Duration = Duration::from_secs(1);
-/// Key repeats and pastes applied before one repaint.
+/// Key repeats, pastes and wheel steps applied before one repaint.
 const INPUT_BURST: usize = 64;
 /// Background poll of `/version`, `/configs` and `/proxies`.
 const SNAPSHOT_POLL: Duration = Duration::from_millis(2200);
@@ -3071,6 +3071,9 @@ struct Redraw {
     /// Memory, the overview's connection count, a routine poll, a graph
     /// shift: they wait for the next data frame or the heartbeat.
     lazy: bool,
+    /// An undrawn key, click, resize or screen change: it can move the panes
+    /// a wheel step lands in.
+    layout: bool,
     last: Instant,
     toast: (bool, Option<Instant>),
     graph: u64,
@@ -3082,6 +3085,7 @@ impl Redraw {
             input: true,
             data: false,
             lazy: false,
+            layout: true,
             // Long enough ago that the first frame draws at once.
             last: now.checked_sub(HEARTBEAT).unwrap_or(now),
             toast: (false, None),
@@ -3093,6 +3097,20 @@ impl Redraw {
     /// from the last draw.
     fn pending(&self) -> bool {
         self.input || self.data || self.lazy
+    }
+
+    /// Whether `ev` waits for the next frame. A click maps a row through the
+    /// last draw's list scroll, so it waits for any undrawn change. A wheel
+    /// step needs only the pane under it, so it waits only for a change that
+    /// can move panes, and a run of them lands in one frame.
+    fn holds(&self, ev: &CEvent) -> bool {
+        let CEvent::Mouse(mouse) = ev else {
+            return false;
+        };
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => self.layout,
+            kind => mouse_acts(kind) && self.pending(),
+        }
     }
 
     fn note(&mut self, shown: Shown) {
@@ -3145,6 +3163,7 @@ impl Redraw {
         self.input = false;
         self.data = false;
         self.lazy = false;
+        self.layout = false;
         self.last = now;
         self.toast = Self::toast_of(app);
         self.graph = app.graph_gen;
@@ -3154,8 +3173,8 @@ impl Redraw {
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     let mut last_tick = Instant::now();
     let mut redraw = Redraw::new(last_tick);
-    // A mouse event read behind undrawn changes waits for the next frame: its
-    // hit areas (proxy_hits, list scroll) come from the last draw.
+    // A mouse event `Redraw::holds` waits here for the next frame: its hit
+    // areas (proxy_hits, list scroll) come from the last draw.
     let mut held: Option<CEvent> = None;
     let mut last_input = last_tick;
 
@@ -3186,19 +3205,24 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         }
         let mut applied = 0;
         while let Some(ev) = next.take() {
-            if matches!(&ev, CEvent::Mouse(m) if mouse_acts(m.kind)) && redraw.pending() {
+            if redraw.holds(&ev) {
                 held = Some(ev);
                 break;
             }
-            let burst = matches!(ev, CEvent::Key(_) | CEvent::Paste(_));
+            let wheel = matches!(&ev, CEvent::Mouse(m)
+                if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown));
+            let burst = wheel || matches!(ev, CEvent::Key(_) | CEvent::Paste(_));
             match handle_event(app, ev) {
                 Handled::Quit => return Ok(()),
-                Handled::Changed => redraw.input = true,
+                Handled::Changed => {
+                    redraw.input = true;
+                    redraw.layout |= !wheel;
+                }
                 Handled::Unchanged => {}
             }
             applied += 1;
-            // Key repeat and pastes coalesce into one frame; mouse events do
-            // not, since each hit-tests against the frame before it.
+            // Key repeat, pastes and wheel steps coalesce into one frame;
+            // clicks do not, since each hit-tests against the frame before it.
             if burst && applied < INPUT_BURST && event::poll(Duration::ZERO)? {
                 next = Some(event::read()?);
             }
@@ -3207,7 +3231,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         let shown = (app.screen, app.setup_phase);
         app.tick(last_tick.elapsed());
         last_tick = Instant::now();
-        redraw.data |= shown != (app.screen, app.setup_phase);
+        let moved = shown != (app.screen, app.setup_phase);
+        redraw.data |= moved;
+        redraw.layout |= moved;
     }
 }
 
@@ -3237,8 +3263,11 @@ fn handle_event(app: &mut App, ev: CEvent) -> Handled {
             if !mouse_acts(mouse.kind) {
                 return Handled::Unchanged;
             }
-            if proxy_mouse_action(app, mouse) {
-                app.activate_selected_node();
+            match proxy_mouse_action(app, mouse) {
+                // Off the lists, on another view, or already at the end.
+                MouseHit::Miss => return Handled::Unchanged,
+                MouseHit::Moved => {}
+                MouseHit::Activate => app.activate_selected_node(),
             }
         }
         CEvent::Paste(text) => handle_paste(app, &text),
@@ -3828,19 +3857,29 @@ fn handle_rule_edit_key(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+/// What a mouse report did to the Proxies lists.
+#[derive(Debug, PartialEq, Eq)]
+enum MouseHit {
+    /// Nothing moved: another view, off the lists, or already at the end.
+    Miss,
+    /// Focus, cursor or scroll moved.
+    Moved,
+    /// A node row was clicked; the caller activates it.
+    Activate,
+}
+
 // Hit regions come from the rendered list, including its scroll offset.
-// Return true only when a node row was clicked; the caller performs activation.
-fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
+fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> MouseHit {
     if app.screen != Screen::Dashboard
         || app.main_tab != MainTab::Proxies
         || app.overlay != Overlay::None
         || app.status_detail
     {
-        return false;
+        return MouseHit::Miss;
     }
     let point = ratatui::layout::Position::new(mouse.column, mouse.row);
     if app.toast_visible() && app.toast_area.is_some_and(|r| r.contains(point)) {
-        return false;
+        return MouseHit::Miss;
     }
     let Some((area, focus, start, len)) = app
         .proxy_hits
@@ -3848,16 +3887,14 @@ fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
         .copied()
         .find(|(r, _, _, _)| r.contains(point))
     else {
-        return false;
+        return MouseHit::Miss;
     };
-    if len == 0 {
-        return false;
-    }
+    let before = (app.focus, app.group_index, app.node_index, app.node_scroll);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let index = start + (mouse.row - area.y) as usize;
             if index >= len {
-                return false;
+                return MouseHit::Miss;
             }
             app.focus = focus;
             match focus {
@@ -3867,11 +3904,25 @@ fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
                 }
                 FocusPane::Nodes => {
                     app.node_index = index;
-                    return true;
+                    return MouseHit::Activate;
                 }
             }
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            // Wheel steps run ahead of the frame (see `Redraw::holds`), so
+            // the length is the live one, not the last draw's: a step over
+            // Groups may already have changed the node list.
+            let len = match focus {
+                FocusPane::Groups => app.snapshot.groups.len(),
+                FocusPane::Nodes => app
+                    .snapshot
+                    .groups
+                    .get(app.group_index)
+                    .map_or(0, |g| g.all.len()),
+            };
+            if len == 0 {
+                return MouseHit::Miss;
+            }
             app.focus = focus;
             let current = match focus {
                 FocusPane::Groups => app.group_index,
@@ -3892,7 +3943,11 @@ fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
         }
         _ => {}
     }
-    false
+    if before == (app.focus, app.group_index, app.node_index, app.node_scroll) {
+        MouseHit::Miss
+    } else {
+        MouseHit::Moved
+    }
 }
 
 fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
@@ -4907,7 +4962,7 @@ mod tests {
                 row: area.y,
                 modifiers: KeyModifiers::NONE,
             };
-            assert!(proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Activate);
             assert_eq!(app.node_index, start);
             assert_eq!(app.focus, FocusPane::Nodes);
             render_text(&mut app, width, height);
@@ -4920,18 +4975,18 @@ mod tests {
                 .proxy_hits
                 .contains(&(area, FocusPane::Nodes, start, 40)));
             event.kind = MouseEventKind::ScrollDown;
-            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Moved);
             assert_eq!(app.node_index, start + 1);
             app.overlay = Overlay::Probe;
             event.kind = MouseEventKind::Down(MouseButton::Left);
-            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Miss);
             app.overlay = Overlay::None;
             app.set_status("Notice", false);
             render_text(&mut app, width, height);
             let toast = app.toast_area.unwrap();
             event.column = toast.x + 1;
             event.row = toast.y + 1;
-            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Miss);
             app.clear_status();
             render_text(&mut app, width, height);
             let (group_area, _, _, _) = app
@@ -4942,12 +4997,12 @@ mod tests {
                 .unwrap();
             event.column = group_area.x + 1;
             event.row = group_area.y + 1;
-            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Moved);
             assert_eq!(app.group_index, 1);
             assert_eq!(app.node_index, 0);
             assert_eq!(app.focus, FocusPane::Groups);
             event.row = group_area.y + 2;
-            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Miss);
             assert_eq!(app.group_index, 1);
         }
     }
@@ -6276,7 +6331,8 @@ mod tests {
             MouseEventKind::ScrollDown,
         ] {
             assert!(mouse_acts(kind));
-            assert_eq!(handle_event(&mut app, mouse(kind)), Handled::Changed);
+            // Nothing drawn, so nothing under the pointer: no frame.
+            assert_eq!(handle_event(&mut app, mouse(kind)), Handled::Unchanged);
         }
         assert_eq!(
             handle_event(&mut app, CEvent::FocusGained),
@@ -6286,6 +6342,150 @@ mod tests {
             handle_event(&mut app, key(KeyCode::Char('q'))),
             Handled::Quit
         );
+    }
+
+    #[test]
+    fn wheel_repaints_only_when_the_proxy_lists_move() {
+        let mut app = offline_app();
+        app.snapshot.groups = vec![mihomo::ProxyGroup {
+            name: "Group".into(),
+            kind: "Selector".into(),
+            now: "Node0".into(),
+            fixed: String::new(),
+            all: (0..40).map(|n| format!("Node{n}")).collect(),
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
+        }];
+        render_text(&mut app, 80, 24);
+        let (area, _, _, _) = app
+            .proxy_hits
+            .iter()
+            .copied()
+            .find(|(_, f, _, _)| *f == FocusPane::Nodes)
+            .unwrap();
+        let wheel = |kind| {
+            CEvent::Mouse(MouseEvent {
+                kind,
+                column: area.x + 1,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert_eq!(
+            handle_event(&mut app, wheel(MouseEventKind::ScrollDown)),
+            Handled::Changed
+        );
+        assert_eq!(app.node_index, 1);
+        app.node_index = 39;
+        render_text(&mut app, 80, 24);
+        assert_eq!(
+            handle_event(&mut app, wheel(MouseEventKind::ScrollDown)),
+            Handled::Unchanged,
+            "already at the end"
+        );
+        assert_eq!(app.node_index, 39);
+        assert_eq!(
+            handle_event(&mut app, wheel(MouseEventKind::ScrollUp)),
+            Handled::Changed
+        );
+        app.main_tab = MainTab::Connections;
+        render_text(&mut app, 80, 24);
+        for kind in [
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            assert_eq!(handle_event(&mut app, wheel(kind)), Handled::Unchanged);
+        }
+    }
+
+    #[test]
+    fn wheel_steps_ahead_of_the_frame_clamp_to_the_live_lists() {
+        let mut app = offline_app();
+        app.snapshot.groups = [40, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| mihomo::ProxyGroup {
+                name: format!("Group{i}"),
+                kind: "Selector".into(),
+                now: "Node0".into(),
+                fixed: String::new(),
+                all: (0..len).map(|n| format!("Node{n}")).collect(),
+                test_url: String::new(),
+                expected_status: String::new(),
+                timeout_ms: 0,
+            })
+            .collect();
+        render_text(&mut app, 80, 24);
+        let pane = |app: &App, focus| {
+            let (area, ..) = app
+                .proxy_hits
+                .iter()
+                .copied()
+                .find(|(_, f, _, _)| *f == focus)
+                .unwrap();
+            area
+        };
+        let step = |area: Rect| MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: area.x + 1,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (groups, nodes) = (pane(&app, FocusPane::Groups), pane(&app, FocusPane::Nodes));
+        // One burst, no frame between: the group changes under the node pane,
+        // whose last draw still says 40 rows.
+        assert_eq!(proxy_mouse_action(&mut app, step(groups)), MouseHit::Moved);
+        assert_eq!(app.group_index, 1);
+        for _ in 0..2 {
+            assert_eq!(proxy_mouse_action(&mut app, step(nodes)), MouseHit::Moved);
+        }
+        assert_eq!(app.node_index, 2);
+        assert_eq!(proxy_mouse_action(&mut app, step(nodes)), MouseHit::Miss);
+        assert_eq!(app.node_index, 2);
+        // A poll emptied the lists since the last draw: nothing to scroll.
+        app.snapshot.groups.clear();
+        assert_eq!(proxy_mouse_action(&mut app, step(groups)), MouseHit::Miss);
+    }
+
+    #[test]
+    fn wheel_steps_wait_only_for_changes_that_move_panes() {
+        let app = offline_app();
+        let t0 = Instant::now();
+        let mouse = |kind| {
+            CEvent::Mouse(MouseEvent {
+                kind,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let click = mouse(MouseEventKind::Down(MouseButton::Left));
+        let wheel = mouse(MouseEventKind::ScrollDown);
+        let mut redraw = Redraw::new(t0);
+        assert!(redraw.holds(&wheel), "nothing laid out yet");
+        redraw.drawn(&app, t0);
+        assert!(!redraw.holds(&click));
+        assert!(!redraw.holds(&wheel));
+        // A wheel step or new data: a click waits, since rows may have
+        // scrolled, but the next wheel step does not.
+        redraw.input = true;
+        assert!(redraw.holds(&click));
+        assert!(!redraw.holds(&wheel));
+        redraw.input = false;
+        redraw.lazy = true;
+        assert!(redraw.holds(&click));
+        assert!(!redraw.holds(&wheel));
+        // A key, resize or screen change can move the panes themselves.
+        redraw.layout = true;
+        assert!(redraw.holds(&wheel));
+        assert!(!redraw.holds(&mouse(MouseEventKind::Moved)));
+        assert!(!redraw.holds(&CEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE
+        ))));
+        redraw.drawn(&app, t0);
+        assert!(!redraw.holds(&wheel));
     }
 
     #[test]
