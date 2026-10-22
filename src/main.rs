@@ -888,8 +888,10 @@ pub struct App {
     pub best_choice: String,
     pub best_scope_index: usize,
     pub action_busy: bool,
-    /// The action thread's follow-up `Snapshot` has not arrived yet.
-    pub snapshot_owed: bool,
+    /// Finished actions whose follow-up `ActionSnapshot` has not arrived yet.
+    /// Other workers' `Snapshot`s do not count: they end with their own
+    /// `ReplyDone` or `GroupTestDone`.
+    pub action_snapshots_owed: usize,
     /// Group delay tests still sending results; each ends with one
     /// `GroupTestDone`.
     pub group_tests: usize,
@@ -1047,7 +1049,7 @@ impl App {
             best_choice: String::new(),
             best_scope_index: 0,
             action_busy: false,
-            snapshot_owed: false,
+            action_snapshots_owed: 0,
             group_tests: 0,
             replies_owed: 0,
             snapshot_pending: false,
@@ -1341,11 +1343,12 @@ impl App {
     /// after it, a refresh, a delay test, a download, another worker the user
     /// started, or keys pressed just now) the loop looks every `BUSY_WAKE`.
     /// Otherwise it sleeps to the next change no event reports: a toast
-    /// expiring, the graph shift, the next poll, or (in `Redraw::wait`) the
-    /// heartbeat. Pushes queued meanwhile land in that one frame.
-    pub fn wake_cap(&self, since_input: Duration, since_tick: Duration) -> Duration {
+    /// expiring, the next poll, or (in `Redraw::wait`) the heartbeat. Pushes
+    /// queued meanwhile land in that one frame, and so does the graph shift
+    /// they complete (`run_app` steps the graph right after the drain).
+    pub fn wake_cap(&self, since_input: Duration) -> Duration {
         if self.action_busy
-            || self.snapshot_owed
+            || self.action_snapshots_owed > 0
             || self.refresh_asked
             || self.refresh_queued
             || self.core_downloading
@@ -1362,11 +1365,6 @@ impl App {
         }
         if let Some(at) = self.toast_started.filter(|_| self.toast_visible()) {
             cap = cap.min(self.toast_life().saturating_sub(at.elapsed()));
-        }
-        // Without samples a shift draws nothing.
-        if self.graph_samples.2 > 0 {
-            let interval = Duration::from_millis(self.config.settings.graph_interval_ms());
-            cap = cap.min(interval.saturating_sub(self.graph_elapsed + since_tick));
         }
         if !self.snapshot_pending {
             cap = cap.min(SNAPSHOT_POLL.saturating_sub(self.last_snapshot_poll.elapsed()));
@@ -1523,6 +1521,7 @@ impl App {
                 }
                 _ => shown.now = true,
             }
+            let is_action_snapshot = matches!(ev, BackendEvent::ActionSnapshot(_));
             match ev {
                 BackendEvent::Traffic { up, down } => {
                     self.up_rate = up;
@@ -1556,10 +1555,10 @@ impl App {
                     snapshot_follows,
                 } => {
                     self.action_busy = false;
-                    self.snapshot_owed = snapshot_follows;
                     // The action thread fetches a snapshot next; skip the poll.
                     // A panicked action sends none, so the next tick polls.
                     if snapshot_follows {
+                        self.action_snapshots_owed += 1;
                         self.last_snapshot_poll = Instant::now();
                     }
                     self.conns.action_finished(Instant::now());
@@ -1650,8 +1649,10 @@ impl App {
                         self.refresh_snapshot_now();
                     }
                 }
-                BackendEvent::Snapshot(snap) => {
-                    self.snapshot_owed = false;
+                BackendEvent::Snapshot(snap) | BackendEvent::ActionSnapshot(snap) => {
+                    if is_action_snapshot {
+                        self.action_snapshots_owed = self.action_snapshots_owed.saturating_sub(1);
+                    }
                     self.accept_snapshot(*snap);
                     self.note_old_core();
                     if self.group_index >= self.snapshot.groups.len() {
@@ -1718,26 +1719,37 @@ impl App {
         shown
     }
 
+    /// Shifts the graph once per interval. `run_app` steps it right after each
+    /// drain, so a shift takes the sample that arrived while the loop slept
+    /// and draws in the same frame as its rate. A sample can still wait one
+    /// idle wake in the queue, so an interval that ends empty holds the shift
+    /// for `GRAPH_GRACE` instead of dropping the column; after that a fresh
+    /// window starts, and the first column after a gap averages a whole
+    /// interval. The clock keeps up to one interval of phase across a shift:
+    /// a shift that ran late is made up by the next sample, not dropped.
     pub fn advance_graph(&mut self, elapsed: Duration) {
+        let interval = Duration::from_millis(self.config.settings.graph_interval_ms());
         self.graph_elapsed += elapsed;
-        if self.graph_elapsed < Duration::from_millis(self.config.settings.graph_interval_ms()) {
+        if self.graph_elapsed < interval {
             return;
         }
-        self.graph_elapsed = Duration::ZERO;
         let (up, down, count) = self.graph_samples;
-        if count > 0 {
-            self.up_history.remove(0);
-            self.up_history.push((up / count as f64) as f32);
-            self.down_history.remove(0);
-            self.down_history.push((down / count as f64) as f32);
-            self.graph_samples = (0.0, 0.0, 0);
-            self.graph_gen = self.graph_gen.wrapping_add(1);
+        if count == 0 {
+            if self.graph_elapsed >= interval + GRAPH_GRACE {
+                self.graph_elapsed = Duration::ZERO;
+            }
+            return;
         }
+        self.graph_elapsed = (self.graph_elapsed - interval).min(interval);
+        self.up_history.remove(0);
+        self.up_history.push((up / count as f64) as f32);
+        self.down_history.remove(0);
+        self.down_history.push((down / count as f64) as f32);
+        self.graph_samples = (0.0, 0.0, 0);
+        self.graph_gen = self.graph_gen.wrapping_add(1);
     }
 
-    pub fn tick(&mut self, elapsed: Duration) {
-        self.advance_graph(elapsed);
-
+    pub fn tick(&mut self) {
         if self.screen == Screen::Setup
             && self.setup_phase == SetupPhase::Starting
             && self.setup_start_at.elapsed() >= Duration::from_secs(10)
@@ -2004,7 +2016,7 @@ impl App {
                 snapshot_follows: true,
             });
             drop(done);
-            let _ = tx.send(BackendEvent::Snapshot(Box::new(fetch_snapshot(&cfg))));
+            let _ = tx.send(BackendEvent::ActionSnapshot(Box::new(fetch_snapshot(&cfg))));
         });
     }
 
@@ -3083,6 +3095,10 @@ const DATA_FRAME: Duration = Duration::from_millis(100);
 /// Ages, "ago" columns and the Setup screen's config check change with time
 /// alone.
 const HEARTBEAT: Duration = Duration::from_secs(1);
+/// How long a graph shift waits past its interval for a sample still queued
+/// before the window starts over: two idle wakes, so one push that lands
+/// just after a wake is not mistaken for a gap.
+const GRAPH_GRACE: Duration = Duration::from_secs(2);
 /// Key repeats, pastes and wheel steps applied before one repaint.
 const INPUT_BURST: usize = 64;
 /// Background poll of `/version`, `/configs` and `/proxies`.
@@ -3158,8 +3174,9 @@ impl Redraw {
     }
 
     /// Notes changes no event reports: a toast shown, replaced or expired,
-    /// the heartbeat, and a graph shift (lazy: it runs on its own timer and
-    /// rides the next frame, so a hidden graph never forces one).
+    /// the heartbeat, and a graph shift (lazy: one its sample's `now` drain
+    /// did not already make due rides the next frame, so a hidden graph
+    /// never forces one).
     fn observe(&mut self, app: &App, now: Instant) {
         self.data |= Self::toast_of(app) != self.toast
             || now.saturating_duration_since(self.last) >= HEARTBEAT;
@@ -3205,18 +3222,28 @@ impl Redraw {
     }
 }
 
+/// Applies what arrived while `run_app` waited, then steps the graph clock:
+/// a due shift takes the sample drained just now, and `observe` sees it
+/// before this frame is decided, so it draws together with the rate.
+fn catch_up(app: &mut App, redraw: &mut Redraw, last_graph: &mut Instant) -> Instant {
+    redraw.note(app.drain_events());
+    let now = Instant::now();
+    app.advance_graph(now.saturating_duration_since(*last_graph));
+    *last_graph = now;
+    redraw.observe(app, now);
+    now
+}
+
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
-    let mut last_tick = Instant::now();
-    let mut redraw = Redraw::new(last_tick);
+    let mut last_graph = Instant::now();
+    let mut redraw = Redraw::new(last_graph);
     // A mouse event `Redraw::holds` waits here for the next frame: its hit
     // areas (proxy_hits, list scroll) come from the last draw.
     let mut held: Option<CEvent> = None;
-    let mut last_input = last_tick;
+    let mut last_input = last_graph;
 
     loop {
-        redraw.note(app.drain_events());
-        let now = Instant::now();
-        redraw.observe(app, now);
+        let now = catch_up(app, &mut redraw, &mut last_graph);
         let frame = app.frame_duration();
         if redraw.due(now, frame) || (held.is_some() && redraw.pending()) {
             // Queued, so Begin and End ride along with the frame's own flushes.
@@ -3229,7 +3256,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
             redraw.drawn(app, Instant::now());
         }
 
-        let cap = app.wake_cap(last_input.elapsed(), last_tick.elapsed());
+        let cap = app.wake_cap(last_input.elapsed());
         let mut next = match held.take() {
             Some(ev) => Some(ev),
             None if event::poll(redraw.wait(Instant::now(), frame, cap))? => Some(event::read()?),
@@ -3264,8 +3291,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         }
 
         let shown = (app.screen, app.setup_phase);
-        app.tick(last_tick.elapsed());
-        last_tick = Instant::now();
+        app.tick();
         let moved = shown != (app.screen, app.setup_phase);
         redraw.data |= moved;
         redraw.layout |= moved;
@@ -5361,7 +5387,7 @@ mod tests {
         app.config.controller.config_dir = "/nonexistent/terc-test".into();
         let poll = |app: &mut App| {
             app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
-            app.tick(Duration::from_millis(10));
+            app.tick();
             finish_poll(app, &paths)
         };
         app.conn_stream_at = Some(Instant::now());
@@ -5383,7 +5409,7 @@ mod tests {
         let has = |got: &[String], path: &str| got.iter().any(|p| p == path);
         let poll = |app: &mut App| {
             app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
-            app.tick(Duration::from_millis(10));
+            app.tick();
             finish_poll(app, &paths)
         };
         // The core looked stopped, so it may have just started: read everything.
@@ -5410,17 +5436,17 @@ mod tests {
         // Entering Rules polls at once instead of waiting for the timer;
         // staying there does not poll early again.
         app.main_tab = MainTab::Rules;
-        app.tick(Duration::from_millis(10));
+        app.tick();
         let rules = finish_poll(&mut app, &paths);
         assert!(
             has(&rules, "/rules") && !has(&rules, "/providers/proxies"),
             "{rules:?}"
         );
-        app.tick(Duration::from_millis(10));
+        app.tick();
         assert!(!app.snapshot_pending);
 
         app.main_tab = MainTab::Providers;
-        app.tick(Duration::from_millis(10));
+        app.tick();
         let providers = finish_poll(&mut app, &paths);
         assert!(has(&providers, "/providers/proxies"), "{providers:?}");
         assert!(has(&providers, "/providers/rules"), "{providers:?}");
@@ -5428,7 +5454,7 @@ mod tests {
 
         // Other tabs poll on the timer and read the providers every 30 s.
         app.main_tab = MainTab::Logs;
-        app.tick(Duration::from_millis(10));
+        app.tick();
         assert!(!app.snapshot_pending);
         assert!(!has(&poll(&mut app), "/providers/proxies"));
         app.providers_polled_at = Some(Instant::now() - Duration::from_secs(31));
@@ -5484,7 +5510,7 @@ mod tests {
         let has = |got: &[String], path: &str| got.iter().any(|p| p == path);
         let poll = |app: &mut App| {
             app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
-            app.tick(Duration::from_millis(10));
+            app.tick();
             finish_poll(app, &paths)
         };
         poll(&mut app);
@@ -6103,7 +6129,7 @@ mod tests {
         assert!(app.drain_events().now);
         assert!(!app.action_busy);
         // The action thread's own snapshot is on its way; no second poll now.
-        app.tick(Duration::from_millis(10));
+        app.tick();
         assert!(!app.snapshot_pending);
         // A panicked action sends no snapshot: the overdue poll runs at once.
         app.last_snapshot_poll = Instant::now() - Duration::from_secs(10);
@@ -6114,7 +6140,7 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(app.status_message.contains("failed unexpectedly"));
-        app.tick(Duration::from_millis(10));
+        app.tick();
         assert!(app.snapshot_pending);
     }
 
@@ -6262,6 +6288,104 @@ mod tests {
     }
 
     #[test]
+    fn a_shift_waits_for_a_sample_still_queued_and_keeps_its_phase() {
+        let mut app = offline_app();
+        let gen = app.graph_gen;
+        let sample = |app: &mut App, up| {
+            app.tx.send(BackendEvent::Traffic { up, down: up }).unwrap();
+            app.drain_events();
+        };
+        sample(&mut app, 100);
+        app.advance_graph(Duration::from_millis(1300));
+        assert_eq!(app.graph_gen, gen + 1);
+        // The next interval ends before its sample is drained: no column is
+        // dropped, and the sample shifts on the next tick.
+        app.advance_graph(Duration::from_millis(900));
+        assert_eq!(app.graph_gen, gen + 1);
+        sample(&mut app, 200);
+        app.advance_graph(Duration::from_millis(50));
+        assert_eq!(app.graph_gen, gen + 2);
+        assert_eq!(app.up_history[HISTORY_LEN - 2..], [100.0, 200.0]);
+        // The 250 ms this shift ran late carry over: the next is due 750 ms on.
+        sample(&mut app, 300);
+        app.advance_graph(Duration::from_millis(740));
+        assert_eq!(app.graph_gen, gen + 2);
+        app.advance_graph(Duration::from_millis(10));
+        assert_eq!(app.graph_gen, gen + 3);
+    }
+
+    #[test]
+    fn a_late_shift_is_made_up_by_the_next_sample_not_dropped() {
+        let mut app = offline_app();
+        let gen = app.graph_gen;
+        // An idle wake drained this sample 800 ms after its interval ended.
+        app.graph_samples = (100.0, 100.0, 1);
+        app.advance_graph(Duration::from_millis(1800));
+        assert_eq!(app.graph_gen, gen + 1);
+        // The next one, 200 ms later, is due: averaging it into the column
+        // after would lose one.
+        app.graph_samples = (200.0, 200.0, 1);
+        app.advance_graph(Duration::from_millis(200));
+        assert_eq!(app.graph_gen, gen + 2);
+        assert_eq!(app.up_history[HISTORY_LEN - 2..], [100.0, 200.0]);
+        // No more than one interval is ever owed.
+        app.graph_samples = (300.0, 300.0, 1);
+        app.advance_graph(Duration::from_secs(5));
+        app.graph_samples = (400.0, 400.0, 1);
+        app.advance_graph(Duration::ZERO);
+        assert_eq!(app.graph_gen, gen + 4);
+        app.graph_samples = (500.0, 500.0, 1);
+        app.advance_graph(Duration::ZERO);
+        assert_eq!(app.graph_gen, gen + 4);
+    }
+
+    #[test]
+    fn the_first_column_after_a_long_gap_averages_a_whole_interval() {
+        let mut app = offline_app();
+        app.set_graph_interval(60_000);
+        let gen = app.graph_gen;
+        let sample = |app: &mut App, up| {
+            app.tx.send(BackendEvent::Traffic { up, down: up }).unwrap();
+            app.drain_events();
+        };
+        // The core is stopped for three minutes; the loop wakes every second.
+        for _ in 0..180 {
+            app.advance_graph(Duration::from_secs(1));
+        }
+        sample(&mut app, 0);
+        app.advance_graph(Duration::from_secs(1));
+        assert_eq!(app.graph_gen, gen, "one sample is not a 60 s column");
+        // From a clean clock: once an interval and the grace pass empty, the
+        // window starts over, and its column averages the whole interval.
+        app.set_graph_interval(60_000);
+        app.advance_graph(Duration::from_secs(60) + GRAPH_GRACE);
+        sample(&mut app, 100);
+        app.advance_graph(Duration::from_secs(1));
+        assert_eq!(app.graph_gen, gen);
+        sample(&mut app, 300);
+        app.advance_graph(Duration::from_secs(59));
+        assert_eq!(app.graph_gen, gen + 1);
+        assert_eq!(*app.up_history.last().unwrap(), 200.0);
+    }
+
+    #[test]
+    fn a_graph_shift_draws_in_the_frame_of_the_sample_that_completes_it() {
+        let mut app = offline_app();
+        let frame = app.frame_duration();
+        let mut redraw = Redraw::new(Instant::now());
+        for up in [100, 300] {
+            // An idle loop slept a heartbeat; the push came in meanwhile.
+            redraw.drawn(&app, Instant::now() - HEARTBEAT);
+            let mut last_graph = Instant::now() - HEARTBEAT;
+            app.tx.send(BackendEvent::Traffic { up, down: up }).unwrap();
+            let now = catch_up(&mut app, &mut redraw, &mut last_graph);
+            assert!(redraw.due(now, frame));
+            assert_eq!(app.up_rate, up);
+            assert_eq!(*app.up_history.last().unwrap(), up as f32);
+        }
+    }
+
+    #[test]
     fn redraw_draws_input_at_once_and_caps_data_and_heartbeat() {
         let app = offline_app();
         let frame = Duration::from_millis(16);
@@ -6303,18 +6427,14 @@ mod tests {
         app.clear_status();
         let idle = Duration::from_secs(60);
         app.snapshot_pending = true;
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), HEARTBEAT);
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
         let typed = Duration::from_millis(500);
-        assert_eq!(app.wake_cap(typed, Duration::ZERO), BUSY_WAKE);
+        assert_eq!(app.wake_cap(typed), BUSY_WAKE);
         app.group_tests = 1;
-        assert_eq!(
-            app.wake_cap(idle, Duration::ZERO),
-            BUSY_WAKE,
-            "delays stream in"
-        );
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE, "delays stream in");
         app.group_tests = 0;
         app.action_busy = true;
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), BUSY_WAKE);
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE);
         app.action_busy = false;
         // The action's own snapshot lands after its toast.
         app.config.controller.config_dir = "/nonexistent/terc-test".into();
@@ -6327,42 +6447,72 @@ mod tests {
             })
             .unwrap();
         app.drain_events();
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), BUSY_WAKE);
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE);
+        // Another worker's snapshot (a delay test, a provider refresh) that
+        // lands first is not the action's.
+        app.group_tests = 1;
         let snap = BackendEvent::Snapshot(Box::new(app.snapshot.clone()));
         app.tx.send(snap).unwrap();
+        app.tx
+            .send(BackendEvent::GroupTestDone { group: "G".into() })
+            .unwrap();
         app.drain_events();
         app.clear_status();
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), HEARTBEAT);
+        assert_eq!(
+            app.wake_cap(idle),
+            BUSY_WAKE,
+            "the action's snapshot is still owed"
+        );
+        let snap = BackendEvent::ActionSnapshot(Box::new(app.snapshot.clone()));
+        app.tx.send(snap).unwrap();
+        assert!(app.drain_events().now);
+        app.clear_status();
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
+        // A chained action can finish before the first one's snapshot lands.
+        let done = || BackendEvent::ActionDone {
+            result: Ok("done".into()),
+            modules: None,
+            profile: None,
+            snapshot_follows: true,
+        };
+        app.tx.send(done()).unwrap();
+        app.tx.send(done()).unwrap();
+        for owed in [true, false] {
+            let snap = BackendEvent::ActionSnapshot(Box::new(app.snapshot.clone()));
+            app.tx.send(snap).unwrap();
+            app.drain_events();
+            app.clear_status();
+            let busy = app.wake_cap(idle) == BUSY_WAKE;
+            assert_eq!(busy, owed);
+        }
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
         app.refresh_asked = true;
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), BUSY_WAKE);
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE);
         app.refresh_asked = false;
         app.replies_owed = 1;
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), BUSY_WAKE);
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE);
         app.tx.send(BackendEvent::ReplyDone).unwrap();
         app.drain_events();
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), HEARTBEAT);
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
         // A toast leaves on time, not up to a heartbeat late.
         app.set_status("hi", false);
         app.toast_started = Some(Instant::now() - Duration::from_millis(3100));
-        let cap = app.wake_cap(idle, Duration::ZERO);
+        let cap = app.wake_cap(idle);
         assert!(cap <= Duration::from_millis(900), "{cap:?}");
         app.clear_status();
-        // The graph shift, once it has samples to draw.
-        app.graph_elapsed = Duration::from_millis(600);
-        assert_eq!(app.wake_cap(idle, Duration::from_millis(100)), HEARTBEAT);
+        // A due graph shift draws lazily, so it sets no wake of its own.
+        app.graph_elapsed = Duration::from_millis(900);
         app.graph_samples = (1.0, 1.0, 1);
-        assert_eq!(
-            app.wake_cap(idle, Duration::from_millis(100)),
-            Duration::from_millis(300)
-        );
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
+        app.graph_elapsed = Duration::ZERO;
         app.graph_samples = (0.0, 0.0, 0);
         // The next poll starts on time.
         app.snapshot_pending = false;
         app.last_snapshot_poll = Instant::now() - Duration::from_millis(2000);
-        assert!(app.wake_cap(idle, Duration::ZERO) <= Duration::from_millis(200));
+        assert!(app.wake_cap(idle) <= Duration::from_millis(200));
         app.snapshot_pending = true;
         app.main_tab = MainTab::Logs;
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), LOG_WAKE);
+        assert_eq!(app.wake_cap(idle), LOG_WAKE);
     }
 
     #[test]
@@ -6399,7 +6549,7 @@ mod tests {
         app.dns_editor.load("example.com");
         app.submit_dns_query();
         assert_eq!(app.replies_owed, 2);
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), BUSY_WAKE);
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE);
         let deadline = Instant::now() + Duration::from_secs(10);
         while app.group_tests + app.replies_owed > 0 {
             assert!(Instant::now() < deadline, "a worker never finished");
@@ -6407,7 +6557,7 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         app.clear_status();
-        assert_eq!(app.wake_cap(idle, Duration::ZERO), HEARTBEAT);
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
     }
 
     #[test]

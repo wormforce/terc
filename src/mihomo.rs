@@ -45,6 +45,8 @@ pub enum BackendEvent {
         payload: String,
     },
     Snapshot(Box<CoreSnapshot>),
+    /// `run_action`'s follow-up snapshot (`App::action_snapshots_owed`).
+    ActionSnapshot(Box<CoreSnapshot>),
     /// A reload or TUN rebuild is about to be sent; closures in `scope` are
     /// blamed on it from now until the action finishes.
     Disrupting {
