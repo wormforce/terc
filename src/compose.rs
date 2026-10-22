@@ -1421,7 +1421,16 @@ fn rule_provider_kinds(chunks: &[YamlChunk]) -> HashMap<String, (String, Vec<Str
 /// provider or of a classical one whose inline payload holds such a rule,
 /// or a logic rule wrapping one. SRC-* rules never resolve. Remote classical
 /// payloads are not visible here and are not flagged.
-fn rule_resolves(rule: &str, providers: &HashMap<String, (String, Vec<String>)>) -> bool {
+///
+/// `seen` remembers each classical provider's answer so a payload is walked
+/// once. A provider counts as non-resolving while its own payload is walked,
+/// so a RULE-SET cycle in a downloaded subscription ends there instead of
+/// overflowing the stack.
+fn rule_resolves<'a>(
+    rule: &str,
+    providers: &'a HashMap<String, (String, Vec<String>)>,
+    seen: &mut HashMap<&'a str, bool>,
+) -> bool {
     let fields = flow_split(rule);
     let Some(kind) = fields.first().map(|k| k.to_ascii_uppercase()) else {
         return false;
@@ -1432,15 +1441,26 @@ fn rule_resolves(rule: &str, providers: &HashMap<String, (String, Vec<String>)>)
         .any(|f| f.eq_ignore_ascii_case("no-resolve"));
     match kind.as_str() {
         "IP-CIDR" | "IP-CIDR6" | "IP-SUFFIX" | "IP-ASN" | "GEOIP" => !no_resolve,
+        "RULE-SET" if no_resolve => false,
         "RULE-SET" => {
-            !no_resolve
-                && fields.get(1).and_then(|n| providers.get(*n)).is_some_and(
-                    |(behavior, payload)| {
-                        behavior.eq_ignore_ascii_case("ipcidr")
-                            || (behavior.eq_ignore_ascii_case("classical")
-                                && payload.iter().any(|r| rule_resolves(r, providers)))
-                    },
-                )
+            let Some((name, (behavior, payload))) =
+                fields.get(1).and_then(|n| providers.get_key_value(*n))
+            else {
+                return false;
+            };
+            if behavior.eq_ignore_ascii_case("ipcidr") {
+                return true;
+            }
+            if !behavior.eq_ignore_ascii_case("classical") {
+                return false;
+            }
+            if let Some(&hit) = seen.get(name.as_str()) {
+                return hit;
+            }
+            seen.insert(name, false);
+            let hit = payload.iter().any(|r| rule_resolves(r, providers, seen));
+            seen.insert(name, hit);
+            hit
         }
         "AND" | "OR" | "NOT" => fields.get(1).is_some_and(|inner| {
             let inner = inner.trim();
@@ -1453,7 +1473,7 @@ fn rule_resolves(rule: &str, providers: &HashMap<String, (String, Vec<String>)>)
                     .strip_prefix('(')
                     .and_then(|v| v.strip_suffix(')'))
                     .unwrap_or(r);
-                rule_resolves(r, providers)
+                rule_resolves(r, providers, seen)
             })
         }),
         _ => false,
@@ -1469,7 +1489,10 @@ fn resolving_rule_note(chunks: &[YamlChunk]) -> Option<String> {
         .map(clash_rule_items)
         .unwrap_or_default();
     let providers = rule_provider_kinds(chunks);
-    let n = rules.iter().position(|r| rule_resolves(r, &providers))?;
+    let mut seen = HashMap::new();
+    let n = rules
+        .iter()
+        .position(|r| rule_resolves(r, &providers, &mut seen))?;
     let rule: String = rules[n].chars().take(60).collect();
     let n = n + 1;
     Some(format!(
@@ -3630,7 +3653,7 @@ mod tests {
                 ),
             ),
         ]);
-        let resolves = |r: &str| rule_resolves(r, &providers);
+        let resolves = |r: &str| rule_resolves(r, &providers, &mut HashMap::new());
         assert!(resolves("GEOIP,LAN,DIRECT"));
         assert!(resolves("IP-ASN,13335,PROXY"));
         assert!(!resolves("GEOIP,CN,DIRECT,no-resolve"));
@@ -3646,6 +3669,48 @@ mod tests {
             "OR,((DOMAIN,a.example),(IP-CIDR,192.0.2.0/24,no-resolve)),PROXY"
         ));
         assert!(!resolves("MATCH,PROXY"));
+    }
+
+    #[test]
+    fn rule_set_cycles_count_as_non_resolving() {
+        let classical = |payload: &[&str]| {
+            (
+                "classical".to_string(),
+                payload.iter().map(|r| r.to_string()).collect(),
+            )
+        };
+        let providers = HashMap::from([
+            (
+                "self".to_string(),
+                classical(&["RULE-SET,self,PROXY", "DOMAIN,a.example"]),
+            ),
+            ("a".to_string(), classical(&["RULE-SET,b,PROXY"])),
+            (
+                "b".to_string(),
+                classical(&["AND,((RULE-SET,a),(DOMAIN,b.example)),PROXY"]),
+            ),
+            ("c".to_string(), classical(&["RULE-SET,d,PROXY"])),
+            (
+                "d".to_string(),
+                classical(&["RULE-SET,c,PROXY", "IP-CIDR,192.0.2.0/24"]),
+            ),
+        ]);
+        let resolves = |r: &str| rule_resolves(r, &providers, &mut HashMap::new());
+        assert!(!resolves("RULE-SET,self,PROXY"));
+        assert!(!resolves("RULE-SET,a,PROXY"));
+        assert!(!resolves("RULE-SET,b,PROXY"));
+        // An IP rule past the back-reference still counts from either end.
+        assert!(resolves("RULE-SET,c,PROXY"));
+        assert!(resolves("RULE-SET,d,PROXY"));
+
+        // The same shapes read from a config: a flow self-reference and a
+        // block A->B->A cycle are skipped, the GEOIP rule after them is not.
+        let doc = "rule-providers:\n  self: {type: inline, behavior: classical, payload: ['RULE-SET,self,PROXY']}\n  a:\n    type: inline\n    behavior: classical\n    payload:\n      - RULE-SET,b,PROXY\n  b:\n    type: inline\n    behavior: classical\n    payload:\n      - RULE-SET,a,PROXY\nrules:\n  - RULE-SET,self,PROXY\n  - RULE-SET,a,PROXY\n  - RULE-SET,b,PROXY\n  - GEOIP,CN,DIRECT\n";
+        let note = resolving_rule_note(&split_chunks(doc)).unwrap();
+        assert!(
+            note.contains("From subscription rule 4 (GEOIP,CN,DIRECT)"),
+            "{note}"
+        );
     }
 
     #[test]
