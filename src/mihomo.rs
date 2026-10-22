@@ -892,20 +892,21 @@ pub fn parse_connections(text: &str) -> Option<(Vec<ConnectionItem>, u64, u64)> 
 /// Typed `/connections` JSON. Only the fields `ConnectionItem` shows are
 /// declared; serde skips the rest without building a tree, and each string
 /// moves into the item. Fields read as leniently as the old `Value` lookups
-/// did: null, a missing key or an odd type gives the default.
+/// did: null, a missing key or an odd type gives the default. `proxies_json`
+/// shares the field readers.
 mod conn_json {
     use super::ConnectionItem;
     use serde::{Deserialize, Deserializer};
     use serde_json::Value;
 
-    fn text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    pub(super) fn text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
         Ok(match Value::deserialize(d)? {
             Value::String(s) => s,
             _ => String::new(),
         })
     }
 
-    fn opt_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    pub(super) fn opt_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
         Ok(match Value::deserialize(d)? {
             Value::String(s) => Some(s),
             _ => None,
@@ -930,7 +931,7 @@ mod conn_json {
         })
     }
 
-    fn nul<'de, D, T>(d: D) -> Result<T, D::Error>
+    pub(super) fn nul<'de, D, T>(d: D) -> Result<T, D::Error>
     where
         D: Deserializer<'de>,
         T: Default + Deserialize<'de>,
@@ -1966,6 +1967,265 @@ mod snapshot_tests {
         assert_eq!(find_executable(std::ffi::OsStr::new(""), "mihomo"), None);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// Mihomo-shaped bodies for `m` inline nodes with `hist` delay records
+    /// each, keys sorted as Go writes them: GET /proxies, whose GLOBAL lists
+    /// DIRECT, REJECT, the proxies and then the groups, and GET
+    /// /providers/proxies for that config (only the `default` mirror) and
+    /// for the same nodes split over two HTTP providers.
+    fn mihomo_bodies(m: usize, hist: usize) -> [String; 3] {
+        use serde_json::json;
+        const URL: &str = "https://www.gstatic.com/generate_204";
+        const TIME: &str = "2026-10-21T21:57:14.123456789+08:00";
+        let regions = ["🇭🇰 香港", "🇯🇵 日本", "🇸🇬 新加坡", "🇺🇸 美国", "🇬🇧 英国"];
+        // Some delays are 0 (a failed test) and some URL states are dead.
+        let history = |seed: usize| -> Vec<Value> {
+            (0..hist)
+                .map(|i| json!({"time": TIME, "delay": (seed * 7 + i * 13) % 400}))
+                .collect()
+        };
+        let proxy = |name: &str, kind: &str, seed: usize| {
+            json!({
+                "alive": true, "dialer-proxy": "", "id": format!("{seed:08x}"), "name": name,
+                "type": kind, "udp": !seed.is_multiple_of(3), "tfo": false, "xudp": seed % 5 == 1,
+                "history": history(seed),
+                "extra": {URL: {"alive": !seed.is_multiple_of(4), "history": history(seed + 1)}},
+            })
+        };
+        let group = |name: &str, kind: &str, all: &[String]| {
+            let test_url = if kind == "URLTest" { URL } else { "" };
+            json!({
+                "name": name, "type": kind, "all": all, "now": all.first(), "fixed": "",
+                "udp": true, "history": [], "extra": {}, "hidden": false,
+                "expectedStatus": "*", "testUrl": test_url,
+            })
+        };
+
+        // Subscription converters list the plan as pseudo-nodes first.
+        let mut names = vec![
+            "剩余流量：12.5 GB".to_string(),
+            "到期时间：2026-12-01".to_string(),
+        ];
+        names.extend((0..m).map(|i| {
+            let region = regions[i % regions.len()];
+            format!(
+                "{region} {:02} | IPLC x{}",
+                i / regions.len() + 1,
+                1 + i % 3
+            )
+        }));
+        let nodes: Vec<Value> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                proxy(
+                    name,
+                    ["Shadowsocks", "Vmess", "Trojan", "Hysteria2"][i % 4],
+                    i,
+                )
+            })
+            .collect();
+        let auto = "♻️ 自动选择".to_string();
+        let region_groups: Vec<String> = regions.iter().map(|r| format!("{r} 自动")).collect();
+        let select: Vec<String> = std::iter::once(auto.clone())
+            .chain(region_groups.iter().cloned())
+            .chain(names.iter().cloned())
+            .collect();
+        let mut groups = vec![
+            group("🚀 节点选择", "Selector", &select),
+            group(&auto, "URLTest", &names[2..]),
+            group("🤖 AI", "Fallback", &region_groups[..2]),
+            group("⚖️ 均衡", "LoadBalance", &names[2..6]),
+            group("🔗 链式", "Relay", &names[2..4]),
+        ];
+        for (region, name) in regions.iter().zip(&region_groups) {
+            let members: Vec<String> = names
+                .iter()
+                .filter(|n| n.starts_with(region))
+                .cloned()
+                .collect();
+            groups.push(group(name, "URLTest", &members));
+        }
+        let builtins: Vec<Value> = [("DIRECT", "Direct"), ("REJECT", "Reject"), ("PASS", "Pass")]
+            .iter()
+            .map(|(name, kind)| json!({"name": name, "type": kind, "udp": true, "history": []}))
+            .collect();
+        let global: Vec<String> = ["DIRECT", "REJECT"]
+            .iter()
+            .map(|n| n.to_string())
+            .chain(names.iter().cloned())
+            .chain(
+                groups
+                    .iter()
+                    .map(|g| g["name"].as_str().unwrap().to_string()),
+            )
+            .collect();
+
+        let mut listed = serde_json::Map::new();
+        for item in nodes.iter().chain(&groups).chain(&builtins) {
+            listed.insert(item["name"].as_str().unwrap().to_string(), item.clone());
+        }
+        listed.insert("GLOBAL".into(), group("GLOBAL", "Selector", &global));
+        let proxies = json!({ "proxies": listed }).to_string();
+
+        let mirror: Vec<&Value> = builtins[..2].iter().chain(&nodes).chain(&groups).collect();
+        let inline = json!({"providers": {"default": {
+            "name": "default", "type": "Proxy", "vehicleType": "Compatible",
+            "expectedStatus": "*", "testUrl": "", "proxies": mirror,
+        }}})
+        .to_string();
+
+        let provider = |name: &str, list: &[Value]| {
+            json!({
+                "name": name, "type": "Proxy", "vehicleType": "HTTP", "expectedStatus": "*",
+                "testUrl": URL, "updatedAt": TIME, "subscriptionInfo": {"Download": 1},
+                "proxies": list,
+            })
+        };
+        let half = nodes.len() / 2;
+        let rest: Vec<&Value> = builtins[..2].iter().chain(&groups).collect();
+        let split = json!({"providers": {
+            "air": provider("air", &nodes[..half]),
+            "default": {"name": "default", "vehicleType": "Compatible", "proxies": rest},
+            "sky": provider("sky", &nodes[half..]),
+        }})
+        .to_string();
+        [proxies, inline, split]
+    }
+
+    /// What a `/proxies` parse produced, with the maps in a fixed order.
+    fn proxies_digest((groups, nodes, sub_info): &ProxiesPart) -> String {
+        let mut nodes: Vec<String> = nodes
+            .iter()
+            .map(|(key, node)| {
+                // No `..`: a new field has to join the comparison.
+                let ProxyNode {
+                    name,
+                    kind,
+                    udp,
+                    delay,
+                    provider,
+                    url_delays,
+                } = node;
+                let mut url_delays: Vec<_> = url_delays.iter().collect();
+                url_delays.sort();
+                format!("{key}|{name}|{kind}|{udp}|{delay:?}|{provider:?}|{url_delays:?}")
+            })
+            .collect();
+        nodes.sort();
+        format!("{groups:?}\n{sub_info:?}\n{}", nodes.join("\n"))
+    }
+
+    #[test]
+    fn typed_proxies_parse_matches_the_value_path() {
+        let [synthetic, _, _] = mihomo_bodies(300, 10);
+        let odd = [
+            "",
+            "oops",
+            "[]",
+            r#"[{"A":{"type":"Selector","all":[]}}]"#,
+            "{}",
+            r#"{"proxies":null}"#,
+            r#"{"proxies":[]}"#,
+            r#"{"proxies":{"A":null}}"#,
+            r#"{"proxies":{"A":["Selector",true]}}"#,
+            r#"{"proxies":{"A":{"type":5,"udp":"yes","history":{"delay":3},"all":"x","now":1,"extra":[]}}}"#,
+            r#"{"proxies":{"A":{"type":null,"udp":null,"history":null,"all":null,"now":null,"extra":null,"testUrl":null}}}"#,
+            r#"{"proxies":{"A":{"type":"Vmess","history":[{"delay":5},null]}}}"#,
+            r#"{"proxies":{"A":{"type":"Vmess","history":[{"delay":5},[7]]}}}"#,
+            r#"{"proxies":{"A":{"type":"Vmess","history":[{"delay":5},{}]}}}"#,
+            r#"{"proxies":{"A":{"type":"Vmess","history":[{"delay":70000}]},"B":{"history":[{"delay":-1}]},"C":{"history":[{"delay":1.5}]},"D":{"history":[{"delay":0}]},"E":{"history":[{"delay":"9"}]}}}"#,
+            r#"{"proxies":{"A":{"extra":{"u":5}}}}"#,
+            r#"{"proxies":{"A":{"extra":{"u":{"alive":"true","history":[{"delay":5}]},"v":{"alive":true,"history":[{"delay":6}]},"w":{"alive":true},"x":{}}}}}"#,
+            r#"{"proxies":{"A":{"type":"Selector","all":["a",1,null,"b"],"now":"a"}}}"#,
+            r#"{"proxies":{"A":{"type":"Selector","type":"URLTest","all":[]}}}"#,
+            r#"{"proxies":{"A":{"type":"Selector","all":[]},"A":{"type":"URLTest","all":["x"]}}}"#,
+            r#"{"proxies":{"GLOBAL":{"type":"Selector","all":["Z","Proxy","Y"]},"Y":{"type":"URLTest","all":["n"],"testUrl":"u","expectedStatus":"204","fixed":"n"},"Z":{"type":"Fallback","all":[]},"Proxy":{"type":"Selector","all":["Y"]},"W":{"type":"Selector","all":[]},"R":{"type":"Relay","all":[]},"n":{"type":"Trojan","udp":true}}}"#,
+            r#"{"proxies":{"S":{"type":"Selector","all":["Traffic: 1 GB","重置: 3 天","到期: 2026-12-01"]}},"extra":1}"#,
+            &synthetic,
+        ];
+        for body in odd {
+            for mode in ["rule", "global"] {
+                let by_value = serde_json::from_str::<Value>(body)
+                    .map(|v| proxies_from_value(&v, mode))
+                    .unwrap_or_default();
+                assert_eq!(
+                    proxies_digest(&parse_proxies(body, mode)),
+                    proxies_digest(&by_value),
+                    "{body:.300} {mode}"
+                );
+            }
+        }
+        // Mihomo's own shape takes the typed path, not the fallback.
+        assert!(serde_json::from_str::<proxies_json::Obj<proxies_json::Body>>(&synthetic).is_ok());
+        let (groups, nodes, sub_info) = parse_proxies(&synthetic, "rule");
+        assert_eq!(groups[0].name, "🚀 节点选择");
+        assert_eq!(groups.len(), 9);
+        assert_eq!(sub_info.unwrap().expire, "2026-12-01");
+        let delays: Vec<_> = nodes.values().flat_map(|n| n.url_delays.values()).collect();
+        assert!(delays.contains(&&None) && delays.iter().any(|d| d.is_some()));
+    }
+
+    fn providers_digest(part: &Option<ProxyProvidersPart>) -> String {
+        let Some((infos, found, extras)) = part else {
+            return "none".into();
+        };
+        let mut extras: Vec<String> = extras
+            .iter()
+            .map(|(name, url_delays)| {
+                let mut url_delays: Vec<_> = url_delays.iter().collect();
+                url_delays.sort();
+                format!("{name}={url_delays:?}")
+            })
+            .collect();
+        extras.sort();
+        format!("{infos:?}\n{found:?}\n{}", extras.join("\n"))
+    }
+
+    #[test]
+    fn typed_provider_parse_matches_the_value_path() {
+        let [_, inline, split] = mihomo_bodies(300, 4);
+        let odd = [
+            "",
+            "[]",
+            "{}",
+            r#"{"providers":null}"#,
+            r#"{"providers":{"a":null}}"#,
+            r#"{"providers":{"a":{"proxies":null,"ruleCount":"3"}}}"#,
+            r#"{"providers":{"a":{"proxies":{},"vehicleType":"HTTP"}}}"#,
+            r#"{"providers":{"a":{"proxies":[1]}}}"#,
+            r#"{"providers":{"a":{"name":"","vehicleType":"compatible","proxies":[{"name":"x","type":"Vmess"}]}}}"#,
+            // A provider named `default` under another key, and a group
+            // that shares a node's name.
+            r#"{"providers":{"k":{"name":"default","vehicleType":"HTTP","proxies":[{"name":"x","extra":{"u":{"alive":true,"history":[{"delay":9}]}}}]},"z":{"name":"z","ruleCount":4,"proxies":[{"name":"x","type":"URLTest","extra":{"u":{"alive":true,"history":[{"delay":7}]}}},{"name":"","type":"Vmess"},{"name":"y","type":5,"udp":1,"history":[{"delay":0}]}]}}}"#,
+            PROVIDERS,
+            &inline,
+            &split,
+        ];
+        for body in odd {
+            let by_value = serde_json::from_str::<Value>(body)
+                .ok()
+                .map(|v| proxy_providers_from_value(&v));
+            assert_eq!(
+                providers_digest(&parse_proxy_providers(body)),
+                providers_digest(&by_value),
+                "{body:.300}"
+            );
+        }
+        for body in [PROVIDERS, &inline, &split] {
+            assert!(
+                serde_json::from_str::<proxies_json::Obj<proxies_json::ProvidersBody>>(body)
+                    .is_ok()
+            );
+        }
+        // The `default` mirror brings neither nodes nor their delays.
+        let (_, found, extras) = parse_proxy_providers(&inline).unwrap();
+        assert!(found.is_empty() && extras.is_empty());
+        let (infos, found, extras) = parse_proxy_providers(&split).unwrap();
+        assert_eq!(infos.len(), 2);
+        assert_eq!(found.len(), 302);
+        assert_eq!(extras.len(), 302);
+    }
 }
 
 pub fn config_yaml_path(cfg: &ControllerConfig) -> PathBuf {
@@ -2180,107 +2440,11 @@ fn fetch_core_snapshot(
         }
     }
 
-    let mut groups = Vec::new();
-    let mut nodes = HashMap::new();
-    let mut sub_info: Option<SubscriptionSummary> = None;
-
-    if let Ok((200, prox_body)) =
-        http_request(&cfg.addr, &cfg.secret, "GET", "/proxies", None, timeout)
-    {
-        if let Ok(v) = serde_json::from_str::<Value>(&prox_body) {
-            if let Some(proxies_obj) = v.get("proxies").and_then(Value::as_object) {
-                // Determine ordering from GLOBAL.all if available
-                let global_order: Vec<String> = proxies_obj
-                    .get("GLOBAL")
-                    .and_then(|g| g.get("all"))
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                for (name, item) in proxies_obj {
-                    let kind = item
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Unknown")
-                        .to_string();
-                    let udp = item.get("udp").and_then(Value::as_bool).unwrap_or(false);
-                    let delay = item
-                        .get("history")
-                        .and_then(Value::as_array)
-                        .and_then(|arr| arr.last())
-                        .and_then(|h| h.get("delay"))
-                        .and_then(Value::as_u64)
-                        .and_then(|d| if d > 0 { Some(d as u16) } else { None });
-
-                    if let Some(all_arr) = item.get("all").and_then(Value::as_array) {
-                        let all: Vec<String> = all_arr
-                            .iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect();
-                        if sub_info.is_none() {
-                            sub_info = extract_subscription_summary(&all);
-                        }
-                        let now = item
-                            .get("now")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let fixed = item
-                            .get("fixed")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        groups.push(ProxyGroup {
-                            name: name.clone(),
-                            kind: kind.clone(),
-                            now,
-                            fixed,
-                            all,
-                            test_url: json_str(item, "testUrl"),
-                            expected_status: json_str(item, "expectedStatus"),
-                            timeout_ms: 0,
-                        });
-                    }
-
-                    nodes.insert(
-                        name.clone(),
-                        ProxyNode {
-                            name: name.clone(),
-                            kind,
-                            udp,
-                            delay,
-                            provider: None,
-                            url_delays: url_delays(item),
-                        },
-                    );
-                }
-
-                // Filter and sort groups cleanly
-                groups.retain(|g| {
-                    let k = g.kind.to_ascii_lowercase();
-                    (k == "selector" || k == "urltest" || k == "fallback" || k == "loadbalance")
-                        && (g.name != "GLOBAL" || mode.eq_ignore_ascii_case("global"))
-                });
-
-                groups.sort_by_key(|g| {
-                    if g.name.eq_ignore_ascii_case("Proxies")
-                        || g.name.eq_ignore_ascii_case("Proxy")
-                        || g.name.contains("节点")
-                    {
-                        0usize
-                    } else if let Some(pos) = global_order.iter().position(|n| n == &g.name) {
-                        pos + 1
-                    } else {
-                        999
-                    }
-                });
-            }
-        }
-    }
+    let (groups, mut nodes, sub_info) =
+        match http_request(&cfg.addr, &cfg.secret, "GET", "/proxies", None, timeout) {
+            Ok((200, body)) => parse_proxies(&body, &mode),
+            _ => ProxiesPart::default(),
+        };
 
     let mut connections = Vec::new();
     let mut connections_ok = false;
@@ -2312,15 +2476,16 @@ fn fetch_core_snapshot(
     }
     let mut providers = Vec::new();
     let get = |path: &str| match http_request(&cfg.addr, &cfg.secret, "GET", path, None, timeout) {
-        Ok((200, body)) => serde_json::from_str::<Value>(&body).ok(),
+        Ok((200, body)) => Some(body),
         _ => None,
     };
     if fetch.providers {
         // One parse feeds both the provider list and the provider nodes.
-        if let Some(v) = get("/providers/proxies") {
-            providers.extend(crate::ops::providers_from_value(&v, "proxy"));
-            let mut extras = provider_url_delays(&v);
-            for found in crate::ops::provider_nodes_from_value(&v) {
+        if let Some((infos, found_nodes, mut extras)) =
+            get("/providers/proxies").and_then(|body| parse_proxy_providers(&body))
+        {
+            providers.extend(infos);
+            for found in found_nodes {
                 let url_delays = extras.remove(&found.name).unwrap_or_default();
                 let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
                     name: found.name,
@@ -2335,7 +2500,9 @@ fn fetch_core_snapshot(
         } else {
             fetched.providers = false;
         }
-        if let Some(v) = get("/providers/rules") {
+        if let Some(v) =
+            get("/providers/rules").and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        {
             providers.extend(crate::ops::providers_from_value(&v, "rule"));
         } else {
             fetched.providers = false;
@@ -2722,6 +2889,444 @@ fn test_delays_async(
     });
 }
 
+/// The groups, the nodes by name and the subscription summary of a
+/// `/proxies` body.
+type ProxiesPart = (
+    Vec<ProxyGroup>,
+    HashMap<String, ProxyNode>,
+    Option<SubscriptionSummary>,
+);
+
+/// A `/proxies` body read through `proxies_json`, without a `Value` tree.
+/// A body of another shape falls back to `proxies_from_value`, so an odd
+/// field can never empty the group list.
+fn parse_proxies(body: &str, mode: &str) -> ProxiesPart {
+    match serde_json::from_str::<proxies_json::Obj<proxies_json::Body>>(body) {
+        Ok(proxies_json::Obj(typed)) => proxies_from_typed(typed, mode),
+        Err(_) => serde_json::from_str::<Value>(body)
+            .map(|v| proxies_from_value(&v, mode))
+            .unwrap_or_default(),
+    }
+}
+
+/// What `proxies_from_value` gives, from the typed body.
+fn proxies_from_typed(body: proxies_json::Body, mode: &str) -> ProxiesPart {
+    let global_order: Vec<String> = body
+        .proxies
+        .get("GLOBAL")
+        .and_then(|g| g.0.all.clone())
+        .unwrap_or_default();
+    let mut groups = Vec::new();
+    let mut nodes = HashMap::with_capacity(body.proxies.len());
+    let mut sub_info: Option<SubscriptionSummary> = None;
+    for (name, proxies_json::Obj(item)) in body.proxies {
+        let kind = item.kind.unwrap_or_else(|| "Unknown".to_string());
+        if let Some(all) = item.all {
+            if sub_info.is_none() {
+                sub_info = extract_subscription_summary(&all);
+            }
+            groups.push(ProxyGroup {
+                name: name.clone(),
+                kind: kind.clone(),
+                now: item.now,
+                fixed: item.fixed,
+                all,
+                test_url: item.test_url,
+                expected_status: item.expected_status,
+                timeout_ms: 0,
+            });
+        }
+        nodes.insert(
+            name.clone(),
+            ProxyNode {
+                name,
+                kind,
+                udp: item.udp,
+                delay: proxies_json::delay_ms(item.history),
+                provider: None,
+                url_delays: item.extra,
+            },
+        );
+    }
+    order_groups(&mut groups, &global_order, mode);
+    (groups, nodes, sub_info)
+}
+
+fn proxies_from_value(v: &Value, mode: &str) -> ProxiesPart {
+    let mut groups = Vec::new();
+    let mut nodes = HashMap::new();
+    let mut sub_info: Option<SubscriptionSummary> = None;
+    if let Some(proxies_obj) = v.get("proxies").and_then(Value::as_object) {
+        // Determine ordering from GLOBAL.all if available
+        let global_order: Vec<String> = proxies_obj
+            .get("GLOBAL")
+            .and_then(|g| g.get("all"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (name, item) in proxies_obj {
+            let kind = item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown")
+                .to_string();
+            let udp = item.get("udp").and_then(Value::as_bool).unwrap_or(false);
+            let delay = item
+                .get("history")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.last())
+                .and_then(|h| h.get("delay"))
+                .and_then(Value::as_u64)
+                .and_then(|d| if d > 0 { Some(d as u16) } else { None });
+
+            if let Some(all_arr) = item.get("all").and_then(Value::as_array) {
+                let all: Vec<String> = all_arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect();
+                if sub_info.is_none() {
+                    sub_info = extract_subscription_summary(&all);
+                }
+                let now = item
+                    .get("now")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let fixed = item
+                    .get("fixed")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                groups.push(ProxyGroup {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    now,
+                    fixed,
+                    all,
+                    test_url: json_str(item, "testUrl"),
+                    expected_status: json_str(item, "expectedStatus"),
+                    timeout_ms: 0,
+                });
+            }
+
+            nodes.insert(
+                name.clone(),
+                ProxyNode {
+                    name: name.clone(),
+                    kind,
+                    udp,
+                    delay,
+                    provider: None,
+                    url_delays: url_delays(item),
+                },
+            );
+        }
+        order_groups(&mut groups, &global_order, mode);
+    }
+    (groups, nodes, sub_info)
+}
+
+/// Keeps the groups the Proxies tab lists (GLOBAL only in global mode):
+/// the main selection group first, then the others in GLOBAL's order.
+fn order_groups(groups: &mut Vec<ProxyGroup>, global_order: &[String], mode: &str) {
+    groups.retain(|g| {
+        let k = g.kind.to_ascii_lowercase();
+        (k == "selector" || k == "urltest" || k == "fallback" || k == "loadbalance")
+            && (g.name != "GLOBAL" || mode.eq_ignore_ascii_case("global"))
+    });
+
+    // Cached: GLOBAL lists the groups after every inline proxy, so each key
+    // is a scan of thousands of names.
+    groups.sort_by_cached_key(|g| {
+        if g.name.eq_ignore_ascii_case("Proxies")
+            || g.name.eq_ignore_ascii_case("Proxy")
+            || g.name.contains("节点")
+        {
+            0usize
+        } else if let Some(pos) = global_order.iter().position(|n| n == &g.name) {
+            pos + 1
+        } else {
+            999
+        }
+    });
+}
+
+/// The proxy providers of a `/providers/proxies` body, their nodes, and
+/// the `url_delays` of every proxy they list (`default` aside), by name.
+type ProxyProvidersPart = (
+    Vec<ProviderInfo>,
+    Vec<crate::ops::ProviderNode>,
+    HashMap<String, HashMap<String, Option<u16>>>,
+);
+
+/// `/providers/proxies` read like `/proxies`: typed, or through
+/// `proxy_providers_from_value` for a body of another shape. None when it
+/// is no JSON.
+fn parse_proxy_providers(body: &str) -> Option<ProxyProvidersPart> {
+    match serde_json::from_str::<proxies_json::Obj<proxies_json::ProvidersBody>>(body) {
+        Ok(proxies_json::Obj(typed)) => Some(proxy_providers_from_typed(typed)),
+        Err(_) => serde_json::from_str::<Value>(body)
+            .ok()
+            .map(|v| proxy_providers_from_value(&v)),
+    }
+}
+
+/// What `proxy_providers_from_value` gives, from the typed body.
+fn proxy_providers_from_typed(body: proxies_json::ProvidersBody) -> ProxyProvidersPart {
+    let mut infos = Vec::new();
+    let mut found = Vec::new();
+    let mut extras = HashMap::new();
+    for (key, proxies_json::Obj(item)) in body.providers {
+        let provider = if item.name.is_empty() { key } else { item.name };
+        if !item.vehicle.eq_ignore_ascii_case("Compatible") {
+            infos.push(ProviderInfo {
+                name: provider.clone(),
+                kind: "proxy".to_string(),
+                vehicle: item.vehicle,
+                behavior: item.behavior,
+                count: item
+                    .rule_count
+                    .map(|n| n as usize)
+                    .or_else(|| item.proxies.as_ref().map(Vec::len))
+                    .unwrap_or(0),
+                updated_at: item.updated_at,
+            });
+        }
+        // The reserved `default` only mirrors what `/proxies` lists.
+        if provider == "default" {
+            continue;
+        }
+        for proxies_json::Obj(proxy) in item.proxies.unwrap_or_default() {
+            if proxy.name.is_empty() {
+                continue;
+            }
+            if !proxy.extra.is_empty() {
+                extras.insert(proxy.name.clone(), proxy.extra);
+            }
+            if !["selector", "urltest", "fallback", "loadbalance", "relay"]
+                .contains(&proxy.kind.to_ascii_lowercase().as_str())
+            {
+                found.push(crate::ops::ProviderNode {
+                    name: proxy.name,
+                    kind: proxy.kind,
+                    udp: proxy.udp,
+                    delay: proxies_json::delay_ms(proxy.history),
+                    provider: provider.clone(),
+                });
+            }
+        }
+    }
+    infos.sort_by(|a, b| a.name.cmp(&b.name));
+    (infos, found, extras)
+}
+
+fn proxy_providers_from_value(v: &Value) -> ProxyProvidersPart {
+    (
+        crate::ops::providers_from_value(v, "proxy"),
+        crate::ops::provider_nodes_from_value(v),
+        provider_url_delays(v),
+    )
+}
+
+/// Typed `/proxies` and `/providers/proxies` JSON. Only the fields the
+/// `Value` functions read are declared, each as leniently as its lookup:
+/// null, a missing key or an odd scalar gives the same default. `history`
+/// keeps only its last delay and `extra` becomes `url_delays` directly. A
+/// shape this rejects (an entry or record that is not an object, a repeated
+/// field) makes the parse fall back to the `Value` functions.
+mod proxies_json {
+    use super::conn_json::{nul, opt_text, text};
+    use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde::Deserialize;
+    use serde_json::Value;
+    use std::collections::{BTreeMap, HashMap};
+    use std::fmt;
+    use std::marker::PhantomData;
+
+    /// `T` read only from a JSON object. Serde also fills a struct from an
+    /// array, field by field, where the `Value` lookups find nothing.
+    pub(super) struct Obj<T>(pub T);
+
+    impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V<T>(PhantomData<T>);
+            impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+                type Value = Obj<T>;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("an object")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Obj<T>, A::Error> {
+                    T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Obj)
+                }
+            }
+            d.deserialize_map(V(PhantomData))
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Body {
+        // A BTreeMap iterates in the order the `Value` map did, which sets
+        // the group order and the group `sub_info` comes from.
+        #[serde(default, deserialize_with = "nul")]
+        pub proxies: BTreeMap<String, Obj<Entry>>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    pub(super) struct Entry {
+        #[serde(rename = "type", deserialize_with = "opt_text")]
+        pub kind: Option<String>,
+        #[serde(deserialize_with = "flag")]
+        pub udp: bool,
+        #[serde(deserialize_with = "last_delay")]
+        pub history: Option<u64>,
+        #[serde(deserialize_with = "opt_texts")]
+        pub all: Option<Vec<String>>,
+        #[serde(deserialize_with = "text")]
+        pub now: String,
+        #[serde(deserialize_with = "text")]
+        pub fixed: String,
+        #[serde(rename = "testUrl", deserialize_with = "text")]
+        pub test_url: String,
+        #[serde(rename = "expectedStatus", deserialize_with = "text")]
+        pub expected_status: String,
+        #[serde(deserialize_with = "extra")]
+        pub extra: HashMap<String, Option<u16>>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct ProvidersBody {
+        #[serde(default, deserialize_with = "nul")]
+        pub providers: BTreeMap<String, Obj<Provider>>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    pub(super) struct Provider {
+        #[serde(deserialize_with = "text")]
+        pub name: String,
+        #[serde(rename = "vehicleType", deserialize_with = "text")]
+        pub vehicle: String,
+        #[serde(deserialize_with = "text")]
+        pub behavior: String,
+        #[serde(rename = "updatedAt", deserialize_with = "text")]
+        pub updated_at: String,
+        #[serde(rename = "ruleCount", deserialize_with = "number")]
+        pub rule_count: Option<u64>,
+        // Null or missing is no list; another non-array falls back.
+        pub proxies: Option<Vec<Obj<Member>>>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    pub(super) struct Member {
+        #[serde(deserialize_with = "text")]
+        pub name: String,
+        #[serde(rename = "type", deserialize_with = "text")]
+        pub kind: String,
+        #[serde(deserialize_with = "flag")]
+        pub udp: bool,
+        #[serde(deserialize_with = "last_delay")]
+        pub history: Option<u64>,
+        #[serde(deserialize_with = "extra")]
+        pub extra: HashMap<String, Option<u16>>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Record {
+        #[serde(deserialize_with = "number")]
+        delay: Option<u64>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct UrlState {
+        #[serde(deserialize_with = "flag")]
+        alive: bool,
+        #[serde(deserialize_with = "last_delay")]
+        history: Option<u64>,
+    }
+
+    /// A `history` delay as `ProxyNode::delay` keeps it: 0 means failed.
+    pub(super) fn delay_ms(delay: Option<u64>) -> Option<u16> {
+        delay.and_then(|d| if d > 0 { Some(d as u16) } else { None })
+    }
+
+    fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+        Ok(Value::deserialize(d)?.as_bool().unwrap_or(false))
+    }
+
+    fn number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        Ok(Value::deserialize(d)?.as_u64())
+    }
+
+    /// The string entries of an array, or None when it is no array.
+    fn opt_texts<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::Array(items) => Some(
+                items
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+    }
+
+    /// The last record's `delay`, without keeping the records.
+    fn last_delay<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        struct Last;
+        impl<'de> Visitor<'de> for Last {
+            type Value = Option<u64>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a delay history")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut last = None;
+                while let Some(Obj(record)) = seq.next_element::<Obj<Record>>()? {
+                    last = record.delay;
+                }
+                Ok(last)
+            }
+        }
+        d.deserialize_any(Last)
+    }
+
+    /// `extra` as `url_delays`: per URL, the last delay while alive.
+    fn extra<'de, D: Deserializer<'de>>(d: D) -> Result<HashMap<String, Option<u16>>, D::Error> {
+        struct Extra;
+        impl<'de> Visitor<'de> for Extra {
+            type Value = HashMap<String, Option<u16>>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("per-URL delay states")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(HashMap::new())
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut out = HashMap::new();
+                while let Some((url, Obj(state))) = map.next_entry::<String, Obj<UrlState>>()? {
+                    out.insert(url, delay_ms(state.history.filter(|_| state.alive)));
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(Extra)
+    }
+}
+
 fn json_str(item: &Value, key: &str) -> String {
     item.get(key)
         .and_then(Value::as_str)
@@ -2751,13 +3356,19 @@ fn url_delays(item: &Value) -> HashMap<String, Option<u16>> {
 }
 
 /// `url_delays` of every node in a `/providers/proxies` body, by node name.
+/// The reserved `default` provider is skipped: it only mirrors what
+/// `/proxies` lists with its own `url_delays`.
 fn provider_url_delays(value: &Value) -> HashMap<String, HashMap<String, Option<u16>>> {
     value
         .get("providers")
         .and_then(Value::as_object)
         .into_iter()
-        .flat_map(|obj| obj.values())
-        .filter_map(|item| item.get("proxies").and_then(Value::as_array))
+        .flatten()
+        .filter(|(key, item)| {
+            let named = item.get("name").and_then(Value::as_str);
+            named.filter(|name| !name.is_empty()).unwrap_or(key) != "default"
+        })
+        .filter_map(|(_, item)| item.get("proxies").and_then(Value::as_array))
         .flatten()
         .map(|proxy| (json_str(proxy, "name"), url_delays(proxy)))
         .filter(|(name, extra)| !name.is_empty() && !extra.is_empty())
