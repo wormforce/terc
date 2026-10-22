@@ -1298,7 +1298,7 @@ fn parse_ipv6(value: &str) -> Option<u128> {
         }
         let zeros = 8 - left.len() - right.len();
         let mut groups = left;
-        groups.extend(std::iter::repeat(0u16).take(zeros));
+        groups.extend(std::iter::repeat_n(0u16, zeros));
         groups.extend(right);
         groups
     } else if left.len() == 8 {

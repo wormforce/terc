@@ -1051,9 +1051,7 @@ fn draw_connection_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push(kv(
             theme,
             "dst",
-            &format!("{} {}", conn.dest_geo, conn.dest_asn)
-                .trim()
-                .to_string(),
+            format!("{} {}", conn.dest_geo, conn.dest_asn).trim(),
         ));
     }
     if !conn.dns_mode.is_empty() {

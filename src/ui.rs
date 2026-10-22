@@ -635,19 +635,23 @@ fn draw_rate_braille(
             let row_from_bottom = area.height as usize - 1 - row;
             let mut down_bits = 0u8;
             let mut up_bits = 0u8;
-            for sub in 0..4 {
+            for (sub, (&left, &right)) in BRAILLE_DOT_BITS[0]
+                .iter()
+                .zip(&BRAILLE_DOT_BITS[1])
+                .enumerate()
+            {
                 let dot_idx = row_from_bottom * 4 + (3 - sub);
                 if dot_idx < d_l {
-                    down_bits |= BRAILLE_DOT_BITS[0][sub];
+                    down_bits |= left;
                 }
                 if dot_idx < d_r {
-                    down_bits |= BRAILLE_DOT_BITS[1][sub];
+                    down_bits |= right;
                 }
                 if dot_idx < u_l {
-                    up_bits |= BRAILLE_DOT_BITS[0][sub];
+                    up_bits |= left;
                 }
                 if dot_idx < u_r {
-                    up_bits |= BRAILLE_DOT_BITS[1][sub];
+                    up_bits |= right;
                 }
             }
             let bits = down_bits | up_bits;

@@ -497,7 +497,10 @@ impl App {
                                 .map(|(_, v)| crate::ops::clean_scalar(v))
                         })
                         .unwrap_or_else(|| "0".into());
-                    if old == value.to_string() {
+                    // Compare as text, as the file holds it: a String never
+                    // equals a JSON number such as a port.
+                    let new = value.to_string();
+                    if old == new {
                         return Ok("端口未改变 / Port unchanged".into());
                     }
                     if let Some(port) = value.as_u64().filter(|p| *p > 0) {
@@ -522,7 +525,7 @@ impl App {
                 )?;
                 if !running
                     || !live_patchable(&raw, &generated, &key, &value)
-                    || crate::mihomo::RELOAD_UNCERTAIN.load(std::sync::atomic::Ordering::SeqCst)
+                    || crate::mihomo::reload_uncertain(&cfg)
                 {
                     crate::mihomo::install_config(&cfg, &generated, running)?;
                     return Ok("设置已保存 / Settings saved".into());
@@ -548,8 +551,7 @@ impl App {
                             // The PATCH may have half-applied; the next
                             // regeneration must reload even when its output is
                             // unchanged.
-                            crate::mihomo::RELOAD_UNCERTAIN
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            crate::mihomo::set_reload_uncertain(&cfg, true);
                             Err(format!(
                                 "实时修改失败，重载也失败 / Live change failed ({err}); reload failed: {e}"
                             ))

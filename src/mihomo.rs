@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
@@ -4159,12 +4159,7 @@ fn regenerate_outcome(
     } else {
         generated.clone()
     };
-    let reload = reload_needed(
-        old.as_deref(),
-        &candidate,
-        running,
-        RELOAD_UNCERTAIN.load(Ordering::SeqCst),
-    );
+    let reload = reload_needed(old.as_deref(), &candidate, running, reload_uncertain(cfg));
     // A file kept after an unanswered reload may already be live, so record
     // the matching cache and routing before reporting the unknown outcome.
     let unknown = if !reload {
@@ -4338,7 +4333,7 @@ fn install_config_with(
             // The core runs the new config; until the file matches, the next
             // regeneration must reload even when its output is unchanged.
             let saved = save();
-            RELOAD_UNCERTAIN.store(saved.is_err(), Ordering::SeqCst);
+            set_reload_uncertain(cfg, saved.is_err());
             saved.map_err(|err| {
                 format!("新配置已生效，但保存失败 / Applied, but could not save config.yaml: {err}")
                     .into()
@@ -4357,7 +4352,7 @@ fn install_config_with(
         // looks the same, so the core's own parse never vouched for this
         // text: check it before it can outlive a core that then restarts.
         Err(ReloadError::Unknown(err)) => {
-            RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+            set_reload_uncertain(cfg, true);
             if !checked {
                 check(false).map_err(|e| {
                     format!(
@@ -5021,7 +5016,7 @@ fn active_macos_network_service() -> Option<String> {
         .or_else(|| scutil_value("State:/Network/Global/IPv6", "PrimaryInterface"));
     // A packet tunnel can be PrimaryService without a Setup/UserDefinedName.
     // Map the active underlying hardware interface to its actual service name.
-    let output = Command::new("/usr/sbin/networksetup")
+    let output = Command::new("networksetup")
         .arg("-listnetworkserviceorder")
         .output()
         .ok()?;
@@ -5252,8 +5247,28 @@ fn put_config(cfg: &ControllerConfig, body: &str) -> Result<(), ReloadError> {
     }
 }
 
-/// Set when a reload got no clear answer, so the core may not run the file.
-pub(crate) static RELOAD_UNCERTAIN: AtomicBool = AtomicBool::new(false);
+/// Config files whose last reload got no clear answer, so the core may not
+/// run them. Keyed by path, so each controller's file (and each test's) has
+/// its own.
+static RELOAD_UNCERTAIN: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Whether a reload of `cfg`'s config.yaml got no clear answer since the
+/// last one that did, so the core may not run the file.
+pub(crate) fn reload_uncertain(cfg: &ControllerConfig) -> bool {
+    RELOAD_UNCERTAIN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&config_yaml_path(cfg))
+}
+
+pub(crate) fn set_reload_uncertain(cfg: &ControllerConfig, uncertain: bool) {
+    let mut files = RELOAD_UNCERTAIN.lock().unwrap_or_else(|e| e.into_inner());
+    if uncertain {
+        files.insert(config_yaml_path(cfg));
+    } else {
+        files.remove(&config_yaml_path(cfg));
+    }
+}
 
 thread_local! {
     /// The UI channel of a `run_action` worker. Each worker runs one action,
@@ -5319,7 +5334,7 @@ pub fn save_config_unchecked(
     // The core now runs a value the file lacks, so the next regeneration
     // must reload even when its output is unchanged.
     if saved.is_err() && running {
-        RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+        set_reload_uncertain(cfg, true);
     }
     saved
 }
@@ -8547,7 +8562,7 @@ proxy-providers:
         assert!(generated.is_file());
 
         // An earlier reload with no answer forces the next one, which clears it.
-        RELOAD_UNCERTAIN.store(true, Ordering::SeqCst);
+        set_reload_uncertain(&cfg, true);
         let server = serve(
             listener.try_clone().unwrap(),
             vec![mode(), mode(), http("204 No Content", ""), proxies()],
@@ -8555,7 +8570,7 @@ proxy-providers:
         let third = regenerate_config(&cfg, &[], true, false, true).unwrap();
         assert!(server.join().unwrap()[2].starts_with("PUT /configs?force=true "));
         assert!(third.contains("已校验并热重载"), "{third}");
-        assert!(!RELOAD_UNCERTAIN.load(Ordering::SeqCst));
+        assert!(!reload_uncertain(&cfg));
         assert_eq!(checks_run(), 0);
         fs::remove_dir_all(home).unwrap();
     }

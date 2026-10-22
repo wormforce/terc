@@ -134,8 +134,7 @@ impl App {
                 // The file now differs from the core, so the next
                 // regeneration reloads even when its output is unchanged.
                 if let Err(err) = live {
-                    crate::mihomo::RELOAD_UNCERTAIN
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    crate::mihomo::set_reload_uncertain(&cfg, true);
                     return Ok(format!(
                         "已保存，重载配置或重启内核后生效 / Saved; the core did not apply it live ({err}), so it takes effect after the next reload or core restart"
                     ));
@@ -352,8 +351,7 @@ impl App {
         let running = self.snapshot.running;
         // After an unanswered reload the core may not run the file, so only a
         // reload makes them match.
-        let uncertain =
-            running && crate::mihomo::RELOAD_UNCERTAIN.load(std::sync::atomic::Ordering::SeqCst);
+        let uncertain = running && crate::mihomo::reload_uncertain(&self.config.controller);
         let change = match module_change(&raw, &next) {
             ModuleChange::Live(_) if !running => ModuleChange::Reload,
             _ if uncertain => ModuleChange::Reload,
@@ -402,8 +400,7 @@ impl App {
                             // the prompt a reload toggle shows. Keys may be
                             // half-applied, so the next toggle reloads, and
                             // asks first.
-                            crate::mihomo::RELOAD_UNCERTAIN
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            crate::mihomo::set_reload_uncertain(&cfg, true);
                             return Err(format!("{failed} ({err})"));
                         }
                     }
@@ -745,9 +742,11 @@ impl App {
 
     pub fn import_profile(&mut self, text: &str) {
         let is_url = text.starts_with("https://") || text.starts_with("http://");
-        let mut record = crate::compose::ProfileSource::default();
-        record.routing = "subscription".into();
-        record.kind = if is_url { "subscription" } else { "proxy" }.into();
+        let mut record = crate::compose::ProfileSource {
+            routing: "subscription".into(),
+            kind: if is_url { "subscription" } else { "proxy" }.into(),
+            ..Default::default()
+        };
         if is_url {
             record.subscription_url = text.trim().into();
             record.name = crate::storage::label("", text, "new");
