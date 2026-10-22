@@ -56,6 +56,9 @@ pub enum BackendEvent {
         items: Vec<ConnectionItem>,
         upload_total: u64,
         download_total: u64,
+        /// When the push was read; rates divide by the time between pushes,
+        /// not between the drains that applied them.
+        at: Instant,
     },
     DelayResult {
         group: String,
@@ -103,6 +106,9 @@ pub struct CoreSnapshot {
     pub connections: Vec<ConnectionItem>,
     /// `/connections` answered with JSON; an empty list is then real, not a fetch failure.
     pub connections_ok: bool,
+    /// When `/connections` answered; like a push's `at`, rates divide by the
+    /// time between reads, not between the drains that applied them.
+    pub connections_at: Option<Instant>,
     pub upload_total: u64,
     pub download_total: u64,
     pub sub_info: Option<SubscriptionSummary>,
@@ -824,6 +830,7 @@ fn stream_session(
                     items,
                     upload_total,
                     download_total,
+                    at: Instant::now(),
                 };
                 if tx.send(event).is_err() {
                     return SessionEnd::Exit;
@@ -1257,6 +1264,7 @@ mod stream_tests {
             items,
             upload_total,
             download_total,
+            ..
         } = worker.next()
         else {
             panic!("expected pushed connections");
@@ -1276,6 +1284,7 @@ mod stream_tests {
             items,
             upload_total,
             download_total,
+            ..
         } = worker.next()
         else {
             panic!("expected pushed connections");
@@ -2448,6 +2457,7 @@ fn fetch_core_snapshot(
 
     let mut connections = Vec::new();
     let mut connections_ok = false;
+    let mut connections_at = None;
     let mut upload_total = 0;
     let mut download_total = 0;
 
@@ -2455,6 +2465,7 @@ fn fetch_core_snapshot(
         if let Ok((200, conn_body)) =
             http_request(&cfg.addr, &cfg.secret, "GET", "/connections", None, timeout)
         {
+            connections_at = Some(Instant::now());
             // A body without a connection list keeps the last one (`connections_ok`
             // stays false) instead of reporting every session as closed.
             if let Some(parsed) = parse_connections(&conn_body) {
@@ -2524,6 +2535,7 @@ fn fetch_core_snapshot(
         nodes,
         connections,
         connections_ok,
+        connections_at,
         upload_total,
         download_total,
         sub_info,

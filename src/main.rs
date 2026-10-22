@@ -888,6 +888,9 @@ pub struct App {
     pub best_choice: String,
     pub best_scope_index: usize,
     pub action_busy: bool,
+    /// Group delay tests still sending results; each ends with one
+    /// `GroupTestDone`.
+    pub group_tests: usize,
     pub snapshot_pending: bool,
     /// A full refresh was asked for while a poll ran (whose host lookups may
     /// be cached); it starts when that poll ends.
@@ -1035,6 +1038,7 @@ impl App {
             best_choice: String::new(),
             best_scope_index: 0,
             action_busy: false,
+            group_tests: 0,
             snapshot_pending: false,
             refresh_queued: false,
             setting_index: 0,
@@ -1309,11 +1313,49 @@ impl App {
         }
     }
 
+    fn toast_life(&self) -> Duration {
+        Duration::from_secs(if self.status_is_error { 8 } else { 4 })
+    }
+
     pub fn toast_visible(&self) -> bool {
         !self.status_message.is_empty()
-            && self.toast_started.is_some_and(|at| {
-                at.elapsed() < Duration::from_secs(if self.status_is_error { 8 } else { 4 })
-            })
+            && self
+                .toast_started
+                .is_some_and(|at| at.elapsed() < self.toast_life())
+    }
+
+    /// Longest `run_app` may block on input. Worker events cannot wake
+    /// `event::poll`, so while a reply is awaited (an action, a delay test, a
+    /// download, or keys pressed just now) the loop looks every `IDLE_WAKE`.
+    /// Otherwise it sleeps to the next change no event reports: a toast
+    /// expiring, the graph shift, the next poll, or (in `Redraw::wait`) the
+    /// heartbeat. Pushes queued meanwhile land in that one frame.
+    pub fn wake_cap(&self, since_input: Duration, since_tick: Duration) -> Duration {
+        if self.action_busy
+            || self.refresh_queued
+            || self.core_downloading
+            || self.pending_best_group.is_some()
+            || self.group_tests > 0
+            || since_input < BUSY_AFTER_INPUT
+        {
+            return IDLE_WAKE;
+        }
+        let mut cap = HEARTBEAT;
+        if self.screen == Screen::Dashboard && self.main_tab == MainTab::Logs && !self.logs_paused {
+            cap = LOG_WAKE;
+        }
+        if let Some(at) = self.toast_started.filter(|_| self.toast_visible()) {
+            cap = cap.min(self.toast_life().saturating_sub(at.elapsed()));
+        }
+        // Without samples a shift draws nothing.
+        if self.graph_samples.2 > 0 {
+            let interval = Duration::from_millis(self.config.settings.graph_interval_ms());
+            cap = cap.min(interval.saturating_sub(self.graph_elapsed + since_tick));
+        }
+        if !self.snapshot_pending {
+            cap = cap.min(SNAPSHOT_POLL.saturating_sub(self.last_snapshot_poll.elapsed()));
+        }
+        cap
     }
 
     pub fn clear_status(&mut self) {
@@ -1508,11 +1550,12 @@ impl App {
                     items,
                     upload_total,
                     download_total,
+                    at,
                 } => {
                     self.conn_stream_at = Some(Instant::now());
                     self.snapshot.upload_total = upload_total;
                     self.snapshot.download_total = download_total;
-                    self.install_connections(items, true);
+                    self.install_connections(items, true, at);
                 }
                 BackendEvent::SnapshotDone(snap) => {
                     self.snapshot_pending = false;
@@ -1550,6 +1593,7 @@ impl App {
                     }
                 }
                 BackendEvent::GroupTestDone { group } => {
+                    self.group_tests = self.group_tests.saturating_sub(1);
                     self.set_status(&format!("Latency test complete: {group}"), false);
                 }
                 BackendEvent::BestTestDone { group, results } => {
@@ -1619,7 +1663,7 @@ impl App {
             && matches!(self.main_tab, MainTab::Rules | MainTab::Providers);
         if !self.action_busy
             && !self.snapshot_pending
-            && (entered || self.last_snapshot_poll.elapsed() >= Duration::from_millis(2200))
+            && (entered || self.last_snapshot_poll.elapsed() >= SNAPSHOT_POLL)
         {
             self.snapshot_pending = true;
             self.last_snapshot_poll = Instant::now();
@@ -1698,7 +1742,8 @@ impl App {
         snapshot.carry_skipped(&mut self.snapshot);
         self.snapshot = snapshot;
         if !keep {
-            self.install_connections(fresh, self.snapshot.running);
+            let at = self.snapshot.connections_at.unwrap_or_else(Instant::now);
+            self.install_connections(fresh, self.snapshot.running, at);
         }
         self.group_index = self
             .group_index
@@ -1706,7 +1751,12 @@ impl App {
         self.clamp_aux();
     }
 
-    fn install_connections(&mut self, mut list: Vec<mihomo::ConnectionItem>, running: bool) {
+    fn install_connections(
+        &mut self,
+        mut list: Vec<mihomo::ConnectionItem>,
+        running: bool,
+        at: Instant,
+    ) {
         let selected = self.selected_connection().map(|c| c.id.clone());
         let was_empty = self.conn_view.is_empty();
         let now_ms = conns::now_ms();
@@ -1715,9 +1765,7 @@ impl App {
             let (up, down) = (self.snapshot.upload_total, self.snapshot.download_total);
             self.conns.note_totals(up, down);
         }
-        let closed = self
-            .conns
-            .observe(&mut list, running, Instant::now(), now_ms);
+        let closed = self.conns.observe(&mut list, running, at, now_ms);
         self.snapshot.connections = list;
         self.rebuild_conn_view();
         // An expired selection stays empty until the user navigates again.
@@ -1968,6 +2016,7 @@ impl App {
             &format!("Testing {} ({})...", group.name, group.all.len()),
             false,
         );
+        self.group_tests += 1;
         test_group_delays_async(
             self.config.controller.clone(),
             group.name.clone(),
@@ -2932,8 +2981,15 @@ fn run(app: &mut App) -> io::Result<()> {
     result
 }
 
-/// Longest the loop blocks on input before it drains backend events again.
+/// Longest the loop blocks on input before it drains backend events again,
+/// while a reply is awaited (`App::wake_cap`); worker events cannot wake
+/// `event::poll`.
 const IDLE_WAKE: Duration = Duration::from_millis(50);
+/// Input this recent keeps the loop at `IDLE_WAKE`, so what a key starts
+/// (a DNS lookup, a tab's first poll) shows at once.
+const BUSY_AFTER_INPUT: Duration = Duration::from_secs(3);
+/// The live Logs tab looks this often while idle.
+const LOG_WAKE: Duration = Duration::from_millis(250);
 /// Data repaints (pushes, polls, toasts) run at most this often; Mihomo
 /// pushes once a second anyway.
 const DATA_FRAME: Duration = Duration::from_millis(100);
@@ -2942,6 +2998,8 @@ const DATA_FRAME: Duration = Duration::from_millis(100);
 const HEARTBEAT: Duration = Duration::from_secs(1);
 /// Key repeats and pastes applied before one repaint.
 const INPUT_BURST: usize = 64;
+/// Background poll of `/version`, `/configs` and `/proxies`.
+const SNAPSHOT_POLL: Duration = Duration::from_millis(2200);
 
 /// When `run_app` repaints: input at once (capped by `refresh_hz`), data at
 /// most every `DATA_FRAME`, and nothing while the screen cannot have changed.
@@ -2997,13 +3055,14 @@ impl Redraw {
             .is_some_and(|gap| now.saturating_duration_since(self.last) >= gap)
     }
 
-    /// How long the loop may wait for input before it has to look again.
-    fn wait(&self, now: Instant, frame: Duration) -> Duration {
+    /// How long the loop may wait for input before it has to look again;
+    /// `cap` is `App::wake_cap`.
+    fn wait(&self, now: Instant, frame: Duration, cap: Duration) -> Duration {
         let since = now.saturating_duration_since(self.last);
         self.gap(frame)
             .unwrap_or(HEARTBEAT)
             .saturating_sub(since)
-            .min(IDLE_WAKE)
+            .min(cap)
     }
 
     fn drawn(&mut self, app: &App, now: Instant) {
@@ -3021,6 +3080,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
     // A mouse event read behind undrawn changes waits for the next frame: its
     // hit areas (proxy_hits, list scroll) come from the last draw.
     let mut held: Option<CEvent> = None;
+    let mut last_input = last_tick;
 
     loop {
         redraw.data |= app.drain_events();
@@ -3038,11 +3098,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
             redraw.drawn(app, Instant::now());
         }
 
+        let cap = app.wake_cap(last_input.elapsed(), last_tick.elapsed());
         let mut next = match held.take() {
             Some(ev) => Some(ev),
-            None if event::poll(redraw.wait(Instant::now(), frame))? => Some(event::read()?),
+            None if event::poll(redraw.wait(Instant::now(), frame, cap))? => Some(event::read()?),
             None => None,
         };
+        if next.is_some() {
+            last_input = Instant::now();
+        }
         let mut applied = 0;
         while let Some(ev) = next.take() {
             if matches!(&ev, CEvent::Mouse(m) if mouse_acts(m.kind)) && redraw.pending() {
@@ -5013,6 +5077,7 @@ mod tests {
                 ],
                 upload_total: 5,
                 download_total: 9,
+                at: Instant::now(),
             })
             .unwrap();
         app.drain_events();
@@ -5052,6 +5117,35 @@ mod tests {
         app.config.settings.connections_stream = false;
         app.conn_stream.enabled.store(false, Ordering::Relaxed);
         assert!(!app.stream_live());
+    }
+
+    #[test]
+    fn connection_rates_count_from_each_read_not_from_the_drain() {
+        let t0 = Instant::now();
+        let dl = |bytes| vec![live_conn("dl", "cdn.example.com:443", Some(5), bytes)];
+        let rate = |app: &App| app.snapshot.connections[0].down_rate;
+        // Two pushes a second apart, applied by one late drain.
+        let mut app = offline_app();
+        for (bytes, secs) in [(1000, 0), (3000, 1)] {
+            app.tx
+                .send(BackendEvent::Connections {
+                    items: dl(bytes),
+                    upload_total: 0,
+                    download_total: bytes,
+                    at: t0 + Duration::from_secs(secs),
+                })
+                .unwrap();
+        }
+        app.drain_events();
+        assert_eq!(rate(&app), 2000);
+        // Polls, too, count from when `/connections` answered.
+        let mut app = offline_app();
+        for (bytes, secs) in [(1000, 0), (9000, 2)] {
+            let mut polled = live_snapshot(dl(bytes));
+            polled.connections_at = Some(t0 + Duration::from_secs(secs));
+            app.accept_snapshot(polled);
+        }
+        assert_eq!(rate(&app), 4000);
     }
 
     /// A controller on 127.0.0.1:0 that answers `{}` and records each path.
@@ -5589,6 +5683,7 @@ mod tests {
                 items: sample_connections(),
                 upload_total: 1,
                 download_total: 1,
+                at: Instant::now(),
             })
             .unwrap();
         app.drain_events();
@@ -5915,11 +6010,19 @@ mod tests {
         redraw.drawn(&app, t0);
         redraw.observe(&app, at(10));
         assert!(!redraw.pending());
-        assert_eq!(redraw.wait(at(10), frame), IDLE_WAKE);
+        assert_eq!(redraw.wait(at(10), frame, IDLE_WAKE), IDLE_WAKE);
+        // Idle, the wait runs to the heartbeat.
+        assert_eq!(
+            redraw.wait(at(10), frame, HEARTBEAT),
+            Duration::from_millis(990)
+        );
         // Data waits for the 100 ms frame, input only for refresh_hz.
         redraw.data = true;
         assert!(!redraw.due(at(40), frame));
-        assert_eq!(redraw.wait(at(70), frame), Duration::from_millis(30));
+        assert_eq!(
+            redraw.wait(at(70), frame, HEARTBEAT),
+            Duration::from_millis(30)
+        );
         assert!(redraw.due(at(100), frame));
         redraw.input = true;
         assert!(redraw.due(at(16), frame));
@@ -5930,6 +6033,48 @@ mod tests {
         assert!(!redraw.pending());
         redraw.observe(&app, at(1100));
         assert!(redraw.due(at(1100), frame));
+    }
+
+    #[test]
+    fn idle_loop_sleeps_to_the_next_deadline_and_looks_often_only_while_busy() {
+        let mut app = offline_app();
+        app.clear_status();
+        let idle = Duration::from_secs(60);
+        app.snapshot_pending = true;
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), HEARTBEAT);
+        let typed = Duration::from_millis(500);
+        assert_eq!(app.wake_cap(typed, Duration::ZERO), IDLE_WAKE);
+        app.group_tests = 1;
+        assert_eq!(
+            app.wake_cap(idle, Duration::ZERO),
+            IDLE_WAKE,
+            "delays stream in"
+        );
+        app.group_tests = 0;
+        app.action_busy = true;
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), IDLE_WAKE);
+        app.action_busy = false;
+        // A toast leaves on time, not up to a heartbeat late.
+        app.set_status("hi", false);
+        app.toast_started = Some(Instant::now() - Duration::from_millis(3700));
+        assert!(app.wake_cap(idle, Duration::ZERO) <= Duration::from_millis(300));
+        app.clear_status();
+        // The graph shift, once it has samples to draw.
+        app.graph_elapsed = Duration::from_millis(600);
+        assert_eq!(app.wake_cap(idle, Duration::from_millis(100)), HEARTBEAT);
+        app.graph_samples = (1.0, 1.0, 1);
+        assert_eq!(
+            app.wake_cap(idle, Duration::from_millis(100)),
+            Duration::from_millis(300)
+        );
+        app.graph_samples = (0.0, 0.0, 0);
+        // The next poll starts on time.
+        app.snapshot_pending = false;
+        app.last_snapshot_poll = Instant::now() - Duration::from_millis(2000);
+        assert!(app.wake_cap(idle, Duration::ZERO) <= Duration::from_millis(200));
+        app.snapshot_pending = true;
+        app.main_tab = MainTab::Logs;
+        assert_eq!(app.wake_cap(idle, Duration::ZERO), LOG_WAKE);
     }
 
     #[test]

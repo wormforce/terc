@@ -580,6 +580,7 @@ impl App {
             return;
         }
         self.set_status(self.t("st_wg_test"), false);
+        self.group_tests += 1;
         test_group_delays_async(
             self.config.controller.clone(),
             "WireGuard".into(),
