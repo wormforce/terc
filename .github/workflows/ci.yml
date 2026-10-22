@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "assets/**"
+      - "LICENSE"
+  pull_request:
+    # labeled: adding the "macos" label starts a run with the macOS tests.
+    types: [opened, synchronize, reopened, labeled]
+    # Do not mark these jobs as required status checks while this filter
+    # exists: a skipped workflow leaves required checks Pending and blocks
+    # the pull request.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "assets/**"
+      - "LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Bumped by hand: clippy runs with -D warnings, and a new release can add
+  # lints that would fail unrelated pull requests.
+  RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  lint:
+    name: Lint (rustfmt, clippy for Linux and macOS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --component clippy,rustfmt \
+            --target aarch64-apple-darwin,x86_64-apple-darwin
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy (Linux)
+        run: cargo clippy --all-targets --locked -- -D warnings
+      # No C dependencies, so the macOS code paths check from Linux without
+      # spending macOS runner minutes.
+      - name: clippy (macOS, aarch64)
+        run: cargo clippy --all-targets --locked --target aarch64-apple-darwin -- -D warnings
+      - name: check (macOS, x86_64)
+        run: cargo check --all-targets --locked --target x86_64-apple-darwin
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # The repository is private, where macOS minutes count about 10x Linux
+        # against the included minutes, and the lint job already cross-checks
+        # the macOS targets. So macOS tests run only on manual runs and on
+        # pull requests labelled "macos".
+        os: ${{ (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'macos')) && fromJSON('["ubuntu-latest","macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Tests must never change the system proxy (AGENTS.md). These stand-ins
+      # come first on PATH, record every call that looks the tool up on PATH
+      # and fail; the step after the tests fails the job if any ran.
+      - name: Shadow networksetup and gsettings
+        run: |
+          shims="$RUNNER_TEMP/proxy-tool-shims"
+          mkdir -p "$shims"
+          for tool in networksetup gsettings; do
+            cat > "$shims/$tool" <<EOF
+          #!/bin/sh
+          echo "$tool \$*" >> "$RUNNER_TEMP/proxy-tool-calls.log"
+          exit 1
+          EOF
+            chmod +x "$shims/$tool"
+          done
+          echo "$shims" >> "$GITHUB_PATH"
+      - name: Test
+        run: cargo test --all-targets --locked
+      - name: Tests ran no system proxy tool
+        if: ${{ !cancelled() }}
+        run: |
+          log="$RUNNER_TEMP/proxy-tool-calls.log"
+          if [ -s "$log" ]; then
+            echo "::error::Tests ran a system proxy tool:"
+            cat "$log"
+            exit 1
+          fi
+      - name: Release build
+        if: runner.os == 'Linux'
+        run: cargo build --release --locked

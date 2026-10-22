@@ -5,7 +5,9 @@
 ## Build & Verification Commands
 
 - Run unit tests: `cargo test --all-targets --locked`
+- Lint: `cargo fmt --check` and `cargo clippy --all-targets --locked -- -D warnings`
 - Build release binary: `cargo build --release --locked`
+- CI (`.github/workflows/ci.yml`) runs these on every pull request and push to main that changes code (changes only to `*.md`, `docs/`, `assets/` or `LICENSE` are skipped), with tests on Linux and clippy cross-checks for the macOS targets; macOS tests run only on manual runs (workflow_dispatch) and on pull requests labelled `macos`. The Rust version it uses is pinned there.
 - macOS global binary symlink: `/opt/homebrew/bin/terc` -> `/Users/grada/Documents/GitHub/terc/target/release/terc`
 
 ## Architectural & Design Rules
