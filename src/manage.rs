@@ -342,6 +342,7 @@ impl App {
                 .unwrap_or_default()
         };
         for name in names {
+            self.replies_owed += 1;
             test_node_async(
                 self.config.controller.clone(),
                 name,

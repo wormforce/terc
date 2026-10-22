@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,8 @@ pub enum BackendEvent {
         payload: String,
     },
     Snapshot(Box<CoreSnapshot>),
+    /// `run_action`'s follow-up snapshot (`App::action_snapshots_owed`).
+    ActionSnapshot(Box<CoreSnapshot>),
     /// A reload or TUN rebuild is about to be sent; closures in `scope` are
     /// blamed on it from now until the action finishes.
     Disrupting {
@@ -56,6 +58,9 @@ pub enum BackendEvent {
         items: Vec<ConnectionItem>,
         upload_total: u64,
         download_total: u64,
+        /// When the push was read; rates divide by the time between pushes,
+        /// not between the drains that applied them.
+        at: Instant,
     },
     DelayResult {
         group: String,
@@ -73,6 +78,8 @@ pub enum BackendEvent {
         text: String,
         is_error: bool,
     },
+    /// The last event of a worker the user started (`App::replies_owed`).
+    ReplyDone,
     CoreDownloadDone {
         ok: bool,
     },
@@ -103,6 +110,9 @@ pub struct CoreSnapshot {
     pub connections: Vec<ConnectionItem>,
     /// `/connections` answered with JSON; an empty list is then real, not a fetch failure.
     pub connections_ok: bool,
+    /// When `/connections` answered; like a push's `at`, rates divide by the
+    /// time between reads, not between the drains that applied them.
+    pub connections_at: Option<Instant>,
     pub upload_total: u64,
     pub download_total: u64,
     pub sub_info: Option<SubscriptionSummary>,
@@ -134,7 +144,8 @@ pub struct Fetch {
     /// provider nodes and their delays, which `/proxies` omits since v1.19.28.
     pub providers: bool,
     /// Reuse the system proxy and core binary lookups for up to `HOST_TTL`
-    /// instead of looking again; see `host_state`.
+    /// instead of looking again, and config.yaml's parse while the file is
+    /// unchanged; see `host_state` and `config_facts`.
     pub cached_host: bool,
 }
 
@@ -823,6 +834,7 @@ fn stream_session(
                     items,
                     upload_total,
                     download_total,
+                    at: Instant::now(),
                 };
                 if tx.send(event).is_err() {
                     return SessionEnd::Exit;
@@ -891,20 +903,21 @@ pub fn parse_connections(text: &str) -> Option<(Vec<ConnectionItem>, u64, u64)> 
 /// Typed `/connections` JSON. Only the fields `ConnectionItem` shows are
 /// declared; serde skips the rest without building a tree, and each string
 /// moves into the item. Fields read as leniently as the old `Value` lookups
-/// did: null, a missing key or an odd type gives the default.
+/// did: null, a missing key or an odd type gives the default. `proxies_json`
+/// shares the field readers.
 mod conn_json {
     use super::ConnectionItem;
     use serde::{Deserialize, Deserializer};
     use serde_json::Value;
 
-    fn text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    pub(super) fn text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
         Ok(match Value::deserialize(d)? {
             Value::String(s) => s,
             _ => String::new(),
         })
     }
 
-    fn opt_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    pub(super) fn opt_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
         Ok(match Value::deserialize(d)? {
             Value::String(s) => Some(s),
             _ => None,
@@ -917,19 +930,28 @@ mod conn_json {
 
     /// String array entries; anything else is skipped.
     fn texts<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+        Ok(opt_texts(d)?.unwrap_or_default())
+    }
+
+    /// The string entries of an array, or None when it is no array.
+    pub(super) fn opt_texts<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Vec<String>>, D::Error> {
         Ok(match Value::deserialize(d)? {
-            Value::Array(items) => items
-                .into_iter()
-                .filter_map(|v| match v {
-                    Value::String(s) => Some(s),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
+            Value::Array(items) => Some(
+                items
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
         })
     }
 
-    fn nul<'de, D, T>(d: D) -> Result<T, D::Error>
+    pub(super) fn nul<'de, D, T>(d: D) -> Result<T, D::Error>
     where
         D: Deserializer<'de>,
         T: Default + Deserialize<'de>,
@@ -1255,6 +1277,7 @@ mod stream_tests {
             items,
             upload_total,
             download_total,
+            ..
         } = worker.next()
         else {
             panic!("expected pushed connections");
@@ -1274,6 +1297,7 @@ mod stream_tests {
             items,
             upload_total,
             download_total,
+            ..
         } = worker.next()
         else {
             panic!("expected pushed connections");
@@ -1617,6 +1641,7 @@ mod snapshot_tests {
         ]);
         let snap = fetch_snapshot(&cfg);
         assert!(snap.running && snap.connections_ok);
+        assert!(snap.connections_at.is_some());
         assert_eq!(snap.connections[0].host, "a.test:443");
         assert_eq!((snap.upload_total, snap.download_total), (5, 6));
 
@@ -1675,6 +1700,8 @@ mod snapshot_tests {
             ]
         );
         assert_eq!(full.fetched, Fetch::default());
+        // Rates count from when `/connections` answered.
+        assert!(full.connections_at.is_some());
         assert_eq!(full.rules.len(), 1);
         // The reserved `default` provider is not listed; `air` brings its node.
         let names: Vec<_> = full.providers.iter().map(|p| p.name.as_str()).collect();
@@ -1692,7 +1719,7 @@ mod snapshot_tests {
         };
         let lean = fetch_snapshot_with(&cfg, fetch);
         assert_eq!(*seen.lock().unwrap(), ["/version", "/configs", "/proxies"]);
-        assert!(lean.running && !lean.connections_ok);
+        assert!(lean.running && !lean.connections_ok && lean.connections_at.is_none());
         assert_eq!(lean.fetched, fetch);
         assert_eq!(lean.mixed_port, 7890);
         assert_eq!(lean.groups.len(), 1);
@@ -1896,6 +1923,65 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn config_facts_follow_file_changes() {
+        let cache = Mutex::new(None);
+        let dir = std::env::temp_dir().join(format!("terc-facts-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        // Polls long after the writes below, whose timestamps are then settled.
+        let later = SystemTime::now() + Duration::from_secs(60);
+        let facts = |cached| config_facts_with(&cache, &path, cached, later);
+        let port = |facts: Arc<ConfigFacts>| facts.values["mixed-port"].clone();
+        fs::write(&path, "mixed-port: 7890\nsniffer:\n  enable: true\n").unwrap();
+        // A poll in the tick of the write reads again each time, although
+        // the key is unchanged: a second write in that tick could keep it.
+        let written = fs::metadata(&path).unwrap().modified().unwrap();
+        let poll = || config_facts_with(&cache, &path, true, written).unwrap();
+        assert!(!Arc::ptr_eq(&poll(), &poll()));
+        let first = facts(true).unwrap();
+        assert!(first.flags.sniffing);
+        // A poll of an unchanged file reuses the parse.
+        assert!(Arc::ptr_eq(&first, &facts(true).unwrap()));
+        assert_eq!(port(first), "7890");
+        // terc's own writes replace the file (a new inode), at the same length.
+        write_private(&path, b"mixed-port: 7891\nsniffer:\n  enable: true\n").unwrap();
+        assert_eq!(port(facts(true).unwrap()), "7891");
+        // An editor writing in place with the same length; the mtime moves
+        // clearly, so the step holds on filesystems with 1 s timestamps.
+        fs::write(&path, "mixed-port: 7892\nsniffer:\n  enable: true\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(port(facts(true).unwrap()), "7892");
+        // A full snapshot parses again although nothing changed, and later
+        // polls reuse that parse.
+        let polled = facts(true).unwrap();
+        let full = facts(false).unwrap();
+        assert!(!Arc::ptr_eq(&polled, &full));
+        assert!(Arc::ptr_eq(&full, &facts(true).unwrap()));
+        // Deleted: nothing, although the slot still holds the last parse.
+        fs::remove_file(&path).unwrap();
+        assert!(facts(true).is_none() && facts(false).is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_facts_read_repeated_keys_as_before() {
+        // Flags and values come from the last chunk of a key, timeouts from
+        // the first proxy-groups chunk.
+        let doc = "mixed-port: 7890\ndns:\n  enable: false\nsniffer:\n  enable: true\nproxy-groups:\n  - {name: Auto, type: url-test, proxies: [A], timeout: 2000}\nmixed-port: 7891\ndns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\nsniffer:\n  enable: false\nproxy-groups:\n  - {name: Auto, type: url-test, proxies: [A], timeout: 3000}\n";
+        let facts = ConfigFacts::parse(doc);
+        assert!(!facts.flags.sniffing);
+        assert!(facts.flags.dns.enable);
+        assert_eq!(facts.flags.dns.nameservers, ["223.5.5.5"]);
+        assert_eq!(facts.values["mixed-port"], "7891");
+        assert_eq!(facts.timeouts, HashMap::from([("Auto".to_string(), 2000)]));
+    }
+
+    #[test]
     fn the_core_binary_is_found_on_path_without_which() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("terc-path-{}", std::process::id()));
@@ -1918,6 +2004,281 @@ mod snapshot_tests {
         assert_eq!(find_executable(&path, "absent"), None);
         assert_eq!(find_executable(std::ffi::OsStr::new(""), "mihomo"), None);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Mihomo-shaped bodies for `m` inline nodes with `hist` delay records
+    /// each, keys sorted as Go writes them: GET /proxies, whose GLOBAL lists
+    /// DIRECT, REJECT, the proxies and then the groups, and GET
+    /// /providers/proxies for that config (only the `default` mirror) and
+    /// for the same nodes split over two HTTP providers.
+    fn mihomo_bodies(m: usize, hist: usize) -> [String; 3] {
+        use serde_json::json;
+        const URL: &str = "https://www.gstatic.com/generate_204";
+        const TIME: &str = "2026-10-21T21:57:14.123456789+08:00";
+        let regions = ["🇭🇰 香港", "🇯🇵 日本", "🇸🇬 新加坡", "🇺🇸 美国", "🇬🇧 英国"];
+        // Some delays are 0 (a failed test) and some URL states are dead.
+        let history = |seed: usize| -> Vec<Value> {
+            (0..hist)
+                .map(|i| json!({"time": TIME, "delay": (seed * 7 + i * 13) % 400}))
+                .collect()
+        };
+        let proxy = |name: &str, kind: &str, seed: usize| {
+            json!({
+                "alive": true, "dialer-proxy": "", "id": format!("{seed:08x}"), "name": name,
+                "type": kind, "udp": !seed.is_multiple_of(3), "tfo": false, "xudp": seed % 5 == 1,
+                "history": history(seed),
+                "extra": {URL: {"alive": !seed.is_multiple_of(4), "history": history(seed + 1)}},
+            })
+        };
+        let group = |name: &str, kind: &str, all: &[String]| {
+            let test_url = if kind == "URLTest" { URL } else { "" };
+            json!({
+                "name": name, "type": kind, "all": all, "now": all.first(), "fixed": "",
+                "udp": true, "history": [], "extra": {}, "hidden": false,
+                "expectedStatus": "*", "testUrl": test_url,
+            })
+        };
+
+        // Subscription converters list the plan as pseudo-nodes first.
+        let mut names = vec![
+            "剩余流量：12.5 GB".to_string(),
+            "到期时间：2026-12-01".to_string(),
+        ];
+        names.extend((0..m).map(|i| {
+            let region = regions[i % regions.len()];
+            format!(
+                "{region} {:02} | IPLC x{}",
+                i / regions.len() + 1,
+                1 + i % 3
+            )
+        }));
+        let nodes: Vec<Value> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                proxy(
+                    name,
+                    ["Shadowsocks", "Vmess", "Trojan", "Hysteria2"][i % 4],
+                    i,
+                )
+            })
+            .collect();
+        let auto = "♻️ 自动选择".to_string();
+        let region_groups: Vec<String> = regions.iter().map(|r| format!("{r} 自动")).collect();
+        let select: Vec<String> = std::iter::once(auto.clone())
+            .chain(region_groups.iter().cloned())
+            .chain(names.iter().cloned())
+            .collect();
+        let mut groups = vec![
+            group("🚀 节点选择", "Selector", &select),
+            group(&auto, "URLTest", &names[2..]),
+            group("🤖 AI", "Fallback", &region_groups[..2]),
+            group("⚖️ 均衡", "LoadBalance", &names[2..6]),
+            group("🔗 链式", "Relay", &names[2..4]),
+        ];
+        for (region, name) in regions.iter().zip(&region_groups) {
+            let members: Vec<String> = names
+                .iter()
+                .filter(|n| n.starts_with(region))
+                .cloned()
+                .collect();
+            groups.push(group(name, "URLTest", &members));
+        }
+        let builtins: Vec<Value> = [("DIRECT", "Direct"), ("REJECT", "Reject"), ("PASS", "Pass")]
+            .iter()
+            .map(|(name, kind)| json!({"name": name, "type": kind, "udp": true, "history": []}))
+            .collect();
+        let global: Vec<String> = ["DIRECT", "REJECT"]
+            .iter()
+            .map(|n| n.to_string())
+            .chain(names.iter().cloned())
+            .chain(
+                groups
+                    .iter()
+                    .map(|g| g["name"].as_str().unwrap().to_string()),
+            )
+            .collect();
+
+        let mut listed = serde_json::Map::new();
+        for item in nodes.iter().chain(&groups).chain(&builtins) {
+            listed.insert(item["name"].as_str().unwrap().to_string(), item.clone());
+        }
+        listed.insert("GLOBAL".into(), group("GLOBAL", "Selector", &global));
+        let proxies = json!({ "proxies": listed }).to_string();
+
+        let mirror: Vec<&Value> = builtins[..2].iter().chain(&nodes).chain(&groups).collect();
+        let inline = json!({"providers": {"default": {
+            "name": "default", "type": "Proxy", "vehicleType": "Compatible",
+            "expectedStatus": "*", "testUrl": "", "proxies": mirror,
+        }}})
+        .to_string();
+
+        let provider = |name: &str, list: &[Value]| {
+            json!({
+                "name": name, "type": "Proxy", "vehicleType": "HTTP", "expectedStatus": "*",
+                "testUrl": URL, "updatedAt": TIME, "subscriptionInfo": {"Download": 1},
+                "proxies": list,
+            })
+        };
+        let half = nodes.len() / 2;
+        let rest: Vec<&Value> = builtins[..2].iter().chain(&groups).collect();
+        let split = json!({"providers": {
+            "air": provider("air", &nodes[..half]),
+            "default": {"name": "default", "vehicleType": "Compatible", "proxies": rest},
+            "sky": provider("sky", &nodes[half..]),
+        }})
+        .to_string();
+        [proxies, inline, split]
+    }
+
+    /// What a `/proxies` parse produced, with the maps in a fixed order.
+    fn proxies_digest((groups, nodes, sub_info): &ProxiesPart) -> String {
+        let mut nodes: Vec<String> = nodes
+            .iter()
+            .map(|(key, node)| {
+                // No `..`: a new field has to join the comparison.
+                let ProxyNode {
+                    name,
+                    kind,
+                    udp,
+                    delay,
+                    provider,
+                    url_delays,
+                } = node;
+                let mut url_delays: Vec<_> = url_delays.iter().collect();
+                url_delays.sort();
+                format!("{key}|{name}|{kind}|{udp}|{delay:?}|{provider:?}|{url_delays:?}")
+            })
+            .collect();
+        nodes.sort();
+        format!("{groups:?}\n{sub_info:?}\n{}", nodes.join("\n"))
+    }
+
+    #[test]
+    fn typed_proxies_parse_matches_the_value_path() {
+        let [synthetic, _, _] = mihomo_bodies(300, 10);
+        let wrong_scalars = r#"{"proxies":{"A":{"type":5,"udp":"yes","all":"x","now":1,"fixed":[],"testUrl":2,"expectedStatus":204}}}"#;
+        let wrong_history = r#"{"proxies":{"A":{"type":"Vmess","history":{"delay":3}}}}"#;
+        let wrong_extra = r#"{"proxies":{"A":{"type":"Vmess","extra":[]}}}"#;
+        let odd = [
+            "",
+            "oops",
+            "[]",
+            r#"[{"A":{"type":"Selector","all":[]}}]"#,
+            "{}",
+            r#"{"proxies":null}"#,
+            r#"{"proxies":[]}"#,
+            r#"{"proxies":{"A":null}}"#,
+            r#"{"proxies":{"A":["Selector",true]}}"#,
+            wrong_scalars,
+            wrong_history,
+            wrong_extra,
+            r#"{"proxies":{"A":{"type":null,"udp":null,"history":null,"all":null,"now":null,"extra":null,"testUrl":null}}}"#,
+            r#"{"proxies":{"A":{"type":"Vmess","history":[{"delay":5},null]}}}"#,
+            r#"{"proxies":{"A":{"type":"Vmess","history":[{"delay":5},[7]]}}}"#,
+            r#"{"proxies":{"A":{"type":"Vmess","history":[{"delay":5},{}]}}}"#,
+            r#"{"proxies":{"A":{"type":"Vmess","history":[{"delay":70000}]},"B":{"history":[{"delay":-1}]},"C":{"history":[{"delay":1.5}]},"D":{"history":[{"delay":0}]},"E":{"history":[{"delay":"9"}]}}}"#,
+            r#"{"proxies":{"A":{"extra":{"u":5}}}}"#,
+            r#"{"proxies":{"A":{"extra":{"u":{"alive":"true","history":[{"delay":5}]},"v":{"alive":true,"history":[{"delay":6}]},"w":{"alive":true},"x":{}}}}}"#,
+            r#"{"proxies":{"A":{"type":"Selector","all":["a",1,null,"b"],"now":"a"}}}"#,
+            r#"{"proxies":{"A":{"type":"Selector","type":"URLTest","all":[]}}}"#,
+            r#"{"proxies":{"A":{"type":"Selector","all":[]},"A":{"type":"URLTest","all":["x"]}}}"#,
+            r#"{"proxies":{"GLOBAL":{"type":"Selector","all":["Z","Proxy","Y"]},"Y":{"type":"URLTest","all":["n"],"testUrl":"u","expectedStatus":"204","fixed":"n"},"Z":{"type":"Fallback","all":[]},"Proxy":{"type":"Selector","all":["Y"]},"W":{"type":"Selector","all":[]},"R":{"type":"Relay","all":[]},"n":{"type":"Trojan","udp":true}}}"#,
+            r#"{"proxies":{"S":{"type":"Selector","all":["Traffic: 1 GB","重置: 3 天","到期: 2026-12-01"]}},"extra":1}"#,
+            &synthetic,
+        ];
+        for body in odd {
+            for mode in ["rule", "global"] {
+                let by_value = serde_json::from_str::<Value>(body)
+                    .map(|v| proxies_from_value(&v, mode))
+                    .unwrap_or_default();
+                assert_eq!(
+                    proxies_digest(&parse_proxies(body, mode)),
+                    proxies_digest(&by_value),
+                    "{body:.300} {mode}"
+                );
+            }
+        }
+        // Mihomo's own shape and odd scalars take the typed path, not the
+        // fallback; a history or extra of another type falls back.
+        let typed = |body: &str| {
+            serde_json::from_str::<proxies_json::Obj<proxies_json::Body>>(body).is_ok()
+        };
+        assert!(typed(&synthetic) && typed(wrong_scalars));
+        assert!(!typed(wrong_history) && !typed(wrong_extra));
+        let (groups, nodes, sub_info) = parse_proxies(&synthetic, "rule");
+        assert_eq!(groups[0].name, "🚀 节点选择");
+        assert_eq!(groups.len(), 9);
+        assert_eq!(sub_info.unwrap().expire, "2026-12-01");
+        let delays: Vec<_> = nodes.values().flat_map(|n| n.url_delays.values()).collect();
+        assert!(delays.contains(&&None) && delays.iter().any(|d| d.is_some()));
+    }
+
+    fn providers_digest(part: &Option<ProxyProvidersPart>) -> String {
+        let Some((infos, found, extras)) = part else {
+            return "none".into();
+        };
+        let mut extras: Vec<String> = extras
+            .iter()
+            .map(|(name, url_delays)| {
+                let mut url_delays: Vec<_> = url_delays.iter().collect();
+                url_delays.sort();
+                format!("{name}={url_delays:?}")
+            })
+            .collect();
+        extras.sort();
+        format!("{infos:?}\n{found:?}\n{}", extras.join("\n"))
+    }
+
+    #[test]
+    fn typed_provider_parse_matches_the_value_path() {
+        let [_, inline, split] = mihomo_bodies(300, 4);
+        let groups = r#"{"providers":{"p":{"name":"p","proxies":[{"name":"r","type":"Relay"},{"name":"s","type":"selector"},{"name":"b","type":"LoadBalance"},{"name":"n","type":"Trojan"}]}}}"#;
+        let odd = [
+            "",
+            "[]",
+            "{}",
+            r#"{"providers":null}"#,
+            r#"{"providers":{"a":null}}"#,
+            r#"{"providers":{"a":{"proxies":null,"ruleCount":"3"}}}"#,
+            r#"{"providers":{"a":{"proxies":{},"vehicleType":"HTTP"}}}"#,
+            r#"{"providers":{"a":{"proxies":[1]}}}"#,
+            r#"{"providers":{"a":{"name":"","vehicleType":"compatible","proxies":[{"name":"x","type":"Vmess"}]}}}"#,
+            // A provider named `default` under another key, and a group
+            // that shares a node's name.
+            r#"{"providers":{"k":{"name":"default","vehicleType":"HTTP","proxies":[{"name":"x","extra":{"u":{"alive":true,"history":[{"delay":9}]}}}]},"z":{"name":"z","ruleCount":4,"proxies":[{"name":"x","type":"URLTest","extra":{"u":{"alive":true,"history":[{"delay":7}]}}},{"name":"","type":"Vmess"},{"name":"y","type":5,"udp":1,"history":[{"delay":0}]}]}}}"#,
+            groups,
+            PROVIDERS,
+            &inline,
+            &split,
+        ];
+        for body in odd {
+            let by_value = serde_json::from_str::<Value>(body)
+                .ok()
+                .map(|v| proxy_providers_from_value(&v));
+            assert_eq!(
+                providers_digest(&parse_proxy_providers(body)),
+                providers_digest(&by_value),
+                "{body:.300}"
+            );
+        }
+        for body in [PROVIDERS, &inline, &split] {
+            assert!(
+                serde_json::from_str::<proxies_json::Obj<proxies_json::ProvidersBody>>(body)
+                    .is_ok()
+            );
+        }
+        // Groups a provider lists are not nodes.
+        let (_, found, _) = parse_proxy_providers(groups).unwrap();
+        let names: Vec<_> = found.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["n"]);
+        // The `default` mirror brings neither nodes nor their delays.
+        let (_, found, extras) = parse_proxy_providers(&inline).unwrap();
+        assert!(found.is_empty() && extras.is_empty());
+        let (infos, found, extras) = parse_proxy_providers(&split).unwrap();
+        assert_eq!(infos.len(), 2);
+        assert_eq!(found.len(), 302);
+        assert_eq!(extras.len(), 302);
     }
 }
 
@@ -1944,43 +2305,15 @@ pub fn fetch_snapshot(cfg: &ControllerConfig) -> CoreSnapshot {
 /// `connections` it has `connections_ok == false`; the other skipped parts
 /// stay empty until `CoreSnapshot::carry_skipped` fills them.
 pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot {
-    // One read serves both the runtime flags and the configured values.
-    let raw = read_config_text(cfg).ok();
-    let mut snapshot = fetch_core_snapshot(cfg, fetch, raw.as_deref());
-    if let Some(raw) = raw
-        .as_deref()
-        .filter(|_| snapshot.groups.iter().any(ProxyGroup::pinnable))
-    {
-        let timeouts = crate::routing::group_timeouts(raw);
+    // One read and one split serve the flags, timeouts and configured values.
+    let facts = config_facts(cfg, fetch.cached_host);
+    let flags = facts.as_ref().map(|facts| facts.flags.clone());
+    let mut snapshot = fetch_core_snapshot(cfg, fetch, flags);
+    if let Some(facts) = &facts {
         for group in &mut snapshot.groups {
-            group.timeout_ms = timeouts.get(&group.name).copied().unwrap_or(0);
+            group.timeout_ms = facts.timeouts.get(&group.name).copied().unwrap_or(0);
         }
-    }
-    if let Some(raw) = raw {
-        for chunk in crate::ops::split_chunks(&raw) {
-            if let Some(key) = chunk.key {
-                if ![
-                    "mode",
-                    "port",
-                    "socks-port",
-                    "mixed-port",
-                    "log-level",
-                    "find-process-mode",
-                    "allow-lan",
-                    "tcp-concurrent",
-                ]
-                .contains(&key.as_str())
-                {
-                    continue;
-                }
-                if let Some((_, value)) = chunk.lines.first().and_then(|l| l.split_once(':')) {
-                    let value = crate::ops::clean_scalar(value);
-                    if !value.is_empty() {
-                        snapshot.config_values.insert(key, value);
-                    }
-                }
-            }
-        }
+        snapshot.config_values = facts.values.clone();
     }
     if !snapshot.running {
         let port = |key: &str| {
@@ -2006,7 +2339,132 @@ pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot
     snapshot
 }
 
-fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) -> CoreSnapshot {
+/// What a snapshot takes from config.yaml.
+#[derive(Debug)]
+struct ConfigFacts {
+    flags: RuntimeFlags,
+    /// Each group's `timeout:`; see `routing::group_timeouts`.
+    timeouts: HashMap<String, u64>,
+    /// Top-level scalars as configured, for the settings rows.
+    values: HashMap<String, String>,
+}
+
+impl ConfigFacts {
+    fn parse(raw: &str) -> Self {
+        let chunks = crate::ops::split_chunks(raw);
+        let mut values = HashMap::new();
+        for chunk in &chunks {
+            let Some(key) = chunk.key.as_deref() else {
+                continue;
+            };
+            if ![
+                "mode",
+                "port",
+                "socks-port",
+                "mixed-port",
+                "log-level",
+                "find-process-mode",
+                "allow-lan",
+                "tcp-concurrent",
+            ]
+            .contains(&key)
+            {
+                continue;
+            }
+            if let Some((_, value)) = chunk.lines.first().and_then(|l| l.split_once(':')) {
+                let value = crate::ops::clean_scalar(value);
+                if !value.is_empty() {
+                    values.insert(key.to_string(), value);
+                }
+            }
+        }
+        Self {
+            flags: crate::ops::parse_yaml_flags_chunks(&chunks),
+            timeouts: crate::routing::group_timeouts(&chunks),
+            values,
+        }
+    }
+}
+
+/// The identity of config.yaml: path, device and inode (terc's writes
+/// replace the file), length, and mtime and ctime to the nanosecond (ctime
+/// cannot be set back by an editor or `touch`).
+type ConfigKey = (PathBuf, u64, u64, u64, (i64, i64), (i64, i64));
+
+/// config.yaml as last parsed, under its identity just before that read.
+static CONFIG_FACTS: Mutex<Option<(ConfigKey, Arc<ConfigFacts>)>> = Mutex::new(None);
+
+fn config_key(path: &Path) -> Option<ConfigKey> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).ok()?;
+    Some((
+        path.to_path_buf(),
+        m.dev(),
+        m.ino(),
+        m.len(),
+        (m.mtime(), m.mtime_nsec()),
+        (m.ctime(), m.ctime_nsec()),
+    ))
+}
+
+/// Whether any write after `now` must change the key's timestamps. Within
+/// one timestamp tick (a jiffy on Linux before 6.13, a second on HFS+, two
+/// on FAT), a second same-length write in place keeps mtime and ctime, so a
+/// parse of a file that new is not kept for later polls.
+fn settled(key: &ConfigKey, now: SystemTime) -> bool {
+    let (.., (mtime, _), (ctime, _)) = key;
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    *mtime.max(ctime) <= now - 2
+}
+
+fn config_facts(cfg: &ControllerConfig, cached: bool) -> Option<Arc<ConfigFacts>> {
+    config_facts_with(
+        &CONFIG_FACTS,
+        &config_yaml_path(cfg),
+        cached,
+        SystemTime::now(),
+    )
+}
+
+/// The facts of the config at `path`, `None` when it cannot be read. A
+/// `cached` call (the background poll) reuses the last parse while the
+/// file's identity is unchanged; any other call reads and parses again, so
+/// a snapshot after terc's own write always sees it, in-place writes
+/// included. The parse is kept for later polls only when the file's
+/// timestamps are `settled` at `now`, a time from before the key is read.
+fn config_facts_with(
+    cache: &Mutex<Option<(ConfigKey, Arc<ConfigFacts>)>>,
+    path: &Path,
+    cached: bool,
+    now: SystemTime,
+) -> Option<Arc<ConfigFacts>> {
+    // Taken before the read: a write in between leaves a key that no longer
+    // matches, so the next poll reads again.
+    let key = config_key(path);
+    let lock = || cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, facts)) = lock()
+        .as_ref()
+        .filter(|(at, _)| cached && key.as_ref() == Some(at))
+    {
+        return Some(facts.clone());
+    }
+    // Read and parsed unlocked, so a large config never holds up another
+    // snapshot; the slot keeps whichever parse finished last, under its key.
+    let raw = fs::read_to_string(path).ok()?;
+    let facts = Arc::new(ConfigFacts::parse(&raw));
+    *lock() = key
+        .filter(|key| settled(key, now))
+        .map(|key| (key, facts.clone()));
+    Some(facts)
+}
+
+fn fetch_core_snapshot(
+    cfg: &ControllerConfig,
+    fetch: Fetch,
+    flags: Option<RuntimeFlags>,
+) -> CoreSnapshot {
     let timeout = Duration::from_millis(700);
     let HostState {
         sysproxy: (net_service, sysproxy_enabled),
@@ -2015,7 +2473,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
     let core_bin_path = core_bin
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
-    let mut flags = raw.map(parse_yaml_flags).unwrap_or_default();
+    let mut flags = flags.unwrap_or_default();
 
     let Ok((200, ver_body)) =
         http_request(&cfg.addr, &cfg.secret, "GET", "/version", None, timeout)
@@ -2056,110 +2514,15 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
         }
     }
 
-    let mut groups = Vec::new();
-    let mut nodes = HashMap::new();
-    let mut sub_info: Option<SubscriptionSummary> = None;
-
-    if let Ok((200, prox_body)) =
-        http_request(&cfg.addr, &cfg.secret, "GET", "/proxies", None, timeout)
-    {
-        if let Ok(v) = serde_json::from_str::<Value>(&prox_body) {
-            if let Some(proxies_obj) = v.get("proxies").and_then(Value::as_object) {
-                // Determine ordering from GLOBAL.all if available
-                let global_order: Vec<String> = proxies_obj
-                    .get("GLOBAL")
-                    .and_then(|g| g.get("all"))
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                for (name, item) in proxies_obj {
-                    let kind = item
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Unknown")
-                        .to_string();
-                    let udp = item.get("udp").and_then(Value::as_bool).unwrap_or(false);
-                    let delay = item
-                        .get("history")
-                        .and_then(Value::as_array)
-                        .and_then(|arr| arr.last())
-                        .and_then(|h| h.get("delay"))
-                        .and_then(Value::as_u64)
-                        .and_then(|d| if d > 0 { Some(d as u16) } else { None });
-
-                    if let Some(all_arr) = item.get("all").and_then(Value::as_array) {
-                        let all: Vec<String> = all_arr
-                            .iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect();
-                        if sub_info.is_none() {
-                            sub_info = extract_subscription_summary(&all);
-                        }
-                        let now = item
-                            .get("now")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let fixed = item
-                            .get("fixed")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        groups.push(ProxyGroup {
-                            name: name.clone(),
-                            kind: kind.clone(),
-                            now,
-                            fixed,
-                            all,
-                            test_url: json_str(item, "testUrl"),
-                            expected_status: json_str(item, "expectedStatus"),
-                            timeout_ms: 0,
-                        });
-                    }
-
-                    nodes.insert(
-                        name.clone(),
-                        ProxyNode {
-                            name: name.clone(),
-                            kind,
-                            udp,
-                            delay,
-                            provider: None,
-                            url_delays: url_delays(item),
-                        },
-                    );
-                }
-
-                // Filter and sort groups cleanly
-                groups.retain(|g| {
-                    let k = g.kind.to_ascii_lowercase();
-                    (k == "selector" || k == "urltest" || k == "fallback" || k == "loadbalance")
-                        && (g.name != "GLOBAL" || mode.eq_ignore_ascii_case("global"))
-                });
-
-                groups.sort_by_key(|g| {
-                    if g.name.eq_ignore_ascii_case("Proxies")
-                        || g.name.eq_ignore_ascii_case("Proxy")
-                        || g.name.contains("节点")
-                    {
-                        0usize
-                    } else if let Some(pos) = global_order.iter().position(|n| n == &g.name) {
-                        pos + 1
-                    } else {
-                        999
-                    }
-                });
-            }
-        }
-    }
+    let (groups, mut nodes, sub_info) =
+        match http_request(&cfg.addr, &cfg.secret, "GET", "/proxies", None, timeout) {
+            Ok((200, body)) => parse_proxies(&body, &mode),
+            _ => ProxiesPart::default(),
+        };
 
     let mut connections = Vec::new();
     let mut connections_ok = false;
+    let mut connections_at = None;
     let mut upload_total = 0;
     let mut download_total = 0;
 
@@ -2167,6 +2530,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
         if let Ok((200, conn_body)) =
             http_request(&cfg.addr, &cfg.secret, "GET", "/connections", None, timeout)
         {
+            connections_at = Some(Instant::now());
             // A body without a connection list keeps the last one (`connections_ok`
             // stays false) instead of reporting every session as closed.
             if let Some(parsed) = parse_connections(&conn_body) {
@@ -2188,15 +2552,16 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
     }
     let mut providers = Vec::new();
     let get = |path: &str| match http_request(&cfg.addr, &cfg.secret, "GET", path, None, timeout) {
-        Ok((200, body)) => serde_json::from_str::<Value>(&body).ok(),
+        Ok((200, body)) => Some(body),
         _ => None,
     };
     if fetch.providers {
         // One parse feeds both the provider list and the provider nodes.
-        if let Some(v) = get("/providers/proxies") {
-            providers.extend(crate::ops::providers_from_value(&v, "proxy"));
-            let mut extras = provider_url_delays(&v);
-            for found in crate::ops::provider_nodes_from_value(&v) {
+        if let Some((infos, found_nodes, mut extras)) =
+            get("/providers/proxies").and_then(|body| parse_proxy_providers(&body))
+        {
+            providers.extend(infos);
+            for found in found_nodes {
                 let url_delays = extras.remove(&found.name).unwrap_or_default();
                 let node = nodes.entry(found.name.clone()).or_insert(ProxyNode {
                     name: found.name,
@@ -2211,7 +2576,9 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
         } else {
             fetched.providers = false;
         }
-        if let Some(v) = get("/providers/rules") {
+        if let Some(v) =
+            get("/providers/rules").and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        {
             providers.extend(crate::ops::providers_from_value(&v, "rule"));
         } else {
             fetched.providers = false;
@@ -2233,6 +2600,7 @@ fn fetch_core_snapshot(cfg: &ControllerConfig, fetch: Fetch, raw: Option<&str>) 
         nodes,
         connections,
         connections_ok,
+        connections_at,
         upload_total,
         download_total,
         sub_info,
@@ -2598,6 +2966,429 @@ fn test_delays_async(
     });
 }
 
+/// The groups, the nodes by name and the subscription summary of a
+/// `/proxies` body.
+type ProxiesPart = (
+    Vec<ProxyGroup>,
+    HashMap<String, ProxyNode>,
+    Option<SubscriptionSummary>,
+);
+
+/// A `/proxies` body read through `proxies_json`, without a `Value` tree.
+/// A body of another shape falls back to `proxies_from_value`, so an odd
+/// field can never empty the group list.
+fn parse_proxies(body: &str, mode: &str) -> ProxiesPart {
+    match serde_json::from_str::<proxies_json::Obj<proxies_json::Body>>(body) {
+        Ok(proxies_json::Obj(typed)) => proxies_from_typed(typed, mode),
+        Err(_) => serde_json::from_str::<Value>(body)
+            .map(|v| proxies_from_value(&v, mode))
+            .unwrap_or_default(),
+    }
+}
+
+/// What `proxies_from_value` gives, from the typed body.
+fn proxies_from_typed(body: proxies_json::Body, mode: &str) -> ProxiesPart {
+    let global_order: Vec<String> = body
+        .proxies
+        .get("GLOBAL")
+        .and_then(|g| g.0.all.clone())
+        .unwrap_or_default();
+    let mut groups = Vec::new();
+    let mut nodes = HashMap::with_capacity(body.proxies.len());
+    let mut sub_info: Option<SubscriptionSummary> = None;
+    for (name, proxies_json::Obj(item)) in body.proxies {
+        let kind = item.kind.unwrap_or_else(|| "Unknown".to_string());
+        if let Some(all) = item.all {
+            if sub_info.is_none() {
+                sub_info = extract_subscription_summary(&all);
+            }
+            groups.push(ProxyGroup {
+                name: name.clone(),
+                kind: kind.clone(),
+                now: item.now,
+                fixed: item.fixed,
+                all,
+                test_url: item.test_url,
+                expected_status: item.expected_status,
+                timeout_ms: 0,
+            });
+        }
+        nodes.insert(
+            name.clone(),
+            ProxyNode {
+                name,
+                kind,
+                udp: item.udp,
+                delay: proxies_json::delay_ms(item.last_delay),
+                provider: None,
+                url_delays: item.extra,
+            },
+        );
+    }
+    order_groups(&mut groups, &global_order, mode);
+    (groups, nodes, sub_info)
+}
+
+fn proxies_from_value(v: &Value, mode: &str) -> ProxiesPart {
+    let mut groups = Vec::new();
+    let mut nodes = HashMap::new();
+    let mut sub_info: Option<SubscriptionSummary> = None;
+    if let Some(proxies_obj) = v.get("proxies").and_then(Value::as_object) {
+        // Determine ordering from GLOBAL.all if available
+        let global_order: Vec<String> = proxies_obj
+            .get("GLOBAL")
+            .and_then(|g| g.get("all"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (name, item) in proxies_obj {
+            let kind = item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown")
+                .to_string();
+            let udp = item.get("udp").and_then(Value::as_bool).unwrap_or(false);
+            let delay = item
+                .get("history")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.last())
+                .and_then(|h| h.get("delay"))
+                .and_then(Value::as_u64)
+                .and_then(|d| if d > 0 { Some(d as u16) } else { None });
+
+            if let Some(all_arr) = item.get("all").and_then(Value::as_array) {
+                let all: Vec<String> = all_arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect();
+                if sub_info.is_none() {
+                    sub_info = extract_subscription_summary(&all);
+                }
+                let now = item
+                    .get("now")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let fixed = item
+                    .get("fixed")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                groups.push(ProxyGroup {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    now,
+                    fixed,
+                    all,
+                    test_url: json_str(item, "testUrl"),
+                    expected_status: json_str(item, "expectedStatus"),
+                    timeout_ms: 0,
+                });
+            }
+
+            nodes.insert(
+                name.clone(),
+                ProxyNode {
+                    name: name.clone(),
+                    kind,
+                    udp,
+                    delay,
+                    provider: None,
+                    url_delays: url_delays(item),
+                },
+            );
+        }
+        order_groups(&mut groups, &global_order, mode);
+    }
+    (groups, nodes, sub_info)
+}
+
+/// Keeps the groups the Proxies tab lists (GLOBAL only in global mode):
+/// the main selection group first, then the others in GLOBAL's order.
+fn order_groups(groups: &mut Vec<ProxyGroup>, global_order: &[String], mode: &str) {
+    groups.retain(|g| {
+        let k = g.kind.to_ascii_lowercase();
+        (k == "selector" || k == "urltest" || k == "fallback" || k == "loadbalance")
+            && (g.name != "GLOBAL" || mode.eq_ignore_ascii_case("global"))
+    });
+
+    // Cached: GLOBAL lists the groups after every inline proxy, so each key
+    // is a scan of thousands of names.
+    groups.sort_by_cached_key(|g| {
+        if g.name.eq_ignore_ascii_case("Proxies")
+            || g.name.eq_ignore_ascii_case("Proxy")
+            || g.name.contains("节点")
+        {
+            0usize
+        } else if let Some(pos) = global_order.iter().position(|n| n == &g.name) {
+            pos + 1
+        } else {
+            999
+        }
+    });
+}
+
+/// The proxy providers of a `/providers/proxies` body, their nodes, and
+/// the `url_delays` of every proxy they list (`default` aside), by name.
+type ProxyProvidersPart = (
+    Vec<ProviderInfo>,
+    Vec<crate::ops::ProviderNode>,
+    HashMap<String, HashMap<String, Option<u16>>>,
+);
+
+/// `/providers/proxies` read like `/proxies`: typed, or through
+/// `proxy_providers_from_value` for a body of another shape. None when it
+/// is no JSON.
+fn parse_proxy_providers(body: &str) -> Option<ProxyProvidersPart> {
+    match serde_json::from_str::<proxies_json::Obj<proxies_json::ProvidersBody>>(body) {
+        Ok(proxies_json::Obj(typed)) => Some(proxy_providers_from_typed(typed)),
+        Err(_) => serde_json::from_str::<Value>(body)
+            .ok()
+            .map(|v| proxy_providers_from_value(&v)),
+    }
+}
+
+/// What `proxy_providers_from_value` gives, from the typed body.
+fn proxy_providers_from_typed(body: proxies_json::ProvidersBody) -> ProxyProvidersPart {
+    let mut infos = Vec::new();
+    let mut found = Vec::new();
+    let mut extras = HashMap::new();
+    for (key, proxies_json::Obj(item)) in body.providers {
+        let provider = crate::ops::provider_name(&key, &item.name).to_string();
+        if !item.vehicle.eq_ignore_ascii_case("Compatible") {
+            infos.push(ProviderInfo {
+                name: provider.clone(),
+                kind: "proxy".to_string(),
+                vehicle: item.vehicle,
+                behavior: item.behavior,
+                count: item
+                    .rule_count
+                    .map(|n| n as usize)
+                    .or_else(|| item.proxies.as_ref().map(Vec::len))
+                    .unwrap_or(0),
+                updated_at: item.updated_at,
+            });
+        }
+        // The reserved `default` only mirrors what `/proxies` lists.
+        if provider == "default" {
+            continue;
+        }
+        for proxies_json::Obj(proxy) in item.proxies.unwrap_or_default() {
+            if proxy.name.is_empty() {
+                continue;
+            }
+            if !proxy.extra.is_empty() {
+                extras.insert(proxy.name.clone(), proxy.extra);
+            }
+            if !crate::ops::is_group_kind(&proxy.kind) {
+                found.push(crate::ops::ProviderNode {
+                    name: proxy.name,
+                    kind: proxy.kind,
+                    udp: proxy.udp,
+                    delay: proxies_json::delay_ms(proxy.last_delay),
+                    provider: provider.clone(),
+                });
+            }
+        }
+    }
+    infos.sort_by(|a, b| a.name.cmp(&b.name));
+    (infos, found, extras)
+}
+
+fn proxy_providers_from_value(v: &Value) -> ProxyProvidersPart {
+    (
+        crate::ops::providers_from_value(v, "proxy"),
+        crate::ops::provider_nodes_from_value(v),
+        provider_url_delays(v),
+    )
+}
+
+/// Typed `/proxies` and `/providers/proxies` JSON. Only the fields the
+/// `Value` functions read are declared, each as leniently as its lookup:
+/// null, a missing key or an odd scalar gives the same default. `history`
+/// is read as `last_delay`, its last record's delay, and `extra` becomes
+/// `url_delays` directly; those two, a provider's `proxies` and the
+/// top-level maps must be null or the container they expect. A shape this
+/// rejects (an entry or record that is not an object, a history, extra or
+/// map of another type, a repeated field) makes the parse fall back to the
+/// `Value` functions.
+mod proxies_json {
+    use super::conn_json::{nul, opt_text, opt_texts, text};
+    use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde::Deserialize;
+    use serde_json::Value;
+    use std::collections::{BTreeMap, HashMap};
+    use std::fmt;
+    use std::marker::PhantomData;
+
+    /// `T` read only from a JSON object. Serde also fills a struct from an
+    /// array, field by field, where the `Value` lookups find nothing.
+    pub(super) struct Obj<T>(pub T);
+
+    impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V<T>(PhantomData<T>);
+            impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+                type Value = Obj<T>;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("an object")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Obj<T>, A::Error> {
+                    T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Obj)
+                }
+            }
+            d.deserialize_map(V(PhantomData))
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Body {
+        // A BTreeMap iterates in the order the `Value` map did, which sets
+        // the group order and the group `sub_info` comes from.
+        #[serde(default, deserialize_with = "nul")]
+        pub proxies: BTreeMap<String, Obj<Entry>>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    pub(super) struct Entry {
+        #[serde(rename = "type", deserialize_with = "opt_text")]
+        pub kind: Option<String>,
+        #[serde(deserialize_with = "flag")]
+        pub udp: bool,
+        #[serde(rename = "history", deserialize_with = "last_delay")]
+        pub last_delay: Option<u64>,
+        #[serde(deserialize_with = "opt_texts")]
+        pub all: Option<Vec<String>>,
+        #[serde(deserialize_with = "text")]
+        pub now: String,
+        #[serde(deserialize_with = "text")]
+        pub fixed: String,
+        #[serde(rename = "testUrl", deserialize_with = "text")]
+        pub test_url: String,
+        #[serde(rename = "expectedStatus", deserialize_with = "text")]
+        pub expected_status: String,
+        #[serde(deserialize_with = "extra")]
+        pub extra: HashMap<String, Option<u16>>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct ProvidersBody {
+        #[serde(default, deserialize_with = "nul")]
+        pub providers: BTreeMap<String, Obj<Provider>>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    pub(super) struct Provider {
+        #[serde(deserialize_with = "text")]
+        pub name: String,
+        #[serde(rename = "vehicleType", deserialize_with = "text")]
+        pub vehicle: String,
+        #[serde(deserialize_with = "text")]
+        pub behavior: String,
+        #[serde(rename = "updatedAt", deserialize_with = "text")]
+        pub updated_at: String,
+        #[serde(rename = "ruleCount", deserialize_with = "number")]
+        pub rule_count: Option<u64>,
+        // Null or missing is no list; another non-array falls back.
+        pub proxies: Option<Vec<Obj<Member>>>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    pub(super) struct Member {
+        #[serde(deserialize_with = "text")]
+        pub name: String,
+        #[serde(rename = "type", deserialize_with = "text")]
+        pub kind: String,
+        #[serde(deserialize_with = "flag")]
+        pub udp: bool,
+        #[serde(rename = "history", deserialize_with = "last_delay")]
+        pub last_delay: Option<u64>,
+        #[serde(deserialize_with = "extra")]
+        pub extra: HashMap<String, Option<u16>>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Record {
+        #[serde(deserialize_with = "number")]
+        delay: Option<u64>,
+    }
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct UrlState {
+        #[serde(deserialize_with = "flag")]
+        alive: bool,
+        #[serde(rename = "history", deserialize_with = "last_delay")]
+        last_delay: Option<u64>,
+    }
+
+    /// A `history` delay as `ProxyNode::delay` keeps it: 0 means failed.
+    pub(super) fn delay_ms(delay: Option<u64>) -> Option<u16> {
+        delay.and_then(|d| if d > 0 { Some(d as u16) } else { None })
+    }
+
+    fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+        Ok(Value::deserialize(d)?.as_bool().unwrap_or(false))
+    }
+
+    fn number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        Ok(Value::deserialize(d)?.as_u64())
+    }
+
+    /// The last record's `delay`, without keeping the records.
+    fn last_delay<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        struct Last;
+        impl<'de> Visitor<'de> for Last {
+            type Value = Option<u64>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a delay history")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut last = None;
+                while let Some(Obj(record)) = seq.next_element::<Obj<Record>>()? {
+                    last = record.delay;
+                }
+                Ok(last)
+            }
+        }
+        d.deserialize_any(Last)
+    }
+
+    /// `extra` as `url_delays`: per URL, the last delay while alive.
+    fn extra<'de, D: Deserializer<'de>>(d: D) -> Result<HashMap<String, Option<u16>>, D::Error> {
+        struct Extra;
+        impl<'de> Visitor<'de> for Extra {
+            type Value = HashMap<String, Option<u16>>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("per-URL delay states")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(HashMap::new())
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut out = HashMap::new();
+                while let Some((url, Obj(state))) = map.next_entry::<String, Obj<UrlState>>()? {
+                    out.insert(url, delay_ms(state.last_delay.filter(|_| state.alive)));
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(Extra)
+    }
+}
+
 fn json_str(item: &Value, key: &str) -> String {
     item.get(key)
         .and_then(Value::as_str)
@@ -2627,13 +3418,19 @@ fn url_delays(item: &Value) -> HashMap<String, Option<u16>> {
 }
 
 /// `url_delays` of every node in a `/providers/proxies` body, by node name.
+/// The reserved `default` provider is skipped: it only mirrors what
+/// `/proxies` lists with its own `url_delays`.
 fn provider_url_delays(value: &Value) -> HashMap<String, HashMap<String, Option<u16>>> {
     value
         .get("providers")
         .and_then(Value::as_object)
         .into_iter()
-        .flat_map(|obj| obj.values())
-        .filter_map(|item| item.get("proxies").and_then(Value::as_array))
+        .flatten()
+        .filter(|(key, item)| {
+            let named = item.get("name").and_then(Value::as_str);
+            crate::ops::provider_name(key, named.unwrap_or("")) != "default"
+        })
+        .filter_map(|(_, item)| item.get("proxies").and_then(Value::as_array))
         .flatten()
         .map(|proxy| (json_str(proxy, "name"), url_delays(proxy)))
         .filter(|(name, extra)| !name.is_empty() && !extra.is_empty())
@@ -4632,6 +5429,7 @@ pub fn dns_query_async(
             Err(err) => (vec![err], true),
         };
         let _ = tx.send(BackendEvent::DnsLookup { lines, is_error });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -5052,6 +5850,7 @@ pub fn flush_dns_async(cfg: ControllerConfig, tx: Sender<BackendEvent>) {
             Err(err) => (err, true),
         };
         let _ = tx.send(BackendEvent::StatusMessage { text, is_error });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -5178,6 +5977,7 @@ pub fn provider_healthcheck_async(
             HealthCheck::Failed(err) => (err, true),
         };
         let _ = tx.send(BackendEvent::StatusMessage { text, is_error });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -5202,6 +6002,7 @@ pub fn refresh_provider_async(
             text,
             is_error: !ok,
         });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -5225,6 +6026,7 @@ pub fn refresh_all_providers_async(
             text: format!("providers {ok} updated  {failed} failed"),
             is_error: ok == 0 && failed > 0,
         });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -5383,6 +6185,7 @@ pub fn test_node_async(
             node,
             delay,
         });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 
@@ -5445,6 +6248,7 @@ pub fn probe_async(cfg: ControllerConfig, node: String, raw: String, tx: Sender<
             lines: report.lines,
             is_error: report.is_error,
         });
+        let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
 

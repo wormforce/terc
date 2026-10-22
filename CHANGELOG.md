@@ -2,6 +2,44 @@
 
 All notable changes to terc. 中文在前，English follows each section.
 
+## Unreleased
+
+### 中文
+
+**变更**
+
+- 空闲时（3 秒内没有按键或点击），流量、内存和连接数最多晚约 1 秒显示。按键和点击照常立即重绘；正在等待的结果（操作及其后的快照、刷新、测速、DNS 查询、provider 更新、内核下载）也照常每 50 ms 检查一次。
+
+**性能**
+
+- 后台轮询缓存从 config.yaml 读出的数据（按路径、inode、长度和时间戳判断文件是否变化），整个文件也只切分一次。2.5 MB 的配置：每次轮询从约 42 ms 降到约 5 ms，内核停止时几乎为零。
+- `/proxies` 和 `/providers/proxies` 改为类型化解析，遇到解析不了的内容时回退到原来的解析。3000 个节点时，每次轮询从约 47 ms 降到约 7 ms。
+- 空闲时主循环不再每 50 ms 醒一次，而是睡到下一次心跳、轮询或提示消失。唤醒从约 20 次/秒降到约 1.4 次/秒。
+- 数据变化分成「立即画」和「随下一帧画」两类：当前页面不显示的推送、没有可见变化的例行轮询、图表移动，不再各自触发一帧。空闲重绘从约 4 帧/秒降到约 1 帧/秒。
+- 排队中的滚轮事件合并成一帧；滚轮没有落在可滚动的列表上时不重绘。400x100 下快速滚动时，Proxies 页 CPU 降到约 1/4，不响应滚轮的页面几乎为零。
+
+**修复**
+
+- 规则集的 payload 里引用自己（或互相引用成环）时，分流提示不再无限递归、栈溢出崩溃。
+
+### English
+
+**Changed**
+
+- While idle (no key or click for 3 s), traffic, memory and connection counts can show up to about 1 s late. Keys and clicks still repaint at once, and results being waited for (an action and its snapshot, a refresh, delay tests, DNS lookups, provider updates, the core download) are still checked every 50 ms.
+
+**Performance**
+
+- Background polls cache what they read from config.yaml (the file counts as changed when its path, inode, length or timestamps change) and split the file only once. With a 2.5 MB config a poll drops from about 42 ms to about 5 ms, and to almost nothing while the core is stopped.
+- `/proxies` and `/providers/proxies` are parsed into typed structs, falling back to the old parser for a body it cannot read. With 3000 nodes a poll drops from about 47 ms to about 7 ms.
+- An idle main loop no longer wakes every 50 ms; it sleeps to the next heartbeat, poll or toast expiry. Wakes drop from about 20/s to about 1.4/s.
+- Data changes are either drawn at once or ride the next frame: pushes the current page does not show, routine polls with no visible change, and graph shifts no longer force a frame each. Idle repaints drop from about 4/s to about 1/s.
+- Queued wheel events coalesce into one frame, and a wheel step that misses every scrollable list repaints nothing. Fast scrolling at 400x100 costs about a quarter of the CPU on the Proxies tab and almost none on pages that ignore the wheel.
+
+**Fixed**
+
+- A rule set whose payload refers back to itself, directly or through a cycle, no longer sends the routing hint into unbounded recursion and a stack-overflow crash.
+
 ## v0.2.0
 
 ### 中文

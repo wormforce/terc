@@ -888,10 +888,24 @@ pub struct App {
     pub best_choice: String,
     pub best_scope_index: usize,
     pub action_busy: bool,
+    /// Finished actions whose follow-up `ActionSnapshot` has not arrived yet.
+    /// Other workers' `Snapshot`s do not count: they end with their own
+    /// `ReplyDone` or `GroupTestDone`.
+    pub action_snapshots_owed: usize,
+    /// Group delay tests still sending results; each ends with one
+    /// `GroupTestDone`.
+    pub group_tests: usize,
+    /// Other workers the user started (provider updates and health checks,
+    /// DNS flushes and lookups, probes, node tests) that have not replied;
+    /// each ends with one `ReplyDone`.
+    pub replies_owed: usize,
     pub snapshot_pending: bool,
     /// A full refresh was asked for while a poll ran (whose host lookups may
     /// be cached); it starts when that poll ends.
     pub refresh_queued: bool,
+    /// A refresh was asked for and its poll has not ended; that poll's
+    /// result draws at once instead of with the next frame.
+    pub refresh_asked: bool,
     pub setting_index: usize,
     pub setting_input: Option<String>,
     pub rule_index: usize,
@@ -1035,8 +1049,12 @@ impl App {
             best_choice: String::new(),
             best_scope_index: 0,
             action_busy: false,
+            action_snapshots_owed: 0,
+            group_tests: 0,
+            replies_owed: 0,
             snapshot_pending: false,
             refresh_queued: false,
+            refresh_asked: false,
             setting_index: 0,
             setting_input: None,
             rule_index: 0,
@@ -1309,11 +1327,49 @@ impl App {
         }
     }
 
+    fn toast_life(&self) -> Duration {
+        Duration::from_secs(if self.status_is_error { 8 } else { 4 })
+    }
+
     pub fn toast_visible(&self) -> bool {
         !self.status_message.is_empty()
-            && self.toast_started.is_some_and(|at| {
-                at.elapsed() < Duration::from_secs(if self.status_is_error { 8 } else { 4 })
-            })
+            && self
+                .toast_started
+                .is_some_and(|at| at.elapsed() < self.toast_life())
+    }
+
+    /// Longest `run_app` may block on input. Worker events cannot wake
+    /// `event::poll`, so while a reply is awaited (an action and the snapshot
+    /// after it, a refresh, a delay test, a download, another worker the user
+    /// started, or keys pressed just now) the loop looks every `BUSY_WAKE`.
+    /// Otherwise it sleeps to the next change no event reports: a toast
+    /// expiring, the next poll, or (in `Redraw::wait`) the heartbeat. Pushes
+    /// queued meanwhile land in that one frame, and so does the graph shift
+    /// they complete (`run_app` steps the graph right after the drain).
+    pub fn wake_cap(&self, since_input: Duration) -> Duration {
+        if self.action_busy
+            || self.action_snapshots_owed > 0
+            || self.refresh_asked
+            || self.refresh_queued
+            || self.core_downloading
+            || self.pending_best_group.is_some()
+            || self.group_tests > 0
+            || self.replies_owed > 0
+            || since_input < BUSY_AFTER_INPUT
+        {
+            return BUSY_WAKE;
+        }
+        let mut cap = HEARTBEAT;
+        if self.screen == Screen::Dashboard && self.main_tab == MainTab::Logs && !self.logs_paused {
+            cap = LOG_WAKE;
+        }
+        if let Some(at) = self.toast_started.filter(|_| self.toast_visible()) {
+            cap = cap.min(self.toast_life().saturating_sub(at.elapsed()));
+        }
+        if !self.snapshot_pending {
+            cap = cap.min(SNAPSHOT_POLL.saturating_sub(self.last_snapshot_poll.elapsed()));
+        }
+        cap
     }
 
     pub fn clear_status(&mut self) {
@@ -1391,16 +1447,81 @@ impl App {
         Duration::from_micros(1_000_000 / hz)
     }
 
-    /// Applies queued backend events. Returns whether any of them can change
-    /// the screen: `/logs` sends a line per new connection, but only the live
-    /// Logs tab shows them (a TUN failure still raises a toast).
-    pub fn drain_events(&mut self) -> bool {
-        let mut visible = false;
+    /// Applies queued backend events and reports what they change on screen.
+    /// `now`: what the user is looking at (rates, the shown tab's own data,
+    /// action results). `later`: background figures (memory, the overview's
+    /// connection count, a routine poll) that can wait for the next frame or
+    /// the heartbeat. `/logs` sends a line per new connection, but only the
+    /// live Logs tab shows them (a TUN failure still raises a toast).
+    pub fn drain_events(&mut self) -> Shown {
+        let mut shown = Shown::default();
         while let Ok(ev) = self.rx.try_recv() {
-            visible |= !matches!(ev, BackendEvent::Log { .. })
-                || (self.screen == Screen::Dashboard
-                    && self.main_tab == MainTab::Logs
-                    && !self.logs_paused);
+            let dashboard = self.screen == Screen::Dashboard;
+            let live_logs = dashboard && self.main_tab == MainTab::Logs && !self.logs_paused;
+            match &ev {
+                BackendEvent::Log { .. } => shown.now |= live_logs,
+                BackendEvent::Memory { .. } => shown.later = true,
+                // The reply it follows reported itself.
+                BackendEvent::ReplyDone => {}
+                BackendEvent::Connections { .. } => {
+                    // Closed sessions also add log lines.
+                    if (dashboard && self.main_tab == MainTab::Connections) || live_logs {
+                        shown.now = true;
+                    } else {
+                        shown.later = true;
+                    }
+                }
+                BackendEvent::DelayResult { .. } => {
+                    // Settings → Subscriptions → Nodes lists own-node delays too.
+                    let own_nodes = self.screen == Screen::Settings
+                        && self.settings_management
+                        && self.profile_page == 2;
+                    if (dashboard && self.main_tab == MainTab::Proxies)
+                        || self.overlay != Overlay::None
+                        || own_nodes
+                    {
+                        shown.now = true;
+                    } else {
+                        shown.later = true;
+                    }
+                }
+                BackendEvent::SnapshotDone(snap) => {
+                    let old = &self.snapshot;
+                    // Node keys act by index and are never held for the next
+                    // frame, so a group whose members moved must show first.
+                    let changed = snap.running != old.running
+                        || snap.mode != old.mode
+                        || snap.sysproxy_enabled != old.sysproxy_enabled
+                        || snap.tun_enabled != old.tun_enabled
+                        || snap.groups.len() != old.groups.len()
+                        || snap
+                            .groups
+                            .iter()
+                            .zip(&old.groups)
+                            .any(|(a, b)| a.now != b.now || a.name != b.name || a.all != b.all);
+                    // Without pushes the poll carries the connection list (and
+                    // its closed-session log lines).
+                    let polled_conns = snap.connections_ok
+                        && !self.stream_live()
+                        && ((dashboard && self.main_tab == MainTab::Connections) || live_logs);
+                    // Rules and Providers show only what this poll reads, and
+                    // the Runtime overlay picks a tunnel by index into its
+                    // nodes; a refresh the user asked for should not look ignored.
+                    if changed
+                        || polled_conns
+                        || self.refresh_asked
+                        || self.screen == Screen::Setup
+                        || self.overlay == Overlay::Runtime
+                        || matches!(self.main_tab, MainTab::Rules | MainTab::Providers)
+                    {
+                        shown.now = true;
+                    } else {
+                        shown.later = true;
+                    }
+                }
+                _ => shown.now = true,
+            }
+            let is_action_snapshot = matches!(ev, BackendEvent::ActionSnapshot(_));
             match ev {
                 BackendEvent::Traffic { up, down } => {
                     self.up_rate = up;
@@ -1437,6 +1558,7 @@ impl App {
                     // The action thread fetches a snapshot next; skip the poll.
                     // A panicked action sends none, so the next tick polls.
                     if snapshot_follows {
+                        self.action_snapshots_owed += 1;
                         self.last_snapshot_poll = Instant::now();
                     }
                     self.conns.action_finished(Instant::now());
@@ -1508,14 +1630,17 @@ impl App {
                     items,
                     upload_total,
                     download_total,
+                    at,
                 } => {
                     self.conn_stream_at = Some(Instant::now());
                     self.snapshot.upload_total = upload_total;
                     self.snapshot.download_total = download_total;
-                    self.install_connections(items, true);
+                    self.install_connections(items, true, at);
                 }
                 BackendEvent::SnapshotDone(snap) => {
                     self.snapshot_pending = false;
+                    // A queued refresh asks again when it starts below.
+                    self.refresh_asked = false;
                     if !self.action_busy {
                         self.accept_snapshot(*snap);
                         self.note_old_core();
@@ -1524,7 +1649,10 @@ impl App {
                         self.refresh_snapshot_now();
                     }
                 }
-                BackendEvent::Snapshot(snap) => {
+                BackendEvent::Snapshot(snap) | BackendEvent::ActionSnapshot(snap) => {
+                    if is_action_snapshot {
+                        self.action_snapshots_owed = self.action_snapshots_owed.saturating_sub(1);
+                    }
                     self.accept_snapshot(*snap);
                     self.note_old_core();
                     if self.group_index >= self.snapshot.groups.len() {
@@ -1550,6 +1678,7 @@ impl App {
                     }
                 }
                 BackendEvent::GroupTestDone { group } => {
+                    self.group_tests = self.group_tests.saturating_sub(1);
                     self.set_status(&format!("Latency test complete: {group}"), false);
                 }
                 BackendEvent::BestTestDone { group, results } => {
@@ -1576,6 +1705,9 @@ impl App {
                 BackendEvent::StatusMessage { text, is_error } => {
                     self.set_status(&text, is_error);
                 }
+                BackendEvent::ReplyDone => {
+                    self.replies_owed = self.replies_owed.saturating_sub(1);
+                }
                 BackendEvent::CoreDownloadDone { ok } => {
                     self.core_downloading = false;
                     if ok {
@@ -1584,29 +1716,40 @@ impl App {
                 }
             }
         }
-        visible
+        shown
     }
 
+    /// Shifts the graph once per interval. `run_app` steps it right after each
+    /// drain, so a shift takes the sample that arrived while the loop slept
+    /// and draws in the same frame as its rate. A sample can still wait one
+    /// idle wake in the queue, so an interval that ends empty holds the shift
+    /// for `GRAPH_GRACE` instead of dropping the column; after that a fresh
+    /// window starts, and the first column after a gap averages a whole
+    /// interval. The clock keeps up to one interval of phase across a shift:
+    /// a shift that ran late is made up by the next sample, not dropped.
     pub fn advance_graph(&mut self, elapsed: Duration) {
+        let interval = Duration::from_millis(self.config.settings.graph_interval_ms());
         self.graph_elapsed += elapsed;
-        if self.graph_elapsed < Duration::from_millis(self.config.settings.graph_interval_ms()) {
+        if self.graph_elapsed < interval {
             return;
         }
-        self.graph_elapsed = Duration::ZERO;
         let (up, down, count) = self.graph_samples;
-        if count > 0 {
-            self.up_history.remove(0);
-            self.up_history.push((up / count as f64) as f32);
-            self.down_history.remove(0);
-            self.down_history.push((down / count as f64) as f32);
-            self.graph_samples = (0.0, 0.0, 0);
-            self.graph_gen = self.graph_gen.wrapping_add(1);
+        if count == 0 {
+            if self.graph_elapsed >= interval + GRAPH_GRACE {
+                self.graph_elapsed = Duration::ZERO;
+            }
+            return;
         }
+        self.graph_elapsed = (self.graph_elapsed - interval).min(interval);
+        self.up_history.remove(0);
+        self.up_history.push((up / count as f64) as f32);
+        self.down_history.remove(0);
+        self.down_history.push((down / count as f64) as f32);
+        self.graph_samples = (0.0, 0.0, 0);
+        self.graph_gen = self.graph_gen.wrapping_add(1);
     }
 
-    pub fn tick(&mut self, elapsed: Duration) {
-        self.advance_graph(elapsed);
-
+    pub fn tick(&mut self) {
         if self.screen == Screen::Setup
             && self.setup_phase == SetupPhase::Starting
             && self.setup_start_at.elapsed() >= Duration::from_secs(10)
@@ -1619,7 +1762,7 @@ impl App {
             && matches!(self.main_tab, MainTab::Rules | MainTab::Providers);
         if !self.action_busy
             && !self.snapshot_pending
-            && (entered || self.last_snapshot_poll.elapsed() >= Duration::from_millis(2200))
+            && (entered || self.last_snapshot_poll.elapsed() >= SNAPSHOT_POLL)
         {
             self.snapshot_pending = true;
             self.last_snapshot_poll = Instant::now();
@@ -1698,7 +1841,8 @@ impl App {
         snapshot.carry_skipped(&mut self.snapshot);
         self.snapshot = snapshot;
         if !keep {
-            self.install_connections(fresh, self.snapshot.running);
+            let at = self.snapshot.connections_at.unwrap_or_else(Instant::now);
+            self.install_connections(fresh, self.snapshot.running, at);
         }
         self.group_index = self
             .group_index
@@ -1706,7 +1850,12 @@ impl App {
         self.clamp_aux();
     }
 
-    fn install_connections(&mut self, mut list: Vec<mihomo::ConnectionItem>, running: bool) {
+    fn install_connections(
+        &mut self,
+        mut list: Vec<mihomo::ConnectionItem>,
+        running: bool,
+        at: Instant,
+    ) {
         let selected = self.selected_connection().map(|c| c.id.clone());
         let was_empty = self.conn_view.is_empty();
         let now_ms = conns::now_ms();
@@ -1715,9 +1864,7 @@ impl App {
             let (up, down) = (self.snapshot.upload_total, self.snapshot.download_total);
             self.conns.note_totals(up, down);
         }
-        let closed = self
-            .conns
-            .observe(&mut list, running, Instant::now(), now_ms);
+        let closed = self.conns.observe(&mut list, running, at, now_ms);
         self.snapshot.connections = list;
         self.rebuild_conn_view();
         // An expired selection stays empty until the user navigates again.
@@ -1816,6 +1963,7 @@ impl App {
     }
 
     pub fn refresh_snapshot_now(&mut self) {
+        self.refresh_asked = true;
         if self.snapshot_pending {
             self.refresh_queued = true;
             return;
@@ -1868,7 +2016,7 @@ impl App {
                 snapshot_follows: true,
             });
             drop(done);
-            let _ = tx.send(BackendEvent::Snapshot(Box::new(fetch_snapshot(&cfg))));
+            let _ = tx.send(BackendEvent::ActionSnapshot(Box::new(fetch_snapshot(&cfg))));
         });
     }
 
@@ -1968,6 +2116,7 @@ impl App {
             &format!("Testing {} ({})...", group.name, group.all.len()),
             false,
         );
+        self.group_tests += 1;
         test_group_delays_async(
             self.config.controller.clone(),
             group.name.clone(),
@@ -2932,22 +3081,50 @@ fn run(app: &mut App) -> io::Result<()> {
     result
 }
 
-/// Longest the loop blocks on input before it drains backend events again.
-const IDLE_WAKE: Duration = Duration::from_millis(50);
+/// How often the loop looks for worker events while a reply is awaited
+/// (`App::wake_cap`); they cannot wake `event::poll`.
+const BUSY_WAKE: Duration = Duration::from_millis(50);
+/// Input this recent keeps the loop at `BUSY_WAKE`, so what a key starts
+/// (a DNS lookup, a tab's first poll) shows at once.
+const BUSY_AFTER_INPUT: Duration = Duration::from_secs(3);
+/// The live Logs tab looks this often while idle.
+const LOG_WAKE: Duration = Duration::from_millis(250);
 /// Data repaints (pushes, polls, toasts) run at most this often; Mihomo
 /// pushes once a second anyway.
 const DATA_FRAME: Duration = Duration::from_millis(100);
 /// Ages, "ago" columns and the Setup screen's config check change with time
 /// alone.
 const HEARTBEAT: Duration = Duration::from_secs(1);
-/// Key repeats and pastes applied before one repaint.
+/// How long a graph shift waits past its interval for a sample still queued
+/// before the window starts over: two idle wakes, so one push that lands
+/// just after a wake is not mistaken for a gap.
+const GRAPH_GRACE: Duration = Duration::from_secs(2);
+/// Key repeats, pastes and wheel steps applied before one repaint.
 const INPUT_BURST: usize = 64;
+/// Background poll of `/version`, `/configs` and `/proxies`.
+const SNAPSHOT_POLL: Duration = Duration::from_millis(2200);
+
+/// What `App::drain_events` changed on screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shown {
+    /// Draw within `DATA_FRAME`.
+    pub now: bool,
+    /// Draw with the next frame, or at the heartbeat.
+    pub later: bool,
+}
 
 /// When `run_app` repaints: input at once (capped by `refresh_hz`), data at
-/// most every `DATA_FRAME`, and nothing while the screen cannot have changed.
+/// most every `DATA_FRAME`, background changes with the next frame or the
+/// heartbeat, and nothing while the screen cannot have changed.
 struct Redraw {
     input: bool,
     data: bool,
+    /// Memory, the overview's connection count, a routine poll, a graph
+    /// shift: they wait for the next data frame or the heartbeat.
+    lazy: bool,
+    /// An undrawn key, click, resize or screen change: it can move the panes
+    /// a wheel step lands in.
+    layout: bool,
     last: Instant,
     toast: (bool, Option<Instant>),
     graph: u64,
@@ -2958,6 +3135,8 @@ impl Redraw {
         Self {
             input: true,
             data: false,
+            lazy: false,
+            layout: true,
             // Long enough ago that the first frame draws at once.
             last: now.checked_sub(HEARTBEAT).unwrap_or(now),
             toast: (false, None),
@@ -2965,20 +3144,43 @@ impl Redraw {
         }
     }
 
+    /// Any undrawn change; a held click waits for it, since hit areas come
+    /// from the last draw.
     fn pending(&self) -> bool {
-        self.input || self.data
+        self.input || self.data || self.lazy
+    }
+
+    /// Whether `ev` waits for the next frame. A click maps a row through the
+    /// last draw's list scroll, so it waits for any undrawn change. A wheel
+    /// step needs only the pane under it, so it waits only for a change that
+    /// can move panes, and a run of them lands in one frame.
+    fn holds(&self, ev: &CEvent) -> bool {
+        let CEvent::Mouse(mouse) = ev else {
+            return false;
+        };
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => self.layout,
+            kind => mouse_acts(kind) && self.pending(),
+        }
+    }
+
+    fn note(&mut self, shown: Shown) {
+        self.data |= shown.now;
+        self.lazy |= shown.later;
     }
 
     fn toast_of(app: &App) -> (bool, Option<Instant>) {
         (app.toast_visible(), app.toast_started)
     }
 
-    /// Notes changes no event reports: a toast shown, replaced or expired, a
-    /// graph shift, and the heartbeat.
+    /// Notes changes no event reports: a toast shown, replaced or expired,
+    /// the heartbeat, and a graph shift (lazy: one its sample's `now` drain
+    /// did not already make due rides the next frame, so a hidden graph
+    /// never forces one).
     fn observe(&mut self, app: &App, now: Instant) {
         self.data |= Self::toast_of(app) != self.toast
-            || app.graph_gen != self.graph
             || now.saturating_duration_since(self.last) >= HEARTBEAT;
+        self.lazy |= app.graph_gen != self.graph;
     }
 
     /// Time since the last frame the pending change has to wait for.
@@ -2987,6 +3189,8 @@ impl Redraw {
             Some(frame)
         } else if self.data {
             Some(frame.max(DATA_FRAME))
+        } else if self.lazy {
+            Some(HEARTBEAT)
         } else {
             None
         }
@@ -2997,35 +3201,49 @@ impl Redraw {
             .is_some_and(|gap| now.saturating_duration_since(self.last) >= gap)
     }
 
-    /// How long the loop may wait for input before it has to look again.
-    fn wait(&self, now: Instant, frame: Duration) -> Duration {
+    /// How long the loop may wait for input before it has to look again;
+    /// `cap` is `App::wake_cap`.
+    fn wait(&self, now: Instant, frame: Duration, cap: Duration) -> Duration {
         let since = now.saturating_duration_since(self.last);
         self.gap(frame)
             .unwrap_or(HEARTBEAT)
             .saturating_sub(since)
-            .min(IDLE_WAKE)
+            .min(cap)
     }
 
     fn drawn(&mut self, app: &App, now: Instant) {
         self.input = false;
         self.data = false;
+        self.lazy = false;
+        self.layout = false;
         self.last = now;
         self.toast = Self::toast_of(app);
         self.graph = app.graph_gen;
     }
 }
 
+/// Applies what arrived while `run_app` waited, then steps the graph clock:
+/// a due shift takes the sample drained just now, and `observe` sees it
+/// before this frame is decided, so it draws together with the rate.
+fn catch_up(app: &mut App, redraw: &mut Redraw, last_graph: &mut Instant) -> Instant {
+    redraw.note(app.drain_events());
+    let now = Instant::now();
+    app.advance_graph(now.saturating_duration_since(*last_graph));
+    *last_graph = now;
+    redraw.observe(app, now);
+    now
+}
+
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
-    let mut last_tick = Instant::now();
-    let mut redraw = Redraw::new(last_tick);
-    // A mouse event read behind undrawn changes waits for the next frame: its
-    // hit areas (proxy_hits, list scroll) come from the last draw.
+    let mut last_graph = Instant::now();
+    let mut redraw = Redraw::new(last_graph);
+    // A mouse event `Redraw::holds` waits here for the next frame: its hit
+    // areas (proxy_hits, list scroll) come from the last draw.
     let mut held: Option<CEvent> = None;
+    let mut last_input = last_graph;
 
     loop {
-        redraw.data |= app.drain_events();
-        let now = Instant::now();
-        redraw.observe(app, now);
+        let now = catch_up(app, &mut redraw, &mut last_graph);
         let frame = app.frame_duration();
         if redraw.due(now, frame) || (held.is_some() && redraw.pending()) {
             // Queued, so Begin and End ride along with the frame's own flushes.
@@ -3038,35 +3256,45 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
             redraw.drawn(app, Instant::now());
         }
 
+        let cap = app.wake_cap(last_input.elapsed());
         let mut next = match held.take() {
             Some(ev) => Some(ev),
-            None if event::poll(redraw.wait(Instant::now(), frame))? => Some(event::read()?),
+            None if event::poll(redraw.wait(Instant::now(), frame, cap))? => Some(event::read()?),
             None => None,
         };
+        if next.is_some() {
+            last_input = Instant::now();
+        }
         let mut applied = 0;
         while let Some(ev) = next.take() {
-            if matches!(&ev, CEvent::Mouse(m) if mouse_acts(m.kind)) && redraw.pending() {
+            if redraw.holds(&ev) {
                 held = Some(ev);
                 break;
             }
-            let burst = matches!(ev, CEvent::Key(_) | CEvent::Paste(_));
+            let wheel = matches!(&ev, CEvent::Mouse(m)
+                if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown));
+            let burst = wheel || matches!(ev, CEvent::Key(_) | CEvent::Paste(_));
             match handle_event(app, ev) {
                 Handled::Quit => return Ok(()),
-                Handled::Changed => redraw.input = true,
+                Handled::Changed => {
+                    redraw.input = true;
+                    redraw.layout |= !wheel;
+                }
                 Handled::Unchanged => {}
             }
             applied += 1;
-            // Key repeat and pastes coalesce into one frame; mouse events do
-            // not, since each hit-tests against the frame before it.
+            // Key repeat, pastes and wheel steps coalesce into one frame;
+            // clicks do not, since each hit-tests against the frame before it.
             if burst && applied < INPUT_BURST && event::poll(Duration::ZERO)? {
                 next = Some(event::read()?);
             }
         }
 
         let shown = (app.screen, app.setup_phase);
-        app.tick(last_tick.elapsed());
-        last_tick = Instant::now();
-        redraw.data |= shown != (app.screen, app.setup_phase);
+        app.tick();
+        let moved = shown != (app.screen, app.setup_phase);
+        redraw.data |= moved;
+        redraw.layout |= moved;
     }
 }
 
@@ -3096,8 +3324,11 @@ fn handle_event(app: &mut App, ev: CEvent) -> Handled {
             if !mouse_acts(mouse.kind) {
                 return Handled::Unchanged;
             }
-            if proxy_mouse_action(app, mouse) {
-                app.activate_selected_node();
+            match proxy_mouse_action(app, mouse) {
+                // Off the lists, on another view, or already at the end.
+                MouseHit::Miss => return Handled::Unchanged,
+                MouseHit::Moved => {}
+                MouseHit::Activate => app.activate_selected_node(),
             }
         }
         CEvent::Paste(text) => handle_paste(app, &text),
@@ -3687,19 +3918,29 @@ fn handle_rule_edit_key(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+/// What a mouse report did to the Proxies lists.
+#[derive(Debug, PartialEq, Eq)]
+enum MouseHit {
+    /// Nothing moved: another view, off the lists, or already at the end.
+    Miss,
+    /// Focus, cursor or scroll moved.
+    Moved,
+    /// A node row was clicked; the caller activates it.
+    Activate,
+}
+
 // Hit regions come from the rendered list, including its scroll offset.
-// Return true only when a node row was clicked; the caller performs activation.
-fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
+fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> MouseHit {
     if app.screen != Screen::Dashboard
         || app.main_tab != MainTab::Proxies
         || app.overlay != Overlay::None
         || app.status_detail
     {
-        return false;
+        return MouseHit::Miss;
     }
     let point = ratatui::layout::Position::new(mouse.column, mouse.row);
     if app.toast_visible() && app.toast_area.is_some_and(|r| r.contains(point)) {
-        return false;
+        return MouseHit::Miss;
     }
     let Some((area, focus, start, len)) = app
         .proxy_hits
@@ -3707,16 +3948,14 @@ fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
         .copied()
         .find(|(r, _, _, _)| r.contains(point))
     else {
-        return false;
+        return MouseHit::Miss;
     };
-    if len == 0 {
-        return false;
-    }
+    let before = (app.focus, app.group_index, app.node_index, app.node_scroll);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let index = start + (mouse.row - area.y) as usize;
             if index >= len {
-                return false;
+                return MouseHit::Miss;
             }
             app.focus = focus;
             match focus {
@@ -3726,11 +3965,25 @@ fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
                 }
                 FocusPane::Nodes => {
                     app.node_index = index;
-                    return true;
+                    return MouseHit::Activate;
                 }
             }
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            // Wheel steps run ahead of the frame (see `Redraw::holds`), so
+            // the length is the live one, not the last draw's: a step over
+            // Groups may already have changed the node list.
+            let len = match focus {
+                FocusPane::Groups => app.snapshot.groups.len(),
+                FocusPane::Nodes => app
+                    .snapshot
+                    .groups
+                    .get(app.group_index)
+                    .map_or(0, |g| g.all.len()),
+            };
+            if len == 0 {
+                return MouseHit::Miss;
+            }
             app.focus = focus;
             let current = match focus {
                 FocusPane::Groups => app.group_index,
@@ -3751,7 +4004,11 @@ fn proxy_mouse_action(app: &mut App, mouse: MouseEvent) -> bool {
         }
         _ => {}
     }
-    false
+    if before == (app.focus, app.group_index, app.node_index, app.node_scroll) {
+        MouseHit::Miss
+    } else {
+        MouseHit::Moved
+    }
 }
 
 fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
@@ -4766,7 +5023,7 @@ mod tests {
                 row: area.y,
                 modifiers: KeyModifiers::NONE,
             };
-            assert!(proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Activate);
             assert_eq!(app.node_index, start);
             assert_eq!(app.focus, FocusPane::Nodes);
             render_text(&mut app, width, height);
@@ -4779,18 +5036,18 @@ mod tests {
                 .proxy_hits
                 .contains(&(area, FocusPane::Nodes, start, 40)));
             event.kind = MouseEventKind::ScrollDown;
-            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Moved);
             assert_eq!(app.node_index, start + 1);
             app.overlay = Overlay::Probe;
             event.kind = MouseEventKind::Down(MouseButton::Left);
-            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Miss);
             app.overlay = Overlay::None;
             app.set_status("Notice", false);
             render_text(&mut app, width, height);
             let toast = app.toast_area.unwrap();
             event.column = toast.x + 1;
             event.row = toast.y + 1;
-            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Miss);
             app.clear_status();
             render_text(&mut app, width, height);
             let (group_area, _, _, _) = app
@@ -4801,12 +5058,12 @@ mod tests {
                 .unwrap();
             event.column = group_area.x + 1;
             event.row = group_area.y + 1;
-            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Moved);
             assert_eq!(app.group_index, 1);
             assert_eq!(app.node_index, 0);
             assert_eq!(app.focus, FocusPane::Groups);
             event.row = group_area.y + 2;
-            assert!(!proxy_mouse_action(&mut app, event));
+            assert_eq!(proxy_mouse_action(&mut app, event), MouseHit::Miss);
             assert_eq!(app.group_index, 1);
         }
     }
@@ -5013,6 +5270,7 @@ mod tests {
                 ],
                 upload_total: 5,
                 download_total: 9,
+                at: Instant::now(),
             })
             .unwrap();
         app.drain_events();
@@ -5052,6 +5310,35 @@ mod tests {
         app.config.settings.connections_stream = false;
         app.conn_stream.enabled.store(false, Ordering::Relaxed);
         assert!(!app.stream_live());
+    }
+
+    #[test]
+    fn connection_rates_count_from_each_read_not_from_the_drain() {
+        let t0 = Instant::now();
+        let dl = |bytes| vec![live_conn("dl", "cdn.example.com:443", Some(5), bytes)];
+        let rate = |app: &App| app.snapshot.connections[0].down_rate;
+        // Two pushes a second apart, applied by one late drain.
+        let mut app = offline_app();
+        for (bytes, secs) in [(1000, 0), (3000, 1)] {
+            app.tx
+                .send(BackendEvent::Connections {
+                    items: dl(bytes),
+                    upload_total: 0,
+                    download_total: bytes,
+                    at: t0 + Duration::from_secs(secs),
+                })
+                .unwrap();
+        }
+        app.drain_events();
+        assert_eq!(rate(&app), 2000);
+        // Polls, too, count from when `/connections` answered.
+        let mut app = offline_app();
+        for (bytes, secs) in [(1000, 0), (9000, 2)] {
+            let mut polled = live_snapshot(dl(bytes));
+            polled.connections_at = Some(t0 + Duration::from_secs(secs));
+            app.accept_snapshot(polled);
+        }
+        assert_eq!(rate(&app), 4000);
     }
 
     /// A controller on 127.0.0.1:0 that answers `{}` and records each path.
@@ -5100,7 +5387,7 @@ mod tests {
         app.config.controller.config_dir = "/nonexistent/terc-test".into();
         let poll = |app: &mut App| {
             app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
-            app.tick(Duration::from_millis(10));
+            app.tick();
             finish_poll(app, &paths)
         };
         app.conn_stream_at = Some(Instant::now());
@@ -5122,7 +5409,7 @@ mod tests {
         let has = |got: &[String], path: &str| got.iter().any(|p| p == path);
         let poll = |app: &mut App| {
             app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
-            app.tick(Duration::from_millis(10));
+            app.tick();
             finish_poll(app, &paths)
         };
         // The core looked stopped, so it may have just started: read everything.
@@ -5149,17 +5436,17 @@ mod tests {
         // Entering Rules polls at once instead of waiting for the timer;
         // staying there does not poll early again.
         app.main_tab = MainTab::Rules;
-        app.tick(Duration::from_millis(10));
+        app.tick();
         let rules = finish_poll(&mut app, &paths);
         assert!(
             has(&rules, "/rules") && !has(&rules, "/providers/proxies"),
             "{rules:?}"
         );
-        app.tick(Duration::from_millis(10));
+        app.tick();
         assert!(!app.snapshot_pending);
 
         app.main_tab = MainTab::Providers;
-        app.tick(Duration::from_millis(10));
+        app.tick();
         let providers = finish_poll(&mut app, &paths);
         assert!(has(&providers, "/providers/proxies"), "{providers:?}");
         assert!(has(&providers, "/providers/rules"), "{providers:?}");
@@ -5167,7 +5454,7 @@ mod tests {
 
         // Other tabs poll on the timer and read the providers every 30 s.
         app.main_tab = MainTab::Logs;
-        app.tick(Duration::from_millis(10));
+        app.tick();
         assert!(!app.snapshot_pending);
         assert!(!has(&poll(&mut app), "/providers/proxies"));
         app.providers_polled_at = Some(Instant::now() - Duration::from_secs(31));
@@ -5194,8 +5481,10 @@ mod tests {
             .unwrap();
         app.drain_events();
         assert!(!app.refresh_queued);
+        assert!(app.refresh_asked, "its own result still draws at once");
         let full = finish_poll(&mut app, &paths);
         assert!(full.iter().any(|p| p == "/version"), "{full:?}");
+        assert!(!app.refresh_asked);
     }
 
     #[test]
@@ -5221,7 +5510,7 @@ mod tests {
         let has = |got: &[String], path: &str| got.iter().any(|p| p == path);
         let poll = |app: &mut App| {
             app.last_snapshot_poll = Instant::now() - Duration::from_secs(3);
-            app.tick(Duration::from_millis(10));
+            app.tick();
             finish_poll(app, &paths)
         };
         poll(&mut app);
@@ -5589,6 +5878,7 @@ mod tests {
                 items: sample_connections(),
                 upload_total: 1,
                 download_total: 1,
+                at: Instant::now(),
             })
             .unwrap();
         app.drain_events();
@@ -5836,10 +6126,10 @@ mod tests {
                 snapshot_follows: true,
             })
             .unwrap();
-        assert!(app.drain_events());
+        assert!(app.drain_events().now);
         assert!(!app.action_busy);
         // The action thread's own snapshot is on its way; no second poll now.
-        app.tick(Duration::from_millis(10));
+        app.tick();
         assert!(!app.snapshot_pending);
         // A panicked action sends no snapshot: the overdue poll runs at once.
         app.last_snapshot_poll = Instant::now() - Duration::from_secs(10);
@@ -5850,7 +6140,7 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(app.status_message.contains("failed unexpectedly"));
-        app.tick(Duration::from_millis(10));
+        app.tick();
         assert!(app.snapshot_pending);
     }
 
@@ -5864,30 +6154,123 @@ mod tests {
     #[test]
     fn drain_reports_only_changes_the_screen_shows() {
         let mut app = offline_app();
-        assert!(!app.drain_events());
+        assert_eq!(app.drain_events(), Shown::default());
         // /logs carries a line per new connection; off the Logs tab it is kept, not drawn.
         app.tx.send(log("info", "[TCP] a --> b match x")).unwrap();
-        assert!(!app.drain_events());
+        assert_eq!(app.drain_events(), Shown::default());
         assert_eq!(app.logs.len(), 1);
         app.main_tab = MainTab::Logs;
         app.tx.send(log("info", "[TCP] c --> d match x")).unwrap();
-        assert!(app.drain_events());
+        assert!(app.drain_events().now);
         app.pause_logs();
         app.tx.send(log("info", "[TCP] e --> f match x")).unwrap();
-        assert!(!app.drain_events());
+        assert_eq!(app.drain_events(), Shown::default());
         // A TUN failure still reaches the screen through the toast.
         app.main_tab = MainTab::Proxies;
         app.tx
             .send(log("error", "Start TUN listening error: denied"))
             .unwrap();
-        assert!(!app.drain_events());
+        assert_eq!(app.drain_events(), Shown::default());
         assert!(app.toast_visible());
         app.tx
             .send(BackendEvent::Traffic { up: 1, down: 2 })
             .unwrap();
         app.tx.send(log("info", "[TCP] g --> h match x")).unwrap();
-        assert!(app.drain_events());
+        assert!(app.drain_events().now);
         assert_eq!(app.logs.len(), 5);
+        // Background figures wait for the next frame; the shown tab's own data does not.
+        let conns = || BackendEvent::Connections {
+            items: Vec::new(),
+            upload_total: 1,
+            download_total: 2,
+            at: Instant::now(),
+        };
+        let later = Shown {
+            now: false,
+            later: true,
+        };
+        let poll = |app: &App| BackendEvent::SnapshotDone(Box::new(app.snapshot.clone()));
+        app.tx.send(BackendEvent::Memory { inuse: 1 }).unwrap();
+        app.tx.send(conns()).unwrap();
+        assert_eq!(app.drain_events(), later);
+        app.tx.send(poll(&app)).unwrap();
+        assert_eq!(app.drain_events(), later);
+        app.tx
+            .send(BackendEvent::DelayResult {
+                group: "g".into(),
+                node: "n".into(),
+                delay: Some(80),
+            })
+            .unwrap();
+        assert!(app.drain_events().now, "delays on the Proxies tab");
+        // A refresh the user asked for shows at once, even if nothing changed.
+        app.refresh_asked = true;
+        app.tx.send(poll(&app)).unwrap();
+        assert!(app.drain_events().now);
+        assert!(!app.refresh_asked);
+        app.main_tab = MainTab::Connections;
+        app.tx.send(conns()).unwrap();
+        assert!(app.drain_events().now);
+        // A poll's list waits while pushes own the tab, and draws without them.
+        let polled = |app: &App, ok: bool| {
+            let mut snap = app.snapshot.clone();
+            snap.connections_ok = ok;
+            BackendEvent::SnapshotDone(Box::new(snap))
+        };
+        assert!(app.stream_live());
+        app.tx.send(polled(&app, true)).unwrap();
+        assert_eq!(app.drain_events(), later);
+        app.conn_stream_at = None;
+        app.tx.send(polled(&app, false)).unwrap();
+        assert_eq!(app.drain_events(), later);
+        app.tx.send(polled(&app, true)).unwrap();
+        assert!(
+            app.drain_events().now,
+            "the polled list on the Connections tab"
+        );
+        let delay = || BackendEvent::DelayResult {
+            group: "g".into(),
+            node: "n".into(),
+            delay: Some(90),
+        };
+        app.tx.send(delay()).unwrap();
+        assert_eq!(app.drain_events(), later);
+        let mut switched = app.snapshot.clone();
+        switched.mode = "global".into();
+        app.tx
+            .send(BackendEvent::SnapshotDone(Box::new(switched)))
+            .unwrap();
+        assert!(app.drain_events().now, "a mode switch shows at once");
+        // Settings → Subscriptions → Nodes shows own-node delays.
+        app.screen = Screen::Settings;
+        app.tx.send(delay()).unwrap();
+        assert_eq!(app.drain_events(), later);
+        app.settings_management = true;
+        app.profile_page = 2;
+        app.tx.send(delay()).unwrap();
+        assert!(app.drain_events().now, "delays on the own-nodes page");
+        // Node keys act by index: nodes inserted ahead of the cursor show at
+        // once, though every group keeps its `now`.
+        app.screen = Screen::Dashboard;
+        app.main_tab = MainTab::Proxies;
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "Main".into(),
+            now: "HK-01".into(),
+            all: vec!["HK-01".into()],
+            ..Default::default()
+        });
+        app.tx.send(poll(&app)).unwrap();
+        assert_eq!(app.drain_events(), later);
+        let mut shifted = app.snapshot.clone();
+        shifted.groups[0].all.insert(0, "JP-03".into());
+        app.tx
+            .send(BackendEvent::SnapshotDone(Box::new(shifted)))
+            .unwrap();
+        assert!(app.drain_events().now, "a moved member list shows at once");
+        // The Runtime overlay picks a tunnel by index into the poll's nodes.
+        app.overlay = Overlay::Runtime;
+        app.tx.send(poll(&app)).unwrap();
+        assert!(app.drain_events().now);
     }
 
     #[test]
@@ -5905,6 +6288,104 @@ mod tests {
     }
 
     #[test]
+    fn a_shift_waits_for_a_sample_still_queued_and_keeps_its_phase() {
+        let mut app = offline_app();
+        let gen = app.graph_gen;
+        let sample = |app: &mut App, up| {
+            app.tx.send(BackendEvent::Traffic { up, down: up }).unwrap();
+            app.drain_events();
+        };
+        sample(&mut app, 100);
+        app.advance_graph(Duration::from_millis(1300));
+        assert_eq!(app.graph_gen, gen + 1);
+        // The next interval ends before its sample is drained: no column is
+        // dropped, and the sample shifts on the next tick.
+        app.advance_graph(Duration::from_millis(900));
+        assert_eq!(app.graph_gen, gen + 1);
+        sample(&mut app, 200);
+        app.advance_graph(Duration::from_millis(50));
+        assert_eq!(app.graph_gen, gen + 2);
+        assert_eq!(app.up_history[HISTORY_LEN - 2..], [100.0, 200.0]);
+        // The 250 ms this shift ran late carry over: the next is due 750 ms on.
+        sample(&mut app, 300);
+        app.advance_graph(Duration::from_millis(740));
+        assert_eq!(app.graph_gen, gen + 2);
+        app.advance_graph(Duration::from_millis(10));
+        assert_eq!(app.graph_gen, gen + 3);
+    }
+
+    #[test]
+    fn a_late_shift_is_made_up_by_the_next_sample_not_dropped() {
+        let mut app = offline_app();
+        let gen = app.graph_gen;
+        // An idle wake drained this sample 800 ms after its interval ended.
+        app.graph_samples = (100.0, 100.0, 1);
+        app.advance_graph(Duration::from_millis(1800));
+        assert_eq!(app.graph_gen, gen + 1);
+        // The next one, 200 ms later, is due: averaging it into the column
+        // after would lose one.
+        app.graph_samples = (200.0, 200.0, 1);
+        app.advance_graph(Duration::from_millis(200));
+        assert_eq!(app.graph_gen, gen + 2);
+        assert_eq!(app.up_history[HISTORY_LEN - 2..], [100.0, 200.0]);
+        // No more than one interval is ever owed.
+        app.graph_samples = (300.0, 300.0, 1);
+        app.advance_graph(Duration::from_secs(5));
+        app.graph_samples = (400.0, 400.0, 1);
+        app.advance_graph(Duration::ZERO);
+        assert_eq!(app.graph_gen, gen + 4);
+        app.graph_samples = (500.0, 500.0, 1);
+        app.advance_graph(Duration::ZERO);
+        assert_eq!(app.graph_gen, gen + 4);
+    }
+
+    #[test]
+    fn the_first_column_after_a_long_gap_averages_a_whole_interval() {
+        let mut app = offline_app();
+        app.set_graph_interval(60_000);
+        let gen = app.graph_gen;
+        let sample = |app: &mut App, up| {
+            app.tx.send(BackendEvent::Traffic { up, down: up }).unwrap();
+            app.drain_events();
+        };
+        // The core is stopped for three minutes; the loop wakes every second.
+        for _ in 0..180 {
+            app.advance_graph(Duration::from_secs(1));
+        }
+        sample(&mut app, 0);
+        app.advance_graph(Duration::from_secs(1));
+        assert_eq!(app.graph_gen, gen, "one sample is not a 60 s column");
+        // From a clean clock: once an interval and the grace pass empty, the
+        // window starts over, and its column averages the whole interval.
+        app.set_graph_interval(60_000);
+        app.advance_graph(Duration::from_secs(60) + GRAPH_GRACE);
+        sample(&mut app, 100);
+        app.advance_graph(Duration::from_secs(1));
+        assert_eq!(app.graph_gen, gen);
+        sample(&mut app, 300);
+        app.advance_graph(Duration::from_secs(59));
+        assert_eq!(app.graph_gen, gen + 1);
+        assert_eq!(*app.up_history.last().unwrap(), 200.0);
+    }
+
+    #[test]
+    fn a_graph_shift_draws_in_the_frame_of_the_sample_that_completes_it() {
+        let mut app = offline_app();
+        let frame = app.frame_duration();
+        let mut redraw = Redraw::new(Instant::now());
+        for up in [100, 300] {
+            // An idle loop slept a heartbeat; the push came in meanwhile.
+            redraw.drawn(&app, Instant::now() - HEARTBEAT);
+            let mut last_graph = Instant::now() - HEARTBEAT;
+            app.tx.send(BackendEvent::Traffic { up, down: up }).unwrap();
+            let now = catch_up(&mut app, &mut redraw, &mut last_graph);
+            assert!(redraw.due(now, frame));
+            assert_eq!(app.up_rate, up);
+            assert_eq!(*app.up_history.last().unwrap(), up as f32);
+        }
+    }
+
+    #[test]
     fn redraw_draws_input_at_once_and_caps_data_and_heartbeat() {
         let app = offline_app();
         let frame = Duration::from_millis(16);
@@ -5915,11 +6396,19 @@ mod tests {
         redraw.drawn(&app, t0);
         redraw.observe(&app, at(10));
         assert!(!redraw.pending());
-        assert_eq!(redraw.wait(at(10), frame), IDLE_WAKE);
+        assert_eq!(redraw.wait(at(10), frame, BUSY_WAKE), BUSY_WAKE);
+        // Idle, the wait runs to the heartbeat.
+        assert_eq!(
+            redraw.wait(at(10), frame, HEARTBEAT),
+            Duration::from_millis(990)
+        );
         // Data waits for the 100 ms frame, input only for refresh_hz.
         redraw.data = true;
         assert!(!redraw.due(at(40), frame));
-        assert_eq!(redraw.wait(at(70), frame), Duration::from_millis(30));
+        assert_eq!(
+            redraw.wait(at(70), frame, HEARTBEAT),
+            Duration::from_millis(30)
+        );
         assert!(redraw.due(at(100), frame));
         redraw.input = true;
         assert!(redraw.due(at(16), frame));
@@ -5930,6 +6419,145 @@ mod tests {
         assert!(!redraw.pending());
         redraw.observe(&app, at(1100));
         assert!(redraw.due(at(1100), frame));
+    }
+
+    #[test]
+    fn idle_loop_sleeps_to_the_next_deadline_and_looks_often_only_while_busy() {
+        let mut app = offline_app();
+        app.clear_status();
+        let idle = Duration::from_secs(60);
+        app.snapshot_pending = true;
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
+        let typed = Duration::from_millis(500);
+        assert_eq!(app.wake_cap(typed), BUSY_WAKE);
+        app.group_tests = 1;
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE, "delays stream in");
+        app.group_tests = 0;
+        app.action_busy = true;
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE);
+        app.action_busy = false;
+        // The action's own snapshot lands after its toast.
+        app.config.controller.config_dir = "/nonexistent/terc-test".into();
+        app.tx
+            .send(BackendEvent::ActionDone {
+                result: Ok("done".into()),
+                modules: None,
+                profile: None,
+                snapshot_follows: true,
+            })
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE);
+        // Another worker's snapshot (a delay test, a provider refresh) that
+        // lands first is not the action's.
+        app.group_tests = 1;
+        let snap = BackendEvent::Snapshot(Box::new(app.snapshot.clone()));
+        app.tx.send(snap).unwrap();
+        app.tx
+            .send(BackendEvent::GroupTestDone { group: "G".into() })
+            .unwrap();
+        app.drain_events();
+        app.clear_status();
+        assert_eq!(
+            app.wake_cap(idle),
+            BUSY_WAKE,
+            "the action's snapshot is still owed"
+        );
+        let snap = BackendEvent::ActionSnapshot(Box::new(app.snapshot.clone()));
+        app.tx.send(snap).unwrap();
+        assert!(app.drain_events().now);
+        app.clear_status();
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
+        // A chained action can finish before the first one's snapshot lands.
+        let done = || BackendEvent::ActionDone {
+            result: Ok("done".into()),
+            modules: None,
+            profile: None,
+            snapshot_follows: true,
+        };
+        app.tx.send(done()).unwrap();
+        app.tx.send(done()).unwrap();
+        for owed in [true, false] {
+            let snap = BackendEvent::ActionSnapshot(Box::new(app.snapshot.clone()));
+            app.tx.send(snap).unwrap();
+            app.drain_events();
+            app.clear_status();
+            let busy = app.wake_cap(idle) == BUSY_WAKE;
+            assert_eq!(busy, owed);
+        }
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
+        app.refresh_asked = true;
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE);
+        app.refresh_asked = false;
+        app.replies_owed = 1;
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE);
+        app.tx.send(BackendEvent::ReplyDone).unwrap();
+        app.drain_events();
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
+        // A toast leaves on time, not up to a heartbeat late.
+        app.set_status("hi", false);
+        app.toast_started = Some(Instant::now() - Duration::from_millis(3100));
+        let cap = app.wake_cap(idle);
+        assert!(cap <= Duration::from_millis(900), "{cap:?}");
+        app.clear_status();
+        // A due graph shift draws lazily, so it sets no wake of its own.
+        app.graph_elapsed = Duration::from_millis(900);
+        app.graph_samples = (1.0, 1.0, 1);
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
+        app.graph_elapsed = Duration::ZERO;
+        app.graph_samples = (0.0, 0.0, 0);
+        // The next poll starts on time.
+        app.snapshot_pending = false;
+        app.last_snapshot_poll = Instant::now() - Duration::from_millis(2000);
+        assert!(app.wake_cap(idle) <= Duration::from_millis(200));
+        app.snapshot_pending = true;
+        app.main_tab = MainTab::Logs;
+        assert_eq!(app.wake_cap(idle), LOG_WAKE);
+    }
+
+    #[test]
+    fn delay_tests_and_lookups_keep_the_loop_awake_until_they_end() {
+        let (addr, _paths) = recording_controller();
+        let mut app = offline_app();
+        app.clear_status();
+        app.config.controller.addr = addr;
+        app.snapshot_pending = true;
+        app.snapshot.groups.push(mihomo::ProxyGroup {
+            name: "Main".into(),
+            kind: "Selector".into(),
+            all: vec!["N0".into()],
+            ..Default::default()
+        });
+        app.snapshot.nodes.insert(
+            "WG".into(),
+            mihomo::ProxyNode {
+                name: "WG".into(),
+                kind: "WireGuard".into(),
+                udp: true,
+                delay: None,
+                provider: None,
+                url_delays: Default::default(),
+            },
+        );
+        let idle = Duration::from_secs(60);
+        // A tunnel run counts on its own, so neither ends the other early.
+        app.test_current_group();
+        assert_eq!(app.group_tests, 1);
+        app.test_all_tunnels();
+        assert_eq!(app.group_tests, 2);
+        app.test_selected_tunnel();
+        app.dns_editor.load("example.com");
+        app.submit_dns_query();
+        assert_eq!(app.replies_owed, 2);
+        assert_eq!(app.wake_cap(idle), BUSY_WAKE);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.group_tests + app.replies_owed > 0 {
+            assert!(Instant::now() < deadline, "a worker never finished");
+            app.drain_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        app.clear_status();
+        assert_eq!(app.wake_cap(idle), HEARTBEAT);
     }
 
     #[test]
@@ -5955,6 +6583,20 @@ mod tests {
         app.graph_gen += 1;
         redraw.observe(&app, t0);
         assert!(redraw.pending(), "graph shifted");
+        // It rides the next data frame, or the heartbeat at the latest, and
+        // never wakes an idle loop sooner.
+        assert!(!redraw.due(t0 + Duration::from_millis(500), frame));
+        assert_eq!(
+            redraw.wait(t0 + Duration::from_millis(500), frame, HEARTBEAT),
+            Duration::from_millis(500)
+        );
+        redraw.note(Shown {
+            now: true,
+            later: false,
+        });
+        assert!(redraw.due(t0 + Duration::from_millis(100), frame));
+        redraw.data = false;
+        assert!(redraw.due(t0 + HEARTBEAT, frame));
         redraw.drawn(&app, t0);
         redraw.observe(&app, t0);
         assert!(!redraw.due(t0 + Duration::from_millis(500), frame));
@@ -5991,7 +6633,8 @@ mod tests {
             MouseEventKind::ScrollDown,
         ] {
             assert!(mouse_acts(kind));
-            assert_eq!(handle_event(&mut app, mouse(kind)), Handled::Changed);
+            // Nothing drawn, so nothing under the pointer: no frame.
+            assert_eq!(handle_event(&mut app, mouse(kind)), Handled::Unchanged);
         }
         assert_eq!(
             handle_event(&mut app, CEvent::FocusGained),
@@ -6001,6 +6644,153 @@ mod tests {
             handle_event(&mut app, key(KeyCode::Char('q'))),
             Handled::Quit
         );
+    }
+
+    #[test]
+    fn wheel_repaints_only_when_the_proxy_lists_move() {
+        let mut app = offline_app();
+        app.snapshot.groups = vec![mihomo::ProxyGroup {
+            name: "Group".into(),
+            kind: "Selector".into(),
+            now: "Node0".into(),
+            fixed: String::new(),
+            all: (0..40).map(|n| format!("Node{n}")).collect(),
+            test_url: String::new(),
+            expected_status: String::new(),
+            timeout_ms: 0,
+        }];
+        render_text(&mut app, 80, 24);
+        let (area, _, _, _) = app
+            .proxy_hits
+            .iter()
+            .copied()
+            .find(|(_, f, _, _)| *f == FocusPane::Nodes)
+            .unwrap();
+        let wheel = |kind| {
+            CEvent::Mouse(MouseEvent {
+                kind,
+                column: area.x + 1,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert_eq!(
+            handle_event(&mut app, wheel(MouseEventKind::ScrollDown)),
+            Handled::Changed
+        );
+        assert_eq!(app.node_index, 1);
+        app.node_index = 39;
+        render_text(&mut app, 80, 24);
+        assert_eq!(
+            handle_event(&mut app, wheel(MouseEventKind::ScrollDown)),
+            Handled::Unchanged,
+            "already at the end"
+        );
+        assert_eq!(app.node_index, 39);
+        assert_eq!(
+            handle_event(&mut app, wheel(MouseEventKind::ScrollUp)),
+            Handled::Changed
+        );
+        app.main_tab = MainTab::Connections;
+        render_text(&mut app, 80, 24);
+        for kind in [
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            assert_eq!(handle_event(&mut app, wheel(kind)), Handled::Unchanged);
+        }
+    }
+
+    #[test]
+    fn wheel_steps_ahead_of_the_frame_clamp_to_the_live_lists() {
+        let mut app = offline_app();
+        app.snapshot.groups = [40, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| mihomo::ProxyGroup {
+                name: format!("Group{i}"),
+                kind: "Selector".into(),
+                now: "Node0".into(),
+                fixed: String::new(),
+                all: (0..len).map(|n| format!("Node{n}")).collect(),
+                test_url: String::new(),
+                expected_status: String::new(),
+                timeout_ms: 0,
+            })
+            .collect();
+        render_text(&mut app, 80, 24);
+        let pane = |app: &App, focus| {
+            let (area, ..) = app
+                .proxy_hits
+                .iter()
+                .copied()
+                .find(|(_, f, _, _)| *f == focus)
+                .unwrap();
+            area
+        };
+        let step = |area: Rect| MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: area.x + 1,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (groups, nodes) = (pane(&app, FocusPane::Groups), pane(&app, FocusPane::Nodes));
+        // One burst, no frame between: the group changes under the node pane,
+        // whose last draw still says 40 rows.
+        assert_eq!(proxy_mouse_action(&mut app, step(groups)), MouseHit::Moved);
+        assert_eq!(app.group_index, 1);
+        for _ in 0..2 {
+            assert_eq!(proxy_mouse_action(&mut app, step(nodes)), MouseHit::Moved);
+        }
+        assert_eq!(app.node_index, 2);
+        assert_eq!(proxy_mouse_action(&mut app, step(nodes)), MouseHit::Miss);
+        assert_eq!(app.node_index, 2);
+        // A poll emptied the lists since the last draw: nothing to scroll.
+        app.snapshot.groups.clear();
+        assert_eq!(proxy_mouse_action(&mut app, step(groups)), MouseHit::Miss);
+    }
+
+    #[test]
+    fn wheel_steps_wait_only_for_changes_that_move_panes() {
+        let app = offline_app();
+        let t0 = Instant::now();
+        let mouse = |kind| {
+            CEvent::Mouse(MouseEvent {
+                kind,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let click = mouse(MouseEventKind::Down(MouseButton::Left));
+        let wheel = mouse(MouseEventKind::ScrollDown);
+        let mut redraw = Redraw::new(t0);
+        assert!(redraw.holds(&wheel), "nothing laid out yet");
+        redraw.drawn(&app, t0);
+        assert!(!redraw.holds(&click));
+        assert!(!redraw.holds(&wheel));
+        // A wheel step or new data: a click waits, since rows may have
+        // scrolled, but the next wheel step does not.
+        redraw.input = true;
+        assert!(redraw.holds(&click));
+        assert!(!redraw.holds(&wheel));
+        redraw.input = false;
+        redraw.lazy = true;
+        assert!(redraw.holds(&click));
+        assert!(!redraw.holds(&wheel));
+        // A key, resize or screen change can move the panes themselves.
+        redraw.layout = true;
+        assert!(redraw.holds(&wheel));
+        assert!(!redraw.holds(&mouse(MouseEventKind::Moved)));
+        assert!(!redraw.holds(&CEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE
+        ))));
+        redraw.drawn(&app, t0);
+        assert!(!redraw.holds(&wheel));
+        // A frame clears the lazy flag too, or every click would wait forever.
+        assert!(!redraw.pending());
+        assert!(!redraw.holds(&click));
     }
 
     #[test]

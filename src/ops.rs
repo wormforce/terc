@@ -514,28 +514,51 @@ pub fn set_nested_bool(doc: &str, path: &[&str], value: bool) -> String {
 }
 
 pub fn parse_yaml_flags(doc: &str) -> RuntimeFlags {
+    parse_yaml_flags_chunks(&split_chunks(doc))
+}
+
+/// `parse_yaml_flags` on a document already split, so one split serves
+/// every key.
+pub(crate) fn parse_yaml_flags_chunks(chunks: &[YamlChunk]) -> RuntimeFlags {
     let mut flags = RuntimeFlags {
-        dns: parse_dns_block(doc),
+        dns: last_chunk_lines(chunks, "dns")
+            .map(dns_from_lines)
+            .unwrap_or_default(),
         ..RuntimeFlags::default()
     };
-    if let Some(value) = last_top_scalar(doc, "ipv6") {
-        flags.ipv6 = parse_yaml_bool(&value).unwrap_or(false);
+    let scalar = |key: &str| {
+        last_chunk_lines(chunks, key)
+            .and_then(|lines| lines.first())
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value)
+    };
+    if let Some(value) = scalar("ipv6") {
+        flags.ipv6 = parse_yaml_bool(value).unwrap_or(false);
     }
-    if let Some(value) = last_top_scalar(doc, "tcp-concurrent") {
-        flags.tcp_concurrent = parse_yaml_bool(&value).unwrap_or(false);
+    if let Some(value) = scalar("tcp-concurrent") {
+        flags.tcp_concurrent = parse_yaml_bool(value).unwrap_or(false);
     }
-    if let Some(value) = last_top_scalar(doc, "find-process-mode") {
-        flags.find_process = clean_scalar(&value);
+    if let Some(value) = scalar("find-process-mode") {
+        flags.find_process = clean_scalar(value);
     }
-    if let Some(lines) = last_block(doc, "tun") {
-        flags.tun_enabled = block_bool(&lines, "enable").unwrap_or(false);
-        flags.tun_stack = block_scalar(&lines, "stack").unwrap_or_default();
-        flags.tun_device = block_scalar(&lines, "device").unwrap_or_default();
+    if let Some(lines) = last_chunk_lines(chunks, "tun") {
+        flags.tun_enabled = block_bool(lines, "enable").unwrap_or(false);
+        flags.tun_stack = block_scalar(lines, "stack").unwrap_or_default();
+        flags.tun_device = block_scalar(lines, "device").unwrap_or_default();
     }
-    if let Some(lines) = last_block(doc, "sniffer") {
-        flags.sniffing = block_bool(&lines, "enable").unwrap_or(false);
+    if let Some(lines) = last_chunk_lines(chunks, "sniffer") {
+        flags.sniffing = block_bool(lines, "enable").unwrap_or(false);
     }
     flags
+}
+
+/// The lines of the last top-level chunk named `key`.
+fn last_chunk_lines<'a>(chunks: &'a [YamlChunk], key: &str) -> Option<&'a [String]> {
+    chunks
+        .iter()
+        .rev()
+        .find(|chunk| chunk.key.as_deref() == Some(key))
+        .map(|chunk| chunk.lines.as_slice())
 }
 
 pub fn apply_general_json(flags: &mut RuntimeFlags, value: &Value) {
@@ -571,9 +594,12 @@ pub fn apply_general_json(flags: &mut RuntimeFlags, value: &Value) {
 }
 
 pub fn parse_dns_block(doc: &str) -> DnsStatus {
-    let Some(lines) = last_block(doc, "dns") else {
-        return DnsStatus::default();
-    };
+    last_chunk_lines(&split_chunks(doc), "dns")
+        .map(dns_from_lines)
+        .unwrap_or_default()
+}
+
+fn dns_from_lines(lines: &[String]) -> DnsStatus {
     let mut status = DnsStatus {
         present: true,
         ..DnsStatus::default()
@@ -686,14 +712,7 @@ pub fn providers_from_value(value: &Value, kind: &str) -> Vec<ProviderInfo> {
         .iter()
         .filter(|(_, item)| !json_string(item, "vehicleType").eq_ignore_ascii_case("Compatible"))
         .map(|(key, item)| {
-            let name = {
-                let named = json_string(item, "name");
-                if named.is_empty() {
-                    key.clone()
-                } else {
-                    named
-                }
-            };
+            let name = provider_name(key, &json_string(item, "name")).to_string();
             let count = item
                 .get("ruleCount")
                 .and_then(Value::as_u64)
@@ -743,14 +762,7 @@ pub fn provider_nodes_from_value(value: &Value) -> Vec<ProviderNode> {
     };
     let mut out = Vec::new();
     for (key, item) in obj {
-        let provider = {
-            let named = json_string(item, "name");
-            if named.is_empty() {
-                key.clone()
-            } else {
-                named
-            }
-        };
+        let provider = provider_name(key, &json_string(item, "name")).to_string();
         if provider == "default" {
             continue;
         }
@@ -762,10 +774,7 @@ pub fn provider_nodes_from_value(value: &Value) -> Vec<ProviderNode> {
         {
             let name = json_string(proxy, "name");
             let kind = json_string(proxy, "type");
-            if name.is_empty()
-                || ["selector", "urltest", "fallback", "loadbalance", "relay"]
-                    .contains(&kind.to_ascii_lowercase().as_str())
-            {
+            if name.is_empty() || is_group_kind(&kind) {
                 continue;
             }
             let delay = proxy
@@ -785,6 +794,21 @@ pub fn provider_nodes_from_value(value: &Value) -> Vec<ProviderNode> {
         }
     }
     out
+}
+
+/// A provider's name: its `name`, or its key when that is empty.
+pub(crate) fn provider_name<'a>(key: &'a str, named: &'a str) -> &'a str {
+    if named.is_empty() {
+        key
+    } else {
+        named
+    }
+}
+
+/// Proxy types that are groups, not nodes, in a provider's `proxies`.
+pub(crate) fn is_group_kind(kind: &str) -> bool {
+    ["selector", "urltest", "fallback", "loadbalance", "relay"]
+        .contains(&kind.to_ascii_lowercase().as_str())
 }
 
 pub fn parse_dns_message(body: &str) -> Result<DnsMessage, String> {
@@ -1472,22 +1496,6 @@ pub(crate) fn join_chunks(chunks: &[YamlChunk]) -> String {
         lines.extend(chunk.lines.iter().cloned());
     }
     join_lines(&lines)
-}
-
-fn last_block(doc: &str, key: &str) -> Option<Vec<String>> {
-    split_chunks(doc).into_iter().rev().find_map(|chunk| {
-        if chunk.key.as_deref() == Some(key) {
-            Some(chunk.lines)
-        } else {
-            None
-        }
-    })
-}
-
-fn last_top_scalar(doc: &str, key: &str) -> Option<String> {
-    let lines = last_block(doc, key)?;
-    let line = lines.first()?;
-    line.split_once(':').map(|(_, value)| value.to_string())
 }
 
 fn block_bool(lines: &[String], key: &str) -> Option<bool> {
