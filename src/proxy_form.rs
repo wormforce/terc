@@ -104,8 +104,10 @@ impl Default for Form {
 }
 impl Form {
     pub fn from_record(id: String, source: ProfileSource) -> Self {
-        let mut f = Self::default();
-        f.edit_id = Some(id);
+        let mut f = Self {
+            edit_id: Some(id),
+            ..Self::default()
+        };
         f.name.load(&source.name);
         f.url.load(&source.subscription_url);
         if source.subscription_url.is_empty() {
@@ -787,9 +789,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     fn filled(protocol: usize) -> Form {
-        let mut f = Form::default();
-        f.kind = 1;
-        f.protocol = protocol;
+        let mut f = Form {
+            kind: 1,
+            protocol,
+            ..Form::default()
+        };
         f.name.load("我的代理");
         f.server.load("192.0.2.1");
         f.secret
@@ -803,10 +807,10 @@ mod tests {
     }
     #[test]
     fn form_records_validate_and_edit_without_losing_protocol_options() {
-        for i in 0..TYPES.len() {
+        for (i, kind) in TYPES.iter().enumerate() {
             let f = filled(i);
             let mut record = f.record().unwrap();
-            assert_eq!(record.nodes[0]["type"], TYPES[i]);
+            assert_eq!(record.nodes[0]["type"], *kind);
             record.nodes[0]["udp"] = json!(true);
             let edited = Form::from_record("proxy-001".into(), record.clone())
                 .record()

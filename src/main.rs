@@ -778,6 +778,10 @@ impl LineEditor {
         self.text.chars().count()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
     pub fn insert(&mut self, input: &str) -> bool {
         let clean: String = input
             .chars()
@@ -4092,6 +4096,9 @@ mod tests {
     fn offline_app() -> App {
         let mut app = App::from_snapshot(Config::default(), CoreSnapshot::default());
         app.screen = Screen::Dashboard;
+        // Nothing listens here, so a worker a test leaves running (a snapshot
+        // poll, say) cannot reach a real core on the default 127.0.0.1:9090.
+        app.config.controller.addr = "127.0.0.1:1".into();
         app
     }
 
