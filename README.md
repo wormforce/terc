@@ -44,6 +44,9 @@
 
 ---
 
+> [!IMPORTANT]
+> **使用声明：** 本软件仅供中国大陆以外地区使用，仅用于学习和研究。
+
 ## 快速开始
 
 **需要：** macOS 14 或更新版本，或 Linux（x86_64 / arm64）、Rust 稳定版，以及 `mihomo` 内核，建议 v1.19.27 或更新（地区组的 `empty-fallback` 从这一版起生效；更旧的内核 terc 会在启动后提示）。macOS 可用 `brew install mihomo`（已装的用 `brew upgrade mihomo` 更新）；两边都可以在设置里下载与本机匹配的官方内核。日常用法见 [使用说明](docs/使用说明.md)。

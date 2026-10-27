@@ -44,6 +44,9 @@
 
 ---
 
+> [!IMPORTANT]
+> **Usage notice:** This software is intended for use outside mainland China only, and solely for learning and research.
+
 ## Quick Start
 
 **Requires:** macOS 14+ or Linux (x86_64 / arm64), Rust stable, and a `mihomo` binary, v1.19.27 or newer recommended (`empty-fallback` on region groups takes effect from that release; terc warns about an older core once it runs). Use `brew install mihomo` on macOS (`brew upgrade mihomo` for an existing one), or the matching official build from inside `terc`. See the [guide](docs/usage.en.md) and the [Chinese manual](docs/使用说明.md).
