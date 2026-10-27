@@ -197,6 +197,9 @@ pub const SIMPLE_RULE_TYPES: &[&str] = &[
 pub const POLICY_TARGETS: &[&str] = &["PROXY", "AI", "AUTO", "DIRECT", "REJECT"];
 
 pub fn terc_dir() -> PathBuf {
+    #[cfg(test)]
+    return crate::test_home().join(".config").join("terc");
+    #[cfg(not(test))]
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))

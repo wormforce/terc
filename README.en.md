@@ -34,7 +34,7 @@
 <br>
 
 <p align="center">
-  <img src="assets/terc-hero.svg" alt="terc interface preview: live traffic graph, proxy controls, policy groups and nodes" width="100%">
+  <img src="assets/terc-hero.png" alt="terc interface preview: live traffic graph, proxy controls, policy groups and nodes" width="100%">
 </p>
 
 <p align="center">
@@ -203,7 +203,7 @@ flowchart LR
 <summary>Project layout</summary>
 
 ```text
-assets/terc-hero.svg           Retro terminal: rounded panels, title cutouts, braille graph
+assets/terc-hero.png           terc interface screenshot: traffic, proxy controls, policy groups and nodes
 src/main.rs                    Event loop, screens, i18n
 src/ui.rs                      Rounded cutout Panel, palettes, Braille/Blocks graph
 src/panels.rs                  Controls, DNS, rules, providers, overlays

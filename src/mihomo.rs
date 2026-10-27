@@ -338,20 +338,29 @@ pub const MAX_DELAY_TIMEOUT_MS: u64 = 32_767;
 /// mark nodes dead in `extra` that the group itself keeps.
 const GROUP_DELAY_TIMEOUT_MS: u64 = 5000;
 
+#[cfg(not(test))]
 const HOMEBREW_CONFIG_DIR: &str = "/opt/homebrew/etc/mihomo";
 
 fn default_config_dir() -> String {
-    if Path::new(HOMEBREW_CONFIG_DIR).join("config.yaml").is_file() {
-        return HOMEBREW_CONFIG_DIR.to_string();
+    #[cfg(test)]
+    return crate::test_home()
+        .join(".config/terc/mihomo")
+        .display()
+        .to_string();
+    #[cfg(not(test))]
+    {
+        if Path::new(HOMEBREW_CONFIG_DIR).join("config.yaml").is_file() {
+            return HOMEBREW_CONFIG_DIR.to_string();
+        }
+        std::env::var_os("HOME")
+            .map(|home| {
+                PathBuf::from(home)
+                    .join(".config/terc/mihomo")
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_else(|| HOMEBREW_CONFIG_DIR.to_string())
     }
-    std::env::var_os("HOME")
-        .map(|home| {
-            PathBuf::from(home)
-                .join(".config/terc/mihomo")
-                .display()
-                .to_string()
-        })
-        .unwrap_or_else(|| HOMEBREW_CONFIG_DIR.to_string())
 }
 
 pub fn config_file_exists(cfg: &ControllerConfig) -> bool {
@@ -404,6 +413,31 @@ pub fn controller_socket_addr(addr: &str) -> io::Result<SocketAddr> {
         .or(found.first())
         .copied()
         .ok_or_else(|| invalid(&"no address"))
+}
+
+/// A core started as this user cannot listen on a privileged controller port:
+/// Mihomo logs "External controller listen error: ... permission denied", then
+/// keeps proxying with no controller, which terc can only report as a stopped
+/// core. The authorized TUN core runs as root and may bind one, so only the
+/// user path checks.
+fn check_controller_bindable(address: SocketAddr) -> Result<(), String> {
+    // Probing every start would race the core for its own port; only a
+    // privileged port can fail for want of permission.
+    if address.port() >= 1024 {
+        return Ok(());
+    }
+    match std::net::TcpListener::bind(address) {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            Err(privileged_controller_error(address))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn privileged_controller_error(address: SocketAddr) -> String {
+    format!(
+        "控制器地址 {address} 是特权端口，普通用户启动的内核无法监听，terc 会一直显示内核未连接 / Controller {address} is a privileged port: a core started as this user cannot listen there, and terc would see the core as stopped. Use a port above 1023 (1024-65535), or start the core as administrator."
+    )
 }
 
 pub fn http_request(
@@ -3653,6 +3687,7 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
         CORE_REFRESHED.with(|cell| cell.set(started.is_ok()));
         return started;
     }
+    check_controller_bindable(address)?;
     let log_path = Path::new(&cfg.config_dir).join("terc-core.log");
     if log_path.is_file() {
         fs::rename(&log_path, log_path.with_file_name("terc-core.previous.log"))
@@ -8885,6 +8920,15 @@ mod download_tests {
             .unwrap();
         child.stdin.take().unwrap().write_all(data).unwrap();
         child.wait_with_output().unwrap().stdout
+    }
+
+    #[test]
+    fn a_privileged_controller_port_says_why_it_cannot_listen() {
+        let text = privileged_controller_error(SocketAddr::from(([127, 0, 0, 1], 1)));
+        assert!(text.contains("127.0.0.1:1"), "{text}");
+        assert!(text.contains("1023"), "{text}");
+        // A port this user can bind never reaches the probe.
+        assert!(check_controller_bindable(SocketAddr::from(([127, 0, 0, 1], 9090))).is_ok());
     }
 
     fn dead_port() -> u16 {

@@ -215,9 +215,12 @@ pub struct Config {
 
 impl Config {
     pub fn path() -> PathBuf {
+        #[cfg(not(test))]
         let base = env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
+        #[cfg(test)]
+        let base = test_home();
         base.join(".config").join("terc").join("config.json")
     }
 
@@ -329,6 +332,19 @@ impl Config {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         crate::mihomo::write_private(path, json.as_bytes()).map_err(|e| e.to_string())
     }
+}
+
+/// Keep tests away from the operator's preferences and source records. Tests
+/// that explicitly set HOME to a temporary directory may still use it.
+#[cfg(test)]
+pub(crate) fn test_home() -> PathBuf {
+    let temp = env::temp_dir();
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        if home.starts_with(&temp) || home.starts_with("/tmp") || home.starts_with("/private/tmp") {
+            return home;
+        }
+    }
+    temp.join(format!("terc-test-home-{}", std::process::id()))
 }
 
 /// Why `Config::load` fell back to defaults.
@@ -629,6 +645,22 @@ mod io_tests {
             *secret
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_preferences_sources_and_core_use_an_isolated_home() {
+        let home = test_home();
+        assert!(Config::path().starts_with(&home));
+        assert!(crate::compose::terc_dir().starts_with(&home));
+        assert!(PathBuf::from(ControllerConfig::default().config_dir).starts_with(&home));
+        if let Some(real_home) = env::var_os("HOME").map(PathBuf::from) {
+            if !real_home.starts_with(env::temp_dir())
+                && !real_home.starts_with("/tmp")
+                && !real_home.starts_with("/private/tmp")
+            {
+                assert_ne!(home, real_home);
+            }
+        }
     }
 
     #[test]

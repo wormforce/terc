@@ -34,7 +34,7 @@
 <br>
 
 <p align="center">
-  <img src="assets/terc-hero.svg" alt="复古终端里的 terc：圆角标题切口、盲文上下行速率图、开关条和节点列表" width="100%">
+  <img src="assets/terc-hero.png" alt="terc 界面：实时速率、内核状态、策略组和节点列表" width="100%">
 </p>
 
 <p align="center">
@@ -213,7 +213,7 @@ flowchart LR
 <summary>项目结构</summary>
 
 ```text
-assets/terc-hero.svg           复古终端画面：圆角面板、标题切口与盲文速率图
+assets/terc-hero.png           terc 界面截图：实时速率、代理控制、策略组和节点列表
 src/main.rs                    事件循环、界面状态与多语言
 src/ui.rs                      圆角镂空 Panel、三套主题、Braille/Blocks 速率图
 src/panels.rs                  开关条、DNS、规则、Provider 与浮层

@@ -223,7 +223,7 @@ fn conns(args: &[String], json: bool) -> i32 {
         })
         .take(limit)
         .collect();
-    rows.sort_by(|a, b| (b.upload + b.download).cmp(&(a.upload + a.download)));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.upload + row.download));
     if json {
         let value: Vec<Value> = rows
             .iter()
