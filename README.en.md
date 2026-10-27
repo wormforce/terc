@@ -152,6 +152,25 @@ Logs: `P` pauses/resumes display while capture continues, `/` searches, and Ente
 
 Best-node selection compares selectable proxy nodes in the current Selector, url-test or fallback group; url-test / fallback groups are judged by their own test URL and expected status, and the result takes effect as a pin. Country hints come from the connected node’s flag, country name, or standalone country code, not IP geolocation. Unknown country or no reachable candidate leaves the current connection unchanged.
 
+## CLI (scripts and agents)
+
+Running `terc` with no arguments still opens the TUI. Subcommands talk to the controller directly, independent of a running TUI, and every command accepts `--json` for scripts and agents.
+
+| Command | Purpose |
+| --- | --- |
+| `terc status` | Core state, version, mode, ports, system proxy, TUN, connections, totals |
+| `terc proxies` | Groups, current node, pin state and node counts |
+| `terc conns --limit 20 --grep Safari` | Active connections sorted by bytes, filtered by host/process/rule |
+| `terc use <group> <node> [--pin]` | Select a node; `--pin` for url-test / fallback |
+| `terc mode rule\|global\|direct` | Switch routing mode |
+| `terc test <group>` | Concurrent delay test for a group |
+| `terc dns <name> [--type A]` | Resolve through the core |
+| `terc explain <target>` | Explain which rule wins and which earlier rules were skipped |
+| `terc sysproxy on\|off [--yes]` | Toggle the system proxy; `on` requires `--yes` |
+| `terc notify-test` | Check the desktop notification backend |
+
+Read-only commands are safe by default. `sysproxy on` changes how the whole machine reaches the network and therefore requires an explicit `--yes`; it is never enabled automatically in an agent session.
+
 ## Configuration
 
 Open **Settings** with <kbd>s</kbd>. UI preferences save to `~/.config/terc/config.json`; proxy settings are written to the core configuration. The interface supports **中文 / English / 日本語**.
@@ -162,7 +181,7 @@ Open **Settings** with <kbd>s</kbd>. UI preferences save to `~/.config/terc/conf
 | **Diagnostics** | Download `mihomo-darwin-arm64`, `darwin-amd64-v1`, `linux-arm64`, or `linux-amd64-v1` into `~/.config/terc/core/mihomo`; DNS, rules, providers, snippets, probe, runtime, logs, core log level, live connection stream |
 | **Snippets** | Built-in YAML overlays, plus any file in `~/.config/terc/modules`. Enabling recursively merges mappings; disabling restores the source. Mihomo validates candidates before applying |
 | **Appearance** | Palette theme (`Spring` / `Vintage` / `Mono`), rate graph style (`Braille` / `Blocks`), UI refresh rate (`15` / `30` / `60` / `120 Hz`, a redraw cap; an unchanged screen is not redrawn), graph interval (`1000–86400000 ms`, arrows adjust by `100 ms`, Enter accepts a typed value; averaged rates, clears history on change), UI language |
-| **Sources & routing** | Independent node sources and routing plans, per-source assignments, reusable policies, validation before applying. Custom rule and AI preset editing is paused |
+| **Sources & routing** | Independent node sources and routing plans, per-source assignments, reusable policies, validation before applying. Manual overrides match first and survive updates; custom routing and AI presets remain paused |
 | **Proxy settings** | Mixed / HTTP / SOCKS ports, LAN access, TUN, DNS, IPv6, test URL and timeout; advanced tools live under Diagnostics |
 
 The graph interval is set in milliseconds. Mihomo normally supplies one traffic sample per second, so the minimum is 1000 ms.

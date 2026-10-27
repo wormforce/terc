@@ -117,6 +117,24 @@ pub fn list(active: &str) -> Vec<ProfileEntry> {
     result.sort_by(|a, b| a.name.cmp(&b.name));
     result
 }
+
+/// Permanently removes an inactive source and its cached data.
+pub fn remove(id: &str, active: &str) -> Result<(), String> {
+    if id == active {
+        return Err("Switch to another proxy before deleting the active profile".into());
+    }
+    let mut components = Path::new(id).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err("Invalid profile ID".into());
+    }
+    let dir = root().join(id);
+    if !dir.join("source.json").is_file() {
+        return Err("Profile no longer exists".into());
+    }
+    fs::remove_dir_all(dir).map_err(|e| format!("Could not delete profile: {e}"))
+}
 /// Returns the legacy node lines that could not be parsed; they stay on disk.
 fn import_old(
     old: &Path,
@@ -205,6 +223,25 @@ fn import_old(
 /// Returns notes about skipped lines and profiles; a broken legacy profile is
 /// reported and left in place rather than blocking the others or startup.
 pub fn migrate(cfg: &mut Config) -> Result<Vec<String>, String> {
+    // A newly selected core must not inherit the legacy imported-001 source
+    // of a different core. Give it its own source based on its own file.
+    if !cfg.core_instances.is_empty() && cfg.controller.profile_id.is_empty() {
+        let name = cfg
+            .core_instances
+            .iter()
+            .find(|e| {
+                e.controller.addr == cfg.controller.addr
+                    && e.controller.config_dir == cfg.controller.config_dir
+                    && e.controller.secret == cfg.controller.secret
+            })
+            .map(|e| e.name.as_str())
+            .unwrap_or("Core");
+        bind_core_source(&root(), &mut cfg.controller, name)?;
+        cfg.active_profile = cfg.controller.profile_id.clone();
+        cfg.active_profile_label = name.to_string();
+        cfg.save()?;
+        return Ok(Vec::new());
+    }
     let mut notes = Vec::new();
     let mut note = |id: &str, result: Result<Vec<String>, String>| match result {
         Ok(skipped) => notes.extend(skipped),
@@ -295,9 +332,65 @@ pub fn migrate(cfg: &mut Config) -> Result<Vec<String>, String> {
     Ok(notes)
 }
 
+fn bind_core_source(
+    root: &Path,
+    controller: &mut crate::mihomo::ControllerConfig,
+    name: &str,
+) -> Result<(), String> {
+    let mut n = 1;
+    while root.join(format!("proxy-{n:03}")).exists() {
+        n += 1;
+    }
+    let id = format!("proxy-{n:03}");
+    let target = root.join(&id);
+    let doc = crate::mihomo::read_config_text(controller)
+        .ok()
+        .map(|text| crate::ops::strip_marked_modules(&text))
+        .filter(|text| crate::ops::has_subscription_source(text));
+    if let Some(text) = &doc {
+        compose::write_private(&target.join("subscription.yaml"), text)?;
+    }
+    let source = ProfileSource {
+        name: name.to_string(),
+        subscription_url: controller.subscription_url.clone(),
+        kind: if doc.is_some() { "imported" } else { "proxy" }.into(),
+        ..ProfileSource::default()
+    };
+    source.save(&target)?;
+    controller.profile_id = id;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_cores_import_their_own_source_without_touching_existing_data() {
+        let temp = std::env::temp_dir().join(format!("terc-core-source-{}", std::process::id()));
+        let root = temp.join("sources");
+        let core = temp.join("core");
+        fs::create_dir_all(root.join("proxy-001")).unwrap();
+        fs::create_dir_all(&core).unwrap();
+        fs::write(root.join("proxy-001/subscription.yaml"), "old source").unwrap();
+        let yaml = "proxies:\n  - {name: xkp, type: direct}\nrules:\n  - MATCH,DIRECT\n";
+        fs::write(core.join("config.yaml"), yaml).unwrap();
+        let mut cfg = crate::mihomo::ControllerConfig {
+            config_dir: core.display().to_string(),
+            ..Default::default()
+        };
+        bind_core_source(&root, &mut cfg, "xkp").unwrap();
+        assert_eq!(cfg.profile_id, "proxy-002");
+        assert_eq!(
+            fs::read_to_string(root.join("proxy-001/subscription.yaml")).unwrap(),
+            "old source"
+        );
+        assert_eq!(fs::read_to_string(core.join("config.yaml")).unwrap(), yaml);
+        assert!(fs::read_to_string(root.join("proxy-002/subscription.yaml"))
+            .unwrap()
+            .contains("name: xkp"));
+        assert_eq!(ProfileSource::load(&root.join("proxy-002")).name, "xkp");
+        fs::remove_dir_all(temp).unwrap();
+    }
     #[test]
     fn display_names_only_replace_legacy_placeholders() {
         assert_eq!(

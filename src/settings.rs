@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingId {
     Core,
+    CoreInstances,
     SystemProxy,
     Mode,
     Download,
@@ -31,6 +32,7 @@ pub enum SettingId {
     Timeout,
     Traffic,
     Toolbar,
+    Notifications,
     ConnStream,
     Modules,
     Probe,
@@ -65,6 +67,8 @@ impl App {
             "启动或停止当前内核。启动失败时请查看设置 → 排查 → 日志。",
             "Start or stop the core. Startup errors appear under Diagnostics → Logs.",
         );
+        add(CoreInstances, C::Core, "内核实例", "Core instances", self.config.controller.addr.clone(),
+            "选择并检查控制器地址、密钥和配置目录；切换后重新运行 terc。", "Select and check a controller address, secret and configuration directory; restart terc after switching.");
         add(
             SystemProxy,
             C::Core,
@@ -251,8 +255,8 @@ impl App {
             "内核日志级别",
             "Core log level",
             self.core_setting("log-level", "info"),
-            "内核自己写出的日志（terc 启动时为 terc-core.log）。新生成的配置默认 warning；日志页始终按 info 订阅，不受影响。排查时可临时切换 debug。",
-            "What the core writes itself (terc-core.log when terc starts it). New configs use warning; the Logs view always subscribes at info. Switch to debug while investigating.",
+            "内核输出写入 terc-core.log；terc 的启停、TUN 与退出记录在 terc-events.log。新生成的配置默认 warning；排查时可临时切换 debug。",
+            "Core output goes to terc-core.log; terc start, stop, TUN and exit events go to terc-events.log. New configs use warning; switch to debug while investigating.",
         );
         add(
             TestUrl,
@@ -271,6 +275,15 @@ impl App {
             format!("{} ms", self.config.controller.timeout_ms),
             "Enter 输入 500–32767 毫秒（Mihomo 测速接口的上限）。URLTest / Fallback 组按组自己的 timeout（默认 5000）测速；测速地址与某个这类组相同时，也按该组的超时与期望状态码，免得把组仍在用的节点记成失效。",
             "Enter a timeout from 500 to 32767 milliseconds, the limit of Mihomo's delay route. URLTest / Fallback groups test with their own timeout (5000 by default); when the test URL is one such a group checks, tests use that group's timeout and expected status, so they never mark dead a node the group still uses.",
+        );
+        add(
+            Notifications,
+            C::Appearance,
+            "系统通知",
+            "Desktop notifications",
+            on(self.config.settings.notifications),
+            "内核、TUN、订阅、配置等关键错误通过系统通知提醒；应用内提示仍然保留。",
+            "Notify on key errors (core, TUN, subscription, config); in-app toasts stay.",
         );
         add(
             Traffic,
@@ -314,7 +327,7 @@ impl App {
             (Providers, "远程资源", "Providers"),
             (Logs, "日志", "Logs"),
         ] {
-            add(id,C::Diagnostics,zh,en,action.clone(),"Enter 打开。自有规则编辑已暂停；规则浏览以当前内核实际生效的顺序为准。","Enter to open. Custom rule editing is paused; rule browsing follows the core's effective order.");
+            add(id,C::Diagnostics,zh,en,action.clone(),"Enter 打开。规则浏览以当前内核实际生效的顺序为准；手动规则在订阅与分流中管理。","Enter to open. Rules follow the core's effective order; manage manual overrides under Sources & Routing.");
         }
         if let Some(input) = &self.setting_input {
             if let Some(row) = rows.get_mut(self.setting_index) {
@@ -337,6 +350,7 @@ impl App {
         let id = self.settings_rows()[self.setting_index].id;
         match id {
             Core => self.toggle_core_service(),
+            CoreInstances => crate::instances::open(self),
             SystemProxy => self.toggle_sysproxy(),
             Mode => self.cycle_routing_mode(),
             Download => self.download_core(),
@@ -424,6 +438,10 @@ impl App {
             }
             Toolbar => {
                 self.config.settings.show_toolbar = !self.config.settings.show_toolbar;
+                self.save_preferences();
+            }
+            Notifications => {
+                self.config.settings.notifications = !self.config.settings.notifications;
                 self.save_preferences();
             }
             ConnStream => {

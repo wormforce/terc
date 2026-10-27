@@ -394,7 +394,7 @@ pub fn draw_connections(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let now_ms = crate::conns::now_ms();
     let lang = app.lang();
-    let (base, suffix) = if app.conn_closed_view {
+    let (base, mut suffix) = if app.conn_closed_view {
         (
             app.t("conn_closed_title"),
             format!(" ({})  d", app.conns.closed().len()),
@@ -415,6 +415,13 @@ pub fn draw_connections(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
         )
     };
+    if !app.conn_query.text.trim().is_empty() {
+        suffix.push_str(&format!(
+            "  /{}{}",
+            app.conn_query.text.trim(),
+            if app.conn_editing { "▏" } else { "" }
+        ));
+    }
     let mut title = module_title_line(theme, lang, 'c', base, base);
     title.spans.push(Span::styled(
         suffix,
@@ -644,12 +651,15 @@ pub fn draw_connections(frame: &mut Frame, app: &mut App, area: Rect) {
 pub fn draw_overlay(frame: &mut Frame, app: &App, area: Rect) {
     match app.overlay {
         Overlay::None => {}
+        Overlay::CoreInstances => crate::instances::draw(frame, app, area),
         Overlay::Modules => draw_modules(frame, app, area),
         Overlay::Probe => draw_probe(frame, app, area),
         Overlay::Runtime => draw_runtime(frame, app, area),
         Overlay::Best => draw_best(frame, app, area),
         Overlay::OwnNodes => crate::manage::draw_own_nodes(frame, app, area),
         Overlay::PrivateRules => crate::manage::draw_private_rules(frame, app, area),
+        Overlay::Palette => draw_palette(frame, app, area),
+        Overlay::Talkers => draw_talkers(frame, app, area),
     }
 }
 
@@ -783,7 +793,20 @@ fn draw_dns_query(frame: &mut Frame, app: &App, area: Rect) {
     if inner.height < 1 {
         return;
     }
-    let input = Rect::new(inner.x, inner.y, inner.width, 1);
+    let log_h = if app.dns_log.is_empty() {
+        0
+    } else {
+        (app.dns_log.len().min(8) + 1) as u16
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(log_h),
+        ])
+        .split(inner);
+    let input = rows[0];
     let chars = app.dns_editor.chars();
     frame.render_widget(
         Paragraph::new(Line::from(editor_line_spans(
@@ -799,33 +822,54 @@ fn draw_dns_query(frame: &mut Frame, app: &App, area: Rect) {
             frame.set_cursor_position(cell);
         }
     }
-    if inner.height > 1 {
-        let style = Style::default().fg(if app.dns_error {
-            theme.accent
-        } else {
-            theme.text
-        });
-        let lines: Vec<Line> = if app.dns_lines.is_empty() {
-            vec![Line::styled(
-                "e    Enter    F    [ ]",
-                Style::default().fg(theme.muted),
-            )]
-        } else {
-            app.dns_lines
-                .iter()
-                .cloned()
-                .map(|line| Line::styled(line, style))
-                .collect()
-        };
-        frame.render_widget(
-            Paragraph::new(lines),
-            Rect::new(
-                inner.x,
-                inner.y + 1,
-                inner.width,
-                inner.height.saturating_sub(1),
-            ),
-        );
+    let style = Style::default().fg(if app.dns_error {
+        theme.accent
+    } else {
+        theme.text
+    });
+    let lines: Vec<Line> = if app.dns_lines.is_empty() {
+        vec![Line::styled(
+            "e    Enter    F    [ ]",
+            Style::default().fg(theme.muted),
+        )]
+    } else {
+        app.dns_lines
+            .iter()
+            .cloned()
+            .map(|line| Line::styled(line, style))
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines), rows[1]);
+    if log_h > 0 {
+        let width = rows[2].width as usize;
+        let mut out = Vec::with_capacity(log_h as usize);
+        out.push(Line::styled(
+            if app.lang() == crate::Lang::Zh {
+                "查询记录"
+            } else {
+                "History"
+            },
+            Style::default().fg(theme.muted),
+        ));
+        for entry in app.dns_log.iter().rev().take(8) {
+            let line = format!(
+                "{}  {:<4} {:<26} {:>5} ms  {}",
+                entry.at,
+                entry.qtype,
+                truncate_str(&entry.name, 26),
+                entry.ms,
+                truncate_str(&entry.summary, width.saturating_sub(48)),
+            );
+            out.push(Line::styled(
+                line,
+                Style::default().fg(if entry.is_error {
+                    theme.accent
+                } else {
+                    theme.text
+                }),
+            ));
+        }
+        frame.render_widget(Paragraph::new(out), rows[2]);
     }
 }
 
@@ -1359,27 +1403,80 @@ fn draw_runtime(frame: &mut Frame, app: &App, area: Rect) {
 
 fn explain_lines(app: &App, report: &crate::ops::ExplainReport) -> Vec<Line<'static>> {
     let theme = app.theme();
+    let zh = app.lang() == crate::Lang::Zh;
     let mut lines = Vec::new();
+    let target = if report.host.is_empty() {
+        report.target.clone()
+    } else {
+        format!("{}  ({})", report.host, report.target)
+    };
+    lines.push(Line::styled(
+        format!("{}  {target}", app.t("explain_target")),
+        Style::default().fg(theme.muted),
+    ));
     if let Some(hit) = &report.matched {
+        let hits = app
+            .snapshot
+            .rules
+            .iter()
+            .find(|rule| rule.index == hit.index)
+            .map(|rule| rule.hit_count)
+            .unwrap_or(0);
         lines.push(Line::styled(
             format!(
-                "{}  #{}  {}  {}  →  {}",
+                "{}  #{}  {}  {}  →  {}   {} {}",
                 app.t("explain_match"),
-                hit.index,
+                hit.index + 1,
                 hit.kind,
-                truncate_str(&hit.payload, 32),
-                hit.proxy
+                truncate_str(&hit.payload, 28),
+                hit.proxy,
+                hits,
+                if zh { "次命中" } else { "hits" }
             ),
             Style::default().fg(theme.peak).add_modifier(Modifier::BOLD),
         ));
+        if let Some(group) = app.snapshot.groups.iter().find(|g| g.name == hit.proxy) {
+            let node = if group.now.is_empty() {
+                &group.fixed
+            } else {
+                &group.now
+            };
+            let delay = app
+                .snapshot
+                .nodes
+                .get(node)
+                .and_then(|n| n.delay)
+                .map(|ms| format!("{ms} ms"))
+                .unwrap_or_else(|| "—".into());
+            lines.push(Line::styled(
+                format!(
+                    "{}  {} → {}  {delay}",
+                    app.t("explain_chain"),
+                    hit.proxy,
+                    node
+                ),
+                Style::default().fg(theme.text),
+            ));
+        }
         if report.partial {
             lines.push(Line::styled(
                 app.t("explain_partial"),
                 Style::default().fg(theme.accent),
             ));
-        } else if let Some(note) = report.uncertain.first() {
+        }
+        for note in report.uncertain.iter().take(2) {
+            if note.reason.is_empty() {
+                continue;
+            }
             lines.push(Line::styled(
-                format!("{} {}", note.kind, note.reason),
+                format!(
+                    "{}  #{}  {}  {}  — {}",
+                    app.t("explain_skip"),
+                    note.index + 1,
+                    note.kind,
+                    truncate_str(&note.payload, 24),
+                    note.reason
+                ),
                 Style::default().fg(theme.muted),
             ));
         }
@@ -1391,6 +1488,22 @@ fn explain_lines(app: &App, report: &crate::ops::ExplainReport) -> Vec<Line<'sta
         if report.partial {
             lines.push(Line::styled(
                 app.t("explain_partial"),
+                Style::default().fg(theme.muted),
+            ));
+        }
+        for note in report.uncertain.iter().take(3) {
+            if note.reason.is_empty() {
+                continue;
+            }
+            lines.push(Line::styled(
+                format!(
+                    "{}  #{}  {}  {}  — {}",
+                    app.t("explain_skip"),
+                    note.index + 1,
+                    note.kind,
+                    truncate_str(&note.payload, 24),
+                    note.reason
+                ),
                 Style::default().fg(theme.muted),
             ));
         }
@@ -1437,4 +1550,203 @@ fn translated(app: &App, id: &str, desc: bool) -> Option<String> {
     } else {
         Some(text.to_string())
     }
+}
+
+fn draw_palette(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let popup = centered_rect(66, 62, area);
+    frame.render_widget(Clear, popup);
+    let title = if app.lang() == crate::Lang::Zh {
+        "命令面板"
+    } else {
+        "Command palette"
+    };
+    let inner = draw_panel(
+        frame,
+        popup,
+        theme,
+        Some(panel_title(title.to_string(), theme)),
+        true,
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            if app.lang() == crate::Lang::Zh {
+                "输入以过滤，Enter 执行，Esc 关闭".to_string()
+            } else {
+                "Type to filter · Enter to run · Esc to close".to_string()
+            },
+            Style::default().fg(theme.muted),
+        )),
+        rows[0],
+    );
+
+    let input = draw_panel(
+        frame,
+        rows[1],
+        theme,
+        Some(panel_title(
+            if app.lang() == crate::Lang::Zh {
+                "搜索"
+            } else {
+                "Search"
+            }
+            .to_string(),
+            theme,
+        )),
+        true,
+    );
+    let text_area = Rect::new(input.x + 1, input.y, input.width.saturating_sub(2), 1);
+    let chars = app.palette_query.chars();
+    if text_area.width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(editor_line_spans(
+                &chars,
+                app.palette_query.cursor,
+                theme,
+                text_area.width as usize,
+            ))),
+            text_area,
+        );
+        if let Some(cell) = editor_cursor_cell(&chars, app.palette_query.cursor, text_area) {
+            frame.set_cursor_position(cell);
+        }
+    }
+
+    let list = crate::palette::filtered(app);
+    let visible = rows[2].height as usize;
+    let start = app.palette_index.saturating_sub(visible.saturating_sub(1));
+    let mut lines = Vec::new();
+    if list.is_empty() {
+        lines.push(Line::styled(
+            if app.lang() == crate::Lang::Zh {
+                "没有匹配的命令"
+            } else {
+                "No matching command"
+            },
+            Style::default().fg(theme.muted),
+        ));
+    } else {
+        for (i, item) in list.iter().enumerate().skip(start).take(visible) {
+            let selected = i == app.palette_index;
+            let marker = if selected { "▸ " } else { "  " };
+            let hint = if item.hint.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", item.hint)
+            };
+            let style = if selected {
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            lines.push(Line::styled(format!("{marker}{}{hint}", item.label), style));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), rows[2]);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!(
+                "{} · {}",
+                if app.lang() == crate::Lang::Zh {
+                    "命令"
+                } else {
+                    "Command"
+                },
+                list.len()
+            ),
+            Style::default().fg(theme.muted),
+        )),
+        rows[3],
+    );
+}
+
+fn draw_talkers(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let popup = centered_rect(80, 72, area);
+    frame.render_widget(Clear, popup);
+    let zh = app.lang() == crate::Lang::Zh;
+    let title = if zh { "流量排行" } else { "Top talkers" };
+    let inner = draw_panel(
+        frame,
+        popup,
+        theme,
+        Some(panel_title(title.to_string(), theme)),
+        true,
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!(
+                "{} · {} · g {} · o {}",
+                if zh { "分组" } else { "Group" },
+                app.talker_group.label(zh),
+                if zh { "切换" } else { "cycle" },
+                if zh { "排序" } else { "sort" },
+            ),
+            Style::default().fg(theme.muted),
+        )),
+        rows[0],
+    );
+    let list =
+        crate::talkers::aggregate(&app.snapshot.connections, app.talker_group, app.talker_sort);
+    let visible = rows[1].height.saturating_sub(2) as usize;
+    let start = app.talker_index.saturating_sub(visible.saturating_sub(1));
+    let mut lines = Vec::new();
+    lines.push(Line::styled(
+        format!(
+            "{:<32}{:>5}{:>14}{:>12}",
+            if zh { "名称" } else { "Name" },
+            if zh { "连接" } else { "Conns" },
+            if zh { "下行/上行" } else { "Down/Up" },
+            if zh { "速率" } else { "Rate" },
+        ),
+        Style::default().fg(theme.muted),
+    ));
+    if list.is_empty() {
+        lines.push(Line::styled(
+            if zh {
+                "暂无活跃连接"
+            } else {
+                "No active connections"
+            },
+            Style::default().fg(theme.muted),
+        ));
+    } else {
+        for (i, t) in list.iter().enumerate().skip(start).take(visible) {
+            let selected = i == app.talker_index;
+            let marker = if selected { "▸ " } else { "  " };
+            let name = crate::ui::truncate_str(&t.name, 29);
+            let line = format!(
+                "{marker}{name:<30}{:>5}{:>7}/{:<6}{:>12}",
+                t.count,
+                crate::ui::format_bytes(t.down),
+                crate::ui::format_bytes(t.up),
+                crate::ui::format_rate(t.total_rate()),
+            );
+            let style = if selected {
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            lines.push(Line::styled(line, style));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), rows[1]);
 }

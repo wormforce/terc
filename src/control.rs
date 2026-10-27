@@ -4,7 +4,11 @@
 //! changes rewrite `config.yaml` and hot-reload, because those fields are
 //! not partial-update keys. Nothing here touches the macOS system proxy.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use crate::{
     mihomo::{
@@ -550,7 +554,18 @@ impl App {
         self.probe_lines = vec![format!("{} {raw}", self.t("st_probe_busy"))];
         self.probe_error = false;
         self.replies_owed += 1;
-        probe_async(self.config.controller.clone(), node, raw, self.tx.clone());
+        let proxy_port = if self.snapshot.mixed_port > 0 {
+            self.snapshot.mixed_port
+        } else {
+            self.snapshot.http_port
+        };
+        probe_async(
+            self.config.controller.clone(),
+            node,
+            raw,
+            proxy_port,
+            self.tx.clone(),
+        );
     }
 
     pub fn open_runtime(&mut self) {
@@ -740,6 +755,62 @@ impl App {
         }
     }
 
+    pub fn delete_selected_profile(&mut self) {
+        if self.action_busy {
+            self.set_status("请等待当前操作完成 / Wait for the current operation", true);
+            return;
+        }
+        let Some(profile) = self.profiles.get(self.profile_index).cloned() else {
+            return;
+        };
+        if profile.active || profile.name == self.config.controller.profile_id {
+            self.pending_profile_delete = None;
+            let message = crate::manage::l3(
+                self,
+                "当前正在使用这个代理。先切换到其他代理，再删除它。",
+                "Switch to another proxy before deleting the active profile.",
+                "使用中のプロファイルです。先に別のプロファイルへ切り替えてください。",
+            );
+            self.set_status(message, true);
+            return;
+        }
+        let confirmed = self
+            .pending_profile_delete
+            .as_ref()
+            .is_some_and(|(id, at)| id == &profile.name && at.elapsed() <= Duration::from_secs(4));
+        if !confirmed {
+            self.pending_profile_delete = Some((profile.name.clone(), Instant::now()));
+            let text = match self.lang() {
+                crate::Lang::Zh => format!("再按 d 永久删除「{}」及其缓存", profile.label),
+                crate::Lang::En => {
+                    format!(
+                        "Press d again to permanently delete {} and its cached data",
+                        profile.label
+                    )
+                }
+                crate::Lang::Ja => format!(
+                    "d をもう一度押すと「{}」とキャッシュを削除します",
+                    profile.label
+                ),
+            };
+            self.set_status(&text, false);
+            return;
+        }
+        self.pending_profile_delete = None;
+        match crate::storage::remove(&profile.name, &self.config.controller.profile_id) {
+            Ok(()) => {
+                self.open_profiles();
+                let text = match self.lang() {
+                    crate::Lang::Zh => format!("已删除代理「{}」", profile.label),
+                    crate::Lang::En => format!("Deleted proxy {}", profile.label),
+                    crate::Lang::Ja => format!("「{}」を削除しました", profile.label),
+                };
+                self.set_status(&text, false);
+            }
+            Err(err) => self.set_status(&err, true),
+        }
+    }
+
     pub fn import_profile(&mut self, text: &str) {
         let is_url = text.starts_with("https://") || text.starts_with("http://");
         let mut record = crate::compose::ProfileSource {
@@ -845,6 +916,20 @@ impl App {
                 "info"
             };
             let entry = (level.to_string(), line.to_string());
+            if !self.logs.contains(&entry) {
+                self.logs.push(entry);
+            }
+        }
+        for line in crate::diagnostics::excerpt(&self.config.controller).lines() {
+            let level = if line.contains("core-down-observed")
+                || line.contains("start-failed")
+                || line.contains("change-failed")
+            {
+                "warning"
+            } else {
+                "info"
+            };
+            let entry = (level.to_string(), format!("terc: {line}"));
             if !self.logs.contains(&entry) {
                 self.logs.push(entry);
             }

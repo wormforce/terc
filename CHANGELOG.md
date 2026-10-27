@@ -6,6 +6,22 @@ All notable changes to terc. 中文在前，English follows each section.
 
 ### 中文
 
+**新增**
+
+- 内核实例列表：分别保存控制器地址、密钥、配置目录和代理来源；支持连接检查及实例切换。
+- 增量手动规则：优先于所选分流方案匹配，更新订阅和切换方案后保留。
+- 命令面板：按 `:` 或 `Ctrl+P`，搜索并执行切页、系统代理、分流模式、TUN、测速、优选、刷新与退出。
+- 连接页按 `t` 打开流量排行：按域名、进程或策略聚合，`g` 切换分组，`o` 切换总量/速率排序。
+- 桌面通知：内核、TUN、订阅、配置等关键错误会发 macOS（`osascript`）或 Linux（`notify-send`）通知，可在 设置 → 外观 关闭。
+- 探测升级为分阶段计时：DNS（内核解析耗时）、TCP、TLS、TTFB、总耗时，经由运行中的代理测量；仍保留节点延迟测试。
+- 规则解释更完整：目标、命中规则与命中次数、策略组→当前节点→延迟，以及被跳过的前序规则和原因。
+- 连接页支持 `/` 搜索主机/进程/规则/链路；详情里按 `e` 用该连接目标打开规则解释。
+- DNS 查询显示耗时，并保留最近 32 条查询记录（时间、类型、名称、耗时、结果）。
+
+
+**新增**
+
+- 新增非交互 CLI：`terc status / proxies / conns / use / mode / test / dns / explain / sysproxy / notify-test`，全部支持 `--json`，供脚本与 agent 使用；`sysproxy on` 必须显式 `--yes`。
 **变更**
 
 - 空闲时（3 秒内没有按键或点击），流量、内存和连接数最多晚约 1 秒显示。按键和点击照常立即重绘；正在等待的结果（操作及其后的快照、刷新、测速、DNS 查询、provider 更新、内核下载）也照常每 50 ms 检查一次。
@@ -20,10 +36,29 @@ All notable changes to terc. 中文在前，English follows each section.
 
 **修复**
 
+- 保留用户明确设置的空控制器密钥；多实例切换时为新内核隔离代理来源。
+- 内核启停和 TUN 事件增加诊断日志；探测短暂失败时不再立即显示内核停止。
+- 代理订阅支持删除，并通过二次确认防止误操作。
 - 规则集的 payload 里引用自己（或互相引用成环）时，分流提示不再无限递归、栈溢出崩溃。
 
 ### English
 
+**Added**
+
+- Core instance list: keep controller address, secret, configuration directory and proxy source per instance; check connections and switch explicitly.
+- Additive manual rules match before the selected routing plan and survive subscription updates and plan changes.
+- Command palette on `:` or `Ctrl+P`: search and run tab switches, system proxy, routing mode, TUN, delay tests, best-node selection, refresh and quit.
+- `t` on the Connections tab opens top talkers: aggregate by domain, process or policy; `g` cycles groups and `o` cycles total/rate sorting.
+- Desktop notifications for key errors (core, TUN, subscription, config) on macOS (`osascript`) and Linux (`notify-send`), with a toggle under Settings → Appearance.
+- Probe now reports staged timings through the running proxy: DNS (core lookup), TCP, TLS, TTFB and total, alongside the existing node delay test.
+- Rule explanations now include the target, matched rule and hit count, policy group → current node → delay, and the earlier rules that were skipped and why.
+- Connections gain `/` search over host, process, rule and chain; `e` in the detail view explains rules for that connection's target.
+- DNS queries show their latency and keep the last 32 lookups (time, type, name, latency, result).
+
+
+**Added**
+
+- Non-interactive CLI: `terc status / proxies / conns / use / mode / test / dns / explain / sysproxy / notify-test`, all with `--json` for scripts and agents; `sysproxy on` requires an explicit `--yes`.
 **Changed**
 
 - While idle (no key or click for 3 s), traffic, memory and connection counts can show up to about 1 s late. Keys and clicks still repaint at once, and results being waited for (an action and its snapshot, a refresh, delay tests, DNS lookups, provider updates, the core download) are still checked every 50 ms.
@@ -38,6 +73,9 @@ All notable changes to terc. 中文在前，English follows each section.
 
 **Fixed**
 
+- Preserve an explicitly empty controller secret and isolate the source of a newly selected core.
+- Record core lifecycle and TUN events; a brief failed probe no longer immediately marks the core stopped.
+- Allow proxy subscriptions to be deleted with a second confirmation.
 - A rule set whose payload refers back to itself, directly or through a cycle, no longer sends the routing hint into unbounded recursion and a stack-overflow crash.
 
 ## v0.2.0

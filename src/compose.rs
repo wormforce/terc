@@ -378,11 +378,12 @@ impl PrivateRules {
         let b = |v: bool| if v { "true" } else { "false" };
         let mut text = String::from(
             "# terc 私有规则 / private rules\n\
-             # 在 terc 里按 R 管理，也可以直接编辑本文件，保存后在 terc 里按 R 再按 Enter 应用。\n\
-             # Edit in terc with R, or by hand; then press R, Enter in terc to apply.\n\
+             # 在 设置 → 订阅与分流 按 r 管理手动规则；手动编辑后在该窗口按 Enter 应用。\n\
+             # In Settings → Sources & Routing press r for manual rules; Enter reapplies file edits.\n\
              #\n\
              # [rules] 每行一条 TYPE,VALUE,TARGET[,no-resolve]，从上到下优先匹配。\n\
-             # TARGET: PROXY（主选择组） AI（AI 组） AUTO（自动测速） DIRECT REJECT，或任意节点名/策略组名。\n\
+             # TARGET: DIRECT REJECT，或当前分流中的节点名/策略组名。\n\
+             # 手动规则优先于所选分流，更新订阅时保留；下面的 AI 与 options 设置已暂停。\n\
              # [ai] members 用 | 分隔节点或策略组名；留空 = 按 filter 自动挑选（默认美/日/新/台，排除香港）。\n\n",
         );
         text.push_str("[ai]\n");
@@ -624,7 +625,7 @@ impl ComposeReport {
             (false, false) => "Source routing preserved",
             (false, true) => "Routing plan applied",
         };
-        if zh {
+        let mut text = if zh {
             format!(
                 "来源 {fmt} {} 节点  手动 {}  {routing}",
                 self.sub_nodes, self.manual_nodes
@@ -634,7 +635,15 @@ impl ComposeReport {
                 "{fmt} {} nodes  Manual {}  {routing}",
                 self.sub_nodes, self.manual_nodes
             )
+        };
+        if self.private_rules > 0 {
+            text.push_str(&if zh {
+                format!("  手动规则 {}", self.private_rules)
+            } else {
+                format!("  Manual rules {}", self.private_rules)
+            });
         }
+        text
     }
 
     /// Short counts of what `details` lists; kept brief for the toast.
@@ -2565,8 +2574,8 @@ pub fn compose(input: &ComposeInput) -> Result<(String, ComposeReport), String> 
         &["proxy-groups", "rules", "rule-providers", "sub-rules"]
     };
     chunks.retain(|c| {
-        !c.key.as_deref().is_some_and(|k| drop_keys.contains(&k))
-            && !(c.key.is_none()
+        !(c.key.as_deref().is_some_and(|k| drop_keys.contains(&k))
+            || c.key.is_none()
                 && c.lines
                     .iter()
                     .all(|l| l.trim().is_empty() || l.starts_with("# terc-generated")))
@@ -3814,6 +3823,88 @@ mod tests {
 
 /// Preserve the source's routing policy. Node-only sources get one simple selector.
 /// This is the only composition path exposed while custom routing is paused.
+/// Add global manual overrides after choosing a routing plan. Never rewrite
+/// the subscription cache or import the retired AI / China-direct presets.
+pub fn prepend_manual_rules(doc: &str, rules: &[String]) -> Result<String, String> {
+    if rules.is_empty() {
+        return Ok(doc.to_string());
+    }
+    let mut chunks = split_chunks(doc);
+    let mut targets: HashSet<String> = [
+        "DIRECT",
+        "REJECT",
+        "REJECT-DROP",
+        "PASS",
+        "COMPATIBLE",
+        "GLOBAL",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    for chunk in &chunks {
+        if matches!(chunk.key.as_deref(), Some("proxies" | "proxy-groups")) {
+            targets.extend(clash_item_names(chunk));
+        }
+    }
+    for rule in rules {
+        if rule.split(',').count() < 3 || rule.starts_with("MATCH,") {
+            return Err(format!(
+                "rules.conf: 无效的手动规则 / Invalid manual rule: {rule}"
+            ));
+        }
+        let target = rule_target(rule);
+        if !targets.contains(&target) {
+            return Err(format!(
+                "rules.conf: 目标不存在于当前分流 / Target missing from current routing: {target}"
+            ));
+        }
+    }
+    let pos = match chunks.iter().rposition(|c| chunk_is(c, "rules")) {
+        Some(pos) => pos,
+        None => {
+            chunks.push(YamlChunk {
+                key: Some("rules".into()),
+                lines: vec!["rules:".into()],
+            });
+            chunks.len() - 1
+        }
+    };
+    let chunk = &mut chunks[pos];
+    let value = chunk.lines.join("\n");
+    let value = value.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+    if value.starts_with('[') {
+        let end = matching_close(value, 0)
+            .ok_or_else(|| "rules: 无效的列表 / Invalid rule list".to_string())?;
+        chunk.lines = std::iter::once("rules:".into())
+            .chain(
+                flow_split(&value[1..end])
+                    .into_iter()
+                    .map(|r| format!("  - {r}")),
+            )
+            .collect();
+    } else {
+        let header = clean_scalar(chunk.lines[0].split_once(':').map(|(_, v)| v).unwrap_or(""));
+        if !header.is_empty() && header != "null" && header != "~" {
+            return Err("rules: 无法合并此列表格式 / Cannot merge this rule list format".into());
+        }
+        chunk.lines[0] = "rules:".into();
+    }
+    let indent = chunk
+        .lines
+        .iter()
+        .skip(1)
+        .find(|l| l.trim_start().starts_with('-'))
+        .map(|l| leading_spaces(l))
+        .unwrap_or(2);
+    chunk.lines.splice(
+        1..1,
+        rules
+            .iter()
+            .map(|rule| format!("{}- {}", " ".repeat(indent), yaml_str(rule))),
+    );
+    Ok(join_chunks(&chunks))
+}
+
 pub fn compose_profile(input: &ComposeInput) -> Result<(String, ComposeReport), String> {
     compose_profile_reserving(input, &HashSet::new())
 }
@@ -4309,6 +4400,40 @@ mod profile_tests {
     use super::*;
 
     const CLASH: &str = "mixed-port: 7897\nproxies:\n  - {name: HK, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake}\nproxy-groups:\n  - name: Airport\n    type: select\n    proxies: [HK]\nrules:\n  - DOMAIN-SUFFIX,example.org,DIRECT\n  - MATCH,Airport\n";
+    #[test]
+    fn manual_overrides_precede_block_and_inline_rules_without_changing_groups() {
+        let rules = vec![
+            "DOMAIN-SUFFIX,anime1.me,DIRECT".into(),
+            "DOMAIN,blocked.example,REJECT".into(),
+        ];
+        for source in [
+            CLASH.to_string(),
+            CLASH.replace(
+                "rules:\n  - DOMAIN-SUFFIX,example.org,DIRECT\n  - MATCH,Airport\n",
+                "rules: ['DOMAIN-SUFFIX,example.org,DIRECT', 'MATCH,Airport']\n",
+            ),
+        ] {
+            let yaml = prepend_manual_rules(&source, &rules).unwrap();
+            let chunks = split_chunks(&yaml);
+            let actual = clash_rule_items(chunks.iter().find(|c| chunk_is(c, "rules")).unwrap());
+            assert_eq!(
+                actual,
+                [
+                    "DOMAIN-SUFFIX,anime1.me,DIRECT",
+                    "DOMAIN,blocked.example,REJECT",
+                    "DOMAIN-SUFFIX,example.org,DIRECT",
+                    "MATCH,Airport"
+                ]
+            );
+            assert!(yaml.starts_with(source.split("rules:").next().unwrap()));
+            assert_eq!(prepend_manual_rules(&source, &[]).unwrap(), source);
+        }
+        let original = CLASH.to_string();
+        let err =
+            prepend_manual_rules(&original, &["DOMAIN,anime1.me,MissingGroup".into()]).unwrap_err();
+        assert!(err.contains("MissingGroup"));
+        assert_eq!(original, CLASH);
+    }
     fn build(sub: Option<&Converted>, nodes: &[ManualNode]) -> String {
         let mut rules = PrivateRules::default();
         rules.rules.push("DOMAIN-SUFFIX,custom.invalid,AI".into());

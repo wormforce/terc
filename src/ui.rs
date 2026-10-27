@@ -1468,6 +1468,14 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let l3 = |zh, en, ja| crate::manage::l3(app, zh, en, ja);
     let shortcuts = [
+        (
+            ": / Ctrl+P",
+            l3(
+                "命令面板：搜索并执行动作",
+                "Command palette: search and run actions",
+                "コマンドパレット：検索して実行",
+            ),
+        ),
         ("Space", app.t("help_space")),
         ("m", app.t("help_m")),
         ("r", app.t("help_r")),
@@ -1478,6 +1486,22 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("Tab ←→ hl  1 2", app.t("help_hl")),
         ("p / c / L", app.t("help_tabs")),
         ("c: o / f / d", app.t("help_conn_keys")),
+        (
+            "c: / · e",
+            l3(
+                "连接：/ 搜索，详情里 e 用该连接的目标解释规则",
+                "Connections: / search, e in detail explains rules for that target",
+                "接続：/ 検索、詳細で e はその対象のルールを説明",
+            ),
+        ),
+        (
+            "c: t",
+            l3(
+                "流量排行：按域名/进程/策略聚合，g 切换分组，o 切换排序",
+                "Top talkers: group by domain/process/policy, g cycles groups, o cycles sort",
+                "通信量ランキング：ドメイン/プロセス/ポリシー別、g で切替、o で並び替え",
+            ),
+        ),
         ("c: x / X", app.t("help_conn_close")),
         ("s", app.t("help_s")),
         ("Rules: e / /", app.t("help_explain")),

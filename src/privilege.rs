@@ -322,7 +322,20 @@ pub(crate) fn start_core(cfg: &ControllerConfig, old_pid: Option<u32>) -> Result
             .map_err(|e| e.to_string())?;
     }
     let old = old_pid.zip(old_core.as_ref().map(|(_, command, _)| command.as_str()));
+    crate::diagnostics::record(
+        cfg,
+        "core-admin-start-request",
+        &format!(
+            "tun_configured=true replacing_pid={}",
+            old_pid.map_or("none".into(), |pid| pid.to_string())
+        ),
+    );
     if let Err(error) = authorize(&launch_script(cfg, &bin, old)) {
+        crate::diagnostics::record(
+            cfg,
+            "core-admin-start-failed",
+            "reason=authorization-or-launch",
+        );
         restore_pid_record(&pid_path, previous_pid.as_deref())
             .map_err(|e| format!("{error}; could not restore PID record: {e}"))?;
         return Err(error);
@@ -332,9 +345,15 @@ pub(crate) fn start_core(cfg: &ControllerConfig, old_pid: Option<u32>) -> Result
         .trim()
         .parse()
         .map_err(|_| "Authorized launch did not return a valid core PID")?;
+    crate::diagnostics::record(cfg, "core-spawned", &format!("pid={pid} privilege=admin"));
     for _ in 0..30 {
         if process_details(pid).is_err() {
             let _ = fs::remove_file(&pid_path);
+            crate::diagnostics::record(
+                cfg,
+                "core-start-exited",
+                &format!("pid={pid} privilege=admin"),
+            );
             return Err(startup_exit_message(cfg));
         }
         if let Some(error) = tun_log_error(cfg, 0) {
@@ -347,6 +366,11 @@ pub(crate) fn start_core(cfg: &ControllerConfig, old_pid: Option<u32>) -> Result
                     .and_then(serde_json::Value::as_bool)
                     == Some(true)
                 {
+                    crate::diagnostics::record(
+                        cfg,
+                        "core-ready",
+                        &format!("pid={pid} privilege=admin tun_ready=true"),
+                    );
                     return Ok(
                         "管理员授权完成，TUN 已开启 / Authorized Mihomo started; TUN enabled"
                             .into(),
@@ -356,6 +380,11 @@ pub(crate) fn start_core(cfg: &ControllerConfig, old_pid: Option<u32>) -> Result
         }
         thread::sleep(Duration::from_millis(200));
     }
+    crate::diagnostics::record(
+        cfg,
+        "core-start-pending",
+        &format!("pid={pid} privilege=admin tun_ready=false"),
+    );
     Err(format!(
         "Authorized core started, but TUN is not ready; inspect {}",
         Path::new(&cfg.config_dir).join("terc-core.log").display()
@@ -388,6 +417,11 @@ pub(crate) fn set_tun(
     enable: bool,
     running: bool,
 ) -> Result<String, String> {
+    crate::diagnostics::record(
+        cfg,
+        "tun-change-request",
+        &format!("enable={enable} running={running}"),
+    );
     if cfg!(target_os = "macos") && running && enable {
         let (pid, uid) = controller_core(cfg)?;
         if uid != 0 {
@@ -408,9 +442,19 @@ pub(crate) fn set_tun(
                 Ok(text) => {
                     // A fresh process starts with an empty resolver cache.
                     mihomo::mark_core_refreshed();
+                    crate::diagnostics::record(
+                        cfg,
+                        "tun-change-applied",
+                        "enable=true method=admin-restart",
+                    );
                     Ok(text)
                 }
                 Err(error) => {
+                    crate::diagnostics::record(
+                        cfg,
+                        "tun-change-failed",
+                        "enable=true method=admin-restart",
+                    );
                     // On cancelled authorization the old process is untouched.
                     if process_details(pid).is_ok_and(|(_, command, executable)| {
                         matching_external_command(cfg, &executable, &command)
@@ -429,13 +473,32 @@ pub(crate) fn set_tun(
                 return Err(conflict);
             }
         }
-        mihomo::set_tun_enabled(cfg, enable).map_err(|e| {
-            if cfg!(target_os = "macos") && managed_core(cfg).is_err() {
+        if let Err(e) = mihomo::set_tun_enabled(cfg, enable) {
+            crate::diagnostics::record(
+                cfg,
+                "tun-change-failed",
+                &format!("enable={enable} method=runtime-patch"),
+            );
+            return Err(if cfg!(target_os = "macos") && managed_core(cfg).is_err() {
                 format!("TUN change failed: {e}. 该内核由外部程序管理，请通过原服务授权；或先在原程序停止内核，再在 设置 → 内核与代理 → 内核服务 由 terc 启动 / Authorize the external core through its service manager, or stop it there and start a terc-managed core in Settings → Core & Proxy → Core service.")
-            } else { format!("TUN change failed: {e}") }
-        })?;
+            } else {
+                format!("TUN change failed: {e}")
+            });
+        }
+        crate::diagnostics::record(
+            cfg,
+            "tun-change-applied",
+            &format!("enable={enable} method=runtime-patch"),
+        );
     }
     mihomo::persist_nested_bool(cfg, &["tun", "enable"], enable)?;
+    if !running {
+        crate::diagnostics::record(
+            cfg,
+            "tun-change-applied",
+            &format!("enable={enable} method=save-for-startup"),
+        );
+    }
     Ok(if !running {
         "TUN 配置已保存，启动内核时生效 / Saved; takes effect at core startup"
     } else if enable {

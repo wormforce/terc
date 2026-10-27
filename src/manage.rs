@@ -1,4 +1,4 @@
-//! Unified profiles and manual-node management. Legacy private-rule tools are not exposed.
+//! Profiles, manual nodes and additive manual rule overrides.
 //!
 //! Every change is written to `~/.config/terc/` first, then the config is
 //! regenerated, validated with `mihomo -t`, and hot-reloaded in the background.
@@ -16,7 +16,7 @@ use ratatui::{
 use crate::{
     compose::{
         add_manual_node, load_manual_nodes, parse_rule_input, remove_manual_node, rule_target,
-        set_rule_target, PrivateRules, AI_PRESET, POLICY_TARGETS,
+        set_rule_target, PrivateRules,
     },
     mihomo::{is_info_pseudo_node, test_node_async},
     subconv::node_summary,
@@ -81,8 +81,7 @@ impl App {
     }
 
     pub fn open_private_rules(&mut self) {
-        self.private_rules =
-            PrivateRules::load(&crate::compose::profile_dir(&self.config.controller));
+        self.private_rules = PrivateRules::load(&crate::compose::terc_dir());
         self.private_rule_index = self
             .private_rule_index
             .min(self.private_rules.rules.len().saturating_sub(1));
@@ -232,10 +231,7 @@ impl App {
                     self.private_rules.rules.insert(at, rule);
                     self.private_rule_index = at;
                     self.manage_input = None;
-                    if let Err(err) = self
-                        .private_rules
-                        .save(&crate::compose::profile_dir(&self.config.controller))
-                    {
+                    if let Err(err) = self.private_rules.save(&crate::compose::terc_dir()) {
                         self.set_status(&err, true);
                     } else {
                         self.apply_composed_noting(note);
@@ -354,10 +350,7 @@ impl App {
     }
 
     fn save_rules_and_apply(&mut self) {
-        if let Err(err) = self
-            .private_rules
-            .save(&crate::compose::profile_dir(&self.config.controller))
-        {
+        if let Err(err) = self.private_rules.save(&crate::compose::terc_dir()) {
             self.set_status(&err, true);
             return;
         }
@@ -395,12 +388,15 @@ impl App {
         else {
             return;
         };
-        let current = rule_target(&rule).to_ascii_uppercase();
-        let next = POLICY_TARGETS
+        let current = rule_target(&rule);
+        let mut targets = vec!["DIRECT".to_string(), "REJECT".to_string()];
+        targets.extend(self.snapshot.groups.iter().map(|g| g.name.clone()));
+        targets.dedup();
+        let next = targets
             .iter()
             .position(|t| *t == current)
-            .map(|i| POLICY_TARGETS[(i + 1) % POLICY_TARGETS.len()])
-            .unwrap_or(POLICY_TARGETS[0]);
+            .map(|i| &targets[(i + 1) % targets.len()])
+            .unwrap_or(&targets[0]);
         self.private_rules.rules[self.private_rule_index] = set_rule_target(&rule, next);
         self.save_rules_and_apply();
     }
@@ -572,19 +568,6 @@ pub fn handle_private_rules_key(app: &mut App, key: KeyEvent) {
         handle_editor_key(app, key);
         return;
     }
-    if app.ai_picker {
-        let len = app.ai_candidates().len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => app.ai_picker = false,
-            KeyCode::Up | KeyCode::Char('k') => move_cursor(&mut app.ai_picker_index, len, false),
-            KeyCode::Down | KeyCode::Char('j') => move_cursor(&mut app.ai_picker_index, len, true),
-            KeyCode::Char(' ') => app.toggle_ai_candidate(),
-            KeyCode::Char('c') => app.ai_picker_selected.clear(),
-            KeyCode::Enter => app.save_ai_picker(),
-            _ => {}
-        }
-        return;
-    }
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let len = app.private_rules.rules.len();
     match key.code {
@@ -598,14 +581,8 @@ pub fn handle_private_rules_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('a') => app.start_manage_input(ManageInput::AddRule),
         KeyCode::Char('d') | KeyCode::Delete => app.remove_selected_rule(),
         KeyCode::Char('t') => app.cycle_selected_rule_target(),
-        KeyCode::Char('p') => app.toggle_ai_preset(),
-        KeyCode::Char('y') => app.toggle_ai_kind(),
-        KeyCode::Char('m') => app.open_ai_picker(),
-        KeyCode::Char('b') => app.toggle_subscription_rules(),
-        KeyCode::Char('c') => app.toggle_cn_direct(),
         KeyCode::Enter => {
-            app.private_rules =
-                PrivateRules::load(&crate::compose::profile_dir(&app.config.controller));
+            app.private_rules = PrivateRules::load(&crate::compose::terc_dir());
             app.apply_composed();
         }
         _ => {}
@@ -797,20 +774,14 @@ fn draw_manual_nodes_content(frame: &mut Frame, app: &App, inner: Rect) {
 
 pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
-    let popup = centered_rect(90, 84, area);
+    let popup = centered_rect(90, 80, area);
     frame.render_widget(Clear, popup);
     let inner = draw_panel(
         frame,
         popup,
         theme,
         Some(panel_title(
-            l3(
-                app,
-                "私有规则与 AI 分流",
-                "Private rules & AI routing",
-                "プライベートルールと AI",
-            )
-            .to_string(),
+            l3(app, "手动规则", "Manual rules", "手動ルール").to_string(),
             theme,
         )),
         true,
@@ -819,210 +790,59 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
-            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Min(2),
             Constraint::Length(if adding { 3 } else { 0 }),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(inner);
-    let rules = &app.private_rules;
-    let on = |v: bool| if v { "●" } else { "○" };
-    let members = if rules.ai.members.is_empty() {
-        l3(
-            app,
-            "自动：美/日/新/台，排除香港",
-            "auto: US/JP/SG/TW, no HK",
-            "自動：米/日/星/台、香港除外",
-        )
-        .to_string()
+    hint(frame, app, rows[0], l3(
+        app,
+        "全局覆盖：手动规则优先，其余交给所选分流。更新订阅、切换方案后保留。保存在 ~/.config/terc/rules.conf",
+        "Global overrides match first; the selected plan handles the rest. Kept across updates and plan switches. File: ~/.config/terc/rules.conf",
+        "手動ルールを優先し、残りは選択中のプランへ。更新・切替後も保持。~/.config/terc/rules.conf",
+    ));
+    let list_inner = draw_panel(frame, rows[1], theme, None, true);
+    let rules = &app.private_rules.rules;
+    if rules.is_empty() {
+        hint(frame, app, list_inner, l3(app,
+            "按 a 添加，例如 anime1.me,DIRECT；目标可用 DIRECT、REJECT 或当前策略组名。",
+            "Press a to add, e.g. anime1.me,DIRECT. Target: DIRECT, REJECT or a current group name.",
+            "a で追加。例：anime1.me,DIRECT。宛先は DIRECT、REJECT またはグループ名。",
+        ));
     } else {
-        truncate_str(&rules.ai.members.join(" | "), 48)
-    };
-    let services = AI_PRESET.len();
-    let domains: usize = AI_PRESET.iter().map(|(_, l)| l.len()).sum();
-    let key = |k: &str| Span::styled(format!("[{k}] "), Style::default().fg(theme.accent));
-    let text = |t: String| Span::styled(t, Style::default().fg(theme.text));
-    let muted = |t: String| Span::styled(t, Style::default().fg(theme.muted));
-    let settings = vec![
-        Line::from(vec![
-            key("p"),
-            text(format!(
-                "{} {}  {services} {} / {domains} {}",
-                on(rules.ai.enabled),
-                l3(app, "AI 预设", "AI preset", "AI プリセット"),
-                l3(app, "类服务", "services", "サービス"),
-                l3(app, "条", "rules", "件"),
-            )),
-            muted("   ".into()),
-            key("y"),
-            text(format!(
-                "{} {}",
-                l3(app, "AI 组", "AI group", "AI グループ"),
-                rules.ai.kind
-            )),
-        ]),
-        Line::from(vec![
-            key("m"),
-            text(format!(
-                "{}  {members}",
-                l3(app, "AI 成员", "AI members", "AI メンバー")
-            )),
-        ]),
-        Line::from(vec![
-            key("b"),
-            text(format!(
-                "{} {}",
-                on(rules.subscription_rules),
-                l3(
-                    app,
-                    "追加机场规则",
-                    "Append airport rules",
-                    "サブスクのルール"
-                )
-            )),
-            muted("   ".into()),
-            key("c"),
-            text(format!(
-                "{} {}",
-                on(rules.cn_direct),
-                l3(app, "国内直连", "China direct", "中国直結")
-            )),
-        ]),
-        Line::from(muted(
-            l3(
-                app,
-                "顺序：私有规则 → AI 预设 → 局域网直连 → 机场规则 → 国内直连 → MATCH,PROXY",
-                "Order: private → AI preset → LAN direct → airport → China direct → MATCH,PROXY",
-                "順序：プライベート → AI → LAN → サブスク → 中国 → MATCH",
-            )
-            .to_string(),
-        )),
-        Line::from(muted("~/.config/terc/rules.conf".into())),
-    ];
-    frame.render_widget(Paragraph::new(settings), rows[0]);
-
-    if app.ai_picker {
-        let candidates = app.ai_candidates();
-        let list_inner = draw_panel(
-            frame,
-            rows[1],
-            theme,
-            Some(panel_title(
-                format!(
-                    "{}  {}",
-                    l3(app, "选择 AI 成员", "Pick AI members", "AI メンバー選択"),
-                    app.ai_picker_selected.len()
-                ),
-                theme,
-            )),
-            true,
-        );
-        if candidates.is_empty() {
-            hint(
-                frame,
-                app,
-                list_inner,
-                l3(
-                    app,
-                    "没有候选：先启动内核（K）或添加手动节点（N）",
-                    "No candidates: start the core (K) or add manual nodes (N)",
-                    "候補なし",
-                ),
-            );
-        } else {
-            let visible = list_inner.height as usize;
-            let start = visible_list_start(app.ai_picker_index, candidates.len(), visible);
-            let items: Vec<ListItem> = candidates
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(visible)
-                .map(|(i, name)| {
-                    let selected = i == app.ai_picker_index;
-                    let picked = app.ai_picker_selected.contains(name);
-                    let is_group = app.snapshot.groups.iter().any(|g| &g.name == name);
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!(
-                                "{}{} {}",
-                                if selected { "› " } else { "  " },
-                                if picked { "●" } else { "○" },
-                                name
-                            ),
-                            selected_style(app, selected),
-                        ),
-                        Span::styled(
-                            if is_group {
-                                format!("  {}", l3(app, "策略组", "group", "グループ"))
+        let visible = list_inner.height as usize;
+        let start = visible_list_start(app.private_rule_index, rules.len(), visible);
+        let items: Vec<ListItem> = rules
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(i, rule)| {
+                let target = rule_target(rule);
+                let parts: Vec<&str> = rule.splitn(3, ',').collect();
+                let kind = parts.first().copied().unwrap_or("");
+                let value = parts.get(1).copied().unwrap_or("");
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{}{:>3}  {:<15} {}",
+                            if i == app.private_rule_index {
+                                "› "
                             } else {
-                                String::new()
+                                "  "
                             },
-                            Style::default().fg(theme.muted),
+                            i + 1,
+                            kind,
+                            truncate_str(value, 40)
                         ),
-                    ]))
-                })
-                .collect();
-            frame.render_widget(List::new(items), list_inner);
-        }
-    } else {
-        let list_inner = draw_panel(
-            frame,
-            rows[1],
-            theme,
-            Some(panel_title(
-                format!(
-                    "{}  {}",
-                    l3(app, "私有规则", "Private rules", "プライベートルール"),
-                    rules.rules.len()
-                ),
-                theme,
-            )),
-            true,
-        );
-        if rules.rules.is_empty() {
-            hint(
-                frame,
-                app,
-                list_inner,
-                l3(
-                    app,
-                    "还没有私有规则。按 a 添加，例如 example.com,AI　或　DOMAIN-KEYWORD,steam,DIRECT　或　PROCESS-NAME,Cursor,AI（较慢：每个连接都要查进程）",
-                    "No private rules. Press a, e.g. example.com,AI  or  DOMAIN-KEYWORD,steam,DIRECT  or  PROCESS-NAME,Cursor,AI (slower: looks up the process per connection)",
-                    "a で追加。例：example.com,AI",
-                ),
-            );
-        } else {
-            let visible = list_inner.height as usize;
-            let start = visible_list_start(app.private_rule_index, rules.rules.len(), visible);
-            let items: Vec<ListItem> = rules
-                .rules
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(visible)
-                .map(|(i, rule)| {
-                    let selected = i == app.private_rule_index;
-                    let target = rule_target(rule);
-                    let parts: Vec<&str> = rule.splitn(3, ',').collect();
-                    let kind = parts.first().copied().unwrap_or("");
-                    let value = parts.get(1).copied().unwrap_or("");
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!(
-                                "{}{:>3}  {:<15} {}",
-                                if selected { "› " } else { "  " },
-                                i + 1,
-                                kind,
-                                truncate_str(value, 40)
-                            ),
-                            selected_style(app, selected),
-                        ),
-                        Span::styled(format!("  → {target}"), Style::default().fg(theme.accent)),
-                    ]))
-                })
-                .collect();
-            frame.render_widget(List::new(items), list_inner);
-        }
+                        selected_style(app, i == app.private_rule_index),
+                    ),
+                    Span::styled(format!("  → {target}"), Style::default().fg(theme.accent)),
+                ]))
+            })
+            .collect();
+        frame.render_widget(List::new(items), list_inner);
     }
     if adding {
         draw_input(
@@ -1031,9 +851,9 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
             rows[2],
             l3(
                 app,
-                "新规则 TYPE,VALUE,TARGET",
-                "New rule TYPE,VALUE,TARGET",
-                "新ルール",
+                "域名,目标 或 TYPE,VALUE,TARGET",
+                "domain,target or TYPE,VALUE,TARGET",
+                "domain,target / TYPE,VALUE,TARGET",
             ),
         );
     }
@@ -1042,26 +862,15 @@ pub fn draw_private_rules(frame: &mut Frame, app: &App, area: Rect) {
         app,
         rows[3],
         if adding {
-            l3(
-                app,
-                "类型：DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN / IP-CIDR / GEOIP / PROCESS-NAME；目标：PROXY AI AUTO DIRECT REJECT。Enter 添加  Esc 取消",
-                "Types: DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN / IP-CIDR / GEOIP / PROCESS-NAME; targets: PROXY AI AUTO DIRECT REJECT. Enter add  Esc cancel",
-                "Enter 追加  Esc 取消",
-            )
-        } else if app.ai_picker {
-            l3(
-                app,
-                "Space 选/取消  c 清空（=自动挑选）  Enter 保存  Esc 取消",
-                "Space toggle  c clear (= auto)  Enter save  Esc cancel",
-                "Space 切替  c クリア  Enter 保存  Esc 取消",
-            )
+            l3(app,
+            "示例 anime1.me,DIRECT。类型：DOMAIN-SUFFIX / DOMAIN / DOMAIN-KEYWORD / IP-CIDR / GEOIP / PROCESS-NAME。Enter 保存并应用  Esc 取消",
+            "Example: anime1.me,DIRECT. Types: DOMAIN-SUFFIX / DOMAIN / DOMAIN-KEYWORD / IP-CIDR / GEOIP / PROCESS-NAME. Enter save & apply  Esc cancel",
+            "例：anime1.me,DIRECT。Enter 保存・適用  Esc 取消")
         } else {
-            l3(
-                app,
-                "a 添加  d 删除  J/K 或 Shift+↑↓ 调整顺序  t 换目标  Enter 重新应用  Esc 关闭",
-                "a add  d delete  J/K or Shift+↑↓ reorder  t target  Enter re-apply  Esc close",
-                "a 追加  d 削除  J/K 並べ替え  t 宛先  Enter 再適用  Esc 閉じる",
-            )
+            l3(app,
+            "a 添加  d 删除  J/K 排序  t 换目标  Enter 重新应用文件  Esc 返回。修改后校验并应用；目标必须存在于当前分流。",
+            "a add  d delete  J/K reorder  t target  Enter reapply file  Esc back. Edits validate & apply; targets must exist in the current plan.",
+            "a 追加  d 削除  J/K 並替  t 宛先  Enter 再適用  Esc 戻る。検証後に適用。")
         },
     );
 }
@@ -1074,6 +883,13 @@ pub fn handle_profiles_key(app: &mut App, key: KeyEvent) {
     if app.manage_input.is_some() {
         handle_editor_key(app, key);
         return;
+    }
+    if key.code == KeyCode::Char('r') {
+        app.open_private_rules();
+        return;
+    }
+    if !matches!(key.code, KeyCode::Char('d') | KeyCode::Delete) {
+        app.pending_profile_delete = None;
     }
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
         app.profile_page = if app.profile_page == 3 { 0 } else { 3 };
@@ -1164,6 +980,7 @@ pub fn handle_profiles_key(app: &mut App, key: KeyEvent) {
                     ));
                 }
             }
+            KeyCode::Char('d') | KeyCode::Delete => app.delete_selected_profile(),
             KeyCode::Char('v') => app.profile_page = 2,
             _ => {}
         },
@@ -1181,9 +998,9 @@ pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
     let title = if routing {
         l3(
             app,
-            "代理列表    [ 分流方案 ]",
-            "Proxies    [ Routing ]",
-            "設定 / ルーティング",
+            "代理列表    [ 分流方案 ]    [r 手动规则]",
+            "Proxies    [ Routing ]    [r Manual rules]",
+            "設定 / ルーティング    [r 手動ルール]",
         )
     } else if app.profile_page == 2 {
         l3(
@@ -1195,9 +1012,9 @@ pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         l3(
             app,
-            "[ 代理列表 ]    分流方案",
-            "[ Proxies ]    Routing",
-            "設定 / サブスクリプション",
+            "[ 代理列表 ]    分流方案    [r 手动规则]",
+            "[ Proxies ]    Routing    [r Manual rules]",
+            "設定 / サブスクリプション    [r 手動ルール]",
         )
     };
     let rows = Layout::default()
@@ -1324,7 +1141,7 @@ pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
             let desc = if routing {
                 l3(app,"Enter 为当前订阅应用所选方案。c 将当前规则与策略组保存为可复用方案。保存后节点成员统一跟随订阅，保留组间引用与过滤条件。","Enter assigns the plan to the active subscription. c saves current routing for reuse. Saved groups use current-source nodes, preserving group links and filters.","Enter 適用 c 保存")
             } else {
-                l3(app,"Enter 切换订阅并加载它记住的分流。a 添加代理  e 编辑选中项  n 改名。u 更新当前订阅  v 管理当前节点。Tab 切换分流。","Enter switches source with its assigned routing. a Add  e Edit selected  c Copy  n Rename. u Update active  v Active nodes. Tab switches to routing.","Enter 切替 a 追加 e 編集 c 保存 n 名前 u 更新 v ノード")
+                l3(app,"Enter 切换订阅并加载它记住的分流。a 添加代理  e 编辑  c 复制当前来源  n 改名  d 删除（再按一次确认）。u 更新订阅  v 管理当前节点。Tab 切换分流。","Enter switches source with its assigned routing. a Add  e Edit  c Copy  n Rename  d Delete (press again to confirm). u Update  v Nodes. Tab switches to routing.","Enter 切替 a 追加 e 編集 c 複製 n 名前 d 削除（再押して確認） u 更新 v ノード")
             };
             frame.render_widget(
                 Paragraph::new(desc)

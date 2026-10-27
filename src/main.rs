@@ -11,13 +11,18 @@ use std::{
 };
 
 pub mod best;
+pub mod cli;
 pub mod compose;
 mod conns;
 pub mod control;
+mod diagnostics;
 mod guard;
+mod instances;
 pub mod manage;
 pub mod mihomo;
+mod notify;
 pub mod ops;
+pub mod palette;
 pub mod panels;
 mod privilege;
 pub mod proxy_form;
@@ -25,6 +30,7 @@ pub mod routing;
 mod settings;
 pub mod storage;
 pub mod subconv;
+pub mod talkers;
 pub mod ui;
 mod ws;
 
@@ -94,6 +100,9 @@ pub enum Overlay {
     Modules,
     Probe,
     Runtime,
+    Palette,
+    Talkers,
+    CoreInstances,
     Best,
     OwnNodes,
     PrivateRules,
@@ -111,6 +120,16 @@ pub enum SettingCategory {
     Appearance,
     Subscription,
     Diagnostics,
+}
+
+#[derive(Clone, Debug)]
+pub struct DnsLogEntry {
+    pub at: String,
+    pub name: String,
+    pub qtype: String,
+    pub ms: u64,
+    pub summary: String,
+    pub is_error: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +158,9 @@ pub struct Settings {
     /// replaced by `Config::default()` on the next save.
     #[serde(default = "default_true")]
     pub connections_stream: bool,
+    /// Desktop notifications for key errors (core / TUN / subscription).
+    #[serde(default = "default_true")]
+    pub notifications: bool,
 }
 
 fn default_graph_interval() -> u64 {
@@ -169,6 +191,7 @@ impl Default for Settings {
             show_traffic: true,
             show_toolbar: true,
             connections_stream: true,
+            notifications: true,
         }
     }
 }
@@ -177,6 +200,8 @@ impl Default for Settings {
 pub struct Config {
     pub settings: Settings,
     pub controller: ControllerConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub core_instances: Vec<instances::CoreInstance>,
     #[serde(default)]
     pub enabled_modules: Vec<String>,
     /// One-time notices already shown, such as `DNS_MODULE_NOTICE`.
@@ -277,17 +302,10 @@ impl Config {
 
     /// Moves the old http default test URL to the https one, never a URL the
     /// user set, and caps a timeout saved before the delay route's limit. An
-    /// empty controller secret, the v0.1.0 default, gets a random one.
+    /// Explicitly empty secrets are kept for controllers without authentication.
     /// Returns whether anything changed.
     fn migrate(&mut self) -> bool {
         let controller = &mut self.controller;
-        let mut changed = false;
-        if controller.secret.is_empty() {
-            if let Some(secret) = random_secret() {
-                controller.secret = secret;
-                changed = true;
-            }
-        }
         let before = (controller.test_url.clone(), controller.timeout_ms);
         if controller.test_url == crate::mihomo::OLD_DEFAULT_TEST_URL {
             controller.test_url = crate::mihomo::DEFAULT_TEST_URL.to_string();
@@ -295,7 +313,7 @@ impl Config {
         controller.timeout_ms = controller
             .timeout_ms
             .min(crate::mihomo::MAX_DELAY_TIMEOUT_MS);
-        changed || before != (controller.test_url.clone(), controller.timeout_ms)
+        before != (controller.test_url.clone(), controller.timeout_ms)
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -329,6 +347,11 @@ impl LoadIssue {
             Self::Unsaved(text) | Self::Unusable(text) => text,
         }
     }
+}
+
+fn clock_hms() -> String {
+    let secs = unix_now() % 86_400;
+    format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
 fn unix_now() -> u64 {
@@ -624,7 +647,7 @@ mod io_tests {
     }
 
     #[test]
-    fn v010_preferences_with_the_empty_default_secret_get_a_random_one() {
+    fn explicitly_empty_controller_secret_is_preserved() {
         let dir = env::temp_dir().join(format!("terc-v010-open-{}", std::process::id()));
         let path = dir.join("config.json");
         fs::create_dir_all(&dir).unwrap();
@@ -632,13 +655,12 @@ mod io_tests {
         fs::write(&path, raw).unwrap();
         let (cfg, issue) = Config::load_from(&path, 0);
         assert!(issue.is_none());
-        let secret = cfg.controller.secret.clone();
-        assert_eq!(secret.len(), 32);
+        assert!(cfg.controller.secret.is_empty());
         let saved: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved["controller"]["secret"], secret.as_str(), "saved once");
+        assert_eq!(saved["controller"]["secret"], "");
         let (again, _) = Config::load_from(&path, 0);
-        assert_eq!(again.controller.secret, secret, "not regenerated");
+        assert!(again.controller.secret.is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -870,6 +892,8 @@ pub struct App {
     pub conn_sort: conns::SortKey,
     pub conn_filter: bool,
     pub conn_closed_view: bool,
+    pub conn_query: LineEditor,
+    pub conn_editing: bool,
     pub closed_index: usize,
     pub session_toast_at: Option<Instant>,
     pub help_scroll: u16,
@@ -916,6 +940,7 @@ pub struct App {
     pub provider_index: usize,
     pub module_index: usize,
     pub profile_index: usize,
+    pub pending_profile_delete: Option<(String, Instant)>,
     pub profile_page: usize,
     pub routing_index: usize,
     pub routing_mode: String,
@@ -924,12 +949,15 @@ pub struct App {
     pub proxy_form: Option<proxy_form::Form>,
     pub tunnel_index: usize,
     pub overlay: Overlay,
+    pub core_instances_ui: instances::State,
+    pub restart_for_core: bool,
     pub catalog: Vec<crate::ops::ModuleSnippet>,
     pub profiles: Vec<crate::ops::ProfileEntry>,
     pub dns_editor: LineEditor,
     pub dns_editing: bool,
     pub dns_qtype_idx: usize,
     pub dns_lines: Vec<String>,
+    pub dns_log: Vec<DnsLogEntry>,
     pub dns_error: bool,
     pub rule_query: LineEditor,
     pub rule_editing: bool,
@@ -938,6 +966,11 @@ pub struct App {
     pub rule_detail: bool,
     pub explain: Option<crate::ops::ExplainReport>,
     pub probe_editor: LineEditor,
+    pub palette_query: LineEditor,
+    pub palette_index: usize,
+    pub talker_group: talkers::Group,
+    pub talker_sort: talkers::Sort,
+    pub talker_index: usize,
     pub probe_lines: Vec<String>,
     pub probe_error: bool,
     pub snapshot: CoreSnapshot,
@@ -956,6 +989,8 @@ pub struct App {
     pub proxy_hits: Vec<(ratatui::layout::Rect, FocusPane, usize, usize)>,
     pub status_message: String,
     pub status_is_error: bool,
+    /// Last desktop notification, used to throttle repeats.
+    pub last_notify: Option<(Instant, String)>,
     pub tx: Sender<BackendEvent>,
     pub rx: Receiver<BackendEvent>,
     pub stop_flag: Arc<AtomicBool>,
@@ -996,6 +1031,21 @@ pub struct App {
 impl App {
     pub fn new(config: Config) -> Self {
         let snapshot = fetch_snapshot(&config.controller);
+        crate::diagnostics::record(
+            &config.controller,
+            "terc-start",
+            &format!("core_running={}", snapshot.running),
+        );
+        if !snapshot.running {
+            let pid_path = PathBuf::from(&config.controller.config_dir).join("terc-core.pid");
+            if let Ok(pid) = fs::read_to_string(pid_path) {
+                crate::diagnostics::record(
+                    &config.controller,
+                    "core-unavailable-at-launch",
+                    &format!("pid_record={}", pid.trim()),
+                );
+            }
+        }
         let mut app = Self::from_snapshot(config, snapshot);
         app.load_core_log();
         spawn_stream_workers(
@@ -1036,6 +1086,8 @@ impl App {
             conn_sort: conns::SortKey::default(),
             conn_filter: false,
             conn_closed_view: false,
+            conn_query: LineEditor::default(),
+            conn_editing: false,
             closed_index: 0,
             session_toast_at: None,
             help_scroll: 0,
@@ -1065,6 +1117,7 @@ impl App {
             provider_index: 0,
             module_index: 0,
             profile_index: 0,
+            pending_profile_delete: None,
             profile_page: 0,
             routing_index: 0,
             routing_mode: String::new(),
@@ -1073,12 +1126,15 @@ impl App {
             proxy_form: None,
             tunnel_index: 0,
             overlay: Overlay::None,
+            core_instances_ui: instances::State::default(),
+            restart_for_core: false,
             catalog: Vec::new(),
             profiles: Vec::new(),
             dns_editor: LineEditor::default(),
             dns_editing: false,
             dns_qtype_idx: 0,
             dns_lines: Vec::new(),
+            dns_log: Vec::new(),
             dns_error: false,
             rule_query: LineEditor::default(),
             rule_editing: false,
@@ -1087,6 +1143,11 @@ impl App {
             rule_detail: false,
             explain: None,
             probe_editor: LineEditor::default(),
+            palette_query: LineEditor::default(),
+            palette_index: 0,
+            talker_group: talkers::Group::Domain,
+            talker_sort: talkers::Sort::Bytes,
+            talker_index: 0,
             probe_lines: Vec::new(),
             probe_error: false,
             snapshot: initial_snapshot,
@@ -1104,6 +1165,7 @@ impl App {
             proxy_hits: Vec::new(),
             status_message: String::new(),
             status_is_error: false,
+            last_notify: None,
             tx,
             rx,
             stop_flag,
@@ -1306,6 +1368,52 @@ impl App {
         self.toast_started = Some(Instant::now());
         self.status_message = text.to_string();
         self.status_is_error = is_error;
+        if is_error {
+            self.notify_error(text);
+        }
+    }
+
+    /// Desktop notification for errors that change how terc behaves. DNS
+    /// lookups and form validation stay in-app, and repeats are throttled so
+    /// a flapping core cannot flood Notification Center.
+    fn notify_error(&mut self, text: &str) {
+        if !self.config.settings.notifications || text.trim().is_empty() {
+            return;
+        }
+        const WORTHY: &[&str] = &[
+            "core",
+            "Core",
+            "内核",
+            "TUN",
+            "tun",
+            "subscription",
+            "Subscription",
+            "订阅",
+            "config",
+            "Config",
+            "配置",
+            "mihomo",
+            "reload",
+            "provider",
+            "Provider",
+        ];
+        if !WORTHY.iter().any(|key| text.contains(key)) {
+            return;
+        }
+        let now = Instant::now();
+        if let Some((at, last)) = &self.last_notify {
+            if last == text || now.duration_since(*at) < Duration::from_secs(4) {
+                return;
+            }
+        }
+        self.last_notify = Some((now, text.to_string()));
+        crate::notify::send("terc", text);
+    }
+
+    pub fn open_palette(&mut self) {
+        self.overlay = Overlay::Palette;
+        self.palette_query.clear();
+        self.palette_index = 0;
     }
 
     pub fn save_preferences(&mut self) {
@@ -1664,9 +1772,35 @@ impl App {
                     }
                     self.clamp_aux();
                 }
-                BackendEvent::DnsLookup { lines, is_error } => {
+                BackendEvent::DnsLookup {
+                    name,
+                    qtype,
+                    ms,
+                    lines,
+                    is_error,
+                } => {
                     self.dns_error = is_error;
                     self.dns_lines = lines;
+                    let summary = if is_error {
+                        self.dns_lines.first().cloned().unwrap_or_default()
+                    } else {
+                        self.dns_lines
+                            .iter()
+                            .find(|line| line.starts_with("    "))
+                            .map(|line| line.trim().to_string())
+                            .unwrap_or_else(|| "no answer".into())
+                    };
+                    self.dns_log.push(DnsLogEntry {
+                        at: clock_hms(),
+                        name,
+                        qtype,
+                        ms,
+                        summary,
+                        is_error,
+                    });
+                    if self.dns_log.len() > 32 {
+                        self.dns_log.remove(0);
+                    }
                 }
                 BackendEvent::ProbeDone { lines, is_error } => {
                     self.probe_error = is_error;
@@ -1813,9 +1947,10 @@ impl App {
     }
 
     pub fn accept_snapshot(&mut self, mut snapshot: CoreSnapshot) {
-        if self.snapshot.running && !snapshot.running {
-            self.load_core_log();
-        }
+        let was_running = self.snapshot.running;
+        // A missed probe still requires a full next poll, even while the UI
+        // retains the running state until a second probe confirms the stop.
+        self.core_polled = snapshot.running;
         // A poll may have started before the latest push: never let it replace
         // fresher pushed data or report sessions as closed.
         if self.stream_live() {
@@ -1833,6 +1968,39 @@ impl App {
             self.down_polls.saturating_add(1)
         };
         let doubtful_stop = !snapshot.running && (self.down_polls < 2 || self.stream_live());
+        if doubtful_stop && was_running {
+            // A single slow controller probe during a network change is not
+            // enough evidence to show the core as stopped.
+            snapshot.running = true;
+        }
+        let confirmed_stop = was_running && !snapshot.running;
+        if confirmed_stop {
+            let pid = fs::read_to_string(
+                PathBuf::from(&self.config.controller.config_dir).join("terc-core.pid"),
+            )
+            .unwrap_or_else(|_| "unknown".into())
+            .trim()
+            .to_string();
+            let core_log = mihomo::core_log_excerpt(&self.config.controller);
+            let exit_marker = if core_log.contains("Mihomo shutting down") {
+                "orderly-shutdown"
+            } else if core_log.to_ascii_lowercase().contains("panic")
+                || core_log.to_ascii_lowercase().contains("fatal")
+            {
+                "panic-or-fatal"
+            } else {
+                "no-shutdown-marker"
+            };
+            crate::diagnostics::record(
+                &self.config.controller,
+                "core-down-observed",
+                &format!(
+                    "pid={pid} action_busy={} core_log={exit_marker}",
+                    self.action_busy
+                ),
+            );
+            self.load_core_log();
+        }
         let keep = (snapshot.running && !snapshot.connections_ok) || doubtful_stop;
         if keep {
             snapshot.upload_total = self.snapshot.upload_total;
@@ -1841,7 +2009,6 @@ impl App {
         if snapshot.running && snapshot.fetched.providers {
             self.providers_polled_at = Some(Instant::now());
         }
-        self.core_polled = snapshot.running;
         snapshot.carry_skipped(&mut self.snapshot);
         self.snapshot = snapshot;
         if !keep {
@@ -1937,9 +2104,26 @@ impl App {
         let now_ms = conns::now_ms();
         let list = &self.snapshot.connections;
         let filter = self.conn_filter;
+        let query = self.conn_query.text.trim().to_lowercase();
         self.conn_view.clear();
-        self.conn_view
-            .extend((0..list.len()).filter(|&i| !filter || conns::is_session(&list[i], now_ms)));
+        self.conn_view.extend((0..list.len()).filter(|&i| {
+            if filter && !conns::is_session(&list[i], now_ms) {
+                return false;
+            }
+            if query.is_empty() {
+                return true;
+            }
+            let item = &list[i];
+            [
+                &item.host,
+                &item.sniff_host,
+                &item.process,
+                &item.rule,
+                &item.chains,
+            ]
+            .iter()
+            .any(|value| value.to_lowercase().contains(&query))
+        }));
         match self.conn_sort {
             // mihomo.rs already sorts by total bytes.
             conns::SortKey::Bytes => {}
@@ -2924,6 +3108,15 @@ impl App {
             (Lang::Zh, "explain_partial") => "内核仍会先判断未展开的 GEOSITE / 规则集",
             (Lang::En, "explain_partial") => "Core still evaluates GEOSITE / rule-set before this",
             (Lang::Ja, "explain_partial") => "コアは GEOSITE / ルールセットを先に評価します",
+            (Lang::Zh, "explain_target") => "目标",
+            (Lang::En, "explain_target") => "TARGET",
+            (Lang::Ja, "explain_target") => "対象",
+            (Lang::Zh, "explain_chain") => "链路",
+            (Lang::En, "explain_chain") => "CHAIN",
+            (Lang::Ja, "explain_chain") => "経路",
+            (Lang::Zh, "explain_skip") => "跳过",
+            (Lang::En, "explain_skip") => "SKIP",
+            (Lang::Ja, "explain_skip") => "スキップ",
             (Lang::Zh, "explain_none") => "没有命中",
             (Lang::En, "explain_none") => "No match",
             (Lang::Ja, "explain_none") => "一致なし",
@@ -2962,6 +3155,11 @@ fn main() -> io::Result<()> {
         println!("terc {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    let cli_args: Vec<String> = env::args().skip(1).collect();
+    if let Some(code) = cli::dispatch(&cli_args) {
+        std::process::exit(code);
+    }
+    let had_config = Config::path().is_file();
     let (mut config, load_issue) = Config::load();
     // Nothing is written at startup after an unusable config.json: the user
     // sees the error first, and only an explicit change saves defaults.
@@ -2988,6 +3186,12 @@ fn main() -> io::Result<()> {
     if let Err(err) = mihomo::controller_socket_addr(&app.config.controller.addr) {
         problems.push(err.to_string());
     }
+    if had_config && !unusable && !app.snapshot.running {
+        problems.push(format!(
+            "{}\n设置 → 代理 → 内核实例，按 c 检查 / Settings → Core → Core instances, c to check",
+            crate::instances::check(&app.config.controller)
+        ));
+    }
     if !problems.is_empty() {
         // The one-time DNS notice is already recorded as seen; keep it.
         if !app.status_message.is_empty() {
@@ -2995,7 +3199,11 @@ fn main() -> io::Result<()> {
         }
         app.set_status(&problems.join(" | "), true);
     }
-    run(&mut app)
+    let result = run(&mut app);
+    if app.restart_for_core {
+        println!("已选择内核实例，请重新运行 terc / Core selected; run terc again.");
+    }
+    result
 }
 
 /// Click and wheel reports only (1000, in SGR 1006 encoding). crossterm's
@@ -3344,6 +3552,15 @@ fn handle_event(app: &mut App, ev: CEvent) -> Handled {
 }
 
 fn handle_paste(app: &mut App, text: &str) {
+    if app.overlay == Overlay::CoreInstances {
+        crate::instances::paste(app, text);
+        return;
+    }
+    if app.overlay == Overlay::Palette {
+        app.palette_query.insert(text);
+        app.palette_index = 0;
+        return;
+    }
     if let Some(form) = app.proxy_form.as_mut() {
         form.paste(text);
     } else if app.screen == Screen::Settings && app.setting_input.is_some() {
@@ -3367,6 +3584,13 @@ fn handle_paste(app: &mut App, text: &str) {
         crate::manage::handle_manage_paste(app, text);
     } else if app.screen == Screen::Dashboard && app.overlay == Overlay::Probe {
         app.probe_editor.insert(text);
+    } else if app.screen == Screen::Dashboard
+        && app.main_tab == MainTab::Connections
+        && app.conn_editing
+    {
+        app.conn_query.insert_text(text);
+        app.conn_index = 0;
+        app.rebuild_conn_view();
     } else if app.screen == Screen::Dashboard && app.main_tab == MainTab::Dns && app.dns_editing {
         app.dns_editor.insert(text);
     } else if app.screen == Screen::Dashboard && app.main_tab == MainTab::Rules && app.rule_editing
@@ -3487,10 +3711,56 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
         app.log_index = 0;
         return false;
     }
+    if app.main_tab == MainTab::Connections && app.conn_editing {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('w'))
+        {
+            app.conn_query.clear();
+            app.conn_index = 0;
+            app.rebuild_conn_view();
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => app.conn_editing = false,
+            KeyCode::Backspace => {
+                app.conn_query.backspace();
+            }
+            KeyCode::Delete => {
+                app.conn_query.delete();
+            }
+            KeyCode::Left => app.conn_query.move_left(),
+            KeyCode::Right => app.conn_query.move_right(),
+            KeyCode::Home => app.conn_query.move_home(),
+            KeyCode::End => app.conn_query.move_end(),
+            KeyCode::Char(ch) => {
+                app.conn_query.insert_text(&ch.to_string());
+            }
+            _ => {}
+        }
+        app.conn_index = 0;
+        app.rebuild_conn_view();
+        return false;
+    }
     if (app.main_tab == MainTab::Connections && app.connection_detail)
         || (app.main_tab == MainTab::Logs && app.log_detail)
         || (app.main_tab == MainTab::Rules && app.rule_detail)
     {
+        if app.main_tab == MainTab::Connections && key.code == KeyCode::Char('e') {
+            if let Some(host) = app.selected_connection().map(|conn| {
+                if conn.sniff_host.is_empty() {
+                    conn.host.clone()
+                } else {
+                    conn.sniff_host.clone()
+                }
+            }) {
+                app.connection_detail = false;
+                app.main_tab = MainTab::Rules;
+                app.rule_explaining = true;
+                app.rule_editing = true;
+                app.rule_target_editor.load(&host);
+            }
+            return false;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Enter => {
                 app.connection_detail = false;
@@ -3507,16 +3777,32 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
         }
         return false;
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+        app.open_palette();
+        return false;
+    }
+    if key.code == KeyCode::Char(':') {
+        app.open_palette();
+        return false;
+    }
     match key.code {
         KeyCode::Char('q') => return true,
         KeyCode::Backspace => app.clear_status(),
-        KeyCode::Esc => match dashboard_esc(app.main_tab, app.rule_query.text.is_empty()) {
-            EscStep::ClearQuery => {
-                app.rule_query.clear();
-                app.rule_index = 0;
+        KeyCode::Esc => {
+            if app.main_tab == MainTab::Connections && !app.conn_query.text.is_empty() {
+                app.conn_query.clear();
+                app.conn_index = 0;
+                app.rebuild_conn_view();
+            } else {
+                match dashboard_esc(app.main_tab, app.rule_query.text.is_empty()) {
+                    EscStep::ClearQuery => {
+                        app.rule_query.clear();
+                        app.rule_index = 0;
+                    }
+                    EscStep::Proxies => app.main_tab = MainTab::Proxies,
+                }
             }
-            EscStep::Proxies => app.main_tab = MainTab::Proxies,
-        },
+        }
         KeyCode::Char(' ') => app.toggle_sysproxy(),
         KeyCode::Char('e') if app.main_tab == MainTab::Dns => app.dns_editing = true,
         KeyCode::Char('e') | KeyCode::Char('/') if app.main_tab == MainTab::Rules => {
@@ -3536,6 +3822,13 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
         },
         KeyCode::Char('H') if app.main_tab == MainTab::Providers => {
             app.healthcheck_selected_provider()
+        }
+        KeyCode::Char('t') if app.main_tab == MainTab::Connections => {
+            app.overlay = Overlay::Talkers;
+            app.talker_index = 0;
+        }
+        KeyCode::Char('/') if app.main_tab == MainTab::Connections && !app.conn_closed_view => {
+            app.conn_editing = true;
         }
         KeyCode::Char('m') => app.cycle_routing_mode(),
         KeyCode::Char('r') if app.main_tab == MainTab::Proxies => app.test_current_group(),
@@ -3565,6 +3858,7 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             app.main_tab = if app.main_tab == MainTab::Logs {
                 MainTab::Proxies
             } else {
+                app.load_core_log();
                 MainTab::Logs
             };
         }
@@ -3772,6 +4066,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
     }
     match app.overlay {
         Overlay::None => {}
+        Overlay::CoreInstances => return crate::instances::handle_key(app, key),
         Overlay::OwnNodes => crate::manage::handle_own_nodes_key(app, key),
         Overlay::PrivateRules => crate::manage::handle_private_rules_key(app, key),
         Overlay::Best => match key.code {
@@ -3826,6 +4121,82 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
                 _ => {}
             }
         }
+        Overlay::Palette => {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('w'))
+            {
+                app.palette_query.clear();
+                app.palette_index = 0;
+                return false;
+            }
+            match key.code {
+                KeyCode::Esc => app.close_overlay(),
+                KeyCode::Enter => {
+                    let list = crate::palette::filtered(app);
+                    if let Some(item) =
+                        list.get(app.palette_index.min(list.len().saturating_sub(1)))
+                    {
+                        let cmd = item.command;
+                        return crate::palette::execute(app, cmd);
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let len = crate::palette::filtered(app).len();
+                    if len > 0 {
+                        app.palette_index = app.palette_index.checked_sub(1).unwrap_or(len - 1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let len = crate::palette::filtered(app).len();
+                    if len > 0 {
+                        app.palette_index = (app.palette_index + 1) % len;
+                    }
+                }
+                KeyCode::Backspace => {
+                    app.palette_query.backspace();
+                    app.palette_index = 0;
+                }
+                KeyCode::Delete => {
+                    app.palette_query.delete();
+                    app.palette_index = 0;
+                }
+                KeyCode::Left => app.palette_query.move_left(),
+                KeyCode::Right => app.palette_query.move_right(),
+                KeyCode::Home => app.palette_query.move_home(),
+                KeyCode::End => app.palette_query.move_end(),
+                KeyCode::Char(ch) => {
+                    app.palette_query.insert(&ch.to_string());
+                    app.palette_index = 0;
+                }
+                _ => {}
+            }
+        }
+        Overlay::Talkers => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
+            KeyCode::Char('g') => {
+                app.talker_group = app.talker_group.next();
+                app.talker_index = 0;
+            }
+            KeyCode::Char('o') => {
+                app.talker_sort = app.talker_sort.next();
+                app.talker_index = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.talker_index = app.talker_index.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = crate::talkers::aggregate(
+                    &app.snapshot.connections,
+                    app.talker_group,
+                    app.talker_sort,
+                )
+                .len();
+                if len > 0 {
+                    app.talker_index = (app.talker_index + 1).min(len - 1);
+                }
+            }
+            _ => {}
+        },
         Overlay::Runtime => match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('w') => app.close_overlay(),
             KeyCode::Up | KeyCode::Char('k') => {
@@ -4194,10 +4565,9 @@ mod tests {
         assert!(fresh.status_message.is_empty());
         fresh.config.enabled_modules = vec!["dns-fakeip".into()];
         assert!(!fresh.note_dns_module_change());
-        assert!(serde_json::to_string(&Config::default())
+        assert!(!serde_json::to_string(&Config::default())
             .unwrap()
-            .find("seen_notices")
-            .is_none());
+            .contains("seen_notices"));
     }
 
     fn render_text(app: &mut App, width: u16, height: u16) -> String {
@@ -4322,7 +4692,10 @@ mod tests {
         for (width, height) in [(42, 12), (80, 24), (120, 30)] {
             app.setting_index = 0;
             press(&mut app, KeyCode::Tab);
-            assert_eq!(app.setting_index, 4);
+            assert_eq!(
+                app.settings_rows()[app.setting_index].id,
+                crate::settings::SettingId::Theme
+            );
             let view = render_text(&mut app, width, height);
             assert!(!view.contains(app.t("set_download_core")));
             press(&mut app, KeyCode::Up);
@@ -4331,11 +4704,17 @@ mod tests {
                 crate::settings::SettingId::Toolbar
             );
             press(&mut app, KeyCode::Down);
-            assert_eq!(app.setting_index, 4);
+            assert_eq!(
+                app.settings_rows()[app.setting_index].id,
+                crate::settings::SettingId::Theme
+            );
             press(&mut app, KeyCode::BackTab);
             assert_eq!(app.setting_index, 0);
             press(&mut app, KeyCode::Char('3'));
-            assert_eq!(app.setting_index, 9);
+            assert_eq!(
+                app.settings_rows()[app.setting_index].id,
+                crate::settings::SettingId::Profiles
+            );
             let view = render_text(&mut app, width, height);
             assert!(!view.contains(app.t("set_theme")));
             press(&mut app, KeyCode::Char('4'));
@@ -4502,7 +4881,11 @@ mod tests {
     fn millisecond_setting_edits_cancel_and_preserves_existing_config() {
         let mut app = offline_app();
         app.screen = Screen::Settings;
-        app.setting_index = 7;
+        app.setting_index = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.id == crate::settings::SettingId::GraphInterval)
+            .unwrap();
         press(&mut app, KeyCode::Enter);
         for c in "1250".chars() {
             press(&mut app, KeyCode::Char(c));
@@ -5631,32 +6014,36 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.overlay, Overlay::None);
 
-        app.private_rules.rules = vec!["DOMAIN-SUFFIX,example.com,AI".into()];
+        app.private_rules.rules = vec!["DOMAIN-SUFFIX,example.com,DIRECT".into()];
         app.overlay = Overlay::PrivateRules;
         let text = render_text(&mut app, 140, 40);
         assert!(text.contains("example.com"));
-        assert!(text.contains("→AI"));
-        assert!(text.contains("AI预设"));
-        app.ai_picker = true;
-        app.snapshot.groups.push(crate::mihomo::ProxyGroup {
-            name: "AUTO".into(),
-            kind: "URLTest".into(),
-            now: String::new(),
-            fixed: String::new(),
-            all: vec![],
-            test_url: String::new(),
-            expected_status: String::new(),
-            timeout_ms: 0,
-        });
-        press(&mut app, KeyCode::Char(' '));
-        assert_eq!(app.ai_picker_selected, vec!["AUTO".to_string()]);
-        let text = render_text(&mut app, 140, 40);
-        assert!(text.contains("●AUTO"));
-        press(&mut app, KeyCode::Char('c'));
-        assert!(app.ai_picker_selected.is_empty());
+        assert!(text.contains("→DIRECT"));
+        assert!(text.contains("手动规则"));
+        assert!(!text.contains("AI预设"));
+        let ai_enabled = app.private_rules.ai.enabled;
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.private_rules.ai.enabled, ai_enabled);
+        press(&mut app, KeyCode::Char('a'));
+        for ch in "anime1.me,DIRECT".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        assert_eq!(app.manage_editor.text, "anime1.me,DIRECT");
         press(&mut app, KeyCode::Esc);
-        assert!(!app.ai_picker);
+        assert!(app.manage_input.is_none());
         assert_eq!(app.overlay, Overlay::PrivateRules);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        app.screen = Screen::Settings;
+        app.settings_management = true;
+        app.profile_page = 3;
+        assert!(render_text(&mut app, 140, 40).contains("手动规则"));
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.overlay, Overlay::PrivateRules);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Settings);
+        assert!(app.settings_management);
+        assert_eq!(app.profile_page, 3);
     }
 
     fn live_conn(
@@ -5854,7 +6241,7 @@ mod tests {
         let logs = app.logs.len();
         // A slow /version and `SendOnDrop`'s fallback both read as not running.
         app.accept_snapshot(CoreSnapshot::default());
-        assert!(!app.snapshot.running);
+        assert!(app.snapshot.running);
         assert_eq!(app.snapshot.connections.len(), 3);
         app.accept_snapshot(live_snapshot(sample_connections()));
         assert!(app.conns.closed().is_empty());

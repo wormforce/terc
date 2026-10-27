@@ -4,7 +4,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::Sender,
@@ -84,6 +84,9 @@ pub enum BackendEvent {
         ok: bool,
     },
     DnsLookup {
+        name: String,
+        qtype: String,
+        ms: u64,
         lines: Vec<String>,
         is_error: bool,
     },
@@ -3611,6 +3614,11 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     if cfg!(test) {
         return Err("the core is never started under test".into());
     }
+    crate::diagnostics::record(
+        cfg,
+        "core-start-request",
+        &format!("tun_configured={}", local_flags(cfg).tun_enabled),
+    );
     let bin = discover_mihomo_binary()
         .ok_or("mihomo binary not found  download the managed core first")?;
     let config_file = config_yaml_path(cfg);
@@ -3671,6 +3679,11 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
         let _ = child.wait();
         return Err(err.to_string());
     }
+    crate::diagnostics::record(
+        cfg,
+        "core-spawned",
+        &format!("pid={} privilege=user", child.id()),
+    );
     // A first start may download GeoIP/GeoSite data before the controller
     // listens, so wait on a deadline while the process stays alive.
     let started = Instant::now();
@@ -3698,6 +3711,14 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
             }
             StartupStep::Exited => {
                 let _ = fs::remove_file(&pid_path);
+                crate::diagnostics::record(
+                    cfg,
+                    "core-start-exited",
+                    &format!(
+                        "exit_status={}",
+                        exited.map(|s| s.to_string()).unwrap_or_default()
+                    ),
+                );
                 return Err(format!(
                     "Mihomo exited ({}): {}",
                     exited.map(|s| s.to_string()).unwrap_or_default(),
@@ -3705,13 +3726,22 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
                 ));
             }
             StartupStep::Ready | StartupStep::StillStarting => {
+                let pid = child.id();
+                let wait_cfg = cfg.clone();
                 thread::spawn(move || {
-                    let _ = child.wait();
+                    let status = child.wait();
+                    crate::diagnostics::record(
+                        &wait_cfg,
+                        "core-process-exited",
+                        &format!("pid={pid} {}", exit_status_label(status)),
+                    );
                 });
                 if step == StartupStep::Ready {
                     CORE_REFRESHED.with(|cell| cell.set(true));
+                    crate::diagnostics::record(cfg, "core-ready", &format!("pid={pid}"));
                     return Ok(format!("Started mihomo ({})", bin.display()));
                 }
+                crate::diagnostics::record(cfg, "core-start-pending", &format!("pid={pid}"));
                 // The PID record stays, so the managed-core guard blocks a second launch.
                 return Ok(format!(
                     "Mihomo is still starting (downloading geodata?); the controller will come up when it finishes. Log: {}",
@@ -3726,6 +3756,18 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
                 CORE_START_DEADLINE.as_secs()
             ),
         };
+        crate::diagnostics::record(
+            cfg,
+            "core-start-failed",
+            &format!(
+                "reason={}",
+                match step {
+                    StartupStep::Rejected(code) => format!("controller-rejected-{code}"),
+                    StartupStep::TimedOut => "controller-timeout".into(),
+                    _ => "startup-error".into(),
+                }
+            ),
+        );
         // A failed start must not leave an orphan that collides with the next attempt.
         let _ = child.kill();
         let _ = child.wait();
@@ -3735,6 +3777,26 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
             log_path.display(),
             core_log_excerpt(cfg)
         ));
+    }
+}
+
+fn exit_status_label(status: io::Result<ExitStatus>) -> String {
+    match status {
+        Ok(status) => {
+            let mut detail = format!("success={}", status.success());
+            if let Some(code) = status.code() {
+                detail.push_str(&format!(" exit_code={code}"));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(signal) = status.signal() {
+                    detail.push_str(&format!(" signal={signal}"));
+                }
+            }
+            detail
+        }
+        Err(error) => format!("wait_error={}", error.kind()),
     }
 }
 
@@ -3748,7 +3810,7 @@ enum CoreProbe {
     Pending,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupStep {
     Ready,
     Exited,
@@ -3792,6 +3854,11 @@ fn log_suggests_download(log: &str) -> bool {
 
 pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     let (pid, uid) = crate::privilege::managed_core(cfg)?;
+    crate::diagnostics::record(
+        cfg,
+        "core-stop-request",
+        &format!("pid={pid} uid={uid} source=core-service"),
+    );
     if cfg!(target_os = "macos") && uid == 0 {
         crate::privilege::stop_core(pid)?;
     } else {
@@ -3815,6 +3882,11 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
         }
     }
     let _ = fs::remove_file(Path::new(&cfg.config_dir).join("terc-core.pid"));
+    crate::diagnostics::record(
+        cfg,
+        "core-stop-complete",
+        &format!("pid={pid} source=core-service"),
+    );
     let (_, enabled) = detect_sysproxy();
     if enabled {
         let ports = read_config_text(cfg)
@@ -4068,6 +4140,8 @@ fn generate(
         None => (compose::carry_runtime_state(&base, &base), Vec::new()),
     };
     let generated = crate::ops::apply_modules_with_switches(&base, modules, &switches)?;
+    let generated = compose::prepend_manual_rules(&generated, &input.rules.rules)?;
+    report.private_rules = input.rules.rules.len();
     // Check what the core will run: the plan's rules, the modules' DNS.
     report.inspect(&generated, route == "subscription");
     Ok((generated, report))
@@ -4141,8 +4215,9 @@ fn regenerate_outcome(
         );
     }
     let manual = compose::load_manual_nodes(&dir);
-    // Custom rules and AI presets are paused. The source owns routing policy.
-    let rules = compose::PrivateRules::default();
+    // Global manual overrides are independent of the source and routing plan.
+    // The retired AI / China-direct presets stay disabled.
+    let rules = compose::PrivateRules::load(&compose::terc_dir());
     let input = compose::ComposeInput {
         subscription: sub.as_ref(),
         manual: &manual,
@@ -5439,11 +5514,19 @@ pub fn dns_query_async(
     tx: Sender<BackendEvent>,
 ) {
     thread::spawn(move || {
+        let started = Instant::now();
         let (lines, is_error) = match query_dns(&cfg, &name, &qtype) {
             Ok(msg) => (format_dns_lines(&name, &qtype, &msg), false),
             Err(err) => (vec![err], true),
         };
-        let _ = tx.send(BackendEvent::DnsLookup { lines, is_error });
+        let ms = started.elapsed().as_millis() as u64;
+        let _ = tx.send(BackendEvent::DnsLookup {
+            name,
+            qtype,
+            ms,
+            lines,
+            is_error,
+        });
         let _ = tx.send(BackendEvent::ReplyDone);
     });
 }
@@ -5905,8 +5988,8 @@ pub fn refresh_provider(cfg: &ControllerConfig, kind: &str, name: &str) -> Resul
 /// Mihomo's reserved `default` provider is its only `Compatible` one, and
 /// updating it does nothing.
 pub fn refreshable_provider(provider: &ProviderInfo) -> bool {
-    !provider.vehicle.eq_ignore_ascii_case("Compatible")
-        && !(provider.kind == "proxy" && provider.name == "default")
+    !(provider.vehicle.eq_ignore_ascii_case("Compatible")
+        || provider.kind == "proxy" && provider.name == "default")
 }
 
 /// Each refresh is a download inside the core; a few run at once.
@@ -6210,7 +6293,7 @@ pub struct ProbeReport {
     pub is_error: bool,
 }
 
-pub fn run_probe(cfg: &ControllerConfig, node: &str, raw: &str) -> ProbeReport {
+pub fn run_probe(cfg: &ControllerConfig, node: &str, raw: &str, proxy_port: u16) -> ProbeReport {
     let target: ProbeTarget = parse_probe_target(raw);
     if target.host.is_empty() && target.delay_url.is_empty() {
         return ProbeReport {
@@ -6225,18 +6308,38 @@ pub fn run_probe(cfg: &ControllerConfig, node: &str, raw: &str) -> ProbeReport {
         dns_ok = true;
     } else if !target.host.is_empty() {
         for qtype in ["A", "AAAA"] {
+            let started = Instant::now();
             match query_dns(cfg, &target.host, qtype) {
                 Ok(msg) => {
                     dns_ok = true;
+                    let ms = started.elapsed().as_secs_f64() * 1000.0;
                     if msg.answers.is_empty() {
-                        lines.push(format!("dns {qtype}  no answer  rcode {}", msg.status));
+                        lines.push(format!(
+                            "dns {qtype}  {ms:.0} ms  no answer  rcode {}",
+                            msg.status
+                        ));
+                    } else {
+                        lines.push(format!("dns {qtype}  {ms:.0} ms"));
                     }
                     for answer in msg.answers {
-                        lines.push(format!("dns {qtype}  {}  {}s", answer.data, answer.ttl));
+                        lines.push(format!("    {}  {}s", answer.data, answer.ttl));
                     }
                 }
                 Err(err) => lines.push(format!("dns {qtype}  {err}")),
             }
+        }
+    }
+    let mut stage_ok = false;
+    if target.delay_url.starts_with("http") {
+        if proxy_port > 0 {
+            lines.push(format!("via    127.0.0.1:{proxy_port}"));
+        }
+        match curl_timings(&target.delay_url, proxy_port, cfg.timeout_ms) {
+            Ok(stage) => {
+                stage_ok = true;
+                lines.extend(stage.lines());
+            }
+            Err(err) => lines.push(format!("stage  {err}")),
         }
     }
     let mut delay_ok = false;
@@ -6252,13 +6355,114 @@ pub fn run_probe(cfg: &ControllerConfig, node: &str, raw: &str) -> ProbeReport {
     }
     ProbeReport {
         lines,
-        is_error: !(dns_ok || delay_ok),
+        is_error: !(dns_ok || delay_ok || stage_ok),
     }
 }
 
-pub fn probe_async(cfg: ControllerConfig, node: String, raw: String, tx: Sender<BackendEvent>) {
+#[derive(Debug, PartialEq)]
+struct StagedTiming {
+    lookup: f64,
+    connect: f64,
+    tls: f64,
+    ttfb: f64,
+    total: f64,
+    code: String,
+}
+
+impl StagedTiming {
+    fn parse(out: &str) -> Option<Self> {
+        let mut parts = out.split_whitespace();
+        let lookup = parts.next()?.parse().ok()?;
+        let connect = parts.next()?.parse().ok()?;
+        let tls = parts.next()?.parse().ok()?;
+        let ttfb = parts.next()?.parse().ok()?;
+        let total = parts.next()?.parse().ok()?;
+        let code = parts.next().unwrap_or("000").to_string();
+        Some(Self {
+            lookup,
+            connect,
+            tls,
+            ttfb,
+            total,
+            code,
+        })
+    }
+
+    fn lines(&self) -> Vec<String> {
+        let ms = |v: f64| v * 1000.0;
+        vec![
+            format!("tcp    {:.0} ms", ms(self.connect - self.lookup).max(0.0)),
+            format!("tls    {:.0} ms", ms(self.tls - self.connect).max(0.0)),
+            format!("ttfb   {:.0} ms", ms(self.ttfb - self.tls).max(0.0)),
+            format!("total  {:.0} ms  http {}", ms(self.total), self.code),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod staged_timing_tests {
+    use super::*;
+
+    #[test]
+    fn parses_curl_checkpoints_and_subtracts_phases() {
+        let t = StagedTiming::parse("0.010 0.030 0.080 0.150 0.160 204").unwrap();
+        assert_eq!(t.code, "204");
+        let lines = t.lines();
+        assert!(lines[0].contains("20 ms"), "{lines:?}");
+        assert!(lines[1].contains("50 ms"), "{lines:?}");
+        assert!(lines[2].contains("70 ms"), "{lines:?}");
+        assert!(lines[3].contains("160 ms"), "{lines:?}");
+    }
+
+    #[test]
+    fn rejects_incomplete_curl_output() {
+        assert!(StagedTiming::parse("0.1 0.2").is_none());
+        assert!(StagedTiming::parse("").is_none());
+    }
+}
+
+/// Staged timings through the running proxy. `curl -w` reports monotonic
+/// checkpoints; the lines subtract them so a slow DNS or TLS phase is visible.
+fn curl_timings(url: &str, proxy_port: u16, timeout_ms: u64) -> Result<StagedTiming, String> {
+    let timeout = Duration::from_millis(timeout_ms.max(1000));
+    let mut cmd = Command::new("curl");
+    cmd.arg("-sS")
+        .arg("-o")
+        .arg("/dev/null")
+        .arg("--max-time")
+        .arg(format!("{:.1}", timeout.as_secs_f64()))
+        .arg("--connect-timeout")
+        .arg(format!("{:.1}", timeout.as_secs_f64()))
+        .arg("-w")
+        .arg("%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total} %{http_code}");
+    if proxy_port > 0 {
+        cmd.arg("--proxy")
+            .arg(format!("http://127.0.0.1:{proxy_port}"));
+    }
+    cmd.arg(url);
+    let output = cmd.output().map_err(|err| format!("curl: {err}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let err = err.lines().next().unwrap_or("curl failed").trim();
+        return Err(if err.is_empty() {
+            "curl failed".into()
+        } else {
+            err.to_string()
+        });
+    }
+    let out = String::from_utf8_lossy(&output.stdout);
+    StagedTiming::parse(out.trim()).ok_or_else(|| "curl returned no timings".into())
+}
+
+pub fn probe_async(
+    cfg: ControllerConfig,
+    node: String,
+    raw: String,
+    proxy_port: u16,
+    tx: Sender<BackendEvent>,
+) {
     thread::spawn(move || {
-        let report = run_probe(&cfg, &node, &raw);
+        let report = run_probe(&cfg, &node, &raw, proxy_port);
         let _ = tx.send(BackendEvent::ProbeDone {
             lines: report.lines,
             is_error: report.is_error,
@@ -7448,6 +7652,47 @@ mod listener_tests {
     const REPORT_SOURCE: &str = "mixed-port: 7890\ndns:\n  enable: true\n  nameserver: [223.5.5.5]\n  fallback: [tls://8.8.8.8]\n  nameserver-policy:\n    'rule-set:cn': 223.5.5.5\nproxies:\n  - {name: HK, type: ss, server: 192.0.2.1, port: 8388, cipher: aes-128-gcm, password: fake, udp: true}\nproxy-groups:\n  - {name: Airport, type: select, proxies: [HK]}\nrule-providers:\n  cn: {type: http, behavior: domain, url: https://example.org/cn.yaml}\nrules:\n  - GEOIP,CN,DIRECT\n  - MATCH,Airport\n";
 
     #[test]
+    fn manual_overrides_survive_routing_switches_and_source_updates() {
+        let cfg = ControllerConfig::default();
+        let rules = crate::compose::PrivateRules {
+            rules: vec!["DOMAIN-SUFFIX,anime1.me,DIRECT".into()],
+            ..Default::default()
+        };
+        for source in [
+            REPORT_SOURCE.to_string(),
+            REPORT_SOURCE.replace("GEOIP,CN,DIRECT", "DOMAIN-SUFFIX,example.org,Airport"),
+        ] {
+            let sub = crate::subconv::convert_subscription(&source).unwrap();
+            let input = crate::compose::ComposeInput {
+                subscription: Some(&sub),
+                manual: &[],
+                rules: &rules,
+                controller_addr: &cfg.addr,
+                secret: &cfg.secret,
+                test_url: &cfg.test_url,
+            };
+            for route in ["subscription", "all", "subscription"] {
+                let (yaml, report) = generate(&cfg, &input, route, None, &[]).unwrap();
+                let manual = yaml.find("DOMAIN-SUFFIX,anime1.me,DIRECT").unwrap();
+                assert!(manual < yaml.find("MATCH,").unwrap(), "{yaml}");
+                assert_eq!(yaml.matches("anime1.me").count(), 1);
+                assert_eq!(report.private_rules, 1);
+                assert!(!yaml.contains("name: AI") && !yaml.contains("GEOSITE,cn"));
+                if route == "subscription" {
+                    assert!(yaml.contains("rule-providers:\n  cn:"));
+                    assert!(yaml.contains("name: Airport, type: select, proxies: [HK]"));
+                    let source_rule = if source.contains("GEOIP,CN") {
+                        "GEOIP,CN,DIRECT"
+                    } else {
+                        "DOMAIN-SUFFIX,example.org,Airport"
+                    };
+                    assert!(manual < yaml.find(source_rule).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_report_describes_the_config_after_routing_and_modules() {
         // The source's own routing: its rule and its DNS are reported.
         let (_, report) = generated(REPORT_SOURCE, "subscription", &[]);
@@ -8224,22 +8469,26 @@ proxy-providers:
     #[cfg(unix)]
     fn config_check_downloading_geodata_gets_more_time() {
         let limits = InstallLimits {
-            check: Duration::from_millis(200),
+            // macOS may spend several hundred ms launching a fresh script.
+            check: Duration::from_secs(1),
             download: Duration::from_secs(10),
             ..TEST_LIMITS
         };
-        let script = "echo 'Can not find GeoSite.dat, start download'; sleep 1; exit 0";
+        let script = "echo 'Can not find GeoSite.dat, start download'; sleep 2; exit 0";
         let (dir, bin) = install_fixture("download", script);
         let cfg = ControllerConfig {
             config_dir: dir.display().to_string(),
             ..ControllerConfig::default()
         };
-        assert!(install_config_with(&cfg, "mode: global\n", false, || Some(bin), &limits).is_ok());
+        let result = install_config_with(&cfg, "mode: global\n", false, || Some(bin), &limits);
+        if let Err(failure) = result {
+            panic!("{}", failure.message);
+        }
         assert_eq!(read_config_text(&cfg).unwrap(), "mode: global\n");
         fs::remove_dir_all(dir).unwrap();
         // The longer deadline still stops a download that never ends.
         let limits = InstallLimits {
-            download: Duration::from_millis(600),
+            download: Duration::from_secs(2),
             ..limits
         };
         let (dir, bin) = install_fixture("download-hung", "echo downloading; exec sleep 30");
