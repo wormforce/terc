@@ -31,6 +31,7 @@ Usage:
   terc dns <name> [--type A] [--json]
   terc explain <target> [--json]
   terc sysproxy on|off [--yes] [--json]
+  terc core start|stop [--json] start or stop the managed core
   terc notify-test [--json]    verify desktop notifications
   terc help
 
@@ -59,6 +60,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "dns" => dns(rest, json),
         "explain" => explain(rest, json),
         "sysproxy" => sysproxy(rest, json),
+        "core" => core(rest, json),
         "notify-test" => notify_test(json),
         "help" | "?" => {
             print!("{USAGE}");
@@ -307,10 +309,50 @@ fn mode(args: &[String], json: bool) -> i32 {
     };
     match mihomo::switch_routing_mode(&config.controller, normalized) {
         Ok(()) => {
+            // A reload or a core restart reads the file's mode, not the running
+            // one, so record the switch the way the TUI's mode key does.
+            let persisted = mihomo::persist_mode(&config.controller, &normalized.to_lowercase());
+            if let Err(err) = &persisted {
+                eprintln!("terc: warning: mode {normalized} not saved to config.yaml: {err}");
+            }
             if json {
-                print_json(&json!({ "ok": true, "mode": normalized }));
+                print_json(
+                    &json!({ "ok": true, "mode": normalized, "persisted": persisted.is_ok() }),
+                );
             } else {
                 println!("mode {normalized}");
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("terc: {err}");
+            1
+        }
+    }
+}
+
+fn core(args: &[String], json: bool) -> i32 {
+    let Some(action) = args
+        .iter()
+        .find(|arg| !arg.starts_with("--"))
+        .map(|arg| arg.to_lowercase())
+    else {
+        return usage_error("core needs start or stop");
+    };
+    let Ok(config) = load_config() else {
+        return 1;
+    };
+    let result = match action.as_str() {
+        "start" => mihomo::start_core_service(&config.controller),
+        "stop" => mihomo::stop_core_service(&config.controller),
+        _ => return usage_error("core takes start or stop"),
+    };
+    match result {
+        Ok(message) => {
+            if json {
+                print_json(&json!({ "ok": true, "action": action, "message": message }));
+            } else {
+                println!("{message}");
             }
             0
         }
