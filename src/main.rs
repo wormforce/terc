@@ -1078,6 +1078,18 @@ impl App {
                     &format!("pid_record={}", pid.trim()),
                 );
             }
+            // A system proxy still pointing at the core that just died sends
+            // every proxy-aware app on the machine to a closed port. Drop our
+            // own entry here; the user turns it back on once the core is up.
+            if snapshot.sysproxy_enabled {
+                if let Ok(Some(note)) = mihomo::release_stale_sysproxy(&config.controller) {
+                    crate::diagnostics::record(
+                        &config.controller,
+                        "sysproxy-stale-released",
+                        &note,
+                    );
+                }
+            }
         }
         let mut app = Self::from_snapshot(config, snapshot);
         app.load_core_log();

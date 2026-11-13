@@ -3922,13 +3922,7 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
         "core-stop-complete",
         &format!("pid={pid} source=core-service"),
     );
-    let (_, enabled) = detect_sysproxy();
-    if enabled {
-        let ports = read_config_text(cfg)
-            .map(|raw| yaml_listener_ports(&raw))
-            .unwrap_or_default();
-        release_sysproxy(&ports)?;
-    }
+    release_stale_sysproxy(cfg)?;
     Ok("Stopped managed Mihomo core".into())
 }
 
@@ -3972,6 +3966,20 @@ fn refuse_sysproxy_in_tests() -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Turn the system proxy off when it is ours and the core it points at is not
+/// running. A stale entry sends every proxy-aware app to a closed port, so this
+/// runs whenever terc finds the core gone: on a stop, and at launch.
+pub fn release_stale_sysproxy(cfg: &ControllerConfig) -> Result<Option<String>, String> {
+    let (_, enabled) = detect_sysproxy();
+    if !enabled {
+        return Ok(None);
+    }
+    let ports = read_config_text(cfg)
+        .map(|raw| yaml_listener_ports(&raw))
+        .unwrap_or_default();
+    release_sysproxy(&ports)
 }
 
 /// Turn off the system proxy entries that still point at this core.
