@@ -111,6 +111,51 @@ pub fn save(name: &str, raw: &str) -> Result<String, String> {
     )?;
     Ok(id)
 }
+
+/// Import an independent Mihomo routing document without applying it.
+pub fn import(location: &str, cfg: &crate::mihomo::ControllerConfig) -> Result<String, String> {
+    let location = location.trim();
+    let raw = if location.starts_with("https://") || location.starts_with("http://") {
+        let mut download = cfg.clone();
+        download.subscription_url = location.into();
+        crate::mihomo::download_subscription(&download)?
+    } else {
+        let path = if let Some(rest) = location.strip_prefix("~/") {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or("HOME is not set")?
+                .join(rest)
+        } else {
+            PathBuf::from(location)
+        };
+        fs::read_to_string(path)
+            .map_err(|e| format!("读取分流文件失败 / Cannot read routing file: {e}"))?
+    };
+    let chunks = split_chunks(&raw);
+    if !chunks.iter().any(|c| c.key.as_deref() == Some("rules")) {
+        return Err("缺少 rules：请导入含策略组和规则的 Mihomo 配置 / Missing rules: import a Mihomo configuration with groups and rules".into());
+    }
+    // URL paths can themselves contain credentials; never use them as a label.
+    let name = if location.starts_with("https://") || location.starts_with("http://") {
+        "Imported routing"
+    } else {
+        let filename = location
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+        filename
+            .strip_suffix(".yaml")
+            .or_else(|| filename.strip_suffix(".yml"))
+            .unwrap_or(filename)
+    };
+    let name = if name.is_empty() {
+        "Imported routing"
+    } else {
+        name
+    };
+    save(name, &raw)
+}
 fn policy_key(key: Option<&str>) -> bool {
     matches!(
         key,
@@ -898,6 +943,35 @@ fn avoid_names(yaml: &str, proxies: &HashSet<String>) -> Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn import_file_saves_policy_without_nodes_and_rejects_missing_rules() {
+        let temp =
+            std::env::temp_dir().join(format!("terc-import-routing-{}.yaml", std::process::id()));
+        let source = "proxies:\n  - {name: AirportNode, type: ss, server: secret.example, password: secret}\nproxy-groups:\n  - {name: Proxy, type: select, proxies: [AirportNode]}\nrules:\n  - DOMAIN-SUFFIX,example.com,Proxy\n  - MATCH,Proxy\n";
+        fs::write(&temp, source).unwrap();
+        let id = import(
+            temp.to_str().unwrap(),
+            &crate::mihomo::ControllerConfig::default(),
+        )
+        .unwrap();
+        let path = directory().join(format!("{id}.json"));
+        let plan: Plan = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(plan.yaml.contains("DOMAIN-SUFFIX,example.com,Proxy"));
+        assert!(plan.yaml.contains("include-all: true"));
+        assert!(!plan.yaml.contains("secret"));
+        fs::write(
+            &temp,
+            "proxy-groups:\n  - {name: X, type: select, proxies: [DIRECT]}\n",
+        )
+        .unwrap();
+        assert!(import(
+            temp.to_str().unwrap(),
+            &crate::mihomo::ControllerConfig::default()
+        )
+        .is_err());
+        fs::remove_file(temp).unwrap();
+        fs::remove_file(path).unwrap();
+    }
     fn drop_unmatched_regions_for(yaml: &str, proxies: &HashSet<String>) -> Result<String, String> {
         drop_unmatched_regions(yaml, proxies, &mut Vec::new())
     }

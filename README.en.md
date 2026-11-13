@@ -85,7 +85,7 @@ Transparency follows your terminal profile. `terc` leaves the background at its 
 | **Themes** | Spring, Vintage, and Mono; all preserve the terminal background |
 
 
-Press `s` → Sources & Routing for the named proxy list; Tab opens routing plans. Press `a` for the unified subscription/proxy form, `e` to edit the selected entry. Both pages stay inside Settings. Sources own nodes, while routing plans own rules and groups. Switching sources restores its assigned plan. Choose subscription routing, Proxy all, routing from another source, or use `c` to save current routing for reuse. Saved groups use current-source nodes, preserving group references and filters.
+Press `s` → Sources & Routing for the named proxy list; Tab opens routing plans. Press `a` for the unified subscription/proxy form, `e` to edit the selected entry. Both pages stay inside Settings. Sources own nodes, while routing plans own rules and groups. Switching sources restores its assigned plan. Choose subscription routing, Proxy all, routing from another source, use `c` to save current routing, or `i` to import routing from a Mihomo configuration file or URL. Import does not apply the plan or change the subscription; choose subscription routing to switch back. Saved groups use current-source nodes, preserving group references and filters.
 
 <details>
 <summary>Advanced tools and diagnostics</summary>

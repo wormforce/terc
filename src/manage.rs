@@ -34,6 +34,7 @@ pub enum ManageInput {
     AddProfile,
     RenameProfile,
     SaveRouting,
+    ImportRouting,
     EditSubscription,
 }
 
@@ -137,6 +138,16 @@ impl App {
             return;
         }
         match kind {
+            ManageInput::ImportRouting => {
+                if self.action_busy {
+                    return;
+                }
+                self.manage_input = None;
+                self.run_action("正在导入分流方案 / Importing routing plan…", None, None, move |cfg| {
+                    crate::routing::import(&text, &cfg)?;
+                    Ok("分流方案已导入；选择后按 Enter 应用 / Plan imported; select it and press Enter to apply".into())
+                });
+            }
             ManageInput::SaveRouting => {
                 let result = crate::mihomo::read_config_text(&self.config.controller)
                     .and_then(|raw| crate::routing::save(&text, &raw));
@@ -992,6 +1003,7 @@ pub fn handle_profiles_key(app: &mut App, key: KeyEvent) {
                 move_cursor(&mut app.routing_index, app.routing_plans.len(), true)
             }
             KeyCode::Char('c') => app.start_manage_input(ManageInput::SaveRouting),
+            KeyCode::Char('i') => app.start_manage_input(ManageInput::ImportRouting),
             KeyCode::Enter => {
                 let Some(plan) = app.routing_plans.get(app.routing_index) else {
                     return;
@@ -1198,6 +1210,12 @@ pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
                     "Name (reuse policies; members follow the current source)",
                     "名前",
                 ),
+                ManageInput::ImportRouting => l3(
+                    app,
+                    "Mihomo 配置文件路径或 URL",
+                    "Mihomo configuration file path or URL",
+                    "Mihomo 設定ファイルのパスまたは URL",
+                ),
                 ManageInput::RenameProfile => l3(app, "订阅名称", "Subscription name", "名前"),
                 ManageInput::EditSubscription => {
                     l3(app, "当前订阅地址", "Active subscription URL", "URL")
@@ -1212,7 +1230,7 @@ pub fn draw_profile_hub(frame: &mut Frame, app: &App, area: Rect) {
             draw_input(frame, app, rows[3], label);
         } else {
             let desc = if routing {
-                l3(app,"Enter 为当前订阅应用所选方案。c 将当前规则与策略组保存为可复用方案。保存后节点成员统一跟随订阅，保留组间引用与过滤条件。","Enter assigns the plan to the active subscription. c saves current routing for reuse. Saved groups use current-source nodes, preserving group links and filters.","Enter 適用 c 保存")
+                l3(app,"Enter 应用所选方案；i 导入文件或链接；c 保存当前分流。方案使用当前来源的节点。","Enter applies a plan; i imports a file or URL; c saves current routing. Plans use the current source's nodes.","Enter 適用 i 読込 c 保存")
             } else {
                 l3(app,"Enter 切换订阅并加载它记住的分流。a 添加代理  e 编辑  c 复制当前来源  n 改名  d 删除（再按一次确认）。u 更新订阅  v 管理当前节点。Tab 切换分流。","Enter switches source with its assigned routing. a Add  e Edit  c Copy  n Rename  d Delete (press again to confirm). u Update  v Nodes. Tab switches to routing.","Enter 切替 a 追加 e 編集 c 複製 n 名前 d 削除（再押して確認） u 更新 v ノード")
             };
