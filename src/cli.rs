@@ -31,6 +31,8 @@ Usage:
   terc dns <name> [--type A] [--json]
   terc explain <target> [--json]
   terc sysproxy on|off [--yes] [--json]
+  terc verify  [--json]        running config vs the generated one
+  terc doctor  [--json]        read-only health checks
   terc notify-test [--json]    verify desktop notifications
   terc help
 
@@ -59,6 +61,8 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "dns" => dns(rest, json),
         "explain" => explain(rest, json),
         "sysproxy" => sysproxy(rest, json),
+        "verify" => verify(json),
+        "doctor" => doctor(json),
         "notify-test" => notify_test(json),
         "help" | "?" => {
             print!("{USAGE}");
@@ -544,6 +548,148 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .position(|arg| arg == flag)
         .and_then(|index| args.get(index + 1))
         .map(String::as_str)
+}
+
+fn verify(json: bool) -> i32 {
+    let Ok(config) = load_config() else {
+        return 1;
+    };
+    let drift = match crate::drift::check(&config.controller) {
+        Ok(drift) => drift,
+        Err(err) => {
+            eprintln!("terc: {err}");
+            return 1;
+        }
+    };
+    let ok = drift.is_clean();
+    if json {
+        print_json(&json!({
+            "ok": ok,
+            "running": drift.running.display().to_string(),
+            "generated": drift.expected.as_ref().map(|p| p.display().to_string()),
+            "generated_missing": drift.generated_missing,
+            "missing_rules": drift.missing_rules.len(),
+            "missing_rules_sample": drift.missing_rules.iter().take(5).cloned().collect::<Vec<_>>(),
+            "missing_dns_policy": drift.missing_dns_policy,
+        }));
+        return if ok { 0 } else { 1 };
+    }
+    if let Some(expected) = &drift.expected {
+        println!("generated {}", expected.display());
+    }
+    println!("running   {}", drift.running.display());
+    if drift.generated_missing {
+        println!("✗ 找不到该 profile 的生成配置，无法比对");
+    } else if ok {
+        println!("✓ 运行配置与生成配置一致");
+    } else {
+        if !drift.missing_rules.is_empty() {
+            println!("✗ 缺少 {} 条规则", drift.missing_rules.len());
+            for rule in drift.missing_rules.iter().take(5) {
+                println!("    - {rule}");
+            }
+        }
+        if !drift.missing_dns_policy.is_empty() {
+            println!("✗ 缺少 {} 条 DNS 策略", drift.missing_dns_policy.len());
+            for entry in &drift.missing_dns_policy {
+                println!("    - {entry}");
+            }
+        }
+    }
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn doctor(json: bool) -> i32 {
+    let Ok(config) = load_config() else {
+        return 1;
+    };
+    let snap = snapshot(&config);
+    let (net_service, live_sysproxy) = mihomo::detect_sysproxy();
+    let drift = crate::drift::check(&config.controller);
+    let drift_error = drift.as_ref().err().cloned();
+    let drift_ok = drift.as_ref().map(|d| d.is_clean()).unwrap_or(true);
+    let generated_missing = drift.as_ref().map(|d| d.generated_missing).unwrap_or(false);
+    let missing_rules = drift.as_ref().map(|d| d.missing_rules.len()).unwrap_or(0);
+    let missing_policy = drift
+        .as_ref()
+        .map(|d| d.missing_dns_policy.len())
+        .unwrap_or(0);
+    // The snapshot and the OS can disagree when a reload lands between them;
+    // reporting both turns a silent mismatch into a visible one.
+    let sysproxy_matches = live_sysproxy == snap.sysproxy_enabled;
+    let ok = snap.running && drift_ok && drift_error.is_none() && sysproxy_matches;
+
+    if json {
+        print_json(&json!({
+            "ok": ok,
+            "core": { "running": snap.running, "version": snap.version, "mode": snap.mode },
+            "ports": { "http": snap.http_port, "socks": snap.socks_port, "mixed": snap.mixed_port },
+            "sysproxy": {
+                "live": live_sysproxy,
+                "reported": snap.sysproxy_enabled,
+                "service": net_service,
+            },
+            "drift": {
+                "clean": drift_ok,
+                "generated_missing": generated_missing,
+                "missing_rules": missing_rules,
+                "missing_dns_policy": missing_policy,
+                "error": drift_error,
+            },
+            "profile": config.controller.profile_id,
+        }));
+        return if ok { 0 } else { 1 };
+    }
+
+    let mark = |good: bool| if good { "✓" } else { "✗" };
+    println!(
+        "{} core      {}",
+        mark(snap.running),
+        if snap.running {
+            format!("running {} ({})", snap.version, snap.mode)
+        } else {
+            "stopped".to_string()
+        }
+    );
+    println!(
+        "{} ports     mixed {} · http {} · socks {}",
+        mark(snap.running),
+        snap.mixed_port,
+        snap.http_port,
+        snap.socks_port
+    );
+    println!(
+        "{} sysproxy  {} （service {}）",
+        mark(sysproxy_matches),
+        if live_sysproxy { "on" } else { "off" },
+        net_service
+    );
+    if let Some(err) = drift_error {
+        println!("✗ drift     {err}");
+    } else if generated_missing {
+        println!("✗ drift     找不到生成配置，无法比对");
+    } else if drift_ok {
+        println!("✓ drift     运行配置与生成配置一致");
+    } else {
+        println!(
+            "✗ drift     缺少 {} 条规则、{} 条 DNS 策略",
+            missing_rules, missing_policy
+        );
+    }
+    println!(
+        "{} profile   {}",
+        mark(!config.controller.profile_id.is_empty()),
+        config.controller.profile_id
+    );
+    if ok {
+        0
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]

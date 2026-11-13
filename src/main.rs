@@ -16,6 +16,7 @@ pub mod compose;
 mod conns;
 pub mod control;
 mod diagnostics;
+pub mod drift;
 mod guard;
 mod instances;
 pub mod manage;
