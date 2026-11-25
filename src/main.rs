@@ -1,3 +1,5 @@
+#[cfg(windows)]
+mod windows;
 use std::{
     env, fs, io,
     path::PathBuf,
@@ -218,6 +220,7 @@ impl Config {
     pub fn path() -> PathBuf {
         #[cfg(not(test))]
         let base = env::var_os("HOME")
+            .or_else(|| env::var_os("USERPROFILE"))
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         #[cfg(test)]
@@ -397,12 +400,16 @@ fn salvage_secret(raw: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// 32 hex characters from `/dev/urandom`. Mihomo installs no auth at all for
+/// 32 hex characters from the operating system random source. Mihomo installs no auth at all for
 /// an empty secret, and its default CORS lets any web page reach the
 /// controller, so a fresh config never starts without one.
 fn random_secret() -> Option<String> {
+    #[cfg(unix)]
     use std::io::Read as _;
     let mut bytes = [0u8; 16];
+    #[cfg(windows)]
+    crate::windows::random_bytes(&mut bytes)?;
+    #[cfg(unix)]
     fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut bytes))
         .ok()?;
@@ -1077,6 +1084,18 @@ impl App {
                     "core-unavailable-at-launch",
                     &format!("pid_record={}", pid.trim()),
                 );
+            }
+            // A system proxy still pointing at the core that died blocks every
+            // proxy-aware app on the machine, so drop our own entry before the
+            // dashboard starts. The user turns it back on once the core is up.
+            if snapshot.sysproxy_enabled {
+                if let Ok(Some(note)) = crate::mihomo::release_stale_sysproxy(&config.controller) {
+                    crate::diagnostics::record(
+                        &config.controller,
+                        "sysproxy-stale-released",
+                        &note,
+                    );
+                }
             }
         }
         let mut app = Self::from_snapshot(config, snapshot);
@@ -2208,7 +2227,7 @@ impl App {
         F: FnOnce(ControllerConfig) -> Result<String, String> + Send + 'static,
     {
         if self.action_busy {
-            self.set_status("Another operation is still running", true);
+            self.set_status(self.t("st_action_busy"), true);
             return;
         }
         self.action_busy = true;
@@ -2246,7 +2265,9 @@ impl App {
             return;
         }
         let catalog = crate::ops::module_catalog(&crate::ops::modules_dir(&PathBuf::from(
-            env::var_os("HOME").unwrap_or_default(),
+            env::var_os("HOME")
+                .or_else(|| env::var_os("USERPROFILE"))
+                .unwrap_or_default(),
         )));
         let modules = crate::ops::enabled_snippets(&catalog, &self.config.enabled_modules);
         let running = self.snapshot.running;
@@ -2504,17 +2525,41 @@ impl App {
         let ports = if self.snapshot.running {
             mihomo::proxy_ports(&self.snapshot)
         } else {
-            Err("Start the core before enabling system proxy".into())
+            Err(self.t("st_core_down").into())
         };
         if !self.snapshot.sysproxy_enabled {
             if let Err(e) = &ports {
-                self.set_status(e, true);
+                let message = if self.snapshot.running && self.config.settings.lang == Lang::Zh {
+                    "内核未启用 HTTP 或混合代理端口。"
+                } else {
+                    e
+                };
+                self.set_status(message, true);
                 return;
             }
         }
         let shown = self.snapshot.sysproxy_enabled;
-        self.run_action("Updating system proxy…", None, None, move |_| {
-            sysproxy_toggle(shown, ports, set_sysproxy)
+        let zh = self.config.settings.lang == Lang::Zh;
+        self.run_action(self.t("st_sysproxy_applying"), None, None, move |cfg| {
+            let result = if shown {
+                mihomo::disable_sysproxy(&cfg)
+            } else {
+                sysproxy_toggle(shown, ports, set_sysproxy)
+            };
+            if zh {
+                result
+                    .map(|_| {
+                        if shown {
+                            "Terc 系统代理已关闭"
+                        } else {
+                            "Terc 系统代理已开启"
+                        }
+                        .into()
+                    })
+                    .map_err(|e| format!("切换系统代理失败。\n{e}"))
+            } else {
+                result
+            }
         });
     }
 
@@ -2528,14 +2573,36 @@ impl App {
             self.apply_core_setting("mode", mode.to_ascii_lowercase().into());
             return;
         }
-        self.run_action("Switching routing mode…", None, None, move |cfg| {
-            switch_routing_mode(&cfg, mode).map_err(|e| e.to_string())?;
+        let zh = self.config.settings.lang == Lang::Zh;
+        self.run_action(self.t("st_mode_applying"), None, None, move |cfg| {
+            switch_routing_mode(&cfg, mode).map_err(|e| {
+                if zh {
+                    format!("切换路由模式失败。\n{e}")
+                } else {
+                    e.to_string()
+                }
+            })?;
             // A later reload applies the file's mode, so record the switch there.
             if config_file_exists(&cfg) {
-                crate::mihomo::persist_mode(&cfg, &mode.to_ascii_lowercase())
-                    .map_err(|e| format!("Routing mode › {mode}; not saved to config.yaml: {e}"))?;
+                crate::mihomo::persist_mode(&cfg, &mode.to_ascii_lowercase()).map_err(|e| {
+                    if zh {
+                        format!("路由模式已切换，但无法保存到 config.yaml。\n{e}")
+                    } else {
+                        format!("Routing mode › {mode}; not saved to config.yaml: {e}")
+                    }
+                })?;
             }
-            Ok(format!("Routing mode › {mode}"))
+            let label = match mode {
+                "Rule" => "规则",
+                "Global" => "全局",
+                "Direct" => "直连",
+                _ => mode,
+            };
+            Ok(if zh {
+                format!("路由模式 › {label}")
+            } else {
+                format!("Routing mode › {mode}")
+            })
         });
     }
 
@@ -2545,11 +2612,22 @@ impl App {
         }
         let running = self.snapshot.running
             || crate::privilege::managed_core(&self.config.controller).is_ok();
-        self.run_action("Updating core service…", None, None, move |cfg| {
-            if running {
+        let zh = self.config.settings.lang == Lang::Zh;
+        self.run_action(self.t("st_core_applying"), None, None, move |cfg| {
+            let result = if running {
                 stop_core_service(&cfg)
             } else {
                 start_core_service(&cfg)
+            };
+            if zh {
+                let failure = if running {
+                    "停止 Mihomo 内核失败。"
+                } else {
+                    "启动 Mihomo 内核失败。"
+                };
+                result.map_err(|e| format!("{failure}\n{e}"))
+            } else {
+                result
             }
         });
     }
@@ -2564,6 +2642,16 @@ impl App {
 
     pub fn t(&self, key: &str) -> &'static str {
         match (self.config.settings.lang, key) {
+            (Lang::Zh, "st_tun_applying") => "正在设置 TUN…",
+            (_, "st_tun_applying") => "Applying TUN…",
+            (Lang::Zh, "st_sysproxy_applying") => "正在切换系统代理…",
+            (_, "st_sysproxy_applying") => "Updating system proxy…",
+            (Lang::Zh, "st_mode_applying") => "正在切换路由模式…",
+            (_, "st_mode_applying") => "Switching routing mode…",
+            (Lang::Zh, "st_core_applying") => "正在更新内核服务…",
+            (_, "st_core_applying") => "Updating core service…",
+            (Lang::Zh, "st_action_busy") => "有操作正在进行，请稍候。",
+            (_, "st_action_busy") => "Another operation is still running",
             (Lang::Zh, "cat_diagnostics") => "排查工具",
             (Lang::Ja, "cat_diagnostics") => "診断ツール",
             (_, "cat_diagnostics") => "Diagnostics",
@@ -3252,6 +3340,10 @@ fn main() -> io::Result<()> {
 struct ClickMouse;
 
 impl crossterm::Command for ClickMouse {
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        crossterm::event::EnableMouseCapture.execute_winapi()
+    }
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
         f.write_str("\x1b[?1000h\x1b[?1006h")
     }
@@ -3567,6 +3659,9 @@ fn mouse_acts(kind: MouseEventKind) -> bool {
 fn handle_event(app: &mut App, ev: CEvent) -> Handled {
     match ev {
         CEvent::Key(key) => {
+            if key.kind == crossterm::event::KeyEventKind::Release {
+                return Handled::Unchanged;
+            }
             if handle_key(app, key) {
                 return Handled::Quit;
             }
@@ -6168,7 +6263,7 @@ mod tests {
         // so this does not reach the controller.
         app.action_busy = true;
         press(&mut app, KeyCode::Char('x'));
-        assert_eq!(app.status_message, "Another operation is still running");
+        assert_eq!(app.status_message, app.t("st_action_busy"));
         app.action_busy = false;
         app.accept_snapshot(live_snapshot(vec![live_conn(
             "ai",

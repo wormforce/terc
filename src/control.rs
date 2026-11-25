@@ -105,12 +105,10 @@ impl App {
         if disrupt.is_some_and(|what| !self.confirm_disruption(what)) {
             return;
         }
-        self.run_action(
-            "正在设置 TUN，macOS 可能请求管理员授权 / Applying TUN…",
-            None,
-            None,
-            move |cfg| crate::privilege::set_tun(&cfg, next, running),
-        );
+        let lang = self.config.settings.lang;
+        self.run_action(self.t("st_tun_applying"), None, None, move |cfg| {
+            crate::privilege::set_tun(&cfg, next, running, lang)
+        });
     }
 
     pub fn toggle_sniffing(&mut self) {
@@ -638,6 +636,7 @@ fn clamp_to(index: usize, len: usize) -> usize {
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }

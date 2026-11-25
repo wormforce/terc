@@ -1445,6 +1445,7 @@ mod tests {
         assert!(node["state-dir"]
             .as_str()
             .unwrap()
+            .replace('\\', "/")
             .contains("tailscale/node-"));
         assert!(node.get("server").is_none() && node.get("port").is_none());
         let mut other = Form::manual_tailscale(None, None);

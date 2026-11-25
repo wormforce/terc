@@ -353,6 +353,7 @@ fn default_config_dir() -> String {
             return HOMEBREW_CONFIG_DIR.to_string();
         }
         std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
             .map(|home| {
                 PathBuf::from(home)
                     .join(".config/terc/mihomo")
@@ -831,7 +832,12 @@ fn stream_session(
     use crate::ws::{Message, WsError};
     let mut client = match crate::ws::connect(addr, CONNECTIONS_WS_PATH, headers, t.connect) {
         Ok(client) => client.with_limits(t.max_frame, t.max_message),
-        Err(WsError::Io(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {
+        Err(WsError::Io(e))
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+            ) =>
+        {
             return SessionEnd::Unreachable(e.to_string())
         }
         Err(e) => return SessionEnd::Failed(e.to_string()),
@@ -1902,6 +1908,8 @@ mod snapshot_tests {
             calls.set(calls.get() + 1);
             HostState {
                 sysproxy: ("GNOME".into(), on),
+                #[cfg(windows)]
+                windows_proxy_server: String::new(),
                 core_bin: Some(bin.clone()),
             }
         };
@@ -1942,6 +1950,8 @@ mod snapshot_tests {
         fs::remove_file(&bin).unwrap();
         let missing = || HostState {
             sysproxy: ("GNOME".into(), false),
+            #[cfg(windows)]
+            windows_proxy_server: String::new(),
             core_bin: None,
         };
         assert_eq!(
@@ -2019,6 +2029,7 @@ mod snapshot_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_core_binary_is_found_on_path_without_which() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("terc-path-{}", std::process::id()));
@@ -2345,7 +2356,10 @@ pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot
     // One read and one split serve the flags, timeouts and configured values.
     let facts = config_facts(cfg, fetch.cached_host);
     let flags = facts.as_ref().map(|facts| facts.flags.clone());
-    let mut snapshot = fetch_core_snapshot(cfg, fetch, flags);
+    let host = host_state(fetch.cached_host);
+    #[cfg(windows)]
+    let (proxy_enabled, proxy_server) = (host.sysproxy.1, host.windows_proxy_server.clone());
+    let mut snapshot = fetch_core_snapshot(cfg, fetch, flags, host);
     if let Some(facts) = &facts {
         for group in &mut snapshot.groups {
             group.timeout_ms = facts.timeouts.get(&group.name).copied().unwrap_or(0);
@@ -2372,6 +2386,14 @@ pub fn fetch_snapshot_with(cfg: &ControllerConfig, fetch: Fetch) -> CoreSnapshot
             .get("mode")
             .cloned()
             .unwrap_or_else(|| "rule".into());
+    }
+    #[cfg(windows)]
+    {
+        snapshot.sysproxy_enabled = proxy_enabled
+            && crate::windows::ours(
+                &proxy_server,
+                &[snapshot.http_port, snapshot.socks_port, snapshot.mixed_port],
+            );
     }
     snapshot
 }
@@ -2432,8 +2454,22 @@ type ConfigKey = (PathBuf, u64, u64, u64, (i64, i64), (i64, i64));
 static CONFIG_FACTS: Mutex<Option<(ConfigKey, Arc<ConfigFacts>)>> = Mutex::new(None);
 
 fn config_key(path: &Path) -> Option<ConfigKey> {
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     let m = fs::metadata(path).ok()?;
+    #[cfg(windows)]
+    {
+        let modified = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some((
+            path.to_path_buf(),
+            0,
+            0,
+            m.len(),
+            (modified.as_secs() as i64, modified.subsec_nanos() as i64),
+            (modified.as_secs() as i64, modified.subsec_nanos() as i64),
+        ))
+    }
+    #[cfg(unix)]
     Some((
         path.to_path_buf(),
         m.dev(),
@@ -2501,12 +2537,14 @@ fn fetch_core_snapshot(
     cfg: &ControllerConfig,
     fetch: Fetch,
     flags: Option<RuntimeFlags>,
+    host: HostState,
 ) -> CoreSnapshot {
     let timeout = Duration::from_millis(700);
     let HostState {
         sysproxy: (net_service, sysproxy_enabled),
         core_bin,
-    } = host_state(fetch.cached_host);
+        ..
+    } = host;
     let core_bin_path = core_bin
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
@@ -3484,8 +3522,12 @@ pub fn is_info_pseudo_node(name: &str) -> bool {
 
 pub fn discover_mihomo_binary() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".config/terc/core/mihomo"));
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        candidates.push(PathBuf::from(home).join(if cfg!(windows) {
+            ".config/terc/core/mihomo.exe"
+        } else {
+            ".config/terc/core/mihomo"
+        }));
     }
     candidates.push(PathBuf::from("/opt/homebrew/bin/mihomo"));
     candidates.push(PathBuf::from("/usr/local/bin/mihomo"));
@@ -3504,6 +3546,7 @@ pub fn discover_mihomo_binary() -> Option<PathBuf> {
 
 /// What `which` does, without starting it: the first executable `name` in
 /// the directories of `path`.
+#[cfg(unix)]
 fn find_executable(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path)
@@ -3512,10 +3555,19 @@ fn find_executable(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
         .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
+#[cfg(windows)]
+fn find_executable(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|dir| dir.join(format!("{name}.exe")))
+        .find(|p| p.is_file())
+}
+
 /// The two lookups a snapshot makes outside the controller.
 #[derive(Clone, Debug, PartialEq)]
 struct HostState {
     sysproxy: (String, bool),
+    #[cfg(windows)]
+    windows_proxy_server: String,
     core_bin: Option<PathBuf>,
 }
 
@@ -3529,9 +3581,22 @@ const HOST_TTL: Duration = Duration::from_secs(15);
 static HOST_CACHE: Mutex<Option<(Instant, HostState)>> = Mutex::new(None);
 
 fn host_state(cached: bool) -> HostState {
-    host_state_with(&HOST_CACHE, cached, Instant::now(), || HostState {
-        sysproxy: detect_sysproxy(),
-        core_bin: discover_mihomo_binary(),
+    host_state_with(&HOST_CACHE, cached, Instant::now(), || {
+        #[cfg(windows)]
+        let (enabled, server) = if cfg!(test) {
+            (false, String::new())
+        } else {
+            crate::windows::proxy_state().unwrap_or_default()
+        };
+        HostState {
+            #[cfg(not(windows))]
+            sysproxy: detect_sysproxy(),
+            #[cfg(windows)]
+            sysproxy: ("Windows".into(), enabled),
+            #[cfg(windows)]
+            windows_proxy_server: server,
+            core_bin: discover_mihomo_binary(),
+        }
     })
 }
 
@@ -3694,20 +3759,42 @@ pub fn start_core_service(cfg: &ControllerConfig) -> Result<String, String> {
             .map_err(|e| e.to_string())?;
     }
     let log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
-    let mut child = Command::new(&bin)
-        .arg("-d")
-        .arg(&cfg.config_dir)
-        .arg("-f")
-        .arg(&config_file)
-        .arg("-ext-ctl")
-        .arg(&cfg.addr)
-        .arg("-secret")
-        .arg(&cfg.secret)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log)
-        .spawn()
+    // A core started from a terminal that is later closed has to outlive the
+    // console: Windows Terminal terminates the processes in its job, and a core
+    // that dies that way leaves the system proxy pointing at a closed port.
+    // Break away from the job when it allows it, and keep the plain detached
+    // spawn when it does not.
+    #[cfg(windows)]
+    const CORE_FLAGS: u32 = 0x00000008 | 0x00000200;
+    let spawn_core = |flags: u32| -> io::Result<std::process::Child> {
+        let mut command = Command::new(&bin);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(flags);
+        }
+        #[cfg(not(windows))]
+        let _ = flags;
+        command
+            .arg("-d")
+            .arg(&cfg.config_dir)
+            .arg("-f")
+            .arg(&config_file)
+            .arg("-ext-ctl")
+            .arg(&cfg.addr)
+            .arg("-secret")
+            .arg(&cfg.secret)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log.try_clone()?)
+            .spawn()
+    };
+    #[cfg(windows)]
+    let mut child = spawn_core(CORE_FLAGS | 0x01000000)
+        .or_else(|_| spawn_core(CORE_FLAGS))
         .map_err(|e| format!("failed to start mihomo: {e}"))?;
+    #[cfg(not(windows))]
+    let mut child = spawn_core(0).map_err(|e| format!("failed to start mihomo: {e}"))?;
     let pid_path = Path::new(&cfg.config_dir).join("terc-core.pid");
     if let Err(err) = fs::write(&pid_path, child.id().to_string()) {
         let _ = child.kill();
@@ -3897,6 +3984,12 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
     if cfg!(target_os = "macos") && uid == 0 {
         crate::privilege::stop_core(pid)?;
     } else {
+        #[cfg(windows)]
+        let output = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        #[cfg(not(windows))]
         let output = Command::new("kill")
             .args(["-TERM", &pid.to_string()])
             .output()
@@ -3922,13 +4015,7 @@ pub fn stop_core_service(cfg: &ControllerConfig) -> Result<String, String> {
         "core-stop-complete",
         &format!("pid={pid} source=core-service"),
     );
-    let (_, enabled) = detect_sysproxy();
-    if enabled {
-        let ports = read_config_text(cfg)
-            .map(|raw| yaml_listener_ports(&raw))
-            .unwrap_or_default();
-        release_sysproxy(&ports)?;
-    }
+    let _ = release_stale_sysproxy(cfg)?;
     Ok("Stopped managed Mihomo core".into())
 }
 
@@ -3978,10 +4065,26 @@ fn refuse_sysproxy_in_tests() -> Result<(), String> {
 fn release_sysproxy(ports: &[u16]) -> Result<Option<String>, String> {
     refuse_sysproxy_in_tests()?;
     match std::env::consts::OS {
+        #[cfg(windows)]
+        "windows" => crate::windows::release_proxy(ports),
         "macos" => release_macos_sysproxy(ports),
         "linux" => release_gnome_sysproxy(ports),
         _ => Ok(None),
     }
+}
+
+/// Turn the system proxy off when it is ours and the core it points at is not
+/// running. A stale entry makes every proxy-aware app on the machine fail, so
+/// this runs whenever terc finds the core gone.
+pub fn release_stale_sysproxy(cfg: &ControllerConfig) -> Result<Option<String>, String> {
+    let (_, enabled) = detect_sysproxy();
+    if !enabled {
+        return Ok(None);
+    }
+    let ports = read_config_text(cfg)
+        .map(|raw| yaml_listener_ports(&raw))
+        .unwrap_or_default();
+    release_sysproxy(&ports)
 }
 
 fn release_macos_sysproxy(ports: &[u16]) -> Result<Option<String>, String> {
@@ -4699,6 +4802,8 @@ pub fn mihomo_asset_id_for(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Some("darwin-arm64"),
         ("macos", "x86_64") => Some("darwin-amd64-v1"),
+        ("windows", "x86_64") => Some("windows-amd64-v1"),
+        ("windows", "aarch64") => Some("windows-arm64"),
         ("linux", "aarch64") => Some("linux-arm64"),
         ("linux", "x86_64") => Some("linux-amd64-v1"),
         _ => None,
@@ -4889,13 +4994,19 @@ fn install_core_from(
     });
     let (version, routes) = latest_core_version(base, core_routes(proxy_port))
         .map_err(|err| format!("Cannot read the latest mihomo version: {err}"))?;
-    let name = format!("mihomo-{asset}-{version}.gz");
+    let extension = if asset.starts_with("windows-") {
+        "zip"
+    } else {
+        "gz"
+    };
+    let name = format!("mihomo-{asset}-{version}.{extension}");
     let part = core_dir.join(format!("{name}.part"));
     // Partial files of other versions, and the old script's mihomo.gz.
     if let Ok(entries) = fs::read_dir(core_dir) {
         for entry in entries.flatten() {
             let file = entry.file_name().to_string_lossy().to_string();
-            let stale = file.ends_with(".gz.part") || file == "mihomo.gz";
+            let stale =
+                file.ends_with(".gz.part") || file.ends_with(".zip.part") || file == "mihomo.gz";
             if stale && entry.path() != part {
                 let _ = fs::remove_file(entry.path());
             }
@@ -4912,8 +5023,15 @@ fn install_core_from(
     let url = format!("{base}/download/{version}/{name}");
     fetch_core_asset(&url, &part, &routes, tx)
         .map_err(|err| format!("Failed to download {name}: {err}"))?;
-    let bin = core_dir.join("mihomo");
+    let bin = core_dir.join(if cfg!(windows) {
+        "mihomo.exe"
+    } else {
+        "mihomo"
+    });
     let fresh = core_dir.join("mihomo.new");
+    #[cfg(windows)]
+    let unpacked = crate::windows::unpack_core(&part, &fresh)?;
+    #[cfg(not(windows))]
     let unpacked = fs::File::create(&fresh)
         .and_then(|file| {
             Command::new("gunzip")
@@ -4952,7 +5070,9 @@ fn install_managed_core(
         "No mihomo build for this OS/CPU (darwin-arm64, darwin-amd64-v1, linux-arm64, linux-amd64-v1)"
             .to_string()
     })?;
-    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| "HOME is not set".to_string())?;
     let core_dir = PathBuf::from(home).join(".config/terc/core");
     install_core_from(MIHOMO_RELEASES, asset, &core_dir, proxy_port, tx)
         .map(|bin| bin.display().to_string())
@@ -4977,11 +5097,13 @@ pub fn download_managed_core_async(tx: Sender<BackendEvent>, proxy_port: Option<
 pub enum SysproxyBackend {
     Macos,
     Gnome,
+    Windows,
     Unavailable,
 }
 
 pub fn sysproxy_backend_for(os: &str, gnome_ready: bool) -> SysproxyBackend {
     match os {
+        "windows" => SysproxyBackend::Windows,
         "macos" => SysproxyBackend::Macos,
         "linux" if gnome_ready => SysproxyBackend::Gnome,
         _ => SysproxyBackend::Unavailable,
@@ -5045,6 +5167,8 @@ pub fn detect_sysproxy() -> (String, bool) {
         return ("n/a".to_string(), false);
     }
     match std::env::consts::OS {
+        #[cfg(windows)]
+        "windows" => crate::windows::detect_proxy(),
         "macos" => detect_macos_sysproxy(),
         "linux" => detect_gnome_sysproxy().unwrap_or_else(|| ("n/a".to_string(), false)),
         _ => ("n/a".to_string(), false),
@@ -6546,10 +6670,25 @@ fn set_gnome_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<S
 pub fn set_sysproxy(enable: bool, http_port: u16, socks_port: u16) -> Result<String, String> {
     refuse_sysproxy_in_tests()?;
     match std::env::consts::OS {
+        #[cfg(windows)]
+        "windows" if enable => crate::windows::set_proxy(http_port, socks_port),
+        #[cfg(windows)]
+        "windows" => Ok(crate::windows::release_proxy(&[http_port, socks_port])?
+            .unwrap_or_else(|| "Terc system proxy is already off".into())),
         "macos" => set_macos_sysproxy(enable, http_port, socks_port),
         "linux" => set_gnome_sysproxy(enable, http_port, socks_port),
         _ => Err("sysproxy_unavailable".to_string()),
     }
+}
+
+pub fn disable_sysproxy(cfg: &ControllerConfig) -> Result<String, String> {
+    if cfg!(windows) {
+        let ports = yaml_listener_ports(&read_config_text(cfg)?);
+        return Ok(
+            release_sysproxy(&ports)?.unwrap_or_else(|| "Terc system proxy is already off".into())
+        );
+    }
+    set_sysproxy(false, 0, 0)
 }
 
 pub fn proxy_ports(snapshot: &CoreSnapshot) -> Result<(u16, u16), String> {
@@ -7477,7 +7616,14 @@ mod tests {
             mihomo_asset_id_for("linux", "x86_64"),
             Some("linux-amd64-v1")
         );
-        assert_eq!(mihomo_asset_id_for("windows", "x86_64"), None);
+        assert_eq!(
+            mihomo_asset_id_for("windows", "x86_64"),
+            Some("windows-amd64-v1")
+        );
+        assert_eq!(
+            mihomo_asset_id_for("windows", "aarch64"),
+            Some("windows-arm64")
+        );
         assert_eq!(mihomo_asset_id_for("linux", "arm"), None);
     }
 
@@ -7541,7 +7687,7 @@ mod tests {
         assert_eq!(sysproxy_backend_for("macos", false), SysproxyBackend::Macos);
         assert_eq!(
             sysproxy_backend_for("windows", true),
-            SysproxyBackend::Unavailable
+            SysproxyBackend::Windows
         );
 
         let on = gnome_proxy_commands(true, 7890, 7891);
@@ -8231,6 +8377,7 @@ proxy-providers:
         fs::metadata(path).unwrap().permissions().mode()
     }
 
+    #[cfg(unix)]
     const TEST_LIMITS: InstallLimits = InstallLimits {
         check: Duration::from_secs(10),
         download: Duration::from_secs(10),
@@ -8859,6 +9006,7 @@ proxy-providers:
         fs::remove_dir_all(home).unwrap();
     }
 
+    #[cfg(unix)]
     fn compose_generated(cfg: &ControllerConfig) -> PathBuf {
         crate::compose::terc_dir()
             .join("generated")
@@ -8866,7 +9014,7 @@ proxy-providers:
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod download_tests {
     use super::*;
     use std::net::TcpListener;

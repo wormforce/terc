@@ -201,6 +201,7 @@ pub fn terc_dir() -> PathBuf {
     return crate::test_home().join(".config").join("terc");
     #[cfg(not(test))]
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")

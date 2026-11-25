@@ -102,9 +102,12 @@ impl App {
             self.pending_regen = true;
             return;
         }
-        let catalog = crate::ops::module_catalog(&crate::ops::modules_dir(
-            &std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
-        ));
+        let catalog =
+            crate::ops::module_catalog(&crate::ops::modules_dir(&std::path::PathBuf::from(
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .unwrap_or_default(),
+            )));
         let modules = crate::ops::enabled_snippets(&catalog, &self.config.enabled_modules);
         let running = self.snapshot.running;
         let zh = self.lang() == Lang::Zh;
@@ -181,7 +184,11 @@ impl App {
                 let zh = self.lang() == Lang::Zh;
                 let modules = crate::ops::enabled_snippets(
                     &crate::ops::module_catalog(&crate::ops::modules_dir(
-                        &std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
+                        &std::path::PathBuf::from(
+                            std::env::var_os("HOME")
+                                .or_else(|| std::env::var_os("USERPROFILE"))
+                                .unwrap_or_default(),
+                        ),
                     )),
                     &self.config.enabled_modules,
                 );
@@ -1015,7 +1022,11 @@ pub fn handle_profiles_key(app: &mut App, key: KeyEvent) {
                 let running = app.snapshot.running;
                 let zh = app.lang() == Lang::Zh;
                 let catalog = crate::ops::module_catalog(&crate::ops::modules_dir(
-                    &std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
+                    &std::path::PathBuf::from(
+                        std::env::var_os("HOME")
+                            .or_else(|| std::env::var_os("USERPROFILE"))
+                            .unwrap_or_default(),
+                    ),
                 ));
                 let modules = crate::ops::enabled_snippets(&catalog, &app.config.enabled_modules);
                 app.run_action(

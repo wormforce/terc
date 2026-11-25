@@ -25,6 +25,7 @@ fn expected_args(cfg: &ControllerConfig) -> String {
     )
 }
 
+#[cfg(not(windows))]
 pub(crate) fn managed_core(cfg: &ControllerConfig) -> Result<(u32, u32), String> {
     let path = Path::new(&cfg.config_dir).join("terc-core.pid");
     let pid: u32 = fs::read_to_string(path)
@@ -53,6 +54,7 @@ pub(crate) fn managed_core(cfg: &ControllerConfig) -> Result<(u32, u32), String>
     parse_managed_process(pid, output.status.success(), &text, &expected_args(cfg))
 }
 
+#[cfg(any(not(windows), test))]
 fn parse_managed_process(
     pid: u32,
     success: bool,
@@ -416,6 +418,7 @@ pub(crate) fn set_tun(
     cfg: &ControllerConfig,
     enable: bool,
     running: bool,
+    lang: crate::Lang,
 ) -> Result<String, String> {
     crate::diagnostics::record(
         cfg,
@@ -479,10 +482,20 @@ pub(crate) fn set_tun(
                 "tun-change-failed",
                 &format!("enable={enable} method=runtime-patch"),
             );
+            if cfg!(windows) && enable && e.to_string().contains("Access is denied") {
+                return Err(match lang {
+                    crate::Lang::Zh => "开启 TUN 失败：Windows 拒绝配置虚拟网卡。请先停止 Terc 的内核，再以管理员身份打开终端，重新启动 Terc 和内核后开启 TUN。",
+                    _ => "Could not enable TUN: Windows denied access to the virtual adapter. Stop the Terc core, then restart Terc and its core from an administrator terminal before retrying.",
+                }
+                .into());
+            }
             return Err(if cfg!(target_os = "macos") && managed_core(cfg).is_err() {
                 format!("TUN change failed: {e}. 该内核由外部程序管理，请通过原服务授权；或先在原程序停止内核，再在 设置 → 内核与代理 → 内核服务 由 terc 启动 / Authorize the external core through its service manager, or stop it there and start a terc-managed core in Settings → Core & Proxy → Core service.")
             } else {
-                format!("TUN change failed: {e}")
+                match lang {
+                    crate::Lang::Zh => format!("切换 TUN 失败。请查看内核日志。\n{e}"),
+                    _ => format!("TUN change failed: {e}"),
+                }
             });
         }
         crate::diagnostics::record(
@@ -491,7 +504,10 @@ pub(crate) fn set_tun(
             &format!("enable={enable} method=runtime-patch"),
         );
     }
-    mihomo::persist_nested_bool(cfg, &["tun", "enable"], enable)?;
+    mihomo::persist_nested_bool(cfg, &["tun", "enable"], enable).map_err(|e| match lang {
+        crate::Lang::Zh => format!("无法保存 TUN 配置。\n{e}"),
+        _ => e,
+    })?;
     if !running {
         crate::diagnostics::record(
             cfg,
@@ -499,20 +515,27 @@ pub(crate) fn set_tun(
             &format!("enable={enable} method=save-for-startup"),
         );
     }
-    Ok(if !running {
-        "TUN 配置已保存，启动内核时生效 / Saved; takes effect at core startup"
-    } else if enable {
-        "TUN 已开启 / TUN enabled"
-    } else {
-        "TUN 已关闭 / TUN disabled"
+    Ok(match (lang, running, enable) {
+        (crate::Lang::Zh, false, _) => "TUN 配置已保存，启动内核时生效",
+        (crate::Lang::Zh, true, true) => "TUN 已开启",
+        (crate::Lang::Zh, true, false) => "TUN 已关闭",
+        (_, false, _) => "TUN settings saved; takes effect at core startup",
+        (_, true, true) => "TUN enabled",
+        (_, true, false) => "TUN disabled",
     }
     .into())
+}
+
+#[cfg(windows)]
+pub(crate) fn managed_core(cfg: &ControllerConfig) -> Result<(u32, u32), String> {
+    crate::windows::managed_core(cfg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    #[cfg(unix)]
     fn admin_script_quotes_arguments_and_checks_identity_before_stopping() {
         let cfg = ControllerConfig {
             config_dir: "/tmp/terc user's config".into(),
@@ -621,6 +644,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn hand_started_homebrew_core_and_explicit_config_are_recognized() {
         let cfg = ControllerConfig {
             config_dir: "/opt/homebrew/etc/mihomo".into(),

@@ -223,3 +223,9 @@ src/mihomo.rs                  HTTP/1.1 over TcpStream, streams, networksetup an
 cargo test --all-targets --locked
 cargo build --release --locked
 ```
+
+## Windows
+
+Windows 10/11 x86_64 and ARM64 are supported. Use Windows Terminal and a stable Rust MSVC toolchain with Visual Studio C++ Build Tools. Run `cargo build --release --locked`, then `.\target\release\terc.exe`.
+
+Ctrl+D in setup downloads the official Windows ZIP core. An existing `mihomo.exe` on PATH is also supported. Data lives in `%USERPROFILE%\.config\terc` (HOME takes priority when set). Space controls the current user's Windows system proxy and requires an HTTP or mixed port. The core continues after the UI exits; stop it in Settings before updating it. For TUN, start Windows Terminal as administrator before launching terc and the core. Windows desktop notifications and in-app elevation are unavailable.

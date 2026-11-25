@@ -486,7 +486,9 @@ impl App {
         let running = self.snapshot.running;
         let modules = crate::ops::enabled_snippets(
             &crate::ops::module_catalog(&crate::ops::modules_dir(&std::path::PathBuf::from(
-                std::env::var_os("HOME").unwrap_or_default(),
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .unwrap_or_default(),
             ))),
             &self.config.enabled_modules,
         );

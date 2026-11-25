@@ -47,6 +47,19 @@
 > [!IMPORTANT]
 > **使用声明：** 本软件仅供中国大陆以外地区使用，仅用于学习和研究。
 
+## Windows
+
+支持 Windows 10 / 11（x86_64 / ARM64），建议在 Windows Terminal 中运行。安装 Rust 稳定版（MSVC 工具链及 Visual Studio C++ Build Tools）后执行：
+
+```powershell
+cargo build --release --locked
+.\target\release\terc.exe
+```
+
+初始设置按 Ctrl+D 下载官方 Windows ZIP 内核，或将 `mihomo.exe` 放入 PATH。配置与内核保存在 `%USERPROFILE%\.config\terc`（设置 HOME 时优先使用 HOME）。Space 切换当前用户的 Windows 系统代理；需要 HTTP 或混合端口。退出界面后后台内核继续运行，可在设置中停止。更新内核前请先停止内核。
+
+TUN 需要以管理员身份运行 Windows Terminal，再启动 terc 与内核。Windows 不提供界面内提权或桌面通知；CLI 与界面内通知可正常使用。
+
 ## 快速开始
 
 **需要：** macOS 14 或更新版本，或 Linux（x86_64 / arm64）、Rust 稳定版，以及 `mihomo` 内核，建议 v1.19.27 或更新（地区组的 `empty-fallback` 从这一版起生效；更旧的内核 terc 会在启动后提示）。macOS 可用 `brew install mihomo`（已装的用 `brew upgrade mihomo` 更新）；两边都可以在设置里下载与本机匹配的官方内核。日常用法见 [使用说明](docs/使用说明.md)。
