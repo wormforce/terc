@@ -7,6 +7,7 @@ pub enum SettingId {
     Core,
     CoreInstances,
     SystemProxy,
+    TerminalProxy,
     Mode,
     Download,
     Theme,
@@ -87,6 +88,15 @@ impl App {
             self.t("desc_mode"),
             self.t("desc_mode"),
         );
+        let terminal_state = match (self.lang() == Lang::Zh, self.terminal_proxy_installed) {
+            (true, true) => "已写入",
+            (true, false) => "未写入",
+            (false, true) => "Installed",
+            (false, false) => "Not installed",
+        };
+        add(TerminalProxy, C::Core, "终端代理", "Terminal proxy", terminal_state.into(),
+            "Enter 一键写入或移除当前 shell 的启动配置，新终端生效。端口随当前内核读取；保留 NO_PROXY，自带局域网与 Tailnet 直连例外。当前窗口：eval \"$(terc env)\"；撤销：eval \"$(terc env --unset)\"。",
+            "Enter installs/removes shell startup integration for new terminals. Reads the selected core's ports; preserves NO_PROXY and adds LAN/Tailnet exclusions. Current shell: eval \"$(terc env)\"; undo: eval \"$(terc env --unset)\".");
         add(
             Download,
             C::Diagnostics,
@@ -352,6 +362,7 @@ impl App {
             Core => self.toggle_core_service(),
             CoreInstances => crate::instances::open(self),
             SystemProxy => self.toggle_sysproxy(),
+            TerminalProxy => self.toggle_terminal_proxy(),
             Mode => self.cycle_routing_mode(),
             Download => self.download_core(),
             Theme => {
@@ -471,6 +482,34 @@ impl App {
                 self.screen = Screen::Dashboard;
                 self.main_tab = crate::MainTab::Logs;
             }
+        }
+    }
+
+    pub fn toggle_terminal_proxy(&mut self) {
+        use crate::shell_proxy::{self, Integration, Shell};
+        let result = (|| -> Result<bool, String> {
+            let integration = Integration::current(Shell::current()?)?;
+            if integration.installed() {
+                integration.uninstall()?;
+                Ok(false)
+            } else {
+                shell_proxy::environment(&self.config.controller)?;
+                integration.install(&std::env::current_exe().map_err(|e| e.to_string())?)?;
+                Ok(true)
+            }
+        })();
+        match result {
+            Ok(installed) => {
+                self.terminal_proxy_installed = installed;
+                let text = match (self.lang() == Lang::Zh, installed) {
+                    (true, true) => "已写入 shell 启动配置，新终端生效。当前窗口：eval \"$(terc env)\"（fish：terc env --shell fish | source）",
+                    (true, false) => "已移除 terc 启动配置。当前窗口撤销：eval \"$(terc env --unset)\"（fish：terc env --shell fish --unset | source）",
+                    (false, true) => "Installed for new terminals. Current shell: eval \"$(terc env)\" (fish: terc env --shell fish | source)",
+                    (false, false) => "Removed startup integration. Current shell: eval \"$(terc env --unset)\" (fish: terc env --shell fish --unset | source)",
+                };
+                self.set_status(text, false);
+            }
+            Err(err) => self.set_status(&err, true),
         }
     }
 

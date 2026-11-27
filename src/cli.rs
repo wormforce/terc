@@ -31,6 +31,8 @@ Usage:
   terc dns <name> [--type A] [--json]
   terc explain <target> [--json]
   terc sysproxy on|off [--yes] [--json]
+  terc env [--shell sh|bash|zsh|fish] [--unset] [--json]
+  terc env install|uninstall|status [--shell bash|zsh|fish] [--json]
   terc verify  [--json]        running config vs the generated one
   terc doctor  [--json]        read-only health checks
   terc core start|stop [--json]  start or stop the managed core
@@ -62,6 +64,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "dns" => dns(rest, json),
         "explain" => explain(rest, json),
         "sysproxy" => sysproxy(rest, json),
+        "env" => terminal_env(rest, json),
         "verify" => verify(json),
         "doctor" => doctor(json),
         "core" => core(rest, json),
@@ -103,6 +106,108 @@ fn usage_error(message: &str) -> i32 {
     eprintln!("terc: {message}\n");
     print!("{USAGE}");
     2
+}
+
+fn terminal_env(args: &[String], json: bool) -> i32 {
+    use crate::shell_proxy::{self, Integration, Shell};
+    let environment = || {
+        let path = Config::path();
+        let text = std::fs::read_to_string(&path)
+            .map_err(|err| format!("Cannot read {}: {err}", path.display()))?;
+        let config: Config = serde_json::from_str(&text)
+            .map_err(|err| format!("Cannot parse {}: {err}", path.display()))?;
+        shell_proxy::environment(&config.controller)
+    };
+    let run = || -> Result<(), String> {
+        let mut shell = None;
+        let mut action = None;
+        let mut unset = false;
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--shell" => {
+                    shell = Some(Shell::parse(
+                        args.next().ok_or("--shell needs a shell name")?,
+                    )?)
+                }
+                "--json" => {}
+                "--unset" => unset = true,
+                "install" | "uninstall" | "status" if action.is_none() => {
+                    action = Some(arg.as_str())
+                }
+                _ => return Err(format!("Unknown env argument: {arg}")),
+            }
+        }
+        if unset && action.is_some() {
+            return Err("--unset cannot be combined with install, uninstall or status".into());
+        }
+        let shell = shell.map(Ok).unwrap_or_else(Shell::current)?;
+        if let Some(action) = action {
+            let integration = Integration::current(shell)?;
+            match action {
+                "install" => {
+                    environment()?;
+                    integration.install(&std::env::current_exe().map_err(|e| e.to_string())?)?;
+                }
+                "uninstall" => integration.uninstall()?,
+                _ => {}
+            }
+            let installed = integration.installed();
+            if json {
+                print_json(
+                    &json!({"shell":shell.name(),"installed":installed,"files":integration.files}),
+                );
+            } else {
+                println!(
+                    "{}: terminal proxy {}",
+                    shell.name(),
+                    if installed {
+                        "installed"
+                    } else {
+                        "not installed"
+                    }
+                );
+                for path in integration.files {
+                    println!("  {}", path.display());
+                }
+                if action == "install" {
+                    println!("Open a new terminal, or run: eval \"$(terc env)\" (fish: terc env --shell fish | source)");
+                }
+                if action == "uninstall" {
+                    println!("Existing shells keep their environment; run terc env --unset through eval/source to disable it there.");
+                }
+            }
+        } else {
+            let script = if unset {
+                shell.unset()
+            } else {
+                match environment() {
+                    Ok(env) => env.render(shell),
+                    Err(err) => {
+                        // Existing eval/source callers must get the blocking
+                        // values even though the command reports failure.
+                        if !json {
+                            print!("{}", shell_proxy::unavailable(shell));
+                        }
+                        return Err(err);
+                    }
+                }
+            };
+            if json {
+                print_json(&json!({"shell":shell.name(),"script":script}));
+            } else {
+                print!("{script}");
+            }
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("terc env: {err}");
+            1
+        }
+    }
 }
 
 fn status(json: bool) -> i32 {

@@ -14,6 +14,7 @@ pub enum Command {
     Settings,
     Help,
     Sysproxy,
+    TerminalProxy,
     Mode,
     Tun,
     TestGroup,
@@ -102,6 +103,16 @@ pub fn items(app: &App) -> Vec<Item> {
             hint: "m",
         },
         Item {
+            command: Command::TerminalProxy,
+            label: label(
+                app,
+                "写入 / 移除终端代理",
+                "Install / remove terminal proxy",
+            ),
+            keywords: "terminal shell env bash zsh fish 终端代理 环境变量",
+            hint: "",
+        },
+        Item {
             command: Command::Tun,
             label: label(app, "切换 TUN", "Toggle TUN"),
             keywords: "tun vpn 虚拟网卡",
@@ -184,6 +195,7 @@ pub fn execute(app: &mut App, command: Command) -> bool {
         }
         Command::Help => app.screen = Screen::Help,
         Command::Sysproxy => app.toggle_sysproxy(),
+        Command::TerminalProxy => app.toggle_terminal_proxy(),
         Command::Mode => app.cycle_routing_mode(),
         Command::Tun => app.toggle_tun(),
         Command::TestGroup => app.test_current_group(),

@@ -186,6 +186,8 @@ macOS 在 设置 → 内核与代理 → TUN 虚拟网卡 开启 TUN 时，terc 
 | `terc dns <name> [--type A]` | 通过内核查询 DNS |
 | `terc explain <target>` | 规则命中解释：命中规则、被跳过的前序规则 |
 | `terc sysproxy on\|off [--yes]` | 开关系统代理；`on` 必须显式 `--yes` |
+| `terc env` / `terc env --unset` | 输出启用 / 撤销当前终端代理的 shell 命令 |
+| `terc env install\|uninstall\|status` | 一键写入、移除或检查终端启动配置；支持 bash、zsh、fish |
 | `terc notify-test` | 验证桌面通知后端 |
 
 ```bash
@@ -196,6 +198,27 @@ terc explain example.com
 ```
 
 只读命令默认安全；`sysproxy on` 会改变整机网络路径，因此必须显式 `--yes`，不会在 agent 会话里自动开启。
+
+### 终端代理
+
+设置 → 内核与代理 → **终端代理**，按 Enter 写入当前 shell 的启动配置，再按一次移除。命令面板也可以搜索「终端代理」。新终端自动读取当前选中内核的端口，不需要开启系统代理。
+
+```sh
+eval "$(terc env)"          # 当前 bash / zsh / sh 窗口启用
+eval "$(terc env --unset)"  # 当前窗口撤销
+terc env install           # 新终端自动启用
+terc env uninstall         # 移除启动配置，保留其他内容
+```
+
+fish 使用 `terc env --shell fish | source`，撤销时加 `--unset`。`--shell bash|zsh|fish` 可指定需要安装的 shell；默认根据 `$SHELL` 选择。
+
+启动配置只添加带标记的一小段调用，并将原文件备份为同名 `.terc.bak`，不改写 Git、npm 或订阅规则。只在启动时查询 `/configs`，不会给每条命令添加检测钩子。内核暂时停止时仍导出配置文件中的端口，请求会失败而不会自动撤销代理。端口或内核切换后，新终端会读取新端口；已有终端重新执行 `eval "$(terc env)"`。
+
+优先使用混合端口：HTTP(S) 环境变量使用 HTTP，`ALL_PROXY` 使用 `socks5h`，让支持 SOCKS 的工具经代理解析 DNS。仅有 SOCKS 监听时只设置 `ALL_PROXY`；不支持 SOCKS 或不读取代理环境变量的程序需要自行配置。现有 `NO_PROXY` / `no_proxy` 会合并保留，并添加本机、局域网、Tailnet 地址和 `.ts.net` 例外。CIDR 例外是否生效取决于调用工具的支持。撤销命令不删除这份例外列表。
+
+如果 shell 已有手写代理导出或 `preexec` 钩子，请自行移除重复的自动设置，避免它们覆盖 terc。TUI 无法修改其父 shell 已有的环境；写入后新开终端或执行上述命令即可。
+
+如果 terc 无法读取配置、控制器拒绝访问，或所有代理端口都关闭，会显示错误并为遵守代理变量的程序设置不可连接的本机代理。此时只保留内置的本机、局域网与 Tailnet 例外。修复后重新执行 `eval "$(terc env)"` 或打开新终端。
 
 ## 配置
 

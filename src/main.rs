@@ -31,6 +31,7 @@ mod privilege;
 pub mod proxy_form;
 pub mod routing;
 mod settings;
+pub mod shell_proxy;
 pub mod storage;
 pub mod subconv;
 pub mod talkers;
@@ -916,6 +917,7 @@ impl LineEditor {
 
 pub struct App {
     pub config: Config,
+    pub terminal_proxy_installed: bool,
     pub screen: Screen,
     pub main_tab: MainTab,
     pub focus: FocusPane,
@@ -1099,6 +1101,9 @@ impl App {
             }
         }
         let mut app = Self::from_snapshot(config, snapshot);
+        app.terminal_proxy_installed = shell_proxy::Shell::current()
+            .and_then(shell_proxy::Integration::current)
+            .is_ok_and(|integration| integration.installed());
         app.load_core_log();
         spawn_stream_workers(
             app.config.controller.addr.clone(),
@@ -1123,6 +1128,7 @@ impl App {
         );
         let mut app = Self {
             config,
+            terminal_proxy_installed: false,
             screen,
             main_tab: MainTab::Proxies,
             focus: FocusPane::Groups,
