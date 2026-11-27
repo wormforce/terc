@@ -22,3 +22,7 @@
    - Never automatically enable the system proxy during non-interactive tests or builds. On macOS that is `networksetup`; on Linux it is `gsettings` for `org.gnome.system.proxy`. Switching system proxy routes while an AI agent session is active can interrupt model streaming.
    - Do not call `networksetup` on Linux. If GNOME `gsettings` is missing, leave the proxy unchanged.
    - If testing live Mihomo routing behavior from an agent session, switch Mihomo to `Direct` mode first.
+
+## Required AI egress verification
+
+For an operator-requested audit or change to a live AI route, verify the actual intended `rule` mode with credential-free probes. This is operational verification of the active configuration, distinct from the automated routing tests above. After changing a subscription, routing policy, AI rule set, core, or relevant group selection, run `python3 scripts/check-ai-egress.py --expected-node '<node name>'` on each affected configured core before reporting success or starting authenticated AI work. Include extra domains used by that application if they differ from the defaults. If any probe fails or cannot be run, report the route as unverified and stop the rollout. Group selection, node delay and previously established connections are insufficient evidence. Preserve deliberate direct exceptions and use an independent AI selection. See [AI egress verification and incident notes](docs/ai-egress-verification.md).
